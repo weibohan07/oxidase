@@ -27,7 +27,7 @@ fn value_lazy_then_greedy() {
 
 #[test]
 fn regex_inside() {
-    let p = compile_path("/u/<id:regex(\"[1-9]\\\\d*\")>").unwrap();
+    let p = compile_path("/u/<id:regex(\"[1-9]\\\\\\\\d*\")>").unwrap();
     assert!(p.is_match("/u/42"));
     assert!(!p.is_match("/u/0"));
 }
