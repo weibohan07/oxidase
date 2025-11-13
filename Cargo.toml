@@ -14,3 +14,4 @@ mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "1"
+regex = "1.12.2"

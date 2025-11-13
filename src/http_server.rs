@@ -9,7 +9,7 @@ use hyper::{
 };
 use tokio::net::TcpListener;
 use std::net::SocketAddr;
-use crate::config::HttpServer;
+use crate::config::http_server::HttpServer;
 use crate::handler::ServiceHandler;
 use hyper_util::rt::TokioIo;
 

@@ -1,5 +1,10 @@
 pub mod r#static {
-    use crate::config::{EvilDirStrategyIndexExists, EvilDirStrategyIndexMissing, IndexStrategy, StaticService};
+    use crate::config::r#static::{
+        EvilDirStrategyIndexExists,
+        EvilDirStrategyIndexMissing,
+        IndexStrategy,
+        StaticService,
+    };
     use crate::handler::ServiceHandler;
 
     use bytes::Bytes;
