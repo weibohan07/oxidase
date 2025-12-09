@@ -4,13 +4,14 @@ use hyper::{body, http, Uri};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 
-use crate::config::forward::{ForwardService, PassHost, PassHostMode};
+use crate::build::service::LoadedForward;
+use crate::config::forward::{PassHost, PassHostMode};
 use crate::config::url_scheme::Scheme;
 use crate::handler::{BoxResponseFuture, ServiceHandler};
 
 pub type ForwardResult<T> = Result<T, String>;
 
-impl ServiceHandler for ForwardService {
+impl ServiceHandler for LoadedForward {
     fn handle_request<'a>(
         &'a self,
         req: &'a mut http::Request<body::Incoming>,
@@ -24,14 +25,13 @@ impl ServiceHandler for ForwardService {
     }
 }
 
-impl ForwardService {
+impl LoadedForward {
     async fn forward_once(
         &self,
         req: &mut http::Request<body::Incoming>,
     ) -> ForwardResult<http::Response<Full<Bytes>>> {
         // TODO: https upstream, timeouts, http version
-
-        if matches!(self.target.scheme, Scheme::Https) {
+        if matches!(self.config.target.scheme, Scheme::Https) {
             return Err("TODO: https upstream not yet implemented".to_string());
         }
 
@@ -51,7 +51,7 @@ impl ForwardService {
             .map_err(|e| format!("failed to build upstream request: {e}"))?;
 
         // copy rest of headers
-        copy_headers(req, &mut upstream_req, self.host_header(req)?, self.x_forwarded);
+        copy_headers(req, &mut upstream_req, self.host_header(req)?, self.config.x_forwarded);
 
         let mut connector = HttpConnector::new();
         connector.enforce_http(true); // TODO: later switch to false for HTTPS support
@@ -85,12 +85,12 @@ impl ForwardService {
         &self,
         req: &http::Request<body::Incoming>,
     ) -> ForwardResult<Uri> {
-        let scheme = match self.target.scheme {
+        let scheme = match self.config.target.scheme {
             Scheme::Http => "http",
             Scheme::Https => "https",
         };
 
-        let mut path = self.target.path_prefix.clone();
+        let mut path = self.config.target.path_prefix.clone();
 
         if path.ends_with('/') && req.uri().path().starts_with('/') {
             path.pop();
@@ -102,7 +102,7 @@ impl ForwardService {
             path.insert(0, '/');
         }
 
-        let mut uri = format!("{scheme}://{}:{}{}", self.target.host, self.target.port, path);
+        let mut uri = format!("{scheme}://{}:{}{}", self.config.target.host, self.config.target.port, path);
         if let Some(q) = req.uri().query() {
             uri.push('?');
             uri.push_str(q);
@@ -117,13 +117,13 @@ impl ForwardService {
         &self,
         req: &http::Request<body::Incoming>,
     ) -> ForwardResult<Option<http::HeaderValue>> {
-        match &self.pass_host {
+        match &self.config.pass_host {
             PassHost::Mode(PassHostMode::Incoming) =>
                 req.headers().get(http::header::HOST)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string()),
             PassHost::Mode(PassHostMode::Target) =>
-                Some(format_host(&self.target.host, self.target.port, self.target.scheme)),
+                Some(format_host(&self.config.target.host, self.config.target.port, self.config.target.scheme)),
             PassHost::Custom { custom } => Some(custom.clone()),
         }.map(|h| http::HeaderValue::from_str(&h)
             .map_err(|e| format!("invalid host header value: {e}")))

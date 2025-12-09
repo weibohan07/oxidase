@@ -6,15 +6,15 @@ use percent_encoding::percent_decode_str;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::build::service::LoadedStatic;
 use crate::config::r#static::{
     EvilDirStrategyIndexExists,
     EvilDirStrategyIndexMissing,
     IndexStrategy,
-    StaticService,
 };
 use crate::handler::{BoxResponseFuture, ServiceHandler};
 
-impl ServiceHandler for StaticService {
+impl ServiceHandler for LoadedStatic {
     fn handle_request<'a>(
         &'a self,
         req: &'a mut http::Request<body::Incoming>,
@@ -31,27 +31,27 @@ impl ServiceHandler for StaticService {
                 Err(msg) => return bad_request(msg),
             };
 
-            let base_dir_path = Path::new(&self.source_dir);
+            let base_dir_path = Path::new(&self.config.source_dir);
             let target_path = base_dir_path.join(&rel);
             let is_target_dir = is_existing_dir(&target_path);
             let is_target_index =
                 !is_url_path_dir
-                && target_path.file_name().map_or(false, |f| f == self.file_index.as_str());
+                && target_path.file_name().map_or(false, |f| f == self.config.file_index.as_str());
 
             eprintln!("Mapped to path: {:?} (is dir: {}, is index: {})", target_path, is_target_dir, is_target_index);
 
             if is_target_index {
-                match &self.index_strategy {
+                match &self.config.index_strategy {
                     IndexStrategy::Redirect { code } =>
                         return redirect_to(&location_cur_dir(req), *code),
                     IndexStrategy::NotFound =>
-                        return nearest_404(base_dir_path, &target_path, &self.file_404, head_only),
+                        return nearest_404(base_dir_path, &target_path, &self.config.file_404, head_only),
                     IndexStrategy::ServeIndex => {},
                 }
             }
 
             let target_file_path = if is_url_path_dir {
-                target_path.join(&self.file_index)
+                target_path.join(&self.config.file_index)
             } else {
                 target_path.clone()
             };
@@ -64,29 +64,29 @@ impl ServiceHandler for StaticService {
             }
 
             if is_target_dir && !is_url_path_dir {
-                let index_file_path = target_path.join(&self.file_index);
+                let index_file_path = target_path.join(&self.config.file_index);
                 let has_index_file = index_file_path.is_file();
 
                 return if has_index_file {
-                    match &self.evil_dir_strategy.if_index_exists {
+                    match &self.config.evil_dir_strategy.if_index_exists {
                         EvilDirStrategyIndexExists::ServeIndex =>
-                            serve_file_or_404(base_dir_path, &index_file_path, &self.file_404, head_only),
+                            serve_file_or_404(base_dir_path, &index_file_path, &self.config.file_404, head_only),
                         EvilDirStrategyIndexExists::Redirect { code } =>
                             redirect_to(&location_with_slash(req), *code),
                         EvilDirStrategyIndexExists::NotFound =>
-                            nearest_404(base_dir_path, &target_path, &self.file_404, head_only),
+                            nearest_404(base_dir_path, &target_path, &self.config.file_404, head_only),
                     }
                 } else {
-                    match &self.evil_dir_strategy.if_index_missing {
+                    match &self.config.evil_dir_strategy.if_index_missing {
                         EvilDirStrategyIndexMissing::Redirect { code } =>
                             redirect_to(&location_with_slash(req), *code),
                         EvilDirStrategyIndexMissing::NotFound =>
-                            nearest_404(base_dir_path, &target_path, &self.file_404, head_only),
+                            nearest_404(base_dir_path, &target_path, &self.config.file_404, head_only),
                     }
                 }
             }
 
-            nearest_404(base_dir_path, &target_file_path, &self.file_404, head_only)
+            nearest_404(base_dir_path, &target_file_path, &self.config.file_404, head_only)
         })
     }
 }

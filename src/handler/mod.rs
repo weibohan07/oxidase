@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::config::service::Service;
+use crate::build::service::LoadedService;
 
 pub type BoxResponseFuture<'a> = Pin<Box<dyn Future<Output = http::Response<Full<Bytes>>> + Send + 'a>>;
 
@@ -16,12 +16,12 @@ pub trait ServiceHandler {
     fn handle_request<'a>(&'a self, req: &'a mut http::Request<body::Incoming>) -> BoxResponseFuture<'a>;
 }
 
-impl ServiceHandler for Service {
+impl ServiceHandler for LoadedService {
     fn handle_request<'a>(&'a self, req: &'a mut http::Request<body::Incoming>) -> BoxResponseFuture<'a> {
         match self {
-            Service::Static(handler) => handler.handle_request(req),
-            Service::Router(_handler) => todo!(),
-            Service::Forward(handler) => handler.handle_request(req),
+            LoadedService::Static(handler) => handler.handle_request(req),
+            LoadedService::Router(_handler) => todo!(),
+            LoadedService::Forward(handler) => handler.handle_request(req),
         }
     }
 }

@@ -9,13 +9,13 @@ use hyper::{
 };
 use tokio::net::TcpListener;
 use std::net::SocketAddr;
-use crate::config::http_server::HttpServer;
+use crate::build::service::BuiltHttpServer;
 use crate::handler::ServiceHandler;
 use hyper_util::rt::TokioIo;
 
 use std::sync::Arc;
 
-pub async fn start_server(hs: HttpServer) {
+pub async fn start_server(hs: BuiltHttpServer) {
     let addr
         = hs.bind
             .parse::<SocketAddr>()
