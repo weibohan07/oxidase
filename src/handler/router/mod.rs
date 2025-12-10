@@ -61,6 +61,7 @@ async fn route_request(
                 idx += 1;
             }
             OpOutcome::Restart => {
+                ctx.captures.clear();
                 step += 1;
                 idx = 0;
             }
@@ -78,6 +79,7 @@ async fn route_request(
                     }
                     OnMatch::Continue => idx += 1,
                     OnMatch::Restart => {
+                        ctx.captures.clear();
                         step += 1;
                         idx = 0;
                     }
