@@ -37,6 +37,10 @@ pub struct Args {
     /// Only validate configuration, do not start servers
     #[arg(short = 'v', long)]
     pub validate_only: bool,
+
+    /// Watch for configuration changes and reload servers
+    #[arg(short = 'w', long)]
+    pub watch: bool,
 }
 
 pub fn load_http_servers(args: &Args) -> Result<Vec<HttpServer>, ConfigError> {
