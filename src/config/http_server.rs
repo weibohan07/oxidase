@@ -10,12 +10,19 @@ use super::service::{validate_service, resolve_service_ref, ServiceRef};
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct HttpServer {
+    #[serde(default)]
+    pub name: Option<String>,
     pub bind: String, // listened host + port
     #[serde(default)]
     pub tls: Option<super::tls::TlsConfig>,
     pub service: ServiceRef,
     #[serde(skip)]
     pub base_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServersFile {
+    pub servers: Vec<HttpServer>,
 }
 
 impl HttpServer {
@@ -31,6 +38,11 @@ impl HttpServer {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.bind.trim().is_empty() {
             return Err(ConfigError::Invalid("`bind` cannot be empty".into()));
+        }
+        if let Some(name) = &self.name {
+            if name.trim().is_empty() {
+                return Err(ConfigError::Invalid("`name` cannot be empty if provided".into()));
+            }
         }
         if let Some(tls) = &self.tls {
             if tls.enabled && (tls.cert_file.exists() || tls.key_file.exists()) {

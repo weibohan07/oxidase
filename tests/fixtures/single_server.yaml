@@ -1,0 +1,4 @@
+bind: "127.0.0.1:7589"
+service:
+  handler: static
+  source_dir: "/tmp"

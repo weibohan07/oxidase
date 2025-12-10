@@ -1,0 +1,11 @@
+servers:
+  - name: first
+    bind: "127.0.0.1:7589"
+    service:
+      handler: static
+      source_dir: "/tmp/a"
+  - name: second
+    bind: "0.0.0.0:9090"
+    service:
+      handler: static
+      source_dir: "/tmp/b"

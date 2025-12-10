@@ -1,4 +1,5 @@
 mod build;
+mod cli;
 mod config;
 mod handler;
 mod http_server;
@@ -6,17 +7,29 @@ mod pattern;
 mod template;
 mod util;
 
-use config::http_server::HttpServer;
-use build::build_http_server;
+use cli::Args;
+use clap::Parser;
 
 #[tokio::main]
 async fn main() {
-    let config
-        = HttpServer::load_from_file("/Users/weibohan/Downloads/oxidase/config_router.yaml")
-            .expect("Failed to load configuration");
+    let args = Args::parse();
+    let servers = cli::load_http_servers(&args)
+        .expect("Failed to load configuration");
 
-    let loaded = build_http_server(config)
-        .expect("Failed to build runtime service");
+    if args.validate_only {
+        println!("configuration valid ({} server(s))", servers.len());
+        return;
+    }
 
-    http_server::start_server(loaded).await;
+    // For now start all servers; each start_server runs its own accept loop.
+    let mut handles = Vec::new();
+    for srv in servers {
+        let built = build::build_http_server(srv)
+            .expect("Failed to build runtime service");
+        handles.push(tokio::spawn(http_server::start_server(built)));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
 }
