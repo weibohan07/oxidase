@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 use super::super::url_scheme::Scheme;
-use super::super::service::Service;
+use super::super::service::ServiceRef;
 
 #[derive(Debug, Clone)]
 pub enum RouterOp {
@@ -27,7 +27,7 @@ pub enum RouterOp {
     Redirect { status: RedirectCode, location: String },
     Respond { status: u16, body: Option<String>, headers: BTreeMap<String, String> },
 
-    Use(Box<Service>),
+    Use(Box<ServiceRef>),
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -69,7 +69,7 @@ enum RouterOpFull {
         #[serde(default)] headers: BTreeMap<String, String>,
     },
 
-    Use(Box<Service>),
+    Use(Box<ServiceRef>),
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]

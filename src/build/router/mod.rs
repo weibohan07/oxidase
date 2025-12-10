@@ -20,6 +20,7 @@ use crate::config::router::r#match::{
 use crate::config::router::{OnMatch, RouterRule};
 use crate::config::url_scheme::Scheme;
 use crate::template::{CompiledTemplate, compile_template};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct LoadedRule {
@@ -103,14 +104,14 @@ pub struct CompiledTestCond {
     pub cond: CompiledBasicCond,
 }
 
-pub fn compile_rules(rules: &[RouterRule]) -> Result<Vec<LoadedRule>, ConfigError> {
-    rules.iter().map(compile_rule).collect()
+pub fn compile_rules(rules: &[RouterRule], base_dir: &Path) -> Result<Vec<LoadedRule>, ConfigError> {
+    rules.iter().map(|r| compile_rule(r, base_dir)).collect()
 }
 
-fn compile_rule(rule: &RouterRule) -> Result<LoadedRule, ConfigError> {
+fn compile_rule(rule: &RouterRule, base_dir: &Path) -> Result<LoadedRule, ConfigError> {
     Ok(LoadedRule {
         when: compile_match(rule.when.as_ref().unwrap_or(&RouterMatch::default()))?,
-        ops: compile_ops(&rule.ops)?,
+        ops: compile_ops(&rule.ops, base_dir)?,
         on_match: rule.on_match.clone(),
     })
 }
@@ -167,16 +168,16 @@ where
     input.map(|s| f(s).map_err(to_config_err)).transpose()
 }
 
-fn compile_ops(ops: &[RouterOp]) -> Result<Vec<LoadedOp>, ConfigError> {
-    ops.iter().map(compile_op).collect()
+fn compile_ops(ops: &[RouterOp], base_dir: &Path) -> Result<Vec<LoadedOp>, ConfigError> {
+    ops.iter().map(|op| compile_op(op, base_dir)).collect()
 }
 
-fn compile_op(op: &RouterOp) -> Result<LoadedOp, ConfigError> {
+fn compile_op(op: &RouterOp, base_dir: &Path) -> Result<LoadedOp, ConfigError> {
     Ok(match op {
         RouterOp::Branch(b) => {
             let cond = compile_cond(&b.r#if)?;
-            let then_ops = compile_ops(&b.then)?;
-            let else_ops = compile_ops(&b.r#else)?;
+            let then_ops = compile_ops(&b.then, base_dir)?;
+            let else_ops = compile_ops(&b.r#else, base_dir)?;
             LoadedOp::Branch(cond, then_ops, else_ops)
         }
         RouterOp::SetScheme(s) => LoadedOp::SetScheme(*s),
@@ -230,7 +231,7 @@ fn compile_op(op: &RouterOp) -> Result<LoadedOp, ConfigError> {
             LoadedOp::Respond { status: *status, body: compiled_body, headers: compiled_headers }
         }
         RouterOp::Use(svc) => {
-            let built = crate::build::service::build_service(svc)?;
+            let built = crate::build::service::build_service_ref(svc, base_dir)?;
             LoadedOp::Use(Box::new(built))
         }
     })

@@ -3,7 +3,7 @@ pub mod op;
 
 use serde::Deserialize;
 
-use super::service::Service;
+use super::service::ServiceRef;
 use r#match::RouterMatch;
 use op::RouterOp;
 
@@ -11,7 +11,7 @@ use op::RouterOp;
 pub struct RouterService {
     pub rules: Vec<RouterRule>,
     #[serde(default)]
-    pub next: Option<Box<Service>>,
+    pub next: Option<Box<ServiceRef>>,
     #[serde(default)]
     pub max_steps: Option<u32>,
 }
