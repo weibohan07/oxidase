@@ -20,7 +20,7 @@ impl ServiceHandler for LoadedService {
     fn handle_request<'a>(&'a self, req: &'a mut http::Request<body::Incoming>) -> BoxResponseFuture<'a> {
         match self {
             LoadedService::Static(handler) => handler.handle_request(req),
-            LoadedService::Router(_handler) => todo!(),
+            LoadedService::Router(handler) => handler.handle_request(req),
             LoadedService::Forward(handler) => handler.handle_request(req),
         }
     }
