@@ -15,27 +15,27 @@ use crate::config::service::{ServiceRef};
     .args(["config", "service_file", "service_inline"])))]
 pub struct Args {
     /// Path to a HttpServer config file (single server & servers list supported)
-    #[arg(long)]
+    #[arg(short, long)]
     pub config: Option<PathBuf>,
 
     /// Path to a Service config file (bind will be taken from --bind)
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     pub service_file: Option<PathBuf>,
 
     /// Inline YAML/JSON for a Service
-    #[arg(long)]
+    #[arg(short = 'i', long)]
     pub service_inline: Option<String>,
 
     /// Bind address when using --service-file / --service-inline
-    #[arg(long, default_value = "127.0.0.1:7589")]
+    #[arg(short, long, default_value = "127.0.0.1:7589")]
     pub bind: String,
 
     /// Pick a server by name when config contains multiple
-    #[arg(long)]
+    #[arg(short, long)]
     pub pick: Option<String>,
 
     /// Only validate configuration, do not start servers
-    #[arg(long)]
+    #[arg(short = 'v', long)]
     pub validate_only: bool,
 }
 
