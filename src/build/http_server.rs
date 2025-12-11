@@ -1,6 +1,7 @@
 use crate::config::error::ConfigError;
 use crate::config::http_server::HttpServer;
-use crate::build::service::{BuildCache, LoadedService, ParseCache, build_service_with_cache, parse_service_ref};
+use crate::build::service::{BuildCache, LoadedService, build_service_with_cache};
+use crate::parser::{ParseCache, parse_service_ref};
 
 #[derive(Debug, Clone)]
 pub struct BuiltHttpServer {

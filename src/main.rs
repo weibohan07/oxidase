@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod handler;
 mod http_server;
+mod parser;
 mod pattern;
 mod template;
 mod util;
@@ -103,7 +104,7 @@ async fn run_watch_loop(args: &Args) {
 
 fn spawn_servers(servers: Vec<config::http_server::HttpServer>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    let mut parse_cache = build::ParseCache::default();
+    let mut parse_cache = parser::ParseCache::default();
     let mut build_cache = build::BuildCache::default();
     for srv in servers {
         match build::build_http_server_with_caches(srv, &mut parse_cache, &mut build_cache) {

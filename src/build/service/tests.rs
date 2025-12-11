@@ -1,8 +1,9 @@
 use super::*;
 use crate::config::router::{OnMatch, RouterRule};
 use crate::config::router::r#match::RouterMatch;
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::config::service::ServiceRef;
+use crate::parser::ParseCache;
+use std::path::Path;
 
 fn static_service(path: &str) -> Service {
     Service::Static(StaticService {
@@ -13,36 +14,6 @@ fn static_service(path: &str) -> Service {
         file_404: Default::default(),
         file_500: Default::default(),
     })
-}
-
-#[test]
-fn parse_cache_dedupes_inline_by_hash_and_base() {
-    let svc = ServiceRef::Inline(static_service("/tmp/a"));
-    let base = Path::new("/tmp");
-    let mut cache = ParseCache::default();
-
-    let first = parse_service_ref(&svc, base, &mut cache).unwrap();
-    let second = parse_service_ref(&svc, base, &mut cache).unwrap();
-
-    assert_eq!(cache.inline.len(), 1);
-    assert_eq!(service_hash(&first.service).unwrap(), service_hash(&second.service).unwrap());
-}
-
-#[test]
-fn parse_cache_dedupes_import_by_path() {
-    let dir = std::env::temp_dir().join("oxidase_parse_cache_import");
-    let _ = fs::create_dir_all(&dir);
-    let svc_file = dir.join("svc.yaml");
-    fs::write(&svc_file, "handler: static\nsource_dir: /tmp/b\nfile_index: index.html\n").unwrap();
-
-    let svc = ServiceRef::Import { import: PathBuf::from("svc.yaml") };
-    let mut cache = ParseCache::default();
-
-    let first = parse_service_ref(&svc, &dir, &mut cache).unwrap();
-    let second = parse_service_ref(&svc, &dir, &mut cache).unwrap();
-
-    assert_eq!(cache.imports.len(), 1);
-    assert_eq!(service_hash(&first.service).unwrap(), service_hash(&second.service).unwrap());
 }
 
 #[test]
