@@ -30,9 +30,9 @@ pub fn resolve_service_ref(
     svc: &ServiceRef,
     base_dir: &Path,
     stack: &mut HashSet<PathBuf>,
-) -> Result<Service, ConfigError> {
+) -> Result<(Service, PathBuf), ConfigError> {
     match svc {
-        ServiceRef::Inline(s) => Ok(s.clone()),
+        ServiceRef::Inline(s) => Ok((s.clone(), base_dir.to_path_buf())),
         ServiceRef::Import { import } => {
             let path = if import.is_absolute() {
                 import.clone()
@@ -66,8 +66,8 @@ pub fn validate_service(svc: &Service, base_dir: &Path) -> Result<(), ConfigErro
             }
             if let Some(n) = &rt.next {
                 let mut stack = HashSet::new();
-                let resolved = resolve_service_ref(n, base_dir, &mut stack)?;
-                validate_service(&resolved, base_dir)?;
+                let (resolved, child_base) = resolve_service_ref(n, base_dir, &mut stack)?;
+                validate_service(&resolved, &child_base)?;
             }
         }
         Service::Forward(fw) => {

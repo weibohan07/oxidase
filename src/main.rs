@@ -103,8 +103,10 @@ async fn run_watch_loop(args: &Args) {
 
 fn spawn_servers(servers: Vec<config::http_server::HttpServer>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
+    let mut parse_cache = build::ParseCache::default();
+    let mut build_cache = build::BuildCache::default();
     for srv in servers {
-        match build::build_http_server(srv) {
+        match build::build_http_server_with_caches(srv, &mut parse_cache, &mut build_cache) {
             Ok(built) => {
                 handles.push(tokio::spawn(http_server::start_server(built)));
             }

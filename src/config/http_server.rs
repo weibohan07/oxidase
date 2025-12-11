@@ -51,8 +51,8 @@ impl HttpServer {
         }
         let base = self.base_dir.as_deref().unwrap_or(Path::new("."));
         let mut stack = HashSet::new();
-        let resolved = resolve_service_ref(&self.service, base, &mut stack)?;
-        validate_service(&resolved, base)?;
+        let (resolved, child_base) = resolve_service_ref(&self.service, base, &mut stack)?;
+        validate_service(&resolved, &child_base)?;
         Ok(())
     }
 }
