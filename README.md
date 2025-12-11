@@ -125,7 +125,7 @@ servers:
     ```
   - **Static**
     ```yaml
-    handler: (static)
+    handler: static
     source_dir: (string)
     file_index: (string)
     file_404?: (string)
