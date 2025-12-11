@@ -4,6 +4,12 @@ English | [简体中文](README.zh.md)
 
 Oxidase is a lightweight HTTP gateway built on Rust / Tokio / Hyper, supporting route matching, rewrites, reverse proxying, and static file serving.
 
+## CS 128 Honors Project
+
+> **Group Name**: Oxidase (group-15)
+>
+> **Group Members**: albertw5, vtyou2
+
 ## TL;DR
 
 With just a handful of lines of config you can spin up the following!
