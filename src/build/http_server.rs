@@ -1,11 +1,12 @@
 use crate::config::error::ConfigError;
 use crate::config::http_server::HttpServer;
-use crate::build::service::{BuildCache, LoadedService, build_service_with_cache};
+use crate::build::service::{BuildCache, LoadedService, build_from_parsed};
 use crate::parser::{ParseCache, parse_service_ref};
 
 #[derive(Debug, Clone)]
 pub struct BuiltHttpServer {
     pub bind: String,
+    #[allow(dead_code)]
     pub tls: Option<crate::config::tls::TlsConfig>,
     pub service: LoadedService,
 }
@@ -25,7 +26,7 @@ pub fn build_http_server_with_caches(
     cfg.validate()?;
     let base = cfg.base_dir.as_deref().unwrap_or(std::path::Path::new("."));
     let parsed = parse_service_ref(&cfg.service, base, parse_cache)?;
-    let service = build_service_with_cache(&parsed.service, &parsed.base_dir, parse_cache, build_cache)?;
+    let service = build_from_parsed(&parsed, &parsed.root, build_cache)?;
     Ok(BuiltHttpServer {
         bind: cfg.bind,
         tls: cfg.tls,

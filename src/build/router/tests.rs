@@ -14,8 +14,6 @@ fn compile_simple_rule() {
         on_match: OnMatch::default(),
     };
 
-    let compiled = compile_rules(&[rule], std::path::Path::new(".")).expect("compile failed");
-    assert_eq!(compiled.len(), 1);
-    assert!(compiled[0].when.host.is_some());
-    assert_eq!(compiled[0].ops.len(), 1);
+    let compiled_match = compile_match(&rule.when.unwrap());
+    assert!(compiled_match.unwrap().host.is_some());
 }

@@ -1,9 +1,9 @@
 use super::*;
 use crate::config::router::{OnMatch, RouterRule};
 use crate::config::router::r#match::RouterMatch;
+use crate::config::router::RouterService;
 use crate::config::r#static::StaticService;
-use crate::config::service::ServiceRef;
-use crate::config::service::Service;
+use crate::config::service::{Service, ServiceRef};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,8 +27,8 @@ fn parse_cache_dedupes_inline_by_hash_and_base() {
     let first = parse_service_ref(&svc, base, &mut cache).unwrap();
     let second = parse_service_ref(&svc, base, &mut cache).unwrap();
 
-    assert_eq!(cache.inline.len(), 1);
-    assert_eq!(service_hash(&first.service).unwrap(), service_hash(&second.service).unwrap());
+    assert_eq!(cache.key_to_parsed.len(), 1);
+    assert_eq!(first.root, second.root);
 }
 
 #[test]
@@ -44,8 +44,9 @@ fn parse_cache_dedupes_import_by_path() {
     let first = parse_service_ref(&svc, &dir, &mut cache).unwrap();
     let second = parse_service_ref(&svc, &dir, &mut cache).unwrap();
 
-    assert_eq!(cache.imports.len(), 1);
-    assert_eq!(service_hash(&first.service).unwrap(), service_hash(&second.service).unwrap());
+    assert_eq!(cache.key_to_parsed.len(), 1);
+    assert_eq!(cache.import_to_key.len(), 1);
+    assert_eq!(first.root, second.root);
 }
 
 #[test]
@@ -60,9 +61,15 @@ fn parse_collects_inline_child_dependency() {
     let mut cache = ParseCache::default();
 
     let parsed = parse_service_ref(&router, base, &mut cache).unwrap();
-    // Should record child inline service key once.
-    assert!(parsed.deps.iter().any(|d| matches!(d, ServiceDep::Inline(_))));
-    assert_eq!(parsed.deps.len(), 1);
+    let root = parsed.services.get(&parsed.root).unwrap();
+    match root {
+        ParsedService::Router(r) => {
+            assert!(r.deps.iter().any(|d| matches!(d, ServiceDep::Inline(_))));
+            assert_eq!(r.deps.len(), 1);
+            assert!(r.next.is_some());
+        }
+        _ => panic!("expected router"),
+    }
 }
 
 #[test]
@@ -77,16 +84,22 @@ fn parse_collects_import_dependency_and_transitive() {
     let mut cache = ParseCache::default();
 
     let parsed = parse_service_ref(&svc, &dir, &mut cache).unwrap();
-    let mut has_import = false;
-    let mut has_inline = false;
-    for dep in parsed.deps.iter() {
-        match dep {
-            ServiceDep::ImportPath(p) => {
-                if p.ends_with("svc_dep.yaml") { has_import = true; }
+    let root = parsed.services.get(&parsed.root).unwrap();
+    match root {
+        ParsedService::Router(r) => {
+            let mut has_import = false;
+            let mut has_inline = false;
+            for dep in r.deps.iter() {
+                match dep {
+                    ServiceDep::ImportPath(p) => {
+                        if p.ends_with("svc_dep.yaml") { has_import = true; }
+                    }
+                    ServiceDep::Inline(_) => has_inline = true,
+                }
             }
-            ServiceDep::Inline(_) => has_inline = true,
+            assert!(has_import);
+            assert!(has_inline);
         }
+        _ => panic!("expected router"),
     }
-    assert!(has_import);
-    assert!(has_inline);
 }
