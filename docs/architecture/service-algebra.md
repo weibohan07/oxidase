@@ -29,7 +29,12 @@ generic mechanism that turns selected failures into another Service execution.
 child lexical scope, and discards that scope on exit.
 
 Each execution frame combines immutable original request metadata, a scoped request
-overlay, lexical bindings, and explicit body state. Scheme, authority, and
+overlay, lexical bindings, explicit body state, and frame-local lazy views. Unchanged
+frame clones share cached effective Headers, decoded query, request namespace, and
+visible bindings. `with_bindings` replaces only the bindings/evaluation cache;
+opening a mutable Transform overlay gives the child a new request-view cache. A
+declined or failed child therefore cannot publish cached mutations back to its
+parent. Scheme, authority, and
 path-and-query replacements are parsed into `http` typed values. Only `http` and
 `https` schemes are accepted; authorities reject userinfo and invalid ports; paths
 must remain origin-form. Constant rewrites fail during compilation and dynamic
@@ -48,6 +53,15 @@ execution and therefore wrap every handled descendant.
 Normal execution uses a no-op trace sink and does not allocate explain event/detail
 strings per Service node. Explain and declarative tests explicitly select the
 structured collector while executing the same graph and leaf boundary.
+
+Production observation is a separate executor boundary. Only an explicit `Observe`
+wrapper starts an `ExecutionObserver` scope. The scope ends when its child returns
+`Handled` (including status class), `Declined`, or `Failed` (including error class),
+and nested wrappers preserve depth. Its latency is service-to-response-head: it does
+not claim to measure delivery of a streaming body. Timeout cancellation closes the
+scope through an RAII guard. The server independently wraps the final `GatewayBody`
+to count emitted bytes and classify completion, body error, idle timeout, or client
+cancellation without collecting the stream.
 
 After the root returns `Handled`, a single protocol finalizer removes hop-by-hop and
 untrusted framing metadata, derives safe lengths, and enforces body rules for HEAD,

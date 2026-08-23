@@ -6,11 +6,16 @@ Oxista is the compiled Site Service and response-document subsystem.
 - `.oxr` defines the HTTP response for one public logical resource.
 - `.oxt` is a pure body-template module with no direct public URL.
 
-Site preparation canonicalizes the root, validates the manifest and typed inputs,
-scans assets and sources once, compiles response documents and templates, checks
-their static dependency graph, and publishes an immutable `SiteSnapshot`. Requests
-perform an indexed lookup; they do not parse YAML, discover candidate files, or
-compile templates.
+Site preparation canonicalizes the root and builds one `SiteSourceIndex` before
+compilation. Each ordinary or precompressed file is streamed through SHA-256 once;
+the index retains canonical/source path, kind, length, modification metadata, and
+digest. `.oxsite`, `.oxr`, and `.oxt` text is retained for compilation, while large
+Asset bytes are not. The same digest records drive Site reuse and representation
+ETags, so compilation never re-reads a file already indexed. The compiler then
+validates typed inputs, compiles response documents and templates, checks their
+static dependency graph, and publishes an immutable `SiteSnapshot`. Requests perform
+an indexed lookup; they do not parse YAML, discover candidate files, or compile
+templates.
 
 Gateway and all three Oxista formats use the same strict source parser. The accepted
 subset allows block mappings and flow sequences, including quoted template text,
@@ -36,7 +41,11 @@ streaming.
 
 An `AssetPlan` contains complete identity, Brotli, and gzip
 `AssetRepresentation` records. Each representation owns its path, byte length,
-content-derived ETag, and modification time; compressed validators are never made by
+content-derived ETag, and modification time. Strong tags use
+`"sha256-<64 lowercase hex>"` over exactly that representation's bytes; weak mode
+adds the standard `W/` prefix. Equal bytes at different paths therefore have equal
+validators, while identity, Brotli, and gzip bytes are independent. Compressed
+validators are never made by
 suffixing an identity ETag. Request processing selects the representation first,
 then applies its metadata, then evaluates validators, and only then handles
 If-Range/Range. `If-None-Match` uses weak comparison and takes precedence over
@@ -59,8 +68,25 @@ profiles in declaration order, then local OXR. Each layer runs remove, set, add.
 Ordinary assets and OXR-backed assets use the same logical extension (never `.br`,
 `.gz`, or `.oxr`) for `defaults.by_extension`.
 
-Templates receive typed, read-only namespaces (`request`, `bindings`, `site`, and
-`page`). Includes are static and resolved at compile time. HTML output autoescapes
+Templates receive typed, read-only public roots (`request`, `bindings`, `site`,
+`resource`, and `page`) plus persistent lexical scopes for external arguments,
+`for`, `with`, and include arguments. Public roots cannot be shadowed. Includes use
+this static grammar:
+
+```django
+{% include "_templates/card.oxt" %}
+{% include "_templates/card.oxt" with item=item show_author=true %}
+{% include "_templates/card.oxt" with item=item only %}
+```
+
+The path is a compile-time quoted string, argument names are bindings, values are
+normal Expressions, duplicates are rejected, and `only` is optional and trailing.
+Preparation resolves the target DAG and rejects missing/unknown arguments, missing
+required parameters, constant type mismatches, and cycles. Runtime evaluates dynamic
+arguments, validates their actual types, and pushes a child-only scope. A normal
+include inherits caller lexical scopes before the explicit argument scope; `only`
+starts again from public roots. Either form drops the child scope on return, and the
+child uses its own effective output/autoescape settings. HTML output autoescapes
 ordinary strings. Oxista has no network, database, shell, arbitrary filesystem, or
 Service-dispatch capability.
 
@@ -81,3 +107,15 @@ Template rendering returns structured limit, evaluation, missing-value, and
 argument errors. Only output, loop, include-depth, expression-step, and render-time
 budget failures become the public `TemplateLimit` Service error class; other Site
 render failures remain `InvalidState`, and clients receive a generic safe error.
+One shared `RenderBudget` is used across nested includes. An expression or loop body
+is charged before execution, include depth is checked before entry, and output size
+is checked before append. At limit N exactly N operations/bytes are allowed; N+1
+fails without executing or writing the extra operation. Cooperative render-time
+checkpoints run at every corresponding boundary.
+
+The shared YAML parser retains original text and key/value byte ranges. Gateway
+semantic lowering, OXR Header policy, and OXT interpolation/tag/include diagnostics
+render exact ranges, including CRLF and Unicode columns; include-cycle diagnostics
+list the source position of each resolved edge. Some other deeper Oxista
+front-matter semantic errors still report the containing source rather than an exact
+scalar and remain an alpha diagnostic limitation.

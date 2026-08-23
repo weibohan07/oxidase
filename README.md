@@ -43,12 +43,38 @@ framing finalizer, and Gateway/Oxista source cannot set hop-by-hop or framing
 headers. HEAD, informational, 204, 205, and 304 body rules are covered by wire
 tests.
 
+`Observe` is a production wrapper rather than explain-only syntax. It records a
+bounded, structured service-to-response-head scope for handled, declined, failed,
+timeout, and nested executions without enabling full traces. A separate streaming
+body adapter records emitted bytes, completion, errors, idle timeouts, and downstream
+cancellation. Metric labels come only from configured Observe names and fixed enums;
+request URLs, queries, and Header values are never labels.
+
 Oxista response headers execute in source order (global defaults, logical extension,
 profiles, then local OXR). Ordinary and OXR-backed assets share extension defaults.
 External OXT files inherit Site output/autoescape defaults; custom 404 templates are
 validated as zero-argument calls and retain their effective metadata. Template
 budget failures are classified separately for `Recover` without exposing details to
 clients.
+
+OXT includes have typed call contracts:
+`{% include "_templates/card.oxt" with item=item only %}`. Arguments are ordinary
+compiled expressions, required/unknown/constant-type errors fail preparation, and
+dynamic values are checked before rendering. Normal include inherits caller locals;
+`only` keeps the read-only `request`, `bindings`, `site`, `resource`, and `page`
+roots while dropping caller template/loop/with scopes. Render budgets are charged
+before each expression, loop body, include, and output write, so exactly the stated
+limit is allowed and the next operation does not execute.
+
+Correctness identities use complete SHA-256 digests with domain-separated,
+length-prefixed structured encoding. Strong Asset validators are
+`"sha256-<64 lowercase hex>"` over the selected representation bytes. One
+`SiteSourceIndex` scan supplies Site reuse identity, representation ETags, cached
+Oxista source text, and compilation metadata; large Asset bytes are not retained.
+Gateway semantic diagnostics and OXT tags/interpolations carry exact byte and
+line/column ranges. Request expression views are frame-local and lazy, so effective
+Headers, query values, bindings, and the request namespace are built once per
+unchanged frame.
 
 Inbound TLS/HTTP/2 and OXT `extends`/`block` are not yet implemented. Atomic
 last-known-good reload is available with `serve --watch`; health and bounded metrics
@@ -115,7 +141,6 @@ listeners:
 
 The v1alpha1 YAML boundary is shared by Gateway and every Oxista format. Unknown or
 duplicate keys, anchors, aliases, merge keys, custom tags, tab indentation, and flow
-mappings fail; flow sequences are allowed. Imports/references are cycle checked,
 mappings fail; flow sequences and literal/folded block scalars are allowed. Imports/
 references are cycle checked, and parsed-but-inert field values are rejected with
 migration guidance. `check` and `serve` use the same compiler and Site preparation
@@ -146,15 +171,15 @@ and their parent directories in the watcher dependency set.
 ## Development
 
 ```bash
-cargo +1.88.0 check --workspace --all-targets --all-features
-cargo +1.88.0 test --workspace
+cargo +1.88.0 check --workspace --all-targets --all-features --locked
+cargo +1.88.0 test --workspace --locked
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo deny check
-cargo check --manifest-path fuzz/Cargo.toml --bins
-cargo build --workspace --release
+cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+cargo build --workspace --release --locked
 ```
 
 The HTTP end-to-end tests bind ephemeral loopback ports. Sandboxed environments may
