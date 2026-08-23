@@ -8,16 +8,19 @@ Service for the lifetime of each request.
 
 The workspace is intentionally layered:
 
-- `oxidase-core`: values, IDs, source locations, patterns, expressions, Service IR,
-  and protocol-independent outcomes.
-- `oxidase-source`: the shared strict YAML subset and position-aware parse errors.
+- `oxidase-core`: values, SHA-256 content identities, IDs, source ranges, patterns,
+  expressions, lazy transactional request frames, Service IR, and
+  protocol-independent outcomes.
+- `oxidase-source`: the shared strict YAML subset plus `SourceDocument<T>` original
+  text and field-path span indexes.
 - `oxidase-config`: strict source models, import/reference resolution, diagnostics,
   and lowering.
-- `oxidase-site`: the Oxista compiler and immutable site resources.
+- `oxidase-site`: the single-scan `SiteSourceIndex`, typed lexical OXT compiler, and
+  immutable site resources.
 - `oxidase-runtime`: transactional request frames, Service execution, resources,
   snapshots, and publication.
-- `oxidase-server`: the selected HTTP data plane, listener lifecycle, and proxy
-  adapter.
+- `oxidase-server`: the selected HTTP data plane, production Observe/body telemetry,
+  listener lifecycle, and streaming proxy adapter.
 - `oxidase-cli`: `check`, `explain`, `compile`, `test`, and `serve` commands.
 - `oxidase-testkit`: reusable fixtures for integration and protocol tests.
 

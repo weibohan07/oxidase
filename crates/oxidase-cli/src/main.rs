@@ -6,7 +6,10 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_config::{Compiler, ExplainRequestSource, TestExpectationSource};
-use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, ResponseHead, ServiceOutcome};
+use oxidase_core::{
+    ContentDigest, ContentDigestBuilder, RequestFrame, RequestMetadata, ResourceId, ResponseHead,
+    ServiceOutcome,
+};
 use oxidase_runtime::{BoxLeafFuture, ExecutionReport, Executor, LeafExecutor, RuntimeSnapshot};
 use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
@@ -524,36 +527,36 @@ async fn watch_dependencies_with_timing(
     }
 }
 
-async fn current_dependency_stamp(reload: &oxidase_server::ReloadHandle) -> u64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchStamp(ContentDigest);
+
+async fn current_dependency_stamp(reload: &oxidase_server::ReloadHandle) -> WatchStamp {
     let dependencies = reload.watched_dependencies();
     dependency_stamp(&dependencies).await
 }
 
-async fn dependency_stamp(dependencies: &[PathBuf]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+async fn dependency_stamp(dependencies: &[PathBuf]) -> WatchStamp {
+    let mut hash = ContentDigestBuilder::new("oxidase/watch-stamp/v1");
+    hash.field_u64("dependency_count", dependencies.len() as u64);
     for path in dependencies {
-        update_stamp(&mut hash, path.to_string_lossy().as_bytes());
+        hash.field_bytes("path", path.to_string_lossy().as_bytes());
         match tokio::fs::metadata(path).await {
             Ok(metadata) => {
-                update_stamp(&mut hash, &metadata.len().to_le_bytes());
-                update_stamp(&mut hash, &[u8::from(metadata.is_dir())]);
+                hash.field_bytes("state", b"present");
+                hash.field_u64("length", metadata.len());
+                hash.field_bytes("is_directory", [u8::from(metadata.is_dir())]);
                 if let Ok(modified) = metadata.modified()
                     && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
                 {
-                    update_stamp(&mut hash, &duration.as_nanos().to_le_bytes());
+                    hash.field_u128("modified_ns", duration.as_nanos());
                 }
             }
-            Err(_) => update_stamp(&mut hash, b"missing"),
+            Err(_) => {
+                hash.field_bytes("state", b"missing");
+            }
         }
     }
-    hash
-}
-
-fn update_stamp(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    WatchStamp(hash.finish())
 }
 
 #[cfg(test)]

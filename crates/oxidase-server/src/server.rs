@@ -12,7 +12,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use oxidase_core::{RequestFrame, RequestMetadata, ServiceOutcome};
 use oxidase_runtime::{Executor, ResourceReuse, RuntimeSnapshot, SnapshotStore};
 use thiserror::Error;
@@ -20,12 +20,22 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::body::{GatewayBody, GatewayBodyPlan};
+use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body};
 use crate::leaves::{HyperLeaves, ProxyClient};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ProductionObserver};
 use crate::response::ResponseFinalizer;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
+    let mut builder = http1::Builder::new();
+    builder
+        .keep_alive(true)
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    builder
+}
 
 pub struct GatewayServer {
     store: Arc<SnapshotStore>,
@@ -778,8 +788,7 @@ async fn serve_admin_connection(
 ) {
     let service =
         service_fn(move |request| handle_admin_request(request, store.clone(), metrics.clone()));
-    let connection = http1::Builder::new()
-        .keep_alive(true)
+    let connection = http1_builder(DEFAULT_HTTP1_HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
     let result = tokio::select! {
@@ -955,8 +964,7 @@ async fn serve_connection(
             metrics.clone(),
         )
     });
-    let connection = http1::Builder::new()
-        .keep_alive(true)
+    let connection = http1_builder(DEFAULT_HTTP1_HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
     let result = tokio::select! {
@@ -990,7 +998,7 @@ async fn handle_request(
     proxy: Arc<ProxyClient>,
     metrics: Arc<Metrics>,
 ) -> Result<Response<GatewayBody>, Infallible> {
-    let _active_request = metrics.request_started();
+    let active_request = metrics.request_started();
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
     let snapshot = store.pin();
@@ -1008,11 +1016,12 @@ async fn handle_request(
             StatusCode::INTERNAL_SERVER_ERROR,
             started.elapsed(),
         );
-        return Ok(safe_response(
+        let response = safe_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
             request.method(),
-        ));
+        );
+        return Ok(instrument_response_body(response, metrics, active_request));
     };
 
     let (parts, body) = request.into_parts();
@@ -1039,17 +1048,15 @@ async fn handle_request(
         Err(error) => {
             tracing::warn!(request_id, error = %error, "request metadata is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
-            return Ok(safe_response(
-                StatusCode::BAD_REQUEST,
-                "Bad Request",
-                &request_method,
-            ));
+            let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
+            return Ok(instrument_response_body(response, metrics, active_request));
         }
     };
     metadata.peer_address = Some(peer_address);
     let leaves = HyperLeaves::new(snapshot.clone(), proxy);
+    let observer = ProductionObserver::new(&metrics, &config_version, &listener_name, request_id);
     let report = Executor::new(&program, &leaves)
-        .execute(RequestFrame::new(metadata), Some(body))
+        .execute_observed(RequestFrame::new(metadata), Some(body), &observer)
         .await;
 
     let (outcome, status, response) = match report.outcome {
@@ -1096,7 +1103,7 @@ async fn handle_request(
         "request complete"
     );
     metrics.record_request(outcome, status, started.elapsed());
-    Ok(response)
+    Ok(instrument_response_body(response, metrics, active_request))
 }
 
 fn response_from_head(
@@ -1179,9 +1186,9 @@ mod tests {
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::watch;
+    use tokio::sync::{oneshot, watch};
 
-    use super::GatewayServer;
+    use super::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayServer, http1_builder};
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
         raw_request(
@@ -1207,6 +1214,68 @@ mod tests {
             .await
             .expect("response can be read");
         String::from_utf8(response).expect("test response is UTF-8")
+    }
+
+    async fn raw_request_allow_disconnect(address: std::net::SocketAddr, request: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("test server accepts connections");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request can be written");
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => response.extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("response read failed: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn write_proxy_gateway(
+        path: &std::path::Path,
+        upstream: std::net::SocketAddr,
+        response_timeout: &str,
+    ) {
+        fs::write(
+            path,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    upstream:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: {response_timeout}
+services:
+  root:
+    type: proxy
+    cluster: upstream
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("proxy gateway config can be written");
     }
 
     fn raw_response_parts(response: &str) -> (&str, &str) {
@@ -1251,6 +1320,49 @@ mod tests {
         })
         .await
         .expect("response arrives before timeout")
+    }
+
+    async fn read_http1_response(stream: &mut tokio::net::TcpStream) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut expected_length = None;
+            let mut chunked = false;
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("response is readable");
+                assert!(read > 0, "connection closed before complete response");
+                response.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = response.windows(4).position(|value| value == b"\r\n\r\n")
+                {
+                    let body_start = header_end + 4;
+                    if expected_length.is_none() && !chunked {
+                        let headers = String::from_utf8_lossy(&response[..header_end]);
+                        expected_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        chunked = headers.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)| {
+                                name.eq_ignore_ascii_case("transfer-encoding")
+                                    && value.trim().eq_ignore_ascii_case("chunked")
+                            })
+                        });
+                    }
+                    if expected_length.is_some_and(|length| response.len() >= body_start + length)
+                        || chunked && response[body_start..].ends_with(b"0\r\n\r\n")
+                    {
+                        return String::from_utf8(response).expect("response is UTF-8");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("complete HTTP/1 response arrives before timeout")
     }
 
     fn available_address() -> std::net::SocketAddr {
@@ -1408,11 +1520,16 @@ services:
       status: 404
       body:
         text: missing
+  observed:
+    type: observe
+    name: public
+    service:
+      ref: root
 listeners:
   - name: test
     bind: 127.0.0.1:0
     service:
-      ref: root
+      ref: observed
 "#,
         )
         .expect("config can be written");
@@ -1444,7 +1561,89 @@ listeners:
         let metrics = request(admin_address, "/metrics", "").await;
         assert!(metrics.contains("oxidase_requests_total 3"));
         assert!(metrics.contains("oxidase_request_outcomes_total{outcome=\"handled\"} 3"));
+        assert!(
+            metrics.contains("oxidase_observe_total{observe=\"public\",outcome=\"handled\"} 3")
+        );
+        assert!(metrics.contains(
+            "oxidase_observe_response_head_duration_seconds_bucket{observe=\"public\",le=\"+Inf\"} 3"
+        ));
+        assert!(
+            metrics.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 3"),
+            "{metrics}"
+        );
         running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn http1_header_timeout_closes_stalled_clients_without_rejecting_progress() {
+        assert_eq!(DEFAULT_HTTP1_HEADER_READ_TIMEOUT, Duration::from_secs(30));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("header timeout listener binds");
+        let address = listener.local_addr().expect("listener address is known");
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("stalled client connects");
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            let _ = http1_builder(Duration::from_millis(40))
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("stalled client connects");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost:")
+            .await
+            .expect("partial header can be written");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("stalled connection closes before test timeout")
+            .expect("stalled connection reaches EOF");
+        assert!(!String::from_utf8_lossy(&response).contains("200 OK"));
+        stalled.await.expect("stalled fixture task completes");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("progressing listener binds");
+        let address = listener.local_addr().expect("listener address is known");
+        let progressing = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("progressing client connects");
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            let _ = http1_builder(Duration::from_millis(200))
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("progressing client connects");
+        client
+            .write_all(b"GET / HTTP/1.1\r\n")
+            .await
+            .expect("request line can be written");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        client
+            .write_all(b"Host: example.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("remaining headers can be written");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("normal response is readable");
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        progressing
+            .await
+            .expect("progressing fixture task completes");
     }
 
     #[tokio::test]
@@ -1723,6 +1922,7 @@ defaults:
         )
         .expect("manifest can be written");
         fs::write(site.join("asset.txt"), "identity-v1").expect("identity can be written");
+        fs::write(site.join("copy.txt"), "identity-v1").expect("copy can be written");
         fs::write(site.join("asset.txt.br"), "brotli-v1").expect("Brotli can be written");
         fs::write(site.join("asset.txt.gz"), "gzip-v1").expect("gzip can be written");
         fs::write(site.join("style.css"), "style-identity").expect("CSS can be written");
@@ -1782,6 +1982,10 @@ listeners:
         assert!(identity.ends_with("identity-v1"));
         assert_eq!(raw_header(&identity, "content-type"), "application/x-asset");
         let identity_etag = raw_header(&identity, "etag");
+        assert!(identity_etag.starts_with("\"sha256-"));
+        assert_eq!(identity_etag.len(), "\"sha256-\"".len() + 64);
+        let copy = request(address, "/copy.txt", "").await;
+        assert_eq!(raw_header(&copy, "etag"), identity_etag);
         let identity_modified = raw_header(&identity, "last-modified");
 
         let brotli = request(address, "/asset.txt", "Accept-Encoding: br\r\n").await;
@@ -1990,7 +2194,7 @@ listeners:
         )
         .expect("manifest can be written");
         fs::write(
-            site.join("_templates/card.oxt"),
+            site.join("_templates/value.oxt"),
             r#"---
 oxista: template/v1
 params:
@@ -1999,7 +2203,16 @@ params:
 {{ count }}
 "#,
         )
-        .expect("template can be written");
+        .expect("typed child template can be written");
+        fs::write(
+            site.join("_templates/card.oxt"),
+            r#"---
+oxista: template/v1
+---
+{% include "_templates/value.oxt" with count=page.count only %}
+"#,
+        )
+        .expect("include caller template can be written");
         fs::write(
             site.join("index.oxr"),
             r#"---
@@ -2010,9 +2223,6 @@ response:
   body:
     template:
       source: _templates/card.oxt
-      with:
-        count:
-          $expr: page.count
 ---
 "#,
         )
@@ -2174,6 +2384,419 @@ listeners:
         }
 
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn upstream_mid_body_disconnect_is_streamed_as_body_error_and_pool_recovers() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("raw upstream binds");
+        let upstream_address = upstream.local_addr().expect("upstream address is known");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = accepts.clone();
+        let upstream_task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = upstream.accept().await.expect("gateway connects upstream");
+                accepts_for_task.fetch_add(1, Ordering::Relaxed);
+                let _ = read_until_contains(&mut stream, "\r\n\r\n").await;
+                if attempt == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nabc",
+                        )
+                        .await
+                        .expect("partial upstream body can be written");
+                    // Drop before the declared Content-Length is complete.
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .expect("healthy upstream response can be written");
+                }
+            }
+        });
+
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_proxy_gateway(&config, upstream_address, "1s");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("proxy config compiles"),
+        )
+        .expect("proxy snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+
+        let truncated = raw_request_allow_disconnect(
+            address,
+            "GET /broken HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(truncated.starts_with("HTTP/1.1 200 OK"), "{truncated}");
+        assert!(truncated.contains("abc"), "{truncated}");
+        assert!(!truncated.contains("502 Bad Gateway"));
+
+        let healthy = request(address, "/healthy", "").await;
+        assert!(healthy.starts_with("HTTP/1.1 200 OK"), "{healthy}");
+        assert!(healthy.ends_with("ok"), "{healthy}");
+        upstream_task.await.expect("raw upstream task completes");
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
+
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_response_body_terminations_total{reason=\"error\"} 1"));
+        assert!(metrics.contains("oxidase_active_requests 0"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn upstream_body_timeout_is_idle_between_frames_not_response_head_timeout() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("raw upstream binds");
+        let upstream_address = upstream.local_addr().expect("upstream address is known");
+        let upstream_task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = upstream.accept().await.expect("gateway connects upstream");
+                let request = read_until_contains(&mut stream, "\r\n\r\n").await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("upstream response head can be written");
+                stream
+                    .write_all(b"3\r\none\r\n")
+                    .await
+                    .expect("first body frame can be written");
+                if attempt == 0 {
+                    assert!(request.starts_with("GET /paced "));
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    stream
+                        .write_all(b"3\r\ntwo\r\n0\r\n\r\n")
+                        .await
+                        .expect("paced body completes");
+                } else {
+                    assert!(request.starts_with("GET /stalled "));
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                }
+            }
+        });
+
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_proxy_gateway(&config, upstream_address, "80ms");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("proxy config compiles"),
+        )
+        .expect("proxy snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+
+        let paced = request(address, "/paced", "").await;
+        assert!(paced.starts_with("HTTP/1.1 200 OK"), "{paced}");
+        assert!(paced.contains("one"), "{paced}");
+        assert!(paced.contains("two"), "{paced}");
+
+        let stalled = raw_request_allow_disconnect(
+            address,
+            "GET /stalled HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(stalled.starts_with("HTTP/1.1 200 OK"), "{stalled}");
+        assert!(stalled.contains("one"), "{stalled}");
+        upstream_task.await.expect("upstream fixture completes");
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_response_body_terminations_total{reason=\"timeout\"} 1"));
+        assert!(metrics.contains("oxidase_active_requests 0"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn client_download_disconnect_cancels_upstream_body_and_releases_request() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("raw upstream binds");
+        let upstream_address = upstream.local_addr().expect("upstream address is known");
+        let (cancelled_sender, cancelled_receiver) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.expect("gateway connects upstream");
+            let _ = read_until_contains(&mut stream, "\r\n\r\n").await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .expect("upstream response head can be written");
+            let chunk = vec![b'a'; 64 * 1024];
+            for _ in 0..256 {
+                if stream.write_all(b"10000\r\n").await.is_err()
+                    || stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    let _ = cancelled_sender.send(true);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = cancelled_sender.send(false);
+        });
+
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_proxy_gateway(&config, upstream_address, "1s");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("proxy config compiles"),
+        )
+        .expect("proxy snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("download client connects");
+        client
+            .write_all(
+                b"GET /download HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .expect("download request can be written");
+        let partial = read_until_contains(&mut client, "aaaa").await;
+        assert!(partial.starts_with("HTTP/1.1 200 OK"), "{partial}");
+        drop(client);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), cancelled_receiver)
+                .await
+                .expect("upstream cancellation is observed")
+                .expect("cancellation fixture reports")
+        );
+        upstream_task.await.expect("upstream fixture completes");
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(
+            metrics.contains("oxidase_response_body_terminations_total{reason=\"cancelled\"} 1")
+        );
+        assert!(metrics.contains("oxidase_active_requests 0"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn client_upload_disconnect_cancels_upstream_request_and_pool_remains_usable() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("raw upstream binds");
+        let upstream_address = upstream.local_addr().expect("upstream address is known");
+        let (upload_sender, upload_receiver) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut first, _) = upstream.accept().await.expect("first upstream connects");
+            let initial = read_until_contains(&mut first, "\r\n\r\n").await;
+            let mut received = initial
+                .split_once("\r\n\r\n")
+                .map_or(0, |(_, body)| body.len());
+            let mut buffer = [0u8; 4096];
+            loop {
+                match first.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => received += read,
+                }
+            }
+            let _ = upload_sender.send(received);
+
+            let (mut second, _) = upstream.accept().await.expect("second upstream connects");
+            let _ = read_until_contains(&mut second, "\r\n\r\n").await;
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("healthy upstream response can be written");
+        });
+
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_proxy_gateway(&config, upstream_address, "1s");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("proxy config compiles"),
+        )
+        .expect("proxy snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("upload client connects");
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 1048576\r\nConnection: keep-alive\r\n\r\npartial-upload",
+            )
+            .await
+            .expect("partial upload can be written");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(client);
+
+        let received = tokio::time::timeout(Duration::from_secs(3), upload_receiver)
+            .await
+            .expect("upstream observes upload cancellation")
+            .expect("upload fixture reports byte count");
+        assert!(received < 1_048_576);
+
+        let healthy = request(address, "/after-upload", "").await;
+        assert!(healthy.starts_with("HTTP/1.1 200 OK"), "{healthy}");
+        assert!(healthy.ends_with("ok"), "{healthy}");
+        upstream_task.await.expect("upstream fixture completes");
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_active_requests 0"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual proxy/reload/fd soak; set OXIDASE_SOAK_ITERATIONS and use --nocapture"]
+    async fn manual_proxy_reload_keepalive_and_cancellation_soak() {
+        let iterations = std::env::var("OXIDASE_SOAK_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100);
+        let (upstream, _, upstream_shutdown, upstream_task) = spawn_upstream().await;
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        fs::write(site.join("site.oxsite"), "oxista: site/v1\n")
+            .expect("site manifest can be written");
+        fs::write(site.join("large.bin"), vec![b'a'; 8 * 1024 * 1024])
+            .expect("large soak asset can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    upstream:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+  sites:
+    files:
+      root: site
+services:
+  root:
+    type: route
+    cases:
+      - when:
+          path: /large.bin
+        service:
+          type: site
+          site: files
+    default:
+      type: proxy
+      cluster: upstream
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("soak gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("soak config compiles"),
+        )
+        .expect("soak snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("soak gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+        let mut keep_alive = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("keep-alive client connects");
+
+        for iteration in 0..iterations {
+            keep_alive
+                .write_all(
+                    format!(
+                        "GET /soak/{iteration} HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("keep-alive request can be written");
+            let response = read_http1_response(&mut keep_alive).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+            if iteration % 10 == 9 {
+                running
+                    .reload_path(&config)
+                    .await
+                    .expect("unchanged soak reload succeeds");
+            }
+            if iteration % 20 == 19 {
+                let mut cancelled = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("cancel client connects");
+                cancelled
+                    .write_all(
+                        b"GET /slow HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .expect("cancel request can be written");
+                drop(cancelled);
+
+                let mut asset_client = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("asset client connects");
+                asset_client
+                    .write_all(
+                        b"GET /large.bin HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .expect("asset request can be written");
+                let _ = read_until_contains(&mut asset_client, "aaaa").await;
+                drop(asset_client);
+            }
+        }
+        drop(keep_alive);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_active_requests 0"), "{metrics}");
+        eprintln!("completed {iterations} keep-alive proxy iterations with periodic reload/cancel");
+        running.shutdown().await.expect("soak gateway shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("soak upstream shuts down");
     }
 
     #[tokio::test]

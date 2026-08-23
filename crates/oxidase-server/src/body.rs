@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,6 +12,8 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use tokio::time::{Instant, Sleep};
+
+use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -92,6 +95,108 @@ pub(crate) fn timeout_incoming_body(body: Incoming, timeout: Duration) -> Gatewa
     TimeoutBody::new(body, timeout).boxed_unsync()
 }
 
+pub(crate) fn instrument_response_body(
+    response: http::Response<GatewayBody>,
+    metrics: Arc<Metrics>,
+    active_request: ActiveRequest,
+) -> http::Response<GatewayBody> {
+    let (parts, body) = response.into_parts();
+    let body = InstrumentedBody::new(body, metrics, active_request).boxed_unsync();
+    http::Response::from_parts(parts, body)
+}
+
+struct InstrumentedBody {
+    inner: GatewayBody,
+    metrics: Arc<Metrics>,
+    active_request: Option<ActiveRequest>,
+    started: std::time::Instant,
+    bytes: u64,
+    termination: Option<BodyTermination>,
+}
+
+impl InstrumentedBody {
+    fn new(inner: GatewayBody, metrics: Arc<Metrics>, active_request: ActiveRequest) -> Self {
+        let mut body = Self {
+            inner,
+            metrics,
+            active_request: Some(active_request),
+            started: std::time::Instant::now(),
+            bytes: 0,
+            termination: None,
+        };
+        if body.inner.is_end_stream() {
+            body.finish(BodyTermination::Completed);
+        }
+        body
+    }
+
+    fn finish(&mut self, termination: BodyTermination) {
+        if self.termination.replace(termination).is_none() {
+            self.metrics
+                .record_response_body(self.bytes, termination, self.started.elapsed());
+            self.active_request.take();
+        }
+    }
+}
+
+impl Body for InstrumentedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes = self.bytes.saturating_add(data.len() as u64);
+                }
+                // Hyper may stop polling after receiving the final frame and
+                // drop the body immediately. Capture completion while the
+                // wrapped body can still report that the stream is exhausted.
+                if self.inner.is_end_stream() {
+                    self.finish(BodyTermination::Completed);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let termination = if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                {
+                    BodyTermination::Timeout
+                } else {
+                    BodyTermination::Error
+                };
+                self.finish(termination);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.finish(BodyTermination::Completed);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for InstrumentedBody {
+    fn drop(&mut self) {
+        if self.termination.is_none() {
+            self.finish(BodyTermination::Cancelled);
+        }
+    }
+}
+
 struct TimeoutBody {
     inner: Pin<Box<Incoming>>,
     deadline: Pin<Box<Sleep>>,
@@ -140,5 +245,120 @@ impl Body for TimeoutBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
+    use http::Response;
+    use http_body::{Body, Frame, SizeHint};
+    use http_body_util::BodyExt;
+
+    use super::{BoxError, GatewayBody, full_body, instrument_response_body};
+    use crate::metrics::Metrics;
+
+    struct FailingBody {
+        data_sent: bool,
+        error_kind: std::io::ErrorKind,
+    }
+
+    impl Body for FailingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if !self.data_sent {
+                self.data_sent = true;
+                return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"abc")))));
+            }
+            Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                self.error_kind,
+                "fixture body failure",
+            )))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    fn failing_body(error_kind: std::io::ErrorKind) -> GatewayBody {
+        FailingBody {
+            data_sent: false,
+            error_kind,
+        }
+        .boxed_unsync()
+    }
+
+    #[tokio::test]
+    async fn records_completed_error_timeout_and_cancelled_body_lifecycles() {
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body(
+            Response::new(full_body(Bytes::from_static(b"done"))),
+            metrics.clone(),
+            active,
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body completes")
+                .to_bytes(),
+            Bytes::from_static(b"done")
+        );
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_response_body_bytes_total 4"));
+        assert!(
+            output.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 1")
+        );
+        assert!(output.contains("oxidase_active_requests 0"));
+
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body(
+            Response::new(failing_body(std::io::ErrorKind::BrokenPipe)),
+            metrics.clone(),
+            active,
+        );
+        assert!(response.into_body().collect().await.is_err());
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_response_body_bytes_total 3"));
+        assert!(output.contains("oxidase_response_body_terminations_total{reason=\"error\"} 1"));
+        assert!(output.contains("oxidase_active_requests 0"));
+
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body(
+            Response::new(failing_body(std::io::ErrorKind::TimedOut)),
+            metrics.clone(),
+            active,
+        );
+        assert!(response.into_body().collect().await.is_err());
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_response_body_terminations_total{reason=\"timeout\"} 1"));
+        assert!(output.contains("oxidase_active_requests 0"));
+
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body(
+            Response::new(full_body(Bytes::from_static(b"not-read"))),
+            metrics.clone(),
+            active,
+        );
+        drop(response);
+        let output = metrics.render_prometheus();
+        assert!(
+            output.contains("oxidase_response_body_terminations_total{reason=\"cancelled\"} 1")
+        );
+        assert!(output.contains("oxidase_active_requests 0"));
     }
 }

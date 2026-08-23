@@ -40,10 +40,31 @@ If-Range 与单 Range。Range 只作用于 GET：有效单 bytes Range 在 ident
 源码不能控制 hop-by-hop 或 framing Header。HEAD、1xx、204、205、304 的 body 规则
 均有 wire-level 测试。
 
+`Observe` 已是生产包装型 Service，而不再只是 explain 事件。它以有界结构化字段
+记录从进入 wrapper 到 child 返回 response head 的 Handled/Declined/Failed、超时和
+嵌套作用域；完整 explain trace 仍默认关闭。独立的流式 body adapter 记录产出字节、
+正常结束、body error、idle timeout 与下游取消。指标 label 只来自配置中的 Observe
+名称和固定枚举，不包含 URL、query 或 Header value。
+
 Oxista Header 按 global defaults → logical extension → profiles → local OXR 分层
 执行；普通 Asset 与 OXR Asset 共用 extension defaults。外部 OXT 会继承 Site 的
 output/autoescape 默认值；自定义 404 在编译期验证为可零参数调用，并使用有效模板
 元数据。模板预算超限可由 `Recover` 精确分类，内部细节不会泄漏给客户端。
+
+OXT include 具有类型化调用契约，例如
+`{% include "_templates/card.oxt" with item=item only %}`。参数表达式统一编译；缺少、
+未知、重复参数和常量类型错误在 preparation 阶段失败，动态值在 render 前验证。
+普通 include 继承调用方 locals；`only` 丢弃 template/loop/with locals，但保留只读的
+`request`、`bindings`、`site`、`resource`、`page` 根。预算在表达式、循环 body、
+include 和输出写入前扣费：恰好达到 limit 允许，第 N+1 次不会执行。
+
+正确性身份统一使用完整 SHA-256；结构化对象使用 domain separator、字段名和长度
+前缀。强 Asset ETag 为最终 representation bytes 对应的
+`"sha256-<64 位小写十六进制>"`。一次 `SiteSourceIndex` 扫描同时提供 Site 复用身份、
+representation ETag、Oxista 源文本与编译 metadata，大 Asset 内容不会常驻内存。
+Gateway semantic diagnostic 与 OXT tag/interpolation 保留精确 byte 和行列范围。
+RequestFrame 的 Header/query/bindings/request namespace 采用 frame-local lazy cache，
+同一未修改 frame 只构造一次。
 
 入站 TLS/HTTP/2 及 OXT `extends/block` 尚未实现。使用 `serve --watch` 可以启用
 保留 last-known-good 的原子 reload；通过独立、显式的 `--admin-bind` 可启用健康检查
@@ -135,15 +156,15 @@ graceful shutdown：空闲 keep-alive 及时关闭，活跃请求继续在其固
 ## 开发
 
 ```bash
-cargo +1.88.0 check --workspace --all-targets --all-features
-cargo +1.88.0 test --workspace
+cargo +1.88.0 check --workspace --all-targets --all-features --locked
+cargo +1.88.0 test --workspace --locked
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo deny check
-cargo check --manifest-path fuzz/Cargo.toml --bins
-cargo build --workspace --release
+cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+cargo build --workspace --release --locked
 ```
 
 HTTP 端到端测试会绑定临时 loopback 端口；沙箱环境可能需要相应权限。

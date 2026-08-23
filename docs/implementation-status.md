@@ -4,8 +4,8 @@ Last updated: 2026-08-23
 
 ## Baseline
 
-- hardening branch: `hardening/v0.2-alpha-semantic-closure`
-- public starting point: `8a164a8772263de782ed859d541d6ba191dbbbfb`
+- hardening branch: `hardening/v0.2-alpha-runtime-semantics`
+- public starting point: semantic-closure merge `61970dad1f3ba159ad1a961096a8b8a9bb2fbbe0`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -25,6 +25,12 @@ Last updated: 2026-08-23
   explicitly collect structured traces without changing the executed graph.
 - Pure in-memory execution for Respond, Redirect, Route, Fallback, Transform,
   Observe, Timeout, Recover, Reenter, Site and Proxy leaf boundaries.
+- `Observe` has production semantics independent from explain tracing. Only explicit
+  wrappers create structured response-head scopes with bounded configured-name,
+  outcome, status-class, error-class, latency, listener, version, and nesting data.
+  A separate streaming body adapter counts emitted bytes and classifies completion,
+  body error, idle timeout, or downstream cancellation while keeping the normal
+  execution trace sink disabled.
 - Graph validation rejects implicit reference cycles, zero Reenter budgets, missing
   nodes, and body-consuming fallback candidates before later alternatives.
 - Phase 2 strict `oxidase.dev/v1alpha1` source AST and compiler with one YAML subset
@@ -42,6 +48,16 @@ Last updated: 2026-08-23
   structured JSON, inline templates, and external templates with parameter
   contracts. OXT supports interpolation, `if/elif/else`, `for/else`, `with`, static
   `include`, comments, and raw blocks with autoescape and bounded execution.
+- Static OXT include is a typed lexical call: a quoted target plus optional
+  `with name=expression ...` and trailing `only`. Preparation rejects missing,
+  unknown, duplicate, constant-type, and cycle errors. Dynamic values are checked
+  at runtime; normal calls inherit caller locals, while `only` retains only the five
+  read-only public roots before pushing explicit arguments. Child scopes and
+  autoescape never leak back to parents.
+- One shared `RenderBudget` charges every expression and loop body before execution,
+  checks include depth before entry, checks output before append, and checkpoints
+  time cooperatively. Nested includes cannot reset any budget; exactly N operations
+  are allowed for a limit of N.
 - HTML/text OXT output now controls default autoescape and Content-Type. Dynamic
   template arguments are checked immediately before render; URL means absolute URL,
   and `safe_html` is rejected until Value can carry trusted provenance. Unsupported
@@ -70,6 +86,16 @@ Last updated: 2026-08-23
   suffix/open-ended/single ranges, HEAD, 406, and 416 are covered on the wire. Range
   applies only to GET; unknown units, malformed or multiple ranges, and ranges with
   identity excluded are ignored in favor of a full negotiated representation.
+- Correctness identity is a complete 32-byte SHA-256 `ContentDigest`. Structured
+  config, Site, Cluster, snapshot, and watch-stamp builders use explicit domains and
+  length-prefixed fields. Config mappings canonicalize key order; Cluster endpoint
+  order remains semantic. Strong representation ETags are
+  `"sha256-<64 lowercase hex>"` over final bytes, with weak mode using `W/`.
+- Candidate Site preparation is `scan -> SiteSourceIndex -> compile -> SiteSnapshot`.
+  Each ordinary or compressed file is streamed for its digest once; Oxista text is
+  retained, large Asset bytes are not, and unchanged indexes reuse the old
+  `Arc<SiteSnapshot>`. Tests cover OXT/compressed changes, add/delete/rename,
+  symlink-target identity, and one-read counters.
 - One root `ResponseFinalizer` owns HTTP framing for Respond, Redirect, Site, Proxy,
   and Transform output. It strips hop-by-hop/untrusted framing metadata and enforces
   HEAD, 1xx, 204, 205, and 304 body semantics. Source header policy rejects direct
@@ -107,6 +133,19 @@ Last updated: 2026-08-23
 - Phase 7 adds an opt-in, separately bound management listener with live/ready
   health and Prometheus text metrics. Outcome, status-class, latency, active request,
   and reload labels are fixed and bounded.
+- Both data-plane and management HTTP/1 listeners use Hyper's timer-backed 30-second
+  request-header timeout. Real socket tests cover a stalled header, progress within
+  the deadline, upstream mid-body truncation, paced versus stalled response bodies,
+  client download cancellation, client upload cancellation, active-request cleanup,
+  and post-failure pool reuse.
+- Shared YAML parsing now returns `SourceDocument<T>` with original text and exact
+  key/value byte plus line/column ranges. Gateway semantic lowering uses these
+  ranges for listeners, references, endpoints, durations, Headers, Patterns,
+  Expressions, and Transform metadata. OXR Header policies, OXT tokens, and include
+  edges retain exact spans, including CRLF and Unicode-column tests.
+- `RequestFrame` lazily caches effective Headers, query values, request namespace,
+  visible bindings, and its Arc-backed evaluation context. Unchanged clones share
+  caches; binding children and mutable overlays invalidate only affected layers.
 - Redirect and constant header validation fail closed; property-style generated
   Pattern/path tests, template-limit tests, and seven cargo-fuzz harnesses cover the
   highest-risk parsers and resolvers.
@@ -123,9 +162,10 @@ Last updated: 2026-08-23
 ## Currently runnable
 
 - A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, reloaded, observed, and tested. One hundred
+  executed in memory, explained, reloaded, observed, and tested. More than 130
   workspace tests pass, including real listener/upstream/watcher tests that require
-  permission to bind loopback ports.
+  permission to bind loopback ports; manual smoke benchmarks remain ignored by the
+  ordinary test suite.
 
 ## Not implemented
 
@@ -141,8 +181,10 @@ Last updated: 2026-08-23
   enforces its configured strict-undefined policy at template interpolation.
 - `compile` writes a deterministic inspection manifest, not a portable executable
   snapshot containing site assets or connection state.
-- Semantic diagnostics retain file and field path but do not yet recover exact
-  scalar lines for every lowering error.
+- Gateway semantic diagnostics, OXR Header policies, and OXT tags/interpolations
+  have exact ranges. Some other deeper `.oxsite`/`.oxr` front-matter semantic errors
+  still identify the containing file rather than the exact scalar; JSON diagnostic
+  output is not implemented.
 - Generated inline Service/Route IDs are deterministic within one source program
   but can change when the import set changes. They are alpha inspection identities,
   not durable API keys, metrics labels, control-plane IDs, or configuration refs.
@@ -161,8 +203,9 @@ Last updated: 2026-08-23
   default always replaces incoming forwarding metadata.
 - The response-header timeout currently bounds connect plus upload/header latency as
   one deadline; per-phase connect/write timing is not separately observable yet.
-- Explicit slow-client and upstream-mid-body disconnect campaigns remain, though
-  active drain, timeout abort, and dropped-body cancellation paths are tested.
+- The adversarial streaming fixtures cover representative disconnect and timeout
+  boundaries, but no long-duration memory/fd soak or sustained fuzz campaign is
+  claimed.
 - The portable watcher polls every 500ms. An edit that preserves path, byte length,
   and filesystem modification timestamp could be missed until another dependency
   changes; triggered preparation itself uses full content fingerprints. Failed
@@ -177,29 +220,36 @@ Last updated: 2026-08-23
 
 ## Validation boundary
 
-- Rust 1.88 was installed locally; MSRV workspace all-target/all-feature check and
-  all 100 workspace tests passed.
-- Stable formatting, workspace/all-target/all-feature Clippy with warnings denied,
-  all 100 workspace tests, docs with warnings denied, and the release workspace build
-  passed. Loopback tests ran with the required local permission.
+- Rust 1.88 was installed locally; the locked MSRV workspace
+  all-target/all-feature check and locked workspace test suite passed.
+- Stable formatting, locked workspace/all-target/all-feature Clippy with warnings
+  denied, locked workspace tests, locked docs with warnings denied, and the locked
+  release workspace build passed. Loopback tests ran with the required local
+  permission.
 - `cargo deny check` passed advisories, bans, licenses, and sources; one allowed
   indirect `syn` duplicate-version warning remains.
 - All seven fuzz harnesses compile; no long fuzz campaign was run.
 - Example `check`, three declarative tests, `explain`, and deterministic manifest
   compilation passed.
-- The release-mode shared-graph smoke benchmark executed 100,000 short paths through
-  a 4,097-node graph in about 171ms on this machine. This is a local regression
-  smoke result, not a performance guarantee.
-- Hosted CI run `32653982248` passed all four jobs on the semantic-closure branch,
-  including Ubuntu loopback tests and the stable release build. `main` branch
-  protection was enabled and read back with strict/up-to-date required checks for
-  `MSRV 1.88`, `Stable workspace`, `Dependency policy`, and
-  `Fuzz harness compile smoke`; signed commits and admin enforcement remain off.
+- Release-mode local smoke measurements on this machine: 100,000 short executions
+  through one shared 4,097-node graph in about 58ms; 100,000 cached RequestFrame
+  contexts in about 0.49ms; 50,000 typed-include renders in about 40ms; Site scan /
+  compile around 20ms / 3ms for 1,000 assets and 250ms / 39ms for 10,000 assets.
+  These are regression observations, not performance guarantees.
+- The ignored manual proxy soak harness was exercised for 20 keep-alive iterations
+  with periodic reload plus downstream cancellation and an 8 MiB Asset. This was a
+  short harness validation, not a sustained soak claim.
+- Semantic-closure PR #3 passed all four required jobs in run `32657427210`, and its
+  merged `main` push passed run `32657645424`, including Ubuntu loopback tests and
+  the stable release build. `main` branch protection was enabled and read back with
+  strict/up-to-date required checks for `MSRV 1.88`, `Stable workspace`,
+  `Dependency policy`, and `Fuzz harness compile smoke`; signed commits and admin
+  enforcement remain off.
 
 ## Next concrete work
 
-1. Add precise scalar source markers and richer multi-file diagnostics.
-2. Run sustained fuzz, slow-client, and upstream mid-body disconnect campaigns with
-   repeatable benchmark baselines.
+1. Finish exact `.oxsite`/`.oxr` semantic spans and add JSON diagnostic rendering.
+2. Run sustained fuzz plus memory/fd proxy and reload soak campaigns using the new
+   bounded metrics and repeatable smoke baselines.
 3. Design the next explicit transport increment (inbound TLS and HTTP/2 lifecycle)
    without weakening snapshot pinning or graceful drain.

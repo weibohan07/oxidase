@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use oxidase_core::SourceSpan;
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -28,8 +29,15 @@ pub enum SiteCompileError {
         #[source]
         source: std::io::Error,
     },
-    #[error("invalid Oxista source `{path}`: {message}")]
-    Source { path: PathBuf, message: String },
+    #[error("invalid Oxista source `{path}` at {line}:{column}-{end_line}:{end_column}: {message}")]
+    Source {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+        message: String,
+    },
     #[error("unsafe site path `{path}`: {message}")]
     UnsafePath { path: PathBuf, message: String },
     #[error("duplicate public site path `{logical_path}` from `{first}` and `{second}`")]
@@ -55,6 +63,21 @@ impl SiteCompileError {
     pub(crate) fn source(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         Self::Source {
             path: path.into(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 1,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn source_span(source: SourceSpan, message: impl Into<String>) -> Self {
+        Self::Source {
+            path: source.file,
+            line: source.line,
+            column: source.column,
+            end_line: source.end_line,
+            end_column: source.end_column,
             message: message.into(),
         }
     }
@@ -99,6 +122,8 @@ pub enum TemplateRenderError {
         template: String,
         expression: String,
     },
+    #[error(transparent)]
+    Argument(#[from] TemplateArgumentError),
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +172,7 @@ impl SiteError {
     pub(crate) fn from_template_render(error: TemplateRenderError) -> Self {
         match error {
             TemplateRenderError::Limit { template, kind } => Self::TemplateLimit { template, kind },
+            TemplateRenderError::Argument(error) => Self::TemplateArgument(error),
             error => Self::TemplateRender(error),
         }
     }

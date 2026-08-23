@@ -90,7 +90,7 @@ impl ProxyClient {
         let mut upstream = Request::new(body);
         *upstream.method_mut() = request.method().clone();
         *upstream.uri_mut() = uri;
-        *upstream.headers_mut() = request.headers();
+        *upstream.headers_mut() = request.effective_headers().clone();
         remove_hop_by_hop(upstream.headers_mut());
         apply_forwarding_headers(upstream.headers_mut(), request, endpoint);
 
@@ -274,7 +274,7 @@ async fn prepare_site_body(
             match stream_asset(
                 &asset,
                 request.method(),
-                &request.headers(),
+                request.effective_headers(),
                 &mut response.status,
                 &mut response.headers,
                 response.head_only,

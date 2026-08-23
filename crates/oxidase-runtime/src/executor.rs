@@ -91,6 +91,93 @@ pub trait TraceSink: Send {
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceObservationContext<'a> {
+    pub observe_name: &'a str,
+    pub service_id: &'a ServiceId,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceObservationOutcome {
+    Handled(StatusCode),
+    Declined,
+    Failed(ErrorClass),
+}
+
+impl ServiceObservationOutcome {
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Handled(_) => "handled",
+            Self::Declined => "declined",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceObservationResult {
+    pub outcome: ServiceObservationOutcome,
+}
+
+pub trait ExecutionObserver: Send + Sync {
+    type Scope: Send;
+
+    fn service_started(&self, context: ServiceObservationContext<'_>) -> Self::Scope;
+
+    fn service_finished(&self, scope: Self::Scope, result: ServiceObservationResult);
+
+    fn service_cancelled(&self, scope: Self::Scope);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopExecutionObserver;
+
+impl ExecutionObserver for NoopExecutionObserver {
+    type Scope = ();
+
+    fn service_started(&self, _context: ServiceObservationContext<'_>) {}
+
+    fn service_finished(&self, _scope: Self::Scope, _result: ServiceObservationResult) {}
+
+    fn service_cancelled(&self, _scope: Self::Scope) {}
+}
+
+struct ActiveObservation<'a, Observer: ExecutionObserver> {
+    observer: &'a Observer,
+    scope: Option<Observer::Scope>,
+}
+
+struct ExecutionContext<'a, RequestBody, Sink, Observer> {
+    body: Option<RequestBody>,
+    state: ExecutionState,
+    trace: &'a mut Sink,
+    observer: &'a Observer,
+}
+
+impl<'a, Observer: ExecutionObserver> ActiveObservation<'a, Observer> {
+    fn new(observer: &'a Observer, scope: Observer::Scope) -> Self {
+        Self {
+            observer,
+            scope: Some(scope),
+        }
+    }
+
+    fn finish(mut self, result: ServiceObservationResult) {
+        let scope = self.scope.take().expect("observation scope is active");
+        self.observer.service_finished(scope, result);
+    }
+}
+
+impl<Observer: ExecutionObserver> Drop for ActiveObservation<'_, Observer> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            self.observer.service_cancelled(scope);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NoopTraceSink;
 
@@ -168,7 +255,9 @@ where
         body: Option<RequestBody>,
     ) -> ExecutionReport<ResponseBody> {
         let mut trace = NoopTraceSink;
-        self.execute_with_sink(request, body, &mut trace).await
+        let observer = NoopExecutionObserver;
+        self.execute_instrumented(request, body, &mut trace, &observer)
+            .await
     }
 
     pub async fn execute_traced(
@@ -177,7 +266,10 @@ where
         body: Option<RequestBody>,
     ) -> ExecutionReport<ResponseBody> {
         let mut trace = ExplainTraceCollector::default();
-        let mut report = self.execute_with_sink(request, body, &mut trace).await;
+        let observer = NoopExecutionObserver;
+        let mut report = self
+            .execute_instrumented(request, body, &mut trace, &observer)
+            .await;
         report.trace = trace.into_trace();
         report
     }
@@ -185,33 +277,83 @@ where
     pub async fn execute_with_sink<Sink>(
         &self,
         request: RequestFrame,
-        mut body: Option<RequestBody>,
+        body: Option<RequestBody>,
         trace: &mut Sink,
     ) -> ExecutionReport<ResponseBody>
     where
         Sink: TraceSink,
     {
-        let mut state = ExecutionState::default();
+        let observer = NoopExecutionObserver;
+        self.execute_instrumented(request, body, trace, &observer)
+            .await
+    }
+
+    pub async fn execute_observed<Observer>(
+        &self,
+        request: RequestFrame,
+        body: Option<RequestBody>,
+        observer: &Observer,
+    ) -> ExecutionReport<ResponseBody>
+    where
+        Observer: ExecutionObserver,
+    {
+        let mut trace = NoopTraceSink;
+        self.execute_instrumented(request, body, &mut trace, observer)
+            .await
+    }
+
+    pub async fn execute_with_sink_and_observer<Sink, Observer>(
+        &self,
+        request: RequestFrame,
+        body: Option<RequestBody>,
+        trace: &mut Sink,
+        observer: &Observer,
+    ) -> ExecutionReport<ResponseBody>
+    where
+        Sink: TraceSink,
+        Observer: ExecutionObserver,
+    {
+        self.execute_instrumented(request, body, trace, observer)
+            .await
+    }
+
+    async fn execute_instrumented<Sink, Observer>(
+        &self,
+        request: RequestFrame,
+        body: Option<RequestBody>,
+        trace: &mut Sink,
+        observer: &Observer,
+    ) -> ExecutionReport<ResponseBody>
+    where
+        Sink: TraceSink,
+        Observer: ExecutionObserver,
+    {
+        let mut execution = ExecutionContext {
+            body,
+            state: ExecutionState::default(),
+            trace,
+            observer,
+        };
         let outcome = self
-            .execute_node(&self.program.entry, request, &mut body, &mut state, trace)
+            .execute_node(&self.program.entry, request, &mut execution, 0)
             .await;
         ExecutionReport {
             outcome,
             trace: ExecutionTrace::default(),
-            body_state: state.body_state,
+            body_state: execution.state.body_state,
         }
     }
 
-    fn execute_node<'b, Sink>(
+    fn execute_node<'b, Sink, Observer>(
         &'b self,
         id: &'b ServiceId,
         request: RequestFrame,
-        body: &'b mut Option<RequestBody>,
-        state: &'b mut ExecutionState,
-        trace: &'b mut Sink,
+        execution: &'b mut ExecutionContext<'_, RequestBody, Sink, Observer>,
+        observation_depth: usize,
     ) -> BoxLeafFuture<'b, ResponseBody>
     where
         Sink: TraceSink + 'b,
+        Observer: ExecutionObserver + 'b,
     {
         Box::pin(async move {
             let Some(node) = self.program.graph.get(id) else {
@@ -220,7 +362,9 @@ where
                     format!("runtime plan references missing service `{id}`"),
                 ));
             };
-            trace.record(id, None, "enter", TraceDetail::Source(&node.source));
+            execution
+                .trace
+                .record(id, None, "enter", TraceDetail::Source(&node.source));
 
             let outcome = match &node.kind {
                 ServiceKind::Respond {
@@ -262,7 +406,7 @@ where
                     self.leaves.execute_site(resource, &request).await
                 }
                 ServiceKind::Proxy { cluster } => {
-                    if state.body_state == BodyState::Consumed {
+                    if execution.state.body_state == BodyState::Consumed {
                         ServiceOutcome::Failed(ServiceError::new(
                             ErrorClass::BodyUnavailable,
                             "request body was already consumed before Proxy",
@@ -270,8 +414,10 @@ where
                     } else {
                         // Mark before the first await so cancellation cannot make a
                         // partially consumed stream appear replayable.
-                        state.body_state = BodyState::Consumed;
-                        self.leaves.execute_proxy(cluster, &request, body).await
+                        execution.state.body_state = BodyState::Consumed;
+                        self.leaves
+                            .execute_proxy(cluster, &request, &mut execution.body)
+                            .await
                     }
                 }
                 ServiceKind::Transform {
@@ -283,7 +429,7 @@ where
                     match apply_request_transform(request_transform, &mut child_request) {
                         Ok(()) => {
                             let outcome = self
-                                .execute_node(service, child_request, body, state, trace)
+                                .execute_node(service, child_request, execution, observation_depth)
                                 .await;
                             apply_response_transform(outcome, response_transform, &request)
                         }
@@ -291,11 +437,26 @@ where
                     }
                 }
                 ServiceKind::Observe { name, service } => {
-                    trace.record(id, None, "observe_start", TraceDetail::Text(name));
+                    execution
+                        .trace
+                        .record(id, None, "observe_start", TraceDetail::Text(name));
+                    let observation = ActiveObservation::new(
+                        execution.observer,
+                        execution
+                            .observer
+                            .service_started(ServiceObservationContext {
+                                observe_name: name,
+                                service_id: id,
+                                depth: observation_depth,
+                            }),
+                    );
                     let outcome = self
-                        .execute_node(service, request, body, state, trace)
+                        .execute_node(service, request, execution, observation_depth + 1)
                         .await;
-                    trace.record(
+                    observation.finish(ServiceObservationResult {
+                        outcome: observation_outcome(&outcome),
+                    });
+                    execution.trace.record(
                         id,
                         None,
                         "observe_finish",
@@ -306,7 +467,7 @@ where
                 ServiceKind::Timeout { duration, service } => {
                     match tokio::time::timeout(
                         *duration,
-                        self.execute_node(service, request, body, state, trace),
+                        self.execute_node(service, request, execution, observation_depth),
                     )
                     .await
                     {
@@ -319,14 +480,14 @@ where
                 }
                 ServiceKind::Recover { service, handlers } => {
                     let outcome = self
-                        .execute_node(service, request.clone(), body, state, trace)
+                        .execute_node(service, request.clone(), execution, observation_depth)
                         .await;
                     if let ServiceOutcome::Failed(error) = outcome {
                         if let Some(handler) = handlers
                             .iter()
                             .find(|handler| handler.classes.contains(&error.class))
                         {
-                            trace.record(
+                            execution.trace.record(
                                 id,
                                 None,
                                 "recover",
@@ -347,9 +508,8 @@ where
                             self.execute_node(
                                 &handler.service,
                                 request.with_bindings(bindings),
-                                body,
-                                state,
-                                trace,
+                                execution,
+                                observation_depth,
                             )
                             .await
                         } else {
@@ -364,7 +524,7 @@ where
                     for case in cases {
                         match case.predicate.evaluate(&request) {
                             Ok(Some(bindings)) => {
-                                trace.record(
+                                execution.trace.record(
                                     id,
                                     Some(&case.id),
                                     "route_match",
@@ -373,7 +533,7 @@ where
                                 selected = Some((case.service.clone(), bindings));
                                 break;
                             }
-                            Ok(None) => trace.record(
+                            Ok(None) => execution.trace.record(
                                 id,
                                 Some(&case.id),
                                 "route_miss",
@@ -391,14 +551,18 @@ where
                         self.execute_node(
                             &service,
                             request.with_bindings(bindings),
-                            body,
-                            state,
-                            trace,
+                            execution,
+                            observation_depth,
                         )
                         .await
                     } else if let Some(default) = default {
-                        trace.record(id, None, "route_default", TraceDetail::Service(default));
-                        self.execute_node(default, request, body, state, trace)
+                        execution.trace.record(
+                            id,
+                            None,
+                            "route_default",
+                            TraceDetail::Service(default),
+                        );
+                        self.execute_node(default, request, execution, observation_depth)
                             .await
                     } else {
                         ServiceOutcome::Declined
@@ -407,12 +571,12 @@ where
                 ServiceKind::Fallback { services } => {
                     let mut outcome = ServiceOutcome::Declined;
                     for service in services {
-                        let body_before = state.body_state;
+                        let body_before = execution.state.body_state;
                         outcome = self
-                            .execute_node(service, request.clone(), body, state, trace)
+                            .execute_node(service, request.clone(), execution, observation_depth)
                             .await;
                         if matches!(outcome, ServiceOutcome::Declined) {
-                            if state.body_state != body_before {
+                            if execution.state.body_state != body_before {
                                 return ServiceOutcome::Failed(ServiceError::new(
                                     ErrorClass::BodyUnavailable,
                                     format!(
@@ -420,7 +584,12 @@ where
                                     ),
                                 ));
                             }
-                            trace.record(id, None, "fallback_next", TraceDetail::Service(service));
+                            execution.trace.record(
+                                id,
+                                None,
+                                "fallback_next",
+                                TraceDetail::Service(service),
+                            );
                         } else {
                             break;
                         }
@@ -428,7 +597,7 @@ where
                     outcome
                 }
                 ServiceKind::Reenter { target, budget } => {
-                    let count = state.reentries.entry(id.clone()).or_default();
+                    let count = execution.state.reentries.entry(id.clone()).or_default();
                     if *count >= *budget {
                         ServiceOutcome::Failed(ServiceError::new(
                             ErrorClass::InvalidState,
@@ -436,7 +605,7 @@ where
                         ))
                     } else {
                         *count += 1;
-                        trace.record(
+                        execution.trace.record(
                             id,
                             None,
                             "reenter",
@@ -446,12 +615,15 @@ where
                                 budget: *budget,
                             },
                         );
-                        self.execute_node(target, request, body, state, trace).await
+                        self.execute_node(target, request, execution, observation_depth)
+                            .await
                     }
                 }
             };
 
-            trace.record(id, None, "outcome", TraceDetail::Text(outcome.kind()));
+            execution
+                .trace
+                .record(id, None, "outcome", TraceDetail::Text(outcome.kind()));
             outcome
         })
     }
@@ -500,6 +672,16 @@ where
     }
 }
 
+fn observation_outcome<ResponseBody>(
+    outcome: &ServiceOutcome<ResponseBody>,
+) -> ServiceObservationOutcome {
+    match outcome {
+        ServiceOutcome::Handled(response) => ServiceObservationOutcome::Handled(response.status),
+        ServiceOutcome::Declined => ServiceObservationOutcome::Declined,
+        ServiceOutcome::Failed(error) => ServiceObservationOutcome::Failed(error.class),
+    }
+}
+
 fn append_query(mut location: String, preserve_query: bool, request: &RequestFrame) -> String {
     if preserve_query
         && !location.contains('?')
@@ -525,35 +707,54 @@ fn apply_request_transform(
     request: &mut RequestFrame,
 ) -> Result<(), ServiceError> {
     let context = request.evaluation_context();
-    request.overlay.method.clone_from(&transform.method);
-    request.overlay.scheme = render_metadata(
+    let scheme = render_metadata(
         &transform.scheme,
         &context,
         "scheme",
         parse_transform_scheme,
     )?;
-    request.overlay.authority = render_metadata(
+    let authority = render_metadata(
         &transform.authority,
         &context,
         "authority",
         parse_transform_authority,
     )?;
-    request.overlay.path_and_query = render_metadata(
+    let path_and_query = render_metadata(
         &transform.path_and_query,
         &context,
         "path_and_query",
         parse_transform_path_and_query,
     )?;
+    let set_headers = transform
+        .headers
+        .set
+        .iter()
+        .map(|header| {
+            render_header(&header.value, &context).map(|value| (header.name.clone(), value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let add_headers = transform
+        .headers
+        .add
+        .iter()
+        .map(|header| {
+            render_header(&header.value, &context).map(|value| (header.name.clone(), value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let overlay = request.overlay_mut();
+    overlay.method.clone_from(&transform.method);
+    overlay.scheme = scheme;
+    overlay.authority = authority;
+    overlay.path_and_query = path_and_query;
     for name in &transform.headers.remove {
-        request.overlay.remove_header(name.clone());
+        overlay.remove_header(name.clone());
     }
-    for header in &transform.headers.set {
-        let value = render_header(&header.value, &context)?;
-        request.overlay.set_header(header.name.clone(), value);
+    for (name, value) in set_headers {
+        overlay.set_header(name, value);
     }
-    for header in &transform.headers.add {
-        let value = render_header(&header.value, &context)?;
-        request.overlay.add_header(header.name.clone(), value);
+    for (name, value) in add_headers {
+        overlay.add_header(name, value);
     }
     Ok(())
 }
@@ -664,7 +865,10 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{BoxLeafFuture, Executor, LeafExecutor};
+    use super::{
+        BoxLeafFuture, ExecutionObserver, Executor, LeafExecutor, ServiceObservationContext,
+        ServiceObservationOutcome, ServiceObservationResult,
+    };
     use crate::RuntimeSnapshot;
 
     #[derive(Default)]
@@ -693,6 +897,13 @@ mod tests {
                         ErrorClass::SiteIo,
                         "fixture failure",
                     )),
+                    "slow" => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::OK,
+                            Bytes::from_static(b"slow"),
+                        ))
+                    }
                     "path" => ServiceOutcome::Handled(ResponseHead::new(
                         StatusCode::OK,
                         Bytes::copy_from_slice(request.path().as_bytes()),
@@ -721,6 +932,67 @@ mod tests {
                     Bytes::from_static(b"proxy"),
                 ))
             })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ObservationEvent {
+        Started {
+            name: String,
+            depth: usize,
+        },
+        Finished {
+            name: String,
+            outcome: ServiceObservationOutcome,
+        },
+        Cancelled {
+            name: String,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<ObservationEvent>>,
+    }
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<ObservationEvent> {
+            self.events
+                .lock()
+                .expect("observer mutex is not poisoned")
+                .clone()
+        }
+    }
+
+    impl ExecutionObserver for RecordingObserver {
+        type Scope = String;
+
+        fn service_started(&self, context: ServiceObservationContext<'_>) -> Self::Scope {
+            self.events
+                .lock()
+                .expect("observer mutex is not poisoned")
+                .push(ObservationEvent::Started {
+                    name: context.observe_name.to_owned(),
+                    depth: context.depth,
+                });
+            context.observe_name.to_owned()
+        }
+
+        fn service_finished(&self, scope: Self::Scope, result: ServiceObservationResult) {
+            self.events
+                .lock()
+                .expect("observer mutex is not poisoned")
+                .push(ObservationEvent::Finished {
+                    name: scope,
+                    outcome: result.outcome,
+                });
+        }
+
+        fn service_cancelled(&self, scope: Self::Scope) {
+            self.events
+                .lock()
+                .expect("observer mutex is not poisoned")
+                .push(ObservationEvent::Cancelled { name: scope });
         }
     }
 
@@ -1152,6 +1424,170 @@ imports: [a.yaml, b.yaml]
                 .events
                 .iter()
                 .any(|event| event.event == "observe_start" && event.detail == "request")
+        );
+    }
+
+    #[tokio::test]
+    async fn production_observer_tracks_nested_and_terminal_outcomes() {
+        let response = text_response("response", StatusCode::CREATED, "ok");
+        let inner = node(
+            "inner",
+            ServiceKind::Observe {
+                name: "inner".to_owned(),
+                service: response.id.clone(),
+            },
+        );
+        let outer = node(
+            "outer",
+            ServiceKind::Observe {
+                name: "outer".to_owned(),
+                service: inner.id.clone(),
+            },
+        );
+        let nested_program = program("outer", vec![response, inner, outer]);
+        let leaves = MemoryLeaves::default();
+        let observer = RecordingObserver::default();
+        let report = Executor::new(&nested_program, &leaves)
+            .execute_observed(request("/private?token=secret"), None, &observer)
+            .await;
+        assert!(matches!(report.outcome, ServiceOutcome::Handled(_)));
+        assert_eq!(
+            observer.events(),
+            [
+                ObservationEvent::Started {
+                    name: "outer".to_owned(),
+                    depth: 0,
+                },
+                ObservationEvent::Started {
+                    name: "inner".to_owned(),
+                    depth: 1,
+                },
+                ObservationEvent::Finished {
+                    name: "inner".to_owned(),
+                    outcome: ServiceObservationOutcome::Handled(StatusCode::CREATED),
+                },
+                ObservationEvent::Finished {
+                    name: "outer".to_owned(),
+                    outcome: ServiceObservationOutcome::Handled(StatusCode::CREATED),
+                },
+            ]
+        );
+
+        for (resource, expected) in [
+            ("decline", ServiceObservationOutcome::Declined),
+            (
+                "fail",
+                ServiceObservationOutcome::Failed(ErrorClass::SiteIo),
+            ),
+        ] {
+            let site = node(
+                "site",
+                ServiceKind::Site {
+                    resource: resource.into(),
+                },
+            );
+            let observe = node(
+                "observe",
+                ServiceKind::Observe {
+                    name: resource.to_owned(),
+                    service: site.id.clone(),
+                },
+            );
+            let outcome_program = program("observe", vec![site, observe]);
+            let observer = RecordingObserver::default();
+            Executor::new(&outcome_program, &leaves)
+                .execute_observed(request("/"), None, &observer)
+                .await;
+            assert_eq!(
+                observer.events().last(),
+                Some(&ObservationEvent::Finished {
+                    name: resource.to_owned(),
+                    outcome: expected,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_observer_finishes_after_recover_and_cancels_on_timeout() {
+        let failed = node(
+            "failed",
+            ServiceKind::Site {
+                resource: "fail".into(),
+            },
+        );
+        let recovered = text_response("recovered", StatusCode::OK, "recovered");
+        let recover = node(
+            "recover",
+            ServiceKind::Recover {
+                service: failed.id.clone(),
+                handlers: vec![RecoverHandler {
+                    classes: BTreeSet::from([ErrorClass::SiteIo]),
+                    service: recovered.id.clone(),
+                }],
+            },
+        );
+        let observe = node(
+            "observe",
+            ServiceKind::Observe {
+                name: "recovered".to_owned(),
+                service: recover.id.clone(),
+            },
+        );
+        let recover_program = program("observe", vec![failed, recovered, recover, observe]);
+        let leaves = MemoryLeaves::default();
+        let observer = RecordingObserver::default();
+        Executor::new(&recover_program, &leaves)
+            .execute_observed(request("/"), None, &observer)
+            .await;
+        assert_eq!(
+            observer.events().last(),
+            Some(&ObservationEvent::Finished {
+                name: "recovered".to_owned(),
+                outcome: ServiceObservationOutcome::Handled(StatusCode::OK),
+            })
+        );
+
+        let slow = node(
+            "slow",
+            ServiceKind::Site {
+                resource: "slow".into(),
+            },
+        );
+        let observe = node(
+            "observe",
+            ServiceKind::Observe {
+                name: "timed".to_owned(),
+                service: slow.id.clone(),
+            },
+        );
+        let timeout = node(
+            "timeout",
+            ServiceKind::Timeout {
+                duration: std::time::Duration::from_millis(1),
+                service: observe.id.clone(),
+            },
+        );
+        let timeout_program = program("timeout", vec![slow, observe, timeout]);
+        let observer = RecordingObserver::default();
+        let report = Executor::new(&timeout_program, &leaves)
+            .execute_observed(request("/"), None, &observer)
+            .await;
+        assert!(matches!(
+            report.outcome,
+            ServiceOutcome::Failed(ref error) if error.class == ErrorClass::Timeout
+        ));
+        assert_eq!(
+            observer.events(),
+            [
+                ObservationEvent::Started {
+                    name: "timed".to_owned(),
+                    depth: 0,
+                },
+                ObservationEvent::Cancelled {
+                    name: "timed".to_owned(),
+                },
+            ]
         );
     }
 

@@ -168,12 +168,7 @@ impl SiteSnapshot {
             return Ok(None);
         }
         if let Some(error_page) = &self.error_404 {
-            let context = self.context(
-                request,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &error_page.template,
-            )?;
+            let context = self.context(request, &BTreeMap::new(), &error_page.template)?;
             let template = self.templates.get(&error_page.template).ok_or_else(|| {
                 SiteError::TemplateRender(TemplateRenderError::MissingValue {
                     template: error_page.template.clone(),
@@ -215,7 +210,7 @@ impl SiteSnapshot {
     ) -> Result<PreparedSiteResponse, SiteError> {
         let mut headers = HeaderMap::new();
         let source_name = plan.source.to_string_lossy();
-        let base_context = self.context(request, &plan.page, &BTreeMap::new(), &source_name)?;
+        let base_context = self.context(request, &plan.page, &source_name)?;
         apply_headers(&plan.headers, &base_context, &mut headers)?;
         let head_only = request.method() == Method::HEAD;
 
@@ -271,9 +266,8 @@ impl SiteSnapshot {
                 let values = template
                     .evaluate_arguments(arguments, &base_context)
                     .map_err(SiteError::TemplateArgument)?;
-                let context = self.context(request, &plan.page, &values, name)?;
                 let body = template
-                    .render(&self.templates, &context, &self.limits)
+                    .render_with_arguments(&self.templates, &base_context, &values, &self.limits)
                     .map_err(SiteError::from_template_render)?;
                 ensure_content_type(
                     &mut headers,
@@ -327,11 +321,17 @@ impl SiteSnapshot {
         &self,
         request: &RequestFrame,
         page: &BTreeMap<String, CompiledValue>,
-        arguments: &BTreeMap<String, Value>,
         source_name: &str,
     ) -> Result<EvalContext, SiteError> {
         let mut context = request.evaluation_context();
         context.insert("site", Value::Map(self.data.clone()));
+        context.insert(
+            "resource",
+            Value::Map(BTreeMap::from([(
+                "path".to_owned(),
+                Value::from(request.path()),
+            )])),
+        );
         let mut page_values = BTreeMap::new();
         for (name, value) in page {
             page_values.insert(
@@ -342,9 +342,6 @@ impl SiteSnapshot {
             );
         }
         context.insert("page", Value::Map(page_values));
-        for (name, value) in arguments {
-            context.insert(name, value.clone());
-        }
         Ok(context)
     }
 }

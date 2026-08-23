@@ -27,6 +27,12 @@ fingerprints run on a single-concurrency blocking compiler worker, not a Tokio a
 worker. New listener sockets are prebound and publication remains serialized by the
 manager.
 
+Site preparation is a single candidate pipeline: scan to `SiteSourceIndex`, compare
+its SHA-256 identity with the published resource, then either reuse the old
+`Arc<SiteSnapshot>` or compile directly from that index. Asset, Brotli, and gzip
+bytes are each read once per candidate; only Oxista text sources are retained in
+memory. This is deliberately not an mtime-only cross-reload digest cache.
+
 The watcher tracks the union of published dependencies and the last attempted
 candidate. A failed new import therefore remains watched, including its declared
 path and parent directory; fixing only that imported file triggers another attempt.
@@ -47,6 +53,12 @@ the configured drain deadline are aborted.
 The watcher polls every 500ms. A filesystem edit that preserves path, byte length,
 and modification timestamp can still be missed until another observed dependency
 changes.
+
+Filesystem watch stamps and content identity are separate. A watch stamp uses path,
+kind, length, and mtime to decide whether to attempt a reload. Config/Site/Cluster
+identity and ETags use complete SHA-256 content digests with domain-separated,
+length-prefixed structured fields. A triggered preparation therefore never treats
+the watch stamp itself as proof that content is unchanged.
 
 ## Response finalization
 
@@ -79,7 +91,9 @@ For a Site asset, request handling is fixed to this order:
    and build the final 200, 206, 304, 406, or 416 response before finalization.
 
 Each representation has its own content-derived ETag, length, and modification
-time. HEAD and all other non-GET methods ignore Range and If-Range while retaining
+time. Strong tags are `"sha256-<64 lowercase hex>"`; weak configuration emits the
+same representation digest with `W/`. HEAD and all other non-GET methods ignore
+Range and If-Range while retaining
 normal negotiation and validator behavior. Unknown units, malformed bytes ranges,
 and multiple ranges are ignored and receive a full negotiated representation. If a
 valid single range arrives with `identity;q=0`, Range is ignored and a full br/gzip
@@ -107,9 +121,37 @@ It serves:
 - `/metrics`: Prometheus text with fixed outcome, status-class, latency, active
   request, and reload counters.
 
+An explicit `Observe` wrapper adds bounded production series:
+
+- `oxidase_observe_total{observe,outcome}`;
+- `oxidase_observe_status_total{observe,class}` and fixed error classes;
+- `oxidase_observe_response_head_duration_seconds_bucket`.
+
+Observe latency ends when the child returns its outcome/response head. It does not
+include streaming body delivery. The root body adapter separately exports emitted
+byte totals, body lifetime buckets, and a fixed termination reason of `completed`,
+`error`, `cancelled`, or `timeout`. Dropping a client response does not cause body
+collection; it drops the upstream/file stream and releases the active-request guard.
+
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service
 source values.
+
+Both user and management HTTP/1 listeners use Hyper's timer-backed 30-second request
+header read timeout. It closes a connection that stops before completing its headers
+without introducing a custom HTTP parser or a new `100-continue` policy.
+
+For a manual short soak (not part of ordinary CI), run:
+
+```bash
+OXIDASE_SOAK_ITERATIONS=1000 cargo test -p oxidase-server \
+  manual_proxy_reload_keepalive_and_cancellation_soak --locked \
+  -- --ignored --nocapture
+```
+
+It combines one persistent HTTP/1 client, periodic atomic reload, downstream
+cancellation, and an 8 MiB streaming Asset. Treat the output as an observation aid
+for memory/fd monitoring, not as a performance or reliability guarantee.
 
 ## Logging
 

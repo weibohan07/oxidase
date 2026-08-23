@@ -1,7 +1,8 @@
 //! Shared strict source parsing for Gateway and Oxista YAML documents.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -17,12 +18,99 @@ pub struct StrictYamlError {
     pub help: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldSpan {
+    pub field_path: String,
+    pub key: SourceRange,
+    pub value: SourceRange,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FieldSpanIndex {
+    spans: BTreeMap<String, FieldSpan>,
+}
+
+impl FieldSpanIndex {
+    #[must_use]
+    pub fn get(&self, field_path: &str) -> Option<&FieldSpan> {
+        self.spans.get(field_path)
+    }
+
+    /// Resolves an exact field first, then its nearest indexed parent.
+    #[must_use]
+    pub fn nearest(&self, field_path: &str) -> Option<&FieldSpan> {
+        let mut candidate = field_path;
+        loop {
+            if let Some(span) = self.get(candidate) {
+                return Some(span);
+            }
+            let dot = candidate.rfind('.');
+            let bracket = candidate.rfind('[');
+            let boundary = dot.into_iter().chain(bracket).max()?;
+            candidate = &candidate[..boundary];
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &FieldSpan)> {
+        self.spans.iter().map(|(path, span)| (path.as_str(), span))
+    }
+
+    #[must_use]
+    pub fn shifted(&self, byte_offset: usize, line_offset: usize) -> Self {
+        let spans = self
+            .spans
+            .iter()
+            .map(|(path, span)| {
+                let mut span = span.clone();
+                shift_range(&mut span.key, byte_offset, line_offset);
+                shift_range(&mut span.value, byte_offset, line_offset);
+                (path.clone(), span)
+            })
+            .collect();
+        Self { spans }
+    }
+}
+
+fn shift_range(range: &mut SourceRange, byte_offset: usize, line_offset: usize) {
+    range.start_byte += byte_offset;
+    range.end_byte += byte_offset;
+    range.start_line += line_offset;
+    range.end_line += line_offset;
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceDocument<T> {
+    pub value: T,
+    pub path: PathBuf,
+    pub text: Arc<str>,
+    pub spans: FieldSpanIndex,
+}
+
 /// Parses the deliberately small YAML subset shared by every Oxidase source
 /// format. Flow sequences are allowed; flow mappings and YAML graph features
 /// are not.
 pub fn parse<T: DeserializeOwned>(path: &Path, source: &str) -> Result<T, StrictYamlError> {
+    parse_document(path, source).map(|document| document.value)
+}
+
+/// Parses a strict YAML document while retaining its original text and a
+/// lightweight field-path span index for semantic diagnostics.
+pub fn parse_document<T: DeserializeOwned>(
+    path: &Path,
+    source: &str,
+) -> Result<SourceDocument<T>, StrictYamlError> {
     validate_subset(path, source)?;
-    serde_yaml_ng::from_str(source).map_err(|error| {
+    let value = serde_yaml_ng::from_str(source).map_err(|error| {
         let location = error.location();
         let (line, column) = location
             .map(|location| (location.line(), location.column()))
@@ -35,7 +123,221 @@ pub fn parse<T: DeserializeOwned>(path: &Path, source: &str) -> Result<T, Strict
             column,
             help: Some("remove unknown fields and ensure every value has the documented type"),
         }
+    })?;
+    Ok(SourceDocument {
+        value,
+        path: path.to_path_buf(),
+        text: Arc::from(source),
+        spans: build_field_span_index(source),
     })
+}
+
+#[derive(Debug)]
+struct SpanFrame {
+    indent: usize,
+    path: String,
+    next_sequence_index: usize,
+}
+
+fn build_field_span_index(source: &str) -> FieldSpanIndex {
+    let mut spans = BTreeMap::new();
+    let mut frames = Vec::<SpanFrame>::new();
+    let mut root_sequence_index = 0usize;
+    let mut block_scalar = None::<BlockScalarState>;
+    let mut byte_offset = 0usize;
+
+    for (line_index, physical_line) in source.split_inclusive('\n').enumerate() {
+        let line_with_cr = physical_line.strip_suffix('\n').unwrap_or(physical_line);
+        let raw_line = line_with_cr.strip_suffix('\r').unwrap_or(line_with_cr);
+        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+        if let Some(state) = block_scalar.as_mut() {
+            if raw_line.trim().is_empty() {
+                byte_offset += physical_line.len();
+                continue;
+            }
+            if indent > state.base_indent {
+                let required_indent = state
+                    .explicit_indent
+                    .map(|explicit| state.base_indent + explicit)
+                    .unwrap_or(indent);
+                state.content_indent.get_or_insert(required_indent);
+                byte_offset += physical_line.len();
+                continue;
+            }
+            block_scalar = None;
+        }
+
+        let structural_line = strip_comment(raw_line);
+        let trimmed = structural_line.trim();
+        if trimmed.is_empty() || matches!(trimmed, "---" | "...") {
+            byte_offset += physical_line.len();
+            continue;
+        }
+        let trimmed_start = structural_line.find(trimmed).unwrap_or(indent);
+        let starts_sequence_item = trimmed == "-" || trimmed.starts_with("- ");
+        let (content, content_start, mapping_indent, item_path) =
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                while frames.last().is_some_and(|frame| indent <= frame.indent) {
+                    frames.pop();
+                }
+                let parent_path = frames
+                    .last()
+                    .map(|frame| frame.path.clone())
+                    .unwrap_or_default();
+                let index = if let Some(parent) = frames.last_mut() {
+                    let index = parent.next_sequence_index;
+                    parent.next_sequence_index += 1;
+                    index
+                } else {
+                    let index = root_sequence_index;
+                    root_sequence_index += 1;
+                    index
+                };
+                let item_path = format!("{parent_path}[{index}]");
+                frames.push(SpanFrame {
+                    indent,
+                    path: item_path.clone(),
+                    next_sequence_index: 0,
+                });
+                let rest = rest.trim_start();
+                let rest_offset = trimmed.len() - rest.len();
+                (rest, trimmed_start + rest_offset, indent + 2, item_path)
+            } else if trimmed == "-" {
+                while frames.last().is_some_and(|frame| indent <= frame.indent) {
+                    frames.pop();
+                }
+                let parent_path = frames
+                    .last()
+                    .map(|frame| frame.path.clone())
+                    .unwrap_or_default();
+                let index = if let Some(parent) = frames.last_mut() {
+                    let index = parent.next_sequence_index;
+                    parent.next_sequence_index += 1;
+                    index
+                } else {
+                    let index = root_sequence_index;
+                    root_sequence_index += 1;
+                    index
+                };
+                let item_path = format!("{parent_path}[{index}]");
+                frames.push(SpanFrame {
+                    indent,
+                    path: item_path.clone(),
+                    next_sequence_index: 0,
+                });
+                ("", trimmed_start + 1, indent + 2, item_path)
+            } else {
+                while frames.last().is_some_and(|frame| indent <= frame.indent) {
+                    frames.pop();
+                }
+                let parent = frames
+                    .last()
+                    .map(|frame| frame.path.clone())
+                    .unwrap_or_default();
+                (trimmed, trimmed_start, indent, parent)
+            };
+
+        if let Some(entry) = mapping_entry_detail(content) {
+            let field_path = append_field_path(&item_path, &entry.key);
+            let key_start = content_start + entry.key_column;
+            let key_end = key_start + entry.raw_key_len;
+            let key = source_range(raw_line, byte_offset, line_index, key_start, key_end);
+            let value = if entry.value.is_empty() {
+                key.clone()
+            } else {
+                let value_start = content_start + entry.value_column;
+                source_range(
+                    raw_line,
+                    byte_offset,
+                    line_index,
+                    value_start,
+                    value_start + entry.value.len(),
+                )
+            };
+            let field_span = FieldSpan {
+                field_path: field_path.clone(),
+                key,
+                value,
+            };
+            spans.insert(field_path.clone(), field_span.clone());
+            if !valid_field_component(&entry.key) {
+                let legacy_path = if item_path.is_empty() {
+                    entry.key.clone()
+                } else {
+                    format!("{item_path}.{}", entry.key)
+                };
+                spans.entry(legacy_path).or_insert(field_span);
+            }
+            if entry.value.is_empty() {
+                frames.push(SpanFrame {
+                    indent: mapping_indent,
+                    path: field_path,
+                    next_sequence_index: 0,
+                });
+            }
+        } else if starts_sequence_item && !content.is_empty() {
+            let value = source_range(
+                raw_line,
+                byte_offset,
+                line_index,
+                content_start,
+                content_start + content.len(),
+            );
+            spans.insert(
+                item_path.clone(),
+                FieldSpan {
+                    field_path: item_path.clone(),
+                    key: value.clone(),
+                    value,
+                },
+            );
+        }
+        if let Some(explicit_indent) = block_scalar_indicator(content, starts_sequence_item) {
+            block_scalar = Some(BlockScalarState {
+                base_indent: mapping_indent,
+                explicit_indent,
+                content_indent: None,
+            });
+        }
+        byte_offset += physical_line.len();
+    }
+    FieldSpanIndex { spans }
+}
+
+fn append_field_path(parent: &str, key: &str) -> String {
+    if valid_field_component(key) {
+        if parent.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{parent}.{key}")
+        }
+    } else {
+        let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("{parent}[\"{escaped}\"]")
+    }
+}
+
+fn valid_field_component(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn source_range(
+    raw_line: &str,
+    byte_offset: usize,
+    zero_based_line: usize,
+    start: usize,
+    end: usize,
+) -> SourceRange {
+    SourceRange {
+        start_byte: byte_offset + start,
+        end_byte: byte_offset + end,
+        start_line: zero_based_line + 1,
+        start_column: raw_line[..start].chars().count() + 1,
+        end_line: zero_based_line + 1,
+        end_column: raw_line[..end].chars().count() + 1,
+    }
 }
 
 fn validate_subset(path: &Path, source: &str) -> Result<(), StrictYamlError> {
@@ -314,10 +616,18 @@ fn find_indicator_token(value: &str, indicator: char) -> Option<usize> {
 }
 
 fn mapping_key(content: &str) -> Option<(String, usize)> {
-    mapping_entry(content).map(|(key, column, _)| (key, column))
+    mapping_entry_detail(content).map(|entry| (entry.key, entry.key_column))
 }
 
-fn mapping_entry(content: &str) -> Option<(String, usize, &str)> {
+struct MappingEntry<'a> {
+    key: String,
+    key_column: usize,
+    raw_key_len: usize,
+    value: &'a str,
+    value_column: usize,
+}
+
+fn mapping_entry_detail(content: &str) -> Option<MappingEntry<'_>> {
     let mut quote = None;
     let mut escaped = false;
     let mut bracket_depth = 0usize;
@@ -352,7 +662,17 @@ fn mapping_entry(content: &str) -> Option<(String, usize, &str)> {
                         })
                         .unwrap_or(raw_key)
                         .to_owned();
-                    return Some((key, column, content[index + 1..].trim()));
+                    let after_colon = &content[index + 1..];
+                    let value = after_colon.trim();
+                    let value_column =
+                        index + 1 + after_colon.find(value).unwrap_or(after_colon.len());
+                    return Some(MappingEntry {
+                        key,
+                        key_column: column,
+                        raw_key_len: raw_key.len(),
+                        value,
+                        value_column,
+                    });
                 }
                 _ => {}
             }
@@ -362,8 +682,8 @@ fn mapping_entry(content: &str) -> Option<(String, usize, &str)> {
 }
 
 fn block_scalar_indicator(content: &str, starts_sequence_item: bool) -> Option<Option<usize>> {
-    let value = mapping_entry(content)
-        .map(|(_, _, value)| value)
+    let value = mapping_entry_detail(content)
+        .map(|entry| entry.value)
         .or_else(|| starts_sequence_item.then_some(content.trim()))?;
     parse_block_scalar_indicator(value)
 }
@@ -393,7 +713,7 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::parse;
+    use super::{parse, parse_document};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -522,5 +842,50 @@ mod tests {
             .expect_err("quoted pipe must not enter block scalar mode");
         assert_eq!(error.code, "source.duplicate_key");
         assert_eq!(error.line, 2);
+    }
+
+    #[test]
+    fn indexes_nested_sequence_quoted_and_post_scalar_field_spans() {
+        let source = concat!(
+            "listeners:\r\n",
+            "  - name: public\r\n",
+            "    bind: 127.0.0.1:8080\r\n",
+            "defaults:\r\n",
+            "  by_extension:\r\n",
+            "    \".css\":\r\n",
+            "      value: 雪\r\n",
+            "body: |-\r\n",
+            "  duplicate: text\r\n",
+            "  duplicate: remains scalar\r\n",
+            "after: final\r\n",
+        );
+        let document = parse_document::<serde_yaml_ng::Value>(Path::new("fixture.yaml"), source)
+            .expect("span fixture parses");
+        let bind = document
+            .spans
+            .get("listeners[0].bind")
+            .expect("listener bind is indexed");
+        assert_eq!((bind.value.start_line, bind.value.start_column), (3, 11));
+        assert_eq!(
+            &document.text[bind.value.start_byte..bind.value.end_byte],
+            "127.0.0.1:8080"
+        );
+        let extension = document
+            .spans
+            .get("defaults.by_extension[\".css\"].value")
+            .expect("quoted extension path is indexed");
+        assert_eq!(
+            (extension.value.start_line, extension.value.start_column),
+            (7, 14)
+        );
+        assert_eq!(
+            &document.text[extension.value.start_byte..extension.value.end_byte],
+            "雪"
+        );
+        let after = document
+            .spans
+            .get("after")
+            .expect("field after block scalar is indexed");
+        assert_eq!((after.key.start_line, after.key.start_column), (11, 1));
     }
 }
