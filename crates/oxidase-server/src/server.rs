@@ -1474,6 +1474,13 @@ services:
           status: 304
           body:
             text: forbidden-304
+      - when:
+          path: /reset-content
+        service:
+          type: respond
+          status: 205
+          body:
+            text: forbidden-205
     default:
       type: respond
       body:
@@ -1511,6 +1518,17 @@ listeners:
             assert!(!headers.contains("transfer-encoding:"));
             assert!(body.is_empty());
         }
+
+        let reset = request(address, "/reset-content", "").await;
+        let (headers, body) = raw_response_parts(&reset);
+        assert!(headers.starts_with("HTTP/1.1 205 Reset Content"));
+        assert!(
+            raw_header_values(&reset, "content-length")
+                .iter()
+                .all(|value| value == "0")
+        );
+        assert!(!headers.to_ascii_lowercase().contains("transfer-encoding:"));
+        assert!(body.is_empty());
 
         let response = raw_request(
             address,
@@ -1790,15 +1808,56 @@ listeners:
         )
         .await;
         let (headers, body) = raw_response_parts(&head_range);
-        assert!(headers.starts_with("HTTP/1.1 206 Partial Content"));
-        assert!(headers.to_ascii_lowercase().contains("content-length: 4"));
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 11"));
+        assert!(!headers.to_ascii_lowercase().contains("content-range:"));
         assert!(body.is_empty());
 
-        for value in ["bytes=99-100", "bytes=0-1,4-5"] {
-            let invalid = request(address, "/asset.txt", &format!("Range: {value}\r\n")).await;
-            assert!(invalid.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
-            assert_eq!(raw_header(&invalid, "content-range"), "bytes */11");
+        let compressed_head_range = raw_request(
+            address,
+            &format!(
+                "HEAD /asset.txt HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\nAccept-Encoding: br\r\nRange: bytes=2-5\r\nIf-Range: {identity_etag}\r\n\r\n"
+            ),
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&compressed_head_range);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-encoding: br")
+        );
+        assert!(headers.to_ascii_lowercase().contains("content-length: 9"));
+        assert!(!headers.to_ascii_lowercase().contains("content-range:"));
+        assert!(body.is_empty());
+
+        for value in ["items=0-10", "bytes=abc", "bytes=-", "bytes=0-1,4-5"] {
+            let ignored = request(
+                address,
+                "/asset.txt",
+                &format!("Accept-Encoding: br\r\nRange: {value}\r\n"),
+            )
+            .await;
+            assert!(ignored.starts_with("HTTP/1.1 200 OK"), "{value}: {ignored}");
+            assert_eq!(raw_header(&ignored, "content-encoding"), "br");
+            assert!(raw_header_values(&ignored, "content-range").is_empty());
+            assert!(ignored.ends_with("brotli-v1"));
         }
+
+        let unsatisfiable = request(address, "/asset.txt", "Range: bytes=99-100\r\n").await;
+        assert!(unsatisfiable.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
+        assert_eq!(raw_header(&unsatisfiable, "content-range"), "bytes */11");
+
+        let compressed_range = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br, identity;q=0\r\nRange: bytes=0-2\r\n",
+        )
+        .await;
+        assert!(compressed_range.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(raw_header(&compressed_range, "content-encoding"), "br");
+        assert!(raw_header_values(&compressed_range, "content-range").is_empty());
+        assert!(compressed_range.ends_with("brotli-v1"));
 
         fs::write(site.join("asset.txt.br"), "brotli-v2-changed")
             .expect("Brotli representation can change");

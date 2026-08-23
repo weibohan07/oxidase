@@ -270,6 +270,7 @@ async fn prepare_site_body(
         PreparedSiteBody::Asset(asset) => {
             match stream_asset(
                 &asset,
+                request.method(),
                 &request.headers(),
                 &mut response.status,
                 &mut response.headers,
@@ -291,17 +292,25 @@ async fn prepare_site_body(
 
 async fn stream_asset(
     asset: &AssetPlan,
+    request_method: &Method,
     request_headers: &HeaderMap,
     status: &mut StatusCode,
     response_headers: &mut HeaderMap,
     head_only: bool,
 ) -> Result<GatewayBodyPlan, ServiceError> {
-    let range_requested = request_headers.contains_key(header::RANGE);
+    let parsed_range = parse_requested_range(request_headers);
+    let range_eligible = request_method == Method::GET
+        && *status == StatusCode::OK
+        && asset.range_requests
+        && matches!(parsed_range, ParsedRange::Single(_));
+    let use_identity_for_range =
+        range_eligible && encoding_preferences(request_headers).identity > 0;
     clear_representation_headers(response_headers);
     if asset.brotli.is_some() || asset.gzip.is_some() {
         merge_vary(response_headers, "accept-encoding");
     }
-    let Some(representation) = select_representation(request_headers, asset, range_requested)
+    let Some(representation) =
+        select_representation(request_headers, asset, use_identity_for_range)
     else {
         *status = StatusCode::NOT_ACCEPTABLE;
         return Ok(GatewayBodyPlan::Empty);
@@ -319,14 +328,13 @@ async fn stream_asset(
         return Ok(GatewayBodyPlan::Empty);
     }
 
-    let range = if *status == StatusCode::OK
-        && asset.range_requests
-        && range_requested
-        && if_range_matches(request_headers, representation)
-    {
-        match requested_range(request_headers, representation.length) {
-            Ok(range) => range,
-            Err(()) => {
+    let range = if use_identity_for_range && if_range_matches(request_headers, representation) {
+        let ParsedRange::Single(range) = parsed_range else {
+            unreachable!("identity is reserved only for a parsed single range")
+        };
+        match range.resolve(representation.length) {
+            ResolvedRange::Satisfiable(range) => Some(range),
+            ResolvedRange::Unsatisfiable => {
                 *status = StatusCode::RANGE_NOT_SATISFIABLE;
                 response_headers.insert(
                     header::CONTENT_RANGE,
@@ -392,55 +400,104 @@ async fn stream_asset(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteRange {
     start: u64,
     end: u64,
 }
 
-fn requested_range(headers: &HeaderMap, length: u64) -> Result<Option<ByteRange>, ()> {
-    let mut values = headers.get_all(header::RANGE).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(());
-    }
-    parse_range(value.to_str().map_err(|_| ())?, length).map(Some)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedRange {
+    None,
+    Ignore,
+    Single(UnresolvedByteRange),
 }
 
-fn parse_range(value: &str, length: u64) -> Result<ByteRange, ()> {
-    let (unit, value) = value.trim().split_once('=').ok_or(())?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnresolvedByteRange {
+    Inclusive { start: u64, end: Option<u64> },
+    Suffix { length: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedRange {
+    Satisfiable(ByteRange),
+    Unsatisfiable,
+}
+
+impl UnresolvedByteRange {
+    fn resolve(self, length: u64) -> ResolvedRange {
+        if length == 0 {
+            return ResolvedRange::Unsatisfiable;
+        }
+        match self {
+            Self::Inclusive { start, end } => {
+                if start >= length || end.is_some_and(|end| start > end) {
+                    return ResolvedRange::Unsatisfiable;
+                }
+                ResolvedRange::Satisfiable(ByteRange {
+                    start,
+                    end: end.unwrap_or(length - 1).min(length - 1),
+                })
+            }
+            Self::Suffix { length: suffix } => {
+                if suffix == 0 {
+                    return ResolvedRange::Unsatisfiable;
+                }
+                let suffix = suffix.min(length);
+                ResolvedRange::Satisfiable(ByteRange {
+                    start: length - suffix,
+                    end: length - 1,
+                })
+            }
+        }
+    }
+}
+
+fn parse_requested_range(headers: &HeaderMap) -> ParsedRange {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return ParsedRange::None;
+    };
+    if values.next().is_some() {
+        return ParsedRange::Ignore;
+    }
+    value.to_str().map_or(ParsedRange::Ignore, parse_range)
+}
+
+fn parse_range(value: &str) -> ParsedRange {
+    let Some((unit, value)) = value.trim().split_once('=') else {
+        return ParsedRange::Ignore;
+    };
     if !unit.eq_ignore_ascii_case("bytes") {
-        return Err(());
+        return ParsedRange::Ignore;
     }
     let value = value.trim();
-    if value.contains(',') || length == 0 {
-        return Err(());
+    if value.contains(',') {
+        return ParsedRange::Ignore;
     }
-    let (start, end) = value.split_once('-').ok_or(())?;
+    let Some((start, end)) = value.split_once('-') else {
+        return ParsedRange::Ignore;
+    };
     let start = start.trim();
     let end = end.trim();
     if start.is_empty() {
-        let suffix = end.parse::<u64>().map_err(|_| ())?.min(length);
-        if suffix == 0 {
-            return Err(());
-        }
-        return Ok(ByteRange {
-            start: length - suffix,
-            end: length - 1,
+        return end.parse::<u64>().map_or(ParsedRange::Ignore, |length| {
+            ParsedRange::Single(UnresolvedByteRange::Suffix { length })
         });
     }
-    let start = start.parse::<u64>().map_err(|_| ())?;
-    if start >= length {
-        return Err(());
-    }
-    let end = if end.is_empty() {
-        length - 1
-    } else {
-        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    let Ok(start) = start.parse::<u64>() else {
+        return ParsedRange::Ignore;
     };
-    (start <= end).then_some(ByteRange { start, end }).ok_or(())
+    let end = if end.is_empty() {
+        None
+    } else {
+        let Ok(end) = end.parse::<u64>() else {
+            return ParsedRange::Ignore;
+        };
+        Some(end)
+    };
+    ParsedRange::Single(UnresolvedByteRange::Inclusive { start, end })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -694,7 +751,10 @@ mod tests {
     use http::{HeaderMap, HeaderValue, header};
     use oxidase_site::{AssetPlan, AssetRepresentation, ContentEncoding};
 
-    use super::{ByteRange, parse_quality, parse_range, select_representation};
+    use super::{
+        ByteRange, ParsedRange, ResolvedRange, UnresolvedByteRange, parse_quality, parse_range,
+        select_representation,
+    };
 
     fn representation(encoding: Option<ContentEncoding>) -> AssetRepresentation {
         AssetRepresentation {
@@ -726,22 +786,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_single_byte_ranges() {
+    fn distinguishes_ignored_and_resolvable_byte_ranges() {
         assert_eq!(
-            parse_range("bytes=2-5", 10).map(|range| (range.start, range.end)),
-            Ok((2, 5))
+            parse_range("bytes=2-5"),
+            ParsedRange::Single(UnresolvedByteRange::Inclusive {
+                start: 2,
+                end: Some(5)
+            })
         );
         assert_eq!(
-            parse_range("bytes=-3", 10).map(|range| (range.start, range.end)),
-            Ok((7, 9))
+            parse_range("bytes=-3"),
+            ParsedRange::Single(UnresolvedByteRange::Suffix { length: 3 })
         );
         assert_eq!(
-            parse_range("bytes=8-", 10).map(|range| (range.start, range.end)),
-            Ok((8, 9))
+            parse_range("bytes=8-"),
+            ParsedRange::Single(UnresolvedByteRange::Inclusive {
+                start: 8,
+                end: None
+            })
         );
-        assert!(parse_range("bytes=11-12", 10).is_err());
-        assert!(parse_range("bytes=0-1,4-5", 10).is_err());
-        assert!(parse_range("items=0-1", 10).is_err());
+        assert_eq!(
+            UnresolvedByteRange::Inclusive {
+                start: 11,
+                end: Some(12)
+            }
+            .resolve(10),
+            ResolvedRange::Unsatisfiable
+        );
+        assert_eq!(parse_range("bytes=0-1,4-5"), ParsedRange::Ignore);
+        assert_eq!(parse_range("items=0-1"), ParsedRange::Ignore);
+        assert_eq!(parse_range("bytes=abc"), ParsedRange::Ignore);
+        assert_eq!(parse_range("bytes=-"), ParsedRange::Ignore);
         let _type_check = ByteRange { start: 0, end: 0 };
     }
 
@@ -793,13 +868,13 @@ mod tests {
     }
 
     #[test]
-    fn range_forces_identity_and_respects_identity_exclusion() {
+    fn valid_range_prefers_identity_only_when_identity_is_acceptable() {
         let asset = asset();
         let selected = select_representation(&encoding_headers("br"), &asset, true)
             .expect("implicit identity remains acceptable");
         assert_eq!(selected.encoding, None);
-        assert!(
-            select_representation(&encoding_headers("br, identity;q=0"), &asset, true,).is_none()
-        );
+        let selected = select_representation(&encoding_headers("br, identity;q=0"), &asset, false)
+            .expect("the ignored range permits Brotli negotiation");
+        assert_eq!(selected.encoding, Some(ContentEncoding::Brotli));
     }
 }
