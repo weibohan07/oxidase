@@ -3342,4 +3342,40 @@ templates:
         assert!(message.contains("unknown parameter `extra`"), "{message}");
         assert!(message.contains("at 4:6-4:"), "{message}");
     }
+
+    #[test]
+    #[ignore = "manual filesystem benchmark; run with --release --ignored --nocapture"]
+    fn synthetic_site_preparation_smoke_benchmark() {
+        for file_count in [1_000usize, 10_000] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir(&root).expect("site directory can be created");
+            let manifest = root.join("site.oxsite");
+            fs::write(&manifest, "oxista: site/v1\n").expect("manifest can be written");
+            for index in 0..file_count {
+                fs::write(
+                    root.join(format!("asset-{index:05}.txt")),
+                    format!("asset {index}\n"),
+                )
+                .expect("synthetic asset can be written");
+            }
+
+            let scan_started = std::time::Instant::now();
+            let index = SiteCompiler::scan(&root, &manifest).expect("synthetic scan succeeds");
+            let scan_elapsed = scan_started.elapsed();
+            assert_eq!(index.entries().count(), file_count + 1);
+            let compile_started = std::time::Instant::now();
+            let snapshot = SiteCompiler::compile_indexed(
+                ResourceId::new(format!("site:bench-{file_count}")),
+                &index,
+                BTreeMap::new(),
+            )
+            .expect("synthetic snapshot compiles");
+            let compile_elapsed = compile_started.elapsed();
+            std::hint::black_box(snapshot.public_paths().count());
+            eprintln!(
+                "site preparation ({file_count} assets): scan {scan_elapsed:?}, compile {compile_elapsed:?}"
+            );
+        }
+    }
 }

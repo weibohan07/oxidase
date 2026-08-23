@@ -661,4 +661,41 @@ mod tests {
             HeaderValue::from_static("parent")
         );
     }
+
+    #[test]
+    #[ignore = "manual microbenchmark; run with --release --ignored --nocapture"]
+    fn request_evaluation_context_smoke_benchmark() {
+        let mut headers = HeaderMap::new();
+        for index in 0..32 {
+            headers.insert(
+                format!("x-bench-{index}")
+                    .parse::<http::HeaderName>()
+                    .expect("benchmark header name is valid"),
+                HeaderValue::from_static("benchmark-value"),
+            );
+        }
+        let frame = RequestFrame::new(
+            RequestMetadata::try_new(
+                Method::GET,
+                "https",
+                "example.test",
+                "/benchmark?z=9&a=1&a=2&message=hello%20world",
+                headers,
+            )
+            .expect("benchmark metadata is valid"),
+        )
+        .with_bindings(BTreeMap::from([(
+            "route".to_owned(),
+            Value::from("benchmark"),
+        )]));
+        let iterations = 100_000usize;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(frame.evaluation_context());
+        }
+        eprintln!(
+            "request evaluation cache: {iterations} contexts in {:?}",
+            started.elapsed()
+        );
+    }
 }

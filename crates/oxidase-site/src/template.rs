@@ -2053,4 +2053,43 @@ mod tests {
             } if template == "slow.oxt"
         ));
     }
+
+    #[test]
+    #[ignore = "manual microbenchmark; run with --release --ignored --nocapture"]
+    fn typed_include_render_smoke_benchmark() {
+        let child = typed_template(
+            "child.oxt",
+            "<li>{{ item }}</li>",
+            &[("item", "string")],
+            TemplateOutput::Html,
+            true,
+        );
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "<ul>{% include \"child.oxt\" with item=page.value only %}</ul>",
+            true,
+        )
+        .expect("benchmark parent compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("child.oxt".to_owned(), child),
+        ]);
+        parent
+            .validate_include_contracts(&templates)
+            .expect("benchmark contract is valid");
+        let context = public_context();
+        let iterations = 50_000usize;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(
+                parent
+                    .render(&templates, &context, &limits())
+                    .expect("benchmark render succeeds"),
+            );
+        }
+        eprintln!(
+            "typed include render: {iterations} renders in {:?}",
+            started.elapsed()
+        );
+    }
 }
