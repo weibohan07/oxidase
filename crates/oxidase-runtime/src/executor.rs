@@ -707,35 +707,54 @@ fn apply_request_transform(
     request: &mut RequestFrame,
 ) -> Result<(), ServiceError> {
     let context = request.evaluation_context();
-    request.overlay.method.clone_from(&transform.method);
-    request.overlay.scheme = render_metadata(
+    let scheme = render_metadata(
         &transform.scheme,
         &context,
         "scheme",
         parse_transform_scheme,
     )?;
-    request.overlay.authority = render_metadata(
+    let authority = render_metadata(
         &transform.authority,
         &context,
         "authority",
         parse_transform_authority,
     )?;
-    request.overlay.path_and_query = render_metadata(
+    let path_and_query = render_metadata(
         &transform.path_and_query,
         &context,
         "path_and_query",
         parse_transform_path_and_query,
     )?;
+    let set_headers = transform
+        .headers
+        .set
+        .iter()
+        .map(|header| {
+            render_header(&header.value, &context).map(|value| (header.name.clone(), value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let add_headers = transform
+        .headers
+        .add
+        .iter()
+        .map(|header| {
+            render_header(&header.value, &context).map(|value| (header.name.clone(), value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let overlay = request.overlay_mut();
+    overlay.method.clone_from(&transform.method);
+    overlay.scheme = scheme;
+    overlay.authority = authority;
+    overlay.path_and_query = path_and_query;
     for name in &transform.headers.remove {
-        request.overlay.remove_header(name.clone());
+        overlay.remove_header(name.clone());
     }
-    for header in &transform.headers.set {
-        let value = render_header(&header.value, &context)?;
-        request.overlay.set_header(header.name.clone(), value);
+    for (name, value) in set_headers {
+        overlay.set_header(name, value);
     }
-    for header in &transform.headers.add {
-        let value = render_header(&header.value, &context)?;
-        request.overlay.add_header(header.name.clone(), value);
+    for (name, value) in add_headers {
+        overlay.add_header(name, value);
     }
     Ok(())
 }

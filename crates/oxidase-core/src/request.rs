@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
@@ -190,8 +190,31 @@ impl Bindings {
 #[derive(Debug, Clone)]
 pub struct RequestFrame {
     original: Arc<RequestMetadata>,
-    pub overlay: RequestOverlay,
-    pub bindings: Bindings,
+    overlay: RequestOverlay,
+    bindings: Bindings,
+    request_cache: Arc<RequestViewCache>,
+    evaluation_cache: Arc<EvaluationCache>,
+}
+
+#[derive(Debug, Default)]
+struct RequestViewCache {
+    effective_headers: OnceLock<HeaderMap>,
+    query: OnceLock<Value>,
+    namespace: OnceLock<Value>,
+    #[cfg(test)]
+    header_builds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    query_builds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    namespace_builds: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct EvaluationCache {
+    bindings: OnceLock<Value>,
+    context: OnceLock<EvalContext>,
+    #[cfg(test)]
+    binding_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl RequestFrame {
@@ -201,12 +224,32 @@ impl RequestFrame {
             original: Arc::new(metadata),
             overlay: RequestOverlay::default(),
             bindings: Bindings::default(),
+            request_cache: Arc::new(RequestViewCache::default()),
+            evaluation_cache: Arc::new(EvaluationCache::default()),
         }
     }
 
     #[must_use]
     pub fn original(&self) -> &RequestMetadata {
         &self.original
+    }
+
+    #[must_use]
+    pub const fn overlay(&self) -> &RequestOverlay {
+        &self.overlay
+    }
+
+    /// Invalidates frame-local derived views before granting mutable access to
+    /// the transactional request overlay.
+    pub fn overlay_mut(&mut self) -> &mut RequestOverlay {
+        self.request_cache = Arc::new(RequestViewCache::default());
+        self.evaluation_cache = Arc::new(EvaluationCache::default());
+        &mut self.overlay
+    }
+
+    #[must_use]
+    pub const fn bindings(&self) -> &Bindings {
+        &self.bindings
     }
 
     #[must_use]
@@ -273,58 +316,105 @@ impl RequestFrame {
 
     #[must_use]
     pub fn headers(&self) -> HeaderMap {
-        let mut headers = self.original.headers.clone();
-        for mutation in &self.overlay.header_mutations {
-            match mutation {
-                HeaderMutation::Set(name, value) => {
-                    headers.insert(name, value.clone());
-                }
-                HeaderMutation::Add(name, value) => {
-                    headers.append(name, value.clone());
-                }
-                HeaderMutation::Remove(name) => {
-                    headers.remove(name);
+        self.effective_headers().clone()
+    }
+
+    #[must_use]
+    pub fn effective_headers(&self) -> &HeaderMap {
+        self.request_cache.effective_headers.get_or_init(|| {
+            #[cfg(test)]
+            self.request_cache
+                .header_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut headers = self.original.headers.clone();
+            for mutation in &self.overlay.header_mutations {
+                match mutation {
+                    HeaderMutation::Set(name, value) => {
+                        headers.insert(name, value.clone());
+                    }
+                    HeaderMutation::Add(name, value) => {
+                        headers.append(name, value.clone());
+                    }
+                    HeaderMutation::Remove(name) => {
+                        headers.remove(name);
+                    }
                 }
             }
-        }
-        headers
+            headers
+        })
     }
 
     #[must_use]
     pub fn with_bindings(&self, values: BTreeMap<String, Value>) -> Self {
         let mut child = self.clone();
         child.bindings = self.bindings.push_scope(values);
+        child.evaluation_cache = Arc::new(EvaluationCache::default());
         child
     }
 
     #[must_use]
     pub fn evaluation_context(&self) -> EvalContext {
-        let mut request = BTreeMap::new();
-        request.insert("method".to_owned(), Value::from(self.method().as_str()));
-        request.insert("scheme".to_owned(), Value::from(self.scheme()));
-        request.insert("authority".to_owned(), Value::from(self.authority()));
-        request.insert("host".to_owned(), Value::from(self.host()));
-        request.insert("path".to_owned(), Value::from(self.path()));
-        request.insert(
-            "path_and_query".to_owned(),
-            Value::from(self.path_and_query()),
-        );
-        request.insert("query".to_owned(), query_value(self.raw_query()));
-        request.insert("headers".to_owned(), headers_value(&self.headers()));
-        if let Some(peer_address) = &self.original.peer_address {
-            request.insert(
-                "peer_address".to_owned(),
-                Value::from(peer_address.to_string()),
-            );
-        }
+        self.evaluation_cache
+            .context
+            .get_or_init(|| {
+                let mut roots = BTreeMap::new();
+                roots.insert("request".to_owned(), self.request_namespace().clone());
+                roots.insert("bindings".to_owned(), self.bindings_value().clone());
+                EvalContext::new(roots)
+            })
+            .clone()
+    }
 
-        let mut roots = BTreeMap::new();
-        roots.insert("request".to_owned(), Value::Map(request));
-        roots.insert(
-            "bindings".to_owned(),
-            Value::Map(self.bindings.visible_values()),
-        );
-        EvalContext::new(roots)
+    fn request_namespace(&self) -> &Value {
+        self.request_cache.namespace.get_or_init(|| {
+            #[cfg(test)]
+            self.request_cache
+                .namespace_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut request = BTreeMap::new();
+            request.insert("method".to_owned(), Value::from(self.method().as_str()));
+            request.insert("scheme".to_owned(), Value::from(self.scheme()));
+            request.insert("authority".to_owned(), Value::from(self.authority()));
+            request.insert("host".to_owned(), Value::from(self.host()));
+            request.insert("path".to_owned(), Value::from(self.path()));
+            request.insert(
+                "path_and_query".to_owned(),
+                Value::from(self.path_and_query()),
+            );
+            request.insert("query".to_owned(), self.query_value().clone());
+            request.insert(
+                "headers".to_owned(),
+                headers_value(self.effective_headers()),
+            );
+            if let Some(peer_address) = &self.original.peer_address {
+                request.insert(
+                    "peer_address".to_owned(),
+                    Value::from(peer_address.to_string()),
+                );
+            }
+
+            Value::Map(request)
+        })
+    }
+
+    fn query_value(&self) -> &Value {
+        self.request_cache.query.get_or_init(|| {
+            #[cfg(test)]
+            self.request_cache
+                .query_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            query_value(self.raw_query())
+        })
+    }
+
+    fn bindings_value(&self) -> &Value {
+        self.evaluation_cache.bindings.get_or_init(|| {
+            #[cfg(test)]
+            self.evaluation_cache
+                .binding_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Value::Map(self.bindings.visible_values())
+        })
     }
 }
 
@@ -381,8 +471,10 @@ fn query_value(query: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
-    use http::{HeaderMap, Method};
+    use http::{HeaderMap, HeaderValue, Method};
 
     use super::{Bindings, RequestFrame, RequestMetadata};
     use crate::Value;
@@ -448,5 +540,125 @@ mod tests {
         let path = super::parse_transform_path_and_query("/ok?b=2&a=1&a=3")
             .expect("origin-form path is valid");
         assert_eq!(path.as_str(), "/ok?b=2&a=1&a=3");
+    }
+
+    #[test]
+    fn repeated_evaluation_builds_each_frame_view_once() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", HeaderValue::from_static("value"));
+        let frame = RequestFrame::new(
+            RequestMetadata::try_new(
+                Method::GET,
+                "https",
+                "example.test",
+                "/search?b=2&a=1&a=3",
+                headers,
+            )
+            .expect("request metadata is valid"),
+        );
+        assert_eq!(frame.request_cache.query_builds.load(Ordering::Relaxed), 0);
+        assert_eq!(frame.raw_query(), Some("b=2&a=1&a=3"));
+        assert_eq!(frame.request_cache.query_builds.load(Ordering::Relaxed), 0);
+
+        for _ in 0..4 {
+            let context = frame.evaluation_context();
+            assert_eq!(
+                context
+                    .root("request")
+                    .and_then(|request| request.get("path"))
+                    .and_then(Value::as_str),
+                Some("/search")
+            );
+        }
+        assert_eq!(frame.request_cache.header_builds.load(Ordering::Relaxed), 1);
+        assert_eq!(frame.request_cache.query_builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            frame.request_cache.namespace_builds.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            frame
+                .evaluation_cache
+                .binding_builds
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let clone = frame.clone();
+        let _ = clone.evaluation_context();
+        assert!(Arc::ptr_eq(&frame.request_cache, &clone.request_cache));
+        assert!(Arc::ptr_eq(
+            &frame.evaluation_cache,
+            &clone.evaluation_cache
+        ));
+        assert_eq!(
+            frame.request_cache.namespace_builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn overlay_and_binding_children_invalidate_only_the_views_they_change() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-scope", HeaderValue::from_static("parent"));
+        let parent = RequestFrame::new(
+            RequestMetadata::try_new(
+                Method::GET,
+                "http",
+                "example.test",
+                "/original?b=2&a=1",
+                headers,
+            )
+            .expect("request metadata is valid"),
+        );
+        let _ = parent.evaluation_context();
+
+        let child =
+            parent.with_bindings(BTreeMap::from([("name".to_owned(), Value::from("child"))]));
+        assert!(Arc::ptr_eq(&parent.request_cache, &child.request_cache));
+        assert!(!Arc::ptr_eq(
+            &parent.evaluation_cache,
+            &child.evaluation_cache
+        ));
+        let child_context = child.evaluation_context();
+        assert_eq!(
+            child_context
+                .root("bindings")
+                .and_then(|bindings| bindings.get("name"))
+                .and_then(Value::as_str),
+            Some("child")
+        );
+        assert!(
+            parent
+                .evaluation_context()
+                .root("bindings")
+                .and_then(|bindings| bindings.get("name"))
+                .is_none()
+        );
+
+        let mut transformed = parent.clone();
+        let overlay = transformed.overlay_mut();
+        overlay.path_and_query = Some(
+            super::parse_transform_path_and_query("/changed?a=1&b=2")
+                .expect("transformed path is valid"),
+        );
+        overlay.set_header(
+            "x-scope".parse().expect("header name is valid"),
+            HeaderValue::from_static("child"),
+        );
+        assert!(!Arc::ptr_eq(
+            &parent.request_cache,
+            &transformed.request_cache
+        ));
+        assert_eq!(transformed.path_and_query(), "/changed?a=1&b=2");
+        assert_eq!(
+            transformed.effective_headers()["x-scope"],
+            HeaderValue::from_static("child")
+        );
+        assert_eq!(parent.path_and_query(), "/original?b=2&a=1");
+        assert_eq!(
+            parent.effective_headers()["x-scope"],
+            HeaderValue::from_static("parent")
+        );
     }
 }

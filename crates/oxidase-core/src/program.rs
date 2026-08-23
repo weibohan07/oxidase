@@ -366,7 +366,7 @@ impl PredicatePlan {
                     .map(|(name, value)| (name, Value::String(value))),
             );
         }
-        let headers = request.headers();
+        let headers = request.effective_headers();
         for predicate in &self.headers {
             let value = headers
                 .get_all(&predicate.name)
