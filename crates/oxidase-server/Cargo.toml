@@ -16,6 +16,7 @@ hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
 oxidase-core = { path = "../oxidase-core" }
+oxidase-config = { path = "../oxidase-config" }
 oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-site = { path = "../oxidase-site" }
 thiserror.workspace = true
@@ -25,7 +26,6 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-oxidase-config = { path = "../oxidase-config" }
 tempfile.workspace = true
 
 [lints]

@@ -42,7 +42,11 @@ enum Command {
     /// Execute declarative tests embedded in the gateway source.
     Test { config: PathBuf },
     /// Serve a compiled gateway (enabled by the data-plane phase).
-    Serve { config: PathBuf },
+    Serve {
+        config: PathBuf,
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 #[tokio::main]
@@ -90,8 +94,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             run_config_tests(&gateway).await
         }
-        Command::Serve { config } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
+        Command::Serve { config, watch } => {
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(&config)?)?;
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -102,11 +106,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             for (name, address) in server.local_addresses() {
                 println!("listener {name} accepting HTTP/1.1 on {address}");
             }
-            server
-                .run_until(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+            let running = server.spawn();
+            let (stop_watcher, watcher_stopped) = tokio::sync::watch::channel(false);
+            let watcher = watch.then(|| {
+                tokio::spawn(watch_dependencies(
+                    config,
+                    running.reload_handle(),
+                    watcher_stopped,
+                ))
+            });
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = stop_watcher.send(true);
+            if let Some(watcher) = watcher {
+                let _ = watcher.await;
+            }
+            running.shutdown().await?;
             Ok(())
         }
     }
@@ -412,5 +426,76 @@ fn compare_leaf(
         && !leaf.is_some_and(|(_, _, actual_path)| actual_path == path)
     {
         mismatches.push(format!("expected rewritten path `{path}`"));
+    }
+}
+
+async fn watch_dependencies(
+    config: PathBuf,
+    reload: oxidase_server::ReloadHandle,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut last = dependency_stamp(&reload.current_snapshot()).await;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                let observed = dependency_stamp(&reload.current_snapshot()).await;
+                if observed == last {
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                match reload.reload_path(&config).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            previous_version = report.previous_version,
+                            current_version = report.current_version,
+                            reused_sites = report.reused_sites,
+                            reused_clusters = report.reused_clusters,
+                            "configuration reload committed"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "configuration reload rejected; retaining last-known-good snapshot");
+                    }
+                }
+                // Record the observed filesystem state even after failure so an
+                // unchanged invalid source does not cause an error loop. A later
+                // edit triggers another full prepare attempt.
+                last = dependency_stamp(&reload.current_snapshot()).await;
+            }
+        }
+    }
+}
+
+async fn dependency_stamp(snapshot: &RuntimeSnapshot) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for path in &snapshot.dependencies {
+        update_stamp(&mut hash, path.to_string_lossy().as_bytes());
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => {
+                update_stamp(&mut hash, &metadata.len().to_le_bytes());
+                update_stamp(&mut hash, &[u8::from(metadata.is_dir())]);
+                if let Ok(modified) = metadata.modified()
+                    && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    update_stamp(&mut hash, &duration.as_nanos().to_le_bytes());
+                }
+            }
+            Err(_) => update_stamp(&mut hash, b"missing"),
+        }
+    }
+    hash
+}
+
+fn update_stamp(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 }

@@ -34,8 +34,8 @@ Proxy over pooled HTTP/1.1, HTTPS, and upstream HTTP/2 connections. Assets are
 streamed from async files and support single byte ranges, ETag/Last-Modified
 conditionals, and precompressed representation selection.
 
-Inbound TLS/HTTP/2, listener-aware reload, management endpoints, and OXT
-`extends`/`block` are not yet implemented. See
+Inbound TLS/HTTP/2, management endpoints, and OXT `extends`/`block` are not yet
+implemented. Atomic last-known-good reload is available with `serve --watch`. See
 [`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
 
 ## Try the vertical slice
@@ -46,6 +46,7 @@ cargo run -p oxidase-cli -- test examples/basic-gateway/oxidase.yaml
 cargo run -p oxidase-cli -- explain examples/basic-gateway/oxidase.yaml \
   --request examples/basic-gateway/requests/home.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
+cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch
 ```
 
 The example demonstrates:
@@ -108,6 +109,11 @@ oxidase test <config>
 
 `compile` currently writes a deterministic inspection manifest, not a self-contained
 binary runtime snapshot.
+
+`serve --watch` watches imported configuration and compiled Site dependencies.
+Reload compiles and prepares the complete candidate, prebinds new listeners, reuses
+unchanged resources, and atomically commits only on success. Existing requests drain
+on their pinned snapshot.
 
 ## Development
 

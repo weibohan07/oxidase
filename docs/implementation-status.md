@@ -55,16 +55,26 @@ Last updated: 2026-08-23
   timeouts, and returns classified Failed outcomes.
 - A real fixture-upstream test covers POST streaming, query preservation, forwarding
   headers, response header sanitization, connection-pool reuse, and timeout mapping.
+- Phase 6 reload compiles and prepares a complete candidate against the current
+  snapshot, content-fingerprints Site/Cluster resources for Arc reuse, prebinds every
+  added/changed listener, stops removed accept loops, atomically publishes, and
+  drains retired connections.
+- `serve --watch` polls the complete config/Oxista file-and-directory dependency
+  graph with debounce. Failed compile, resource preparation, or listener bind leaves
+  the last-known-good snapshot untouched.
+- Integration tests prove invalid and bind-conflicting reload rollback, listener
+  retain/add/remove behavior, old long-running requests crossing a commit, and new
+  requests immediately observing the new version.
 
 ## Currently runnable
 
 - A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, and tested. Forty-five workspace tests pass,
+  executed in memory, explained, reloaded, and tested. Forty-eight workspace tests pass,
   including two real listener tests that require permission to bind loopback ports.
 
 ## Not implemented
 
-- Inbound TLS/HTTP2 and listener-aware atomic reload.
+- Inbound TLS/HTTP2 and Phase 7 hardening capabilities.
 
 ## Known limitations
 
@@ -91,9 +101,15 @@ Last updated: 2026-08-23
   one deadline; per-phase connect/write timing is not separately observable yet.
 - Explicit slow-client, client-disconnect, and upstream-mid-body disconnect tests
   remain for hardening, though dropped Hyper bodies propagate cancellation.
+- The portable watcher polls every 500ms. An edit that preserves path, byte length,
+  and filesystem modification timestamp could be missed until another dependency
+  changes; triggered preparation itself uses full content fingerprints.
+- Renaming a Listener while reusing its exact occupied address is rejected on
+  platforms without safe port sharing, preserving last-known-good. Unchanged names
+  and ordinary add/remove/address transitions are supported.
 
 ## Next concrete work
 
-Implement dependency-aware reload with prepare/commit, last-known-good publication,
-resource reuse, listener add/remove rollback and drain, and cross-version request
-tests.
+Add bounded metrics and management listeners, strengthen cancellation/security
+tests, add property/fuzz harnesses, document operations and migration, and finish
+release-quality CI/security files.

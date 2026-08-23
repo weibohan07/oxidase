@@ -32,8 +32,8 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2 的 Proxy。Asset 使用异步文件流，支持
 单 Range、ETag/Last-Modified 条件请求与预压缩表示选择。
 
-入站 TLS/HTTP/2、Listener 生命周期感知的 reload、管理接口及 OXT
-`extends/block` 尚未实现。准确边界见
+入站 TLS/HTTP/2、管理接口及 OXT `extends/block` 尚未实现。使用 `serve --watch`
+可以启用保留 last-known-good 的原子 reload。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
 ## 运行垂直切片
@@ -44,6 +44,7 @@ cargo run -p oxidase-cli -- test examples/basic-gateway/oxidase.yaml
 cargo run -p oxidase-cli -- explain examples/basic-gateway/oxidase.yaml \
   --request examples/basic-gateway/requests/home.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
+cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch
 ```
 
 示例覆盖：
@@ -104,6 +105,10 @@ oxidase test <config>
 ```
 
 `compile` 当前输出确定性的检查清单，并非包含全部资源的可执行二进制快照。
+
+`serve --watch` 会监控 imported config 和已编译 Site 的依赖。Reload 会先完成候选
+版本的完整编译与资源准备，预绑定新增 Listener，复用未变化资源，全部成功后才
+原子提交；已有请求继续在其固定快照上 drain。
 
 ## 开发
 

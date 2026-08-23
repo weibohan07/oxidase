@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -12,10 +13,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use oxidase_core::{RequestFrame, RequestMetadata, ServiceOutcome};
-use oxidase_runtime::{Executor, RuntimeSnapshot, SnapshotStore};
+use oxidase_runtime::{Executor, ResourceReuse, RuntimeSnapshot, SnapshotStore};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::body::{GatewayBody, GatewayBodyPlan, full_body};
@@ -30,8 +31,35 @@ pub struct GatewayServer {
     drain_timeout: Duration,
 }
 
+struct ActiveListener {
+    configured_address: SocketAddr,
+    local_address: SocketAddr,
+    generation: u64,
+    shutdown: watch::Sender<bool>,
+    accept_stopped: Option<oneshot::Receiver<()>>,
+    task: JoinHandle<()>,
+}
+
+struct ListenerCompletion {
+    name: String,
+    generation: u64,
+    result: Result<(), ServerError>,
+}
+
+enum Control {
+    Reload {
+        snapshot: Box<RuntimeSnapshot>,
+        reuse: ResourceReuse,
+        response: oneshot::Sender<Result<ReloadReport, ServerError>>,
+    },
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
+}
+
 struct BoundListener {
     name: String,
+    configured_address: SocketAddr,
     listener: TcpListener,
     local_address: SocketAddr,
 }
@@ -57,6 +85,7 @@ impl GatewayServer {
                     })?;
             listeners.push(BoundListener {
                 name: configured.name.clone(),
+                configured_address: configured.bind,
                 listener,
                 local_address,
             });
@@ -84,11 +113,16 @@ impl GatewayServer {
 
     pub fn spawn(self) -> RunningServer {
         let addresses = self.local_addresses();
-        let (shutdown, receiver) = watch::channel(false);
+        let store = self.store.clone();
+        let (control, receiver) = mpsc::channel(8);
         let task = tokio::spawn(self.run(receiver));
         RunningServer {
             addresses,
-            shutdown,
+            reload: ReloadHandle {
+                store,
+                control: control.clone(),
+            },
+            control,
             task,
         }
     }
@@ -102,32 +136,83 @@ impl GatewayServer {
         running.shutdown().await
     }
 
-    async fn run(self, receiver: watch::Receiver<bool>) -> Result<(), ServerError> {
-        let mut tasks = JoinSet::new();
-        for listener in self.listeners {
-            tasks.spawn(run_listener(
-                listener,
-                self.store.clone(),
-                self.proxy.clone(),
-                receiver.clone(),
-                self.drain_timeout,
-            ));
+    async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Result<(), ServerError> {
+        let (completion_sender, mut completions) = mpsc::unbounded_channel();
+        let mut listeners = BTreeMap::new();
+        let mut generation = 1u64;
+        for listener in self.listeners.drain(..) {
+            let name = listener.name.clone();
+            listeners.insert(
+                name,
+                start_listener(
+                    listener,
+                    generation,
+                    self.store.clone(),
+                    self.proxy.clone(),
+                    self.drain_timeout,
+                    completion_sender.clone(),
+                ),
+            );
+            generation = generation.saturating_add(1);
         }
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => return Err(ServerError::Task(error.to_string())),
+
+        loop {
+            tokio::select! {
+                command = control.recv() => {
+                    match command {
+                        Some(Control::Reload { snapshot, reuse, response }) => {
+                            let environment = ReloadEnvironment {
+                                store: &self.store,
+                                proxy: &self.proxy,
+                                drain_timeout: self.drain_timeout,
+                                completion: &completion_sender,
+                            };
+                            let result = apply_reload(
+                                *snapshot,
+                                reuse,
+                                &mut listeners,
+                                &mut generation,
+                                environment,
+                            ).await;
+                            let _ = response.send(result);
+                        }
+                        Some(Control::Shutdown { response }) => {
+                            stop_all_listeners(&mut listeners).await;
+                            let _ = response.send(());
+                            return Ok(());
+                        }
+                        None => {
+                            stop_all_listeners(&mut listeners).await;
+                            return Ok(());
+                        }
+                    }
+                }
+                completion = completions.recv() => {
+                    if let Some(completion) = completion {
+                        let is_active = listeners
+                            .get(&completion.name)
+                            .is_some_and(|listener| listener.generation == completion.generation);
+                        if is_active {
+                            listeners.remove(&completion.name);
+                            completion.result?;
+                            return Err(ServerError::Task(format!(
+                                "listener `{}` stopped unexpectedly",
+                                completion.name
+                            )));
+                        } else if let Err(error) = completion.result {
+                            tracing::warn!(listener = completion.name, error = %error, "retired listener failed while draining");
+                        }
+                    }
+                }
             }
         }
-        Ok(())
     }
 }
 
 pub struct RunningServer {
     addresses: Vec<(String, SocketAddr)>,
-    shutdown: watch::Sender<bool>,
+    reload: ReloadHandle,
+    control: mpsc::Sender<Control>,
     task: JoinHandle<Result<(), ServerError>>,
 }
 
@@ -137,11 +222,242 @@ impl RunningServer {
         &self.addresses
     }
 
+    #[must_use]
+    pub fn reload_handle(&self) -> ReloadHandle {
+        self.reload.clone()
+    }
+
+    pub async fn reload_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ReloadReport, ServerError> {
+        self.reload.reload_path(path).await
+    }
+
     pub async fn shutdown(self) -> Result<(), ServerError> {
-        let _ = self.shutdown.send(true);
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Shutdown { response })
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
+        let _ = received.await;
         self.task
             .await
             .map_err(|error| ServerError::Task(error.to_string()))?
+    }
+}
+
+#[derive(Clone)]
+pub struct ReloadHandle {
+    store: Arc<SnapshotStore>,
+    control: mpsc::Sender<Control>,
+}
+
+impl ReloadHandle {
+    pub async fn reload_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ReloadReport, ServerError> {
+        let current = self.store.pin();
+        let gateway = oxidase_config::Compiler::compile_path(path)
+            .map_err(|error| ServerError::Reload(error.to_string()))?;
+        let (snapshot, reuse) = RuntimeSnapshot::prepare_reusing(gateway, Some(&current))
+            .map_err(|error| ServerError::Reload(error.to_string()))?;
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Reload {
+                snapshot: Box::new(snapshot),
+                reuse,
+                response,
+            })
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
+        received.await.map_err(|_| ServerError::ControlClosed)?
+    }
+
+    #[must_use]
+    pub fn current_snapshot(&self) -> Arc<RuntimeSnapshot> {
+        self.store.pin()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadReport {
+    pub previous_version: String,
+    pub current_version: String,
+    pub reused_sites: usize,
+    pub reused_clusters: usize,
+    pub listeners_added: Vec<String>,
+    pub listeners_removed: Vec<String>,
+    pub listeners_retained: Vec<String>,
+    pub local_addresses: Vec<(String, SocketAddr)>,
+}
+
+fn start_listener(
+    listener: BoundListener,
+    generation: u64,
+    store: Arc<SnapshotStore>,
+    proxy: Arc<ProxyClient>,
+    drain_timeout: Duration,
+    completion: mpsc::UnboundedSender<ListenerCompletion>,
+) -> ActiveListener {
+    let name = listener.name.clone();
+    let configured_address = listener.configured_address;
+    let local_address = listener.local_address;
+    let (shutdown, receiver) = watch::channel(false);
+    let (accept_stopped, stopped) = oneshot::channel();
+    let completion_name = name.clone();
+    let task = tokio::spawn(async move {
+        let result = run_listener(
+            listener,
+            store,
+            proxy,
+            receiver,
+            drain_timeout,
+            accept_stopped,
+        )
+        .await;
+        let _ = completion.send(ListenerCompletion {
+            name: completion_name,
+            generation,
+            result,
+        });
+    });
+    ActiveListener {
+        configured_address,
+        local_address,
+        generation,
+        shutdown,
+        accept_stopped: Some(stopped),
+        task,
+    }
+}
+
+async fn apply_reload(
+    snapshot: RuntimeSnapshot,
+    reuse: ResourceReuse,
+    active: &mut BTreeMap<String, ActiveListener>,
+    generation: &mut u64,
+    environment: ReloadEnvironment<'_>,
+) -> Result<ReloadReport, ServerError> {
+    let retained = snapshot
+        .listeners
+        .iter()
+        .filter(|listener| {
+            active
+                .get(&listener.name)
+                .is_some_and(|active| active.configured_address == listener.bind)
+        })
+        .map(|listener| listener.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    // Every new socket is prepared before accept state or the published snapshot is
+    // changed. Dropping this vector rolls the whole preparation back on any error.
+    let mut prepared = Vec::new();
+    for configured in snapshot
+        .listeners
+        .iter()
+        .filter(|listener| !retained.contains(&listener.name))
+    {
+        let listener =
+            TcpListener::bind(configured.bind)
+                .await
+                .map_err(|source| ServerError::Bind {
+                    listener: configured.name.clone(),
+                    address: configured.bind,
+                    source,
+                })?;
+        let local_address = listener
+            .local_addr()
+            .map_err(|source| ServerError::LocalAddress {
+                listener: configured.name.clone(),
+                source,
+            })?;
+        prepared.push(BoundListener {
+            name: configured.name.clone(),
+            configured_address: configured.bind,
+            listener,
+            local_address,
+        });
+    }
+
+    let to_stop = active
+        .keys()
+        .filter(|name| !retained.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut retired = Vec::new();
+    for name in &to_stop {
+        if let Some(mut listener) = active.remove(name) {
+            let _ = listener.shutdown.send(true);
+            if let Some(stopped) = listener.accept_stopped.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), stopped).await;
+            }
+            retired.push(listener);
+        }
+    }
+
+    let previous_version = environment.store.pin().config_version.to_string();
+    let current_version = snapshot.config_version.to_string();
+    environment.store.publish(snapshot);
+
+    let listeners_added = prepared
+        .iter()
+        .map(|listener| listener.name.clone())
+        .collect::<Vec<_>>();
+    for listener in prepared {
+        let name = listener.name.clone();
+        active.insert(
+            name,
+            start_listener(
+                listener,
+                *generation,
+                environment.store.clone(),
+                environment.proxy.clone(),
+                environment.drain_timeout,
+                environment.completion.clone(),
+            ),
+        );
+        *generation = generation.saturating_add(1);
+    }
+    // Dropping JoinHandle detaches retired tasks; they continue to drain and report
+    // completion through the manager's completion channel.
+    drop(retired);
+
+    Ok(ReloadReport {
+        previous_version,
+        current_version,
+        reused_sites: reuse.sites,
+        reused_clusters: reuse.clusters,
+        listeners_added,
+        listeners_removed: to_stop,
+        listeners_retained: retained.into_iter().collect(),
+        local_addresses: active
+            .iter()
+            .map(|(name, listener)| (name.clone(), listener.local_address))
+            .collect(),
+    })
+}
+
+struct ReloadEnvironment<'a> {
+    store: &'a Arc<SnapshotStore>,
+    proxy: &'a Arc<ProxyClient>,
+    drain_timeout: Duration,
+    completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
+}
+
+async fn stop_all_listeners(active: &mut BTreeMap<String, ActiveListener>) {
+    let mut listeners = std::mem::take(active).into_values().collect::<Vec<_>>();
+    for listener in &listeners {
+        let _ = listener.shutdown.send(true);
+    }
+    for listener in &mut listeners {
+        if let Some(stopped) = listener.accept_stopped.take() {
+            let _ = stopped.await;
+        }
+    }
+    for listener in listeners {
+        let _ = listener.task.await;
     }
 }
 
@@ -151,8 +467,10 @@ async fn run_listener(
     proxy: Arc<ProxyClient>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
+    accept_stopped: oneshot::Sender<()>,
 ) -> Result<(), ServerError> {
     let mut connections = JoinSet::new();
+    let mut accept_error = None;
     loop {
         tokio::select! {
             biased;
@@ -162,10 +480,16 @@ async fn run_listener(
                 }
             }
             accepted = listener.listener.accept() => {
-                let (stream, peer_address) = accepted.map_err(|source| ServerError::Accept {
-                    listener: listener.name.clone(),
-                    source,
-                })?;
+                let (stream, peer_address) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(source) => {
+                        accept_error = Some(ServerError::Accept {
+                            listener: listener.name.clone(),
+                            source,
+                        });
+                        break;
+                    }
+                };
                 let listener_name = listener.name.clone();
                 let store = store.clone();
                 let proxy = proxy.clone();
@@ -181,6 +505,8 @@ async fn run_listener(
         }
     }
 
+    let _ = accept_stopped.send(());
+
     let drained = tokio::time::timeout(drain_timeout, async {
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result {
@@ -193,7 +519,11 @@ async fn run_listener(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
-    Ok(())
+    if let Some(error) = accept_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 async fn serve_connection(
@@ -393,6 +723,10 @@ pub enum ServerError {
     Task(String),
     #[error("cannot initialize HTTP data plane: {0}")]
     DataPlane(String),
+    #[error("reload failed: {0}")]
+    Reload(String),
+    #[error("server control channel is closed")]
+    ControlClosed,
 }
 
 #[cfg(test)]
@@ -530,6 +864,19 @@ mod tests {
             while connections.join_next().await.is_some() {}
         });
         (address, accepts, shutdown, task)
+    }
+
+    fn write_respond_gateway(path: &std::path::Path, body: &str, extra_listener: Option<&str>) {
+        let extra_listener = extra_listener.map_or(String::new(), |bind| {
+            format!("  - name: extra\n    bind: {bind}\n    service:\n      ref: root\n")
+        });
+        fs::write(
+            path,
+            format!(
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices:\n  root:\n    type: respond\n    body:\n      text: {body}\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    service:\n      ref: root\n{extra_listener}"
+            ),
+        )
+        .expect("gateway config can be written");
     }
 
     #[tokio::test]
@@ -698,6 +1045,153 @@ listeners:
         let timeout = request(address, "/slow", "").await;
         assert!(timeout.starts_with("HTTP/1.1 504 Gateway Timeout"));
         assert!(timeout.ends_with("Gateway Timeout"));
+
+        running.shutdown().await.expect("gateway shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("upstream task shuts down");
+    }
+
+    #[tokio::test]
+    async fn reload_is_atomic_and_manages_listener_lifecycle() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "one", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        assert!(request(address, "/", "").await.ends_with("one"));
+
+        write_respond_gateway(&config, "two", None);
+        let report = running.reload_path(&config).await.expect("reload commits");
+        assert_eq!(report.listeners_retained, vec!["test"]);
+        assert!(request(address, "/", "").await.ends_with("two"));
+        let last_good = report.current_version;
+
+        fs::write(
+            &config,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nunknown: true\n",
+        )
+        .expect("invalid config can be written");
+        assert!(running.reload_path(&config).await.is_err());
+        assert_eq!(
+            running
+                .reload_handle()
+                .current_snapshot()
+                .config_version
+                .as_str(),
+            last_good
+        );
+        assert!(request(address, "/", "").await.ends_with("two"));
+
+        write_respond_gateway(&config, "two", Some(&address.to_string()));
+        assert!(running.reload_path(&config).await.is_err());
+        assert!(request(address, "/", "").await.ends_with("two"));
+
+        write_respond_gateway(&config, "three", Some("127.0.0.1:0"));
+        let added = running
+            .reload_path(&config)
+            .await
+            .expect("new listener is prepared and committed");
+        assert_eq!(added.listeners_added, vec!["extra"]);
+        assert_eq!(added.local_addresses.len(), 2);
+        assert!(request(address, "/", "").await.ends_with("three"));
+
+        write_respond_gateway(&config, "four", None);
+        let removed = running
+            .reload_path(&config)
+            .await
+            .expect("removed listener drains");
+        assert_eq!(removed.listeners_removed, vec!["extra"]);
+        assert!(request(address, "/", "").await.ends_with("four"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn long_request_keeps_old_snapshot_while_new_requests_switch() {
+        let (upstream, accepts, upstream_shutdown, upstream_task) = spawn_upstream().await;
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("initial config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let old_request = tokio::spawn(request(address, "/slow", ""));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepts.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old request reaches upstream");
+
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+services:
+  root:
+    type: respond
+    body:
+      text: new-version
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("new config can be written");
+        let report = running.reload_path(&config).await.expect("reload commits");
+        assert_eq!(report.reused_clusters, 1);
+        assert!(request(address, "/", "").await.ends_with("new-version"));
+        let old_response = old_request.await.expect("old request task completes");
+        assert!(old_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(old_response.contains("/slow||"));
 
         running.shutdown().await.expect("gateway shuts down");
         let _ = upstream_shutdown.send(true);

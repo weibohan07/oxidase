@@ -725,6 +725,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -768,7 +769,9 @@ dependencies = [
  "oxidase-core",
  "oxidase-site",
  "serde_json",
+ "tempfile",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]
