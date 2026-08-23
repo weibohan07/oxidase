@@ -18,6 +18,10 @@ handle; graph cost is not proportional to the total node count. Inline Service a
 Route identities are derived from a compiler-owned canonical source-file identity
 plus semantic field path, so equal paths in separate imports cannot collide.
 Duplicate generated IDs are compiler errors rather than map overwrites.
+Generated inline Service/Route IDs are deterministic inspection identities within
+one compiled source program. The source ordinal can change when the import set
+changes, so these alpha IDs are not durable API keys, long-lived metric labels,
+stable configuration references, or control-plane protocol identifiers.
 
 `Fallback` tries the next candidate only after `Declined`. `Recover` is the only
 generic mechanism that turns selected failures into another Service execution.
@@ -47,8 +51,14 @@ structured collector while executing the same graph and leaf boundary.
 
 After the root returns `Handled`, a single protocol finalizer removes hop-by-hop and
 untrusted framing metadata, derives safe lengths, and enforces body rules for HEAD,
-1xx, 204, and 304. A response status such as 404 remains handled; finalization does
-not change the `Handled`/`Declined`/`Failed` algebra.
+1xx, 204, 205, and 304. A response status such as 404 remains handled; finalization
+does not change the `Handled`/`Declined`/`Failed` algebra.
+
+Site template output/loop/include-depth/expression-step/render-time budget failures
+enter the algebra as `Failed(TemplateLimit)` and can be selected by `Recover`.
+Template evaluation, argument-contract, and response-metadata failures are
+`Failed(InvalidState)`; concrete asset file I/O remains `Failed(SiteIo)`. Internal
+detail stays in diagnostics and is never copied into the safe client response.
 
 Predicates in v0.2 inspect only the request head. A body-consuming Service marks the
 body irreversible; fallback after such a candidate requires a future explicit

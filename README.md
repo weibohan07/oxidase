@@ -33,12 +33,22 @@ The runnable HTTP/1.1 slice supports every current Service node, including strea
 Proxy over pooled HTTP/1.1, HTTPS, and upstream HTTP/2 connections. Assets are
 streamed from async files and support quality-weighted identity/Brotli/gzip
 selection, representation-specific ETags, correct validator precedence, If-Range,
-and single byte ranges. Range requests deliberately use identity.
+and single byte ranges. Range applies only to GET: a valid single bytes range uses
+identity when acceptable, while HEAD, unknown/malformed units, multipart requests,
+and an identity-excluded range fall back to the normal full-representation path.
 
 Listener programs share one immutable `ServiceGraph`; normal requests do not clone
 the graph or collect explain traces. Every handled response passes through one
 framing finalizer, and Gateway/Oxista source cannot set hop-by-hop or framing
-headers. HEAD, informational, 204, and 304 body rules are covered by wire tests.
+headers. HEAD, informational, 204, 205, and 304 body rules are covered by wire
+tests.
+
+Oxista response headers execute in source order (global defaults, logical extension,
+profiles, then local OXR). Ordinary and OXR-backed assets share extension defaults.
+External OXT files inherit Site output/autoescape defaults; custom 404 templates are
+validated as zero-argument calls and retain their effective metadata. Template
+budget failures are classified separately for `Recover` without exposing details to
+clients.
 
 Inbound TLS/HTTP/2 and OXT `extends`/`block` are not yet implemented. Atomic
 last-known-good reload is available with `serve --watch`; health and bounded metrics
@@ -106,8 +116,10 @@ listeners:
 The v1alpha1 YAML boundary is shared by Gateway and every Oxista format. Unknown or
 duplicate keys, anchors, aliases, merge keys, custom tags, tab indentation, and flow
 mappings fail; flow sequences are allowed. Imports/references are cycle checked,
-and parsed-but-inert field values are rejected with migration guidance. `check` and
-`serve` use the same compiler and Site preparation path.
+mappings fail; flow sequences and literal/folded block scalars are allowed. Imports/
+references are cycle checked, and parsed-but-inert field values are rejected with
+migration guidance. `check` and `serve` use the same compiler and Site preparation
+path.
 
 ## CLI
 
@@ -127,7 +139,9 @@ Reload compiles and prepares the complete candidate, prebinds new listeners, reu
 unchanged resources, and atomically commits only on success. Blocking preparation
 runs off Tokio workers. Failed-candidate imports remain watched, and retired HTTP/1
 connections receive graceful shutdown: idle keep-alive closes promptly while active
-requests drain on their pinned snapshot.
+requests drain on their pinned snapshot. Failed Site candidates also retain scanned
+OXT/OXR/assets, missing declared paths, template roots, precompressed candidates,
+and their parent directories in the watcher dependency set.
 
 ## Development
 
