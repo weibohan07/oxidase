@@ -3,7 +3,6 @@
 mod compiler;
 mod diagnostic;
 mod source;
-mod strict_yaml;
 
 pub use compiler::{
     ClusterSpec, CompiledGateway, CompiledListener, CompiledResources, Compiler, GatewaySummary,

@@ -1209,54 +1209,15 @@ fn parse_yaml<T: serde::de::DeserializeOwned>(
     path: &Path,
     source: &str,
 ) -> Result<T, SiteCompileError> {
-    reject_duplicate_keys(path, source)?;
-    serde_yaml_ng::from_str(source)
-        .map_err(|error| SiteCompileError::source(path, error.to_string()))
-}
-
-fn reject_duplicate_keys(path: &Path, source: &str) -> Result<(), SiteCompileError> {
-    let mut frames = Vec::<(usize, BTreeSet<String>)>::new();
-    for (line_number, raw) in source.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim_end();
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent = raw.len() - raw.trim_start_matches(' ').len();
-        let trimmed = line.trim_start();
-        let (indent, content, sequence) = trimmed
-            .strip_prefix("- ")
-            .map_or((indent, trimmed, false), |content| {
-                (indent + 2, content, true)
-            });
-        if sequence {
-            while frames.last().is_some_and(|frame| frame.0 >= indent) {
-                frames.pop();
-            }
-        } else {
-            while frames.last().is_some_and(|frame| frame.0 > indent) {
-                frames.pop();
-            }
-        }
-        let Some((key, _)) = content.split_once(':') else {
-            continue;
-        };
-        let key = key.trim().trim_matches(['\'', '"']).to_owned();
-        if frames.last().is_none_or(|frame| frame.0 < indent) {
-            frames.push((indent, BTreeSet::new()));
-        }
-        if !frames
-            .last_mut()
-            .expect("mapping frame exists")
-            .1
-            .insert(key.clone())
-        {
-            return Err(SiteCompileError::source(
-                path,
-                format!("duplicate key `{key}` on line {}", line_number + 1),
-            ));
-        }
-    }
-    Ok(())
+    oxidase_source::parse(path, source).map_err(|error| {
+        SiteCompileError::source(
+            error.path,
+            format!(
+                "error[{}] at {}:{}: {}",
+                error.code, error.line, error.column, error.message
+            ),
+        )
+    })
 }
 
 fn parse_duration(source: &str) -> Result<Duration, String> {
@@ -1760,5 +1721,59 @@ output: json
         .expect_err("JSON OXT must be rejected");
         assert!(error.to_string().contains("output: json"));
         assert!(error.to_string().contains("structured JSON"));
+    }
+
+    #[test]
+    fn every_oxista_yaml_entrypoint_uses_the_shared_strict_subset() {
+        for kind in ["oxsite", "oxr", "oxt"] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+            let manifest = if kind == "oxsite" {
+                "oxista: site/v1\noxista: site/v1\n"
+            } else {
+                "oxista: site/v1\ntemplates:\n  roots: [_templates]\n"
+            };
+            fs::write(root.join("site.oxsite"), manifest).expect("manifest can be written");
+            if kind == "oxr" {
+                fs::write(
+                    root.join("page.oxr"),
+                    r#"---
+oxista: response/v1
+response:
+  body:
+    text: first
+response:
+  body:
+    text: second
+---
+"#,
+                )
+                .expect("OXR can be written");
+            } else if kind == "oxt" {
+                fs::write(
+                    root.join("_templates/page.oxt"),
+                    r#"---
+oxista: template/v1
+output: html
+output: text
+---
+body
+"#,
+                )
+                .expect("OXT can be written");
+            }
+            let error = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("duplicate key must fail in every Oxista source");
+            assert!(
+                error.to_string().contains("source.duplicate_key"),
+                "{error}"
+            );
+        }
     }
 }

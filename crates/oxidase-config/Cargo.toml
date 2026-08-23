@@ -11,6 +11,7 @@ bytes.workspace = true
 http.workspace = true
 indexmap.workspace = true
 oxidase-core = { path = "../oxidase-core" }
+oxidase-source = { path = "../oxidase-source" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

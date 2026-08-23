@@ -7,6 +7,7 @@ members = [
     "crates/oxidase-runtime",
     "crates/oxidase-server",
     "crates/oxidase-site",
+    "crates/oxidase-source",
     "crates/oxidase-testkit",
 ]
 default-members = ["crates/oxidase-cli"]

@@ -18,6 +18,7 @@ use oxidase_core::{
 use serde::Serialize;
 use url::Url;
 
+use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
     BodySource, ClusterSource, ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource,
@@ -25,7 +26,6 @@ use crate::source::{
     RedirectQuerySource, RequestTransformSource, ResourcesSource, ResponseTransformSource,
     ServiceSource, SiteSource,
 };
-use crate::{API_VERSION, strict_yaml};
 
 #[derive(Debug, Clone)]
 pub struct CompiledGateway {
@@ -188,8 +188,7 @@ impl Compiler {
                 span(path, "request"),
             ))
         })?;
-        strict_yaml::parse(path, &source, "request")
-            .map_err(|diagnostic| CompileError::one(*diagnostic))
+        parse_yaml(path, &source, "request")
     }
 }
 
@@ -277,8 +276,7 @@ impl Loader {
                 span(path, ""),
             ))
         })?;
-        let document: GatewaySource = strict_yaml::parse(path, &source, "")
-            .map_err(|diagnostic| CompileError::one(*diagnostic))?;
+        let document: GatewaySource = parse_yaml(path, &source, "")?;
 
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1308,6 +1306,29 @@ fn span(path: &Path, field_path: impl Into<String>) -> SourceSpan {
     }
 }
 
+fn parse_yaml<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    source: &str,
+    field_path: &str,
+) -> Result<T, CompileError> {
+    oxidase_source::parse(path, source).map_err(|error| {
+        let mut diagnostic = Diagnostic::new(
+            error.code,
+            error.message,
+            SourceSpan {
+                file: error.path,
+                line: error.line,
+                column: error.column,
+                field_path: field_path.to_owned(),
+            },
+        );
+        if let Some(help) = error.help {
+            diagnostic = diagnostic.with_help(help);
+        }
+        CompileError::one(diagnostic)
+    })
+}
+
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
     if *hash == 0 {
         *hash = 0xcbf2_9ce4_8422_2325;
@@ -1736,5 +1757,14 @@ listeners:
                 .to_string()
                 .contains("services.root.response.headers.add.Trailer")
         );
+    }
+
+    #[test]
+    fn gateway_uses_shared_strict_yaml_subset() {
+        let (_directory, path) =
+            write_config("api_version: oxidase.dev/v1alpha1\nkind: gateway\nkind: gateway\n");
+        let error = Compiler::compile_path(path).expect_err("duplicate Gateway key must fail");
+        assert_eq!(error.diagnostics[0].code, "source.duplicate_key");
+        assert_eq!(error.diagnostics[0].source.line, 3);
     }
 }
