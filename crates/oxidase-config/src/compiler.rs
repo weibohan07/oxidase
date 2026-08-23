@@ -220,6 +220,30 @@ impl<T> Located<T> {
     }
 }
 
+/// Compiler-owned identity for one canonical source file.
+///
+/// The ordinal is assigned from the sorted canonical dependency set. This keeps
+/// generated IDs deterministic without exposing an absolute checkout path in
+/// diagnostics, explain output, or manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceFileId(usize);
+
+#[derive(Debug, Clone, Copy)]
+struct SourceNodeKey<'a> {
+    file: SourceFileId,
+    field_path: &'a str,
+}
+
+impl SourceNodeKey<'_> {
+    fn inline_service_id(self) -> ServiceId {
+        ServiceId::new(format!("inline:s{:08}:{}", self.file.0, self.field_path))
+    }
+
+    fn route_id(self) -> RouteId {
+        RouteId::new(format!("route:s{:08}:{}", self.file.0, self.field_path))
+    }
+}
+
 #[derive(Default)]
 struct Loader {
     loaded: BTreeSet<PathBuf>,
@@ -295,9 +319,18 @@ impl Loader {
     }
 
     fn finish(self, root: PathBuf) -> MergedSource {
+        let mut dependencies = self.dependencies;
+        dependencies.sort();
+        dependencies.dedup();
+        let source_files = dependencies
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), SourceFileId(index)))
+            .collect();
         let mut merged = MergedSource {
             root,
-            dependencies: self.dependencies,
+            dependencies,
+            source_files,
             hash: self.hash,
             ..MergedSource::default()
         };
@@ -358,6 +391,7 @@ impl Loader {
 struct MergedSource {
     root: PathBuf,
     dependencies: Vec<PathBuf>,
+    source_files: BTreeMap<PathBuf, SourceFileId>,
     hash: u64,
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
@@ -367,6 +401,24 @@ struct MergedSource {
     listeners: Vec<Located<ListenerSource>>,
     tests: Vec<Located<ConfigTestSource>>,
     merge_errors: Vec<Diagnostic>,
+}
+
+impl MergedSource {
+    fn node_key<'a>(
+        &self,
+        file: &Path,
+        field_path: &'a str,
+    ) -> Result<SourceNodeKey<'a>, CompileError> {
+        let file = self.source_files.get(file).copied().ok_or_else(|| {
+            diagnostic_at(
+                "service.source_identity",
+                "internal compiler error: source file has no assigned identity",
+                file,
+                field_path,
+            )
+        })?;
+        Ok(SourceNodeKey { file, field_path })
+    }
 }
 
 fn merge_resources(merged: &mut MergedSource, resources: ResourcesSource, file: &Path) {
@@ -641,7 +693,7 @@ impl<'a> ProgramBuilder<'a> {
         match source {
             ServiceSource::Reference(reference) => self.compile_named(&reference.reference),
             ServiceSource::Inline(_) => {
-                let id = ServiceId::new(format!("inline:{field_path}"));
+                let id = self.source.node_key(file, field_path)?.inline_service_id();
                 self.compile_inline_or_reference_as(id.clone(), source, file, field_path)?;
                 Ok(id)
             }
@@ -667,19 +719,37 @@ impl<'a> ProgramBuilder<'a> {
                     services: vec![target],
                 },
             };
-            self.nodes.insert(id, node);
-            return Ok(());
+            return self.insert_node(node);
         };
         let kind = self.compile_inline(source, file, field_path)?;
-        self.nodes.insert(
-            id.clone(),
-            ServiceNode {
-                id,
-                source: span(file, field_path),
-                kind,
-            },
-        );
-        Ok(())
+        self.insert_node(ServiceNode {
+            id,
+            source: span(file, field_path),
+            kind,
+        })
+    }
+
+    fn insert_node(&mut self, node: ServiceNode) -> Result<(), CompileError> {
+        use std::collections::btree_map::Entry;
+
+        match self.nodes.entry(node.id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(node);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(CompileError::one(
+                Diagnostic::new(
+                    "service.duplicate_internal_id",
+                    format!("duplicate generated Service ID `{}`", node.id),
+                    node.source.clone(),
+                )
+                .with_reference_chain(vec![
+                    entry.get().source.to_string(),
+                    node.source.to_string(),
+                ])
+                .with_help("report this compiler identity collision as an Oxidase bug"),
+            )),
+        }
     }
 
     fn compile_inline(
@@ -791,7 +861,7 @@ impl<'a> ProgramBuilder<'a> {
                     .map(|(index, case)| {
                         let case_path = format!("{field_path}.cases[{index}]");
                         Ok(RouteCase {
-                            id: RouteId::new(format!("route:{case_path}")),
+                            id: self.source.node_key(file, &case_path)?.route_id(),
                             predicate: compile_predicate(
                                 &case.predicate,
                                 file,
@@ -1237,16 +1307,38 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 mod tests {
     use std::fs;
 
-    use oxidase_core::ServiceKind;
+    use http::StatusCode;
+    use oxidase_core::{
+        HeaderTransforms, RespondBody, ServiceId, ServiceKind, ServiceNode, SourceSpan,
+    };
     use tempfile::tempdir;
 
-    use super::Compiler;
+    use super::{CompiledResources, Compiler, MergedSource, ProgramBuilder};
 
     fn write_config(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary directory is available");
         let path = directory.path().join("oxidase.yaml");
         fs::write(&path, source).expect("fixture config can be written");
         (directory, path)
+    }
+
+    fn write_file(directory: &std::path::Path, name: &str, source: &str) {
+        fs::write(directory.join(name), source).expect("fixture config can be written");
+    }
+
+    fn response_text<'a>(gateway: &'a super::CompiledGateway, listener: &str) -> &'a str {
+        let listener = gateway
+            .listeners
+            .iter()
+            .find(|candidate| candidate.name == listener)
+            .expect("listener exists");
+        match &gateway.nodes[&listener.service].kind {
+            ServiceKind::Respond {
+                body: RespondBody::Text(body),
+                ..
+            } => body.source(),
+            other => panic!("expected Respond, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1400,5 +1492,154 @@ listeners:
         .expect("root can be written");
         let gateway = Compiler::compile_path(root).expect("import graph compiles");
         assert_eq!(gateway.dependencies.len(), 2);
+    }
+
+    #[test]
+    fn imported_listener_inline_services_have_distinct_source_identities() {
+        let directory = tempdir().expect("temporary directory is available");
+        write_file(
+            directory.path(),
+            "a.yaml",
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: a
+    bind: 127.0.0.1:7589
+    service:
+      type: respond
+      body:
+        text: A
+"#,
+        );
+        write_file(
+            directory.path(),
+            "b.yaml",
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: b
+    bind: 127.0.0.1:7590
+    service:
+      type: respond
+      body:
+        text: B
+"#,
+        );
+        write_file(
+            directory.path(),
+            "root.yaml",
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports:
+  - a.yaml
+  - b.yaml
+"#,
+        );
+
+        let gateway = Compiler::compile_path(directory.path().join("root.yaml"))
+            .expect("import graph compiles");
+        assert_ne!(gateway.listeners[0].service, gateway.listeners[1].service);
+        assert_eq!(gateway.nodes.len(), 2);
+        assert_eq!(response_text(&gateway, "a"), "A");
+        assert_eq!(response_text(&gateway, "b"), "B");
+    }
+
+    #[test]
+    fn imported_nested_routes_and_children_have_distinct_source_identities() {
+        let directory = tempdir().expect("temporary directory is available");
+        for (file, listener, bind, body) in [
+            ("a.yaml", "a", "127.0.0.1:7589", "A"),
+            ("b.yaml", "b", "127.0.0.1:7590", "B"),
+        ] {
+            write_file(
+                directory.path(),
+                file,
+                &format!(
+                    r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: {listener}
+    bind: {bind}
+    service:
+      type: route
+      cases:
+        - when:
+            path: /matched
+          service:
+            type: respond
+            body:
+              text: {body}
+"#
+                ),
+            );
+        }
+        write_file(
+            directory.path(),
+            "root.yaml",
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [a.yaml, b.yaml]
+"#,
+        );
+
+        let root = directory.path().join("root.yaml");
+        let first = Compiler::compile_path(&root).expect("import graph compiles");
+        let second = Compiler::compile_path(&root).expect("repeat compile succeeds");
+
+        let route = |gateway: &super::CompiledGateway, index: usize| {
+            let entry = &gateway.listeners[index].service;
+            let ServiceKind::Route { cases, .. } = &gateway.nodes[entry].kind else {
+                panic!("listener entry must be a Route");
+            };
+            (entry.clone(), cases[0].id.clone(), cases[0].service.clone())
+        };
+        let first_a = route(&first, 0);
+        let first_b = route(&first, 1);
+        assert_ne!(first_a.0, first_b.0);
+        assert_ne!(first_a.1, first_b.1);
+        assert_ne!(first_a.2, first_b.2);
+        assert_eq!(first.nodes.len(), 4);
+
+        assert_eq!(first_a, route(&second, 0));
+        assert_eq!(first_b, route(&second, 1));
+        assert_eq!(
+            first.nodes.keys().collect::<Vec<_>>(),
+            second.nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(first.summary()).expect("summary serializes"),
+            serde_json::to_value(second.summary()).expect("summary serializes")
+        );
+    }
+
+    #[test]
+    fn duplicate_generated_service_id_is_an_error() {
+        let source = MergedSource::default();
+        let resources = CompiledResources::default();
+        let mut builder = ProgramBuilder::new(&source, &resources);
+        let node = |field_path: &str| ServiceNode {
+            id: ServiceId::new("inline:s00000000:collision"),
+            source: SourceSpan::synthetic(field_path),
+            kind: ServiceKind::Respond {
+                status: StatusCode::OK,
+                headers: HeaderTransforms::default(),
+                body: RespondBody::Empty,
+            },
+        };
+
+        builder
+            .insert_node(node("first"))
+            .expect("first insertion succeeds");
+        let error = builder
+            .insert_node(node("second"))
+            .expect_err("duplicate generated ID must fail");
+        assert_eq!(error.diagnostics[0].code, "service.duplicate_internal_id");
+        assert!(error.to_string().contains("first"));
+        assert!(error.to_string().contains("second"));
     }
 }

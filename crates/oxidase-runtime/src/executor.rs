@@ -513,16 +513,19 @@ struct ExecutionState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::sync::Mutex;
 
     use bytes::Bytes;
     use http::{HeaderMap, HeaderName, Method, StatusCode};
+    use oxidase_config::Compiler;
     use oxidase_core::{
         CompiledTemplate, ErrorClass, HeaderTransform, HeaderTransforms, PredicatePlan,
         RecoverHandler, RequestFrame, RequestMetadata, RequestTransform, RespondBody, ResponseHead,
         ResponseTransform, RouteCase, RouteId, ServiceId, ServiceKind, ServiceNode, ServiceOutcome,
         ServiceProgram, SourceSpan,
     };
+    use tempfile::tempdir;
 
     use super::{BoxLeafFuture, Executor, LeafExecutor};
 
@@ -838,6 +841,56 @@ mod tests {
                 .execute(request("/"), None)
                 .await;
             assert!(matches!(report.outcome, ServiceOutcome::Failed(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn imported_listener_inline_services_execute_distinct_nodes() {
+        let directory = tempdir().expect("temporary directory is available");
+        for (file, listener, bind, body) in [
+            ("a.yaml", "a", "127.0.0.1:7589", "A"),
+            ("b.yaml", "b", "127.0.0.1:7590", "B"),
+        ] {
+            fs::write(
+                directory.path().join(file),
+                format!(
+                    r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: {listener}
+    bind: {bind}
+    service:
+      type: respond
+      body:
+        text: {body}
+"#
+                ),
+            )
+            .expect("import can be written");
+        }
+        let root = directory.path().join("root.yaml");
+        fs::write(
+            &root,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [a.yaml, b.yaml]
+"#,
+        )
+        .expect("root can be written");
+        let gateway = Compiler::compile_path(root).expect("import graph compiles");
+        let leaves = MemoryLeaves::default();
+
+        for (listener, expected) in [("a", b"A".as_slice()), ("b", b"B".as_slice())] {
+            let program = gateway
+                .program_for(listener)
+                .expect("listener program exists");
+            let report = Executor::new(&program, &leaves)
+                .execute(request("/"), None)
+                .await;
+            let ServiceOutcome::Handled(response) = report.outcome else {
+                panic!("listener must handle request");
+            };
+            assert_eq!(response.body.as_ref(), expected);
         }
     }
 }
