@@ -48,6 +48,8 @@ pub enum SiteError {
     InvalidRequestPath(String),
     #[error("site template failed: {0}")]
     Template(String),
+    #[error("site template argument is invalid: {0}")]
+    TemplateArgument(String),
     #[error("site response metadata is invalid: {0}")]
     Response(String),
 }

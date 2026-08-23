@@ -1562,6 +1562,84 @@ listeners:
     }
 
     #[tokio::test]
+    async fn hides_dynamic_template_type_errors_behind_safe_500() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("_templates/card.oxt"),
+            r#"---
+oxista: template/v1
+params:
+  count: int
+---
+{{ count }}
+"#,
+        )
+        .expect("template can be written");
+        fs::write(
+            site.join("index.oxr"),
+            r#"---
+oxista: response/v1
+page:
+  count: wrong
+response:
+  body:
+    template:
+      source: _templates/card.oxt
+      with:
+        count:
+          $expr: page.count
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let response = request(address, "/index", "").await;
+        assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(response.ends_with("Internal Server Error"));
+        assert!(!response.contains("parameter `count`"));
+        assert!(!response.contains("expects int"));
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn proxies_streaming_bodies_with_pooling_headers_and_timeout() {
         let (upstream, accepts, upstream_shutdown, upstream_task) = spawn_upstream().await;
         let directory = tempdir().expect("temporary directory is available");

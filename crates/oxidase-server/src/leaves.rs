@@ -177,9 +177,10 @@ impl LeafExecutor<Incoming, GatewayBodyPlan> for HyperLeaves {
                         GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
                     ))
                 }
-                Err(error) => {
-                    ServiceOutcome::Failed(ServiceError::new(ErrorClass::SiteIo, error.to_string()))
-                }
+                Err(error) => ServiceOutcome::Failed(ServiceError::new(
+                    ErrorClass::InvalidState,
+                    error.to_string(),
+                )),
             }
         })
     }

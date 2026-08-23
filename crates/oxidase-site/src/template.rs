@@ -186,6 +186,49 @@ impl CompiledOxt {
         Ok(())
     }
 
+    pub(crate) fn evaluate_arguments(
+        &self,
+        arguments: &BTreeMap<String, CompiledValue>,
+        context: &EvalContext,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        let mut values = BTreeMap::new();
+        for (name, kind) in &self.params {
+            let Some(argument) = arguments.get(name) else {
+                if kind.optional() {
+                    continue;
+                }
+                return Err(format!(
+                    "template `{}` is missing required parameter `{name}`",
+                    self.name
+                ));
+            };
+            let value = argument.evaluate(context).map_err(|error| {
+                format!(
+                    "template `{}` parameter `{name}` evaluation failed: {error}",
+                    self.name
+                )
+            })?;
+            if !kind.accepts(&value) {
+                return Err(format!(
+                    "template `{}` parameter `{name}` expects {}, received {}",
+                    self.name,
+                    kind.describe(),
+                    kind.actual_description(&value)
+                ));
+            }
+            values.insert(name.clone(), value);
+        }
+        for name in arguments.keys() {
+            if !self.params.contains_key(name) {
+                return Err(format!(
+                    "template `{}` received unknown parameter `{name}`",
+                    self.name
+                ));
+            }
+        }
+        Ok(values)
+    }
+
     pub(crate) fn render(
         &self,
         templates: &BTreeMap<String, Self>,
@@ -251,7 +294,6 @@ enum ValueType {
     Float { optional: bool },
     String { optional: bool },
     Url { optional: bool },
-    SafeHtml { optional: bool },
     List { item: Box<Self>, optional: bool },
     Map { item: Box<Self>, optional: bool },
 }
@@ -269,7 +311,10 @@ impl ValueType {
             "float" => Ok(Self::Float { optional }),
             "string" => Ok(Self::String { optional }),
             "url" => Ok(Self::Url { optional }),
-            "safe_html" => Ok(Self::SafeHtml { optional }),
+            "safe_html" => Err(
+                "template parameter type `safe_html` is unavailable because runtime values do not carry trusted HTML provenance; use `string` and allow HTML autoescape"
+                    .to_owned(),
+            ),
             source if source.starts_with("list<") && source.ends_with('>') => Ok(Self::List {
                 item: Box::new(Self::parse(&source[5..source.len() - 1])?),
                 optional,
@@ -291,7 +336,6 @@ impl ValueType {
             | Self::Float { optional }
             | Self::String { optional }
             | Self::Url { optional }
-            | Self::SafeHtml { optional }
             | Self::List { optional, .. }
             | Self::Map { optional, .. } => *optional,
         }
@@ -307,9 +351,11 @@ impl ValueType {
             Self::Bool { .. } => matches!(value, Value::Bool(_)),
             Self::Int { .. } => matches!(value, Value::Integer(_)),
             Self::Float { .. } => matches!(value, Value::Float(_) | Value::Integer(_)),
-            Self::String { .. } | Self::Url { .. } | Self::SafeHtml { .. } => {
-                matches!(value, Value::String(_))
-            }
+            Self::String { .. } => matches!(value, Value::String(_)),
+            Self::Url { .. } => value
+                .as_str()
+                .and_then(|value| url::Url::parse(value).ok())
+                .is_some(),
             Self::List { item, .. } => {
                 matches!(value, Value::List(values) if values.iter().all(|value| item.accepts(value)))
             }
@@ -328,9 +374,16 @@ impl ValueType {
             Self::Float { .. } => "float",
             Self::String { .. } => "string",
             Self::Url { .. } => "url",
-            Self::SafeHtml { .. } => "safe_html",
             Self::List { .. } => "list",
             Self::Map { .. } => "map",
+        }
+    }
+
+    fn actual_description(&self, value: &Value) -> String {
+        if matches!(self, Self::Url { .. }) && matches!(value, Value::String(_)) {
+            "string (not an absolute URL)".to_owned()
+        } else {
+            value.type_name().to_owned()
         }
     }
 }

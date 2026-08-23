@@ -244,17 +244,13 @@ impl SiteSnapshot {
                 (plan.status, PreparedSiteBody::Bytes(Bytes::from(body)))
             }
             SiteResponseKind::Template { name, arguments } => {
-                let mut values = BTreeMap::new();
-                for (name, value) in arguments {
-                    values.insert(
-                        name.clone(),
-                        value.evaluate(&base_context).map_err(SiteError::Template)?,
-                    );
-                }
-                let context = self.context(request, &plan.page, &values)?;
                 let template = self.templates.get(name).ok_or_else(|| {
                     SiteError::Template(format!("compiled template `{name}` is missing"))
                 })?;
+                let values = template
+                    .evaluate_arguments(arguments, &base_context)
+                    .map_err(SiteError::TemplateArgument)?;
+                let context = self.context(request, &plan.page, &values)?;
                 let body = template
                     .render(&self.templates, &context, &self.limits)
                     .map_err(SiteError::Template)?;

@@ -221,6 +221,7 @@ fn validate_manifest(
         }
     }
     for (name, contract) in &source.inputs {
+        validate_input_kind(path, name, &contract.kind)?;
         match inputs.get(name) {
             None if contract.required => {
                 return Err(SiteCompileError::Input {
@@ -282,6 +283,28 @@ fn supported_deny_pattern(pattern: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains(['*', '?', '[', ']']))
 }
 
+fn validate_input_kind(path: &Path, name: &str, kind: &str) -> Result<(), SiteCompileError> {
+    let base = kind.strip_suffix('?').unwrap_or(kind);
+    if base == "safe_html" {
+        return Err(SiteCompileError::source(
+            path,
+            format!(
+                "inputs.{name}.type `safe_html` is unavailable because runtime values do not carry trusted HTML provenance; use `string`"
+            ),
+        ));
+    }
+    if !matches!(
+        base,
+        "any" | "null" | "bool" | "int" | "float" | "string" | "url"
+    ) {
+        return Err(SiteCompileError::source(
+            path,
+            format!("inputs.{name}.type uses unknown value type `{kind}`"),
+        ));
+    }
+    Ok(())
+}
+
 fn input_accepts(kind: &str, value: &Value) -> bool {
     match kind {
         "any" => true,
@@ -289,7 +312,7 @@ fn input_accepts(kind: &str, value: &Value) -> bool {
         "bool" => matches!(value, Value::Bool(_)),
         "int" => matches!(value, Value::Integer(_)),
         "float" => matches!(value, Value::Integer(_) | Value::Float(_)),
-        "string" | "safe_html" => matches!(value, Value::String(_)),
+        "string" => matches!(value, Value::String(_)),
         "url" => value
             .as_str()
             .and_then(|value| url::Url::parse(value).ok())
@@ -1271,7 +1294,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::SiteCompiler;
-    use crate::PreparedSiteBody;
+    use crate::{PreparedSiteBody, SiteError};
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary site directory is available");
@@ -1774,6 +1797,155 @@ body
                 error.to_string().contains("source.duplicate_key"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn validates_dynamic_template_arguments_before_rendering() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/card.oxt"),
+            r#"---
+oxista: template/v1
+output: text
+params:
+  count: int
+  target: url
+---
+{{ count }} {{ target }}
+"#,
+        )
+        .expect("template can be written");
+        for (name, count, target) in [
+            ("bad-count", "wrong", "https://example.test/"),
+            ("bad-url", "7", "/local-only"),
+            ("good", "7", "https://example.test/path"),
+        ] {
+            fs::write(
+                root.join(format!("{name}.oxr")),
+                format!(
+                    r#"---
+oxista: response/v1
+page:
+  count: {count}
+  target: {target}
+response:
+  body:
+    template:
+      source: _templates/card.oxt
+      with:
+        count:
+          $expr: page.count
+        target:
+          $expr: page.target
+---
+"#
+                ),
+            )
+            .expect("OXR can be written");
+        }
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("dynamic arguments compile");
+
+        let error = snapshot
+            .execute(&request("/bad-count"))
+            .expect_err("wrong dynamic integer must fail at runtime");
+        let SiteError::TemplateArgument(message) = error else {
+            panic!("wrong type must be a template argument error");
+        };
+        assert!(message.contains("_templates/card.oxt"));
+        assert!(message.contains("parameter `count`"));
+        assert!(message.contains("expects int, received string"));
+
+        let error = snapshot
+            .execute(&request("/bad-url"))
+            .expect_err("relative URL must fail at runtime");
+        let SiteError::TemplateArgument(message) = error else {
+            panic!("wrong URL must be a template argument error");
+        };
+        assert!(message.contains("parameter `target`"));
+        assert!(message.contains("expects url"));
+        assert!(message.contains("not an absolute URL"));
+
+        let response = snapshot
+            .execute(&request("/good"))
+            .expect("valid dynamic values render")
+            .expect("path is handled");
+        let PreparedSiteBody::Bytes(body) = response.body else {
+            panic!("template response is rendered bytes");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&body).trim(),
+            "7 https://example.test/path"
+        );
+    }
+
+    #[test]
+    fn rejects_safe_html_without_provenance_and_checks_constants_early() {
+        for parameter in ["safe_html", "int"] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+            fs::write(
+                root.join("site.oxsite"),
+                "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+            )
+            .expect("manifest can be written");
+            fs::write(
+                root.join("_templates/card.oxt"),
+                format!(
+                    r#"---
+oxista: template/v1
+params:
+  value: {parameter}
+---
+{{{{ value }}}}
+"#
+                ),
+            )
+            .expect("template can be written");
+            if parameter == "int" {
+                fs::write(
+                    root.join("page.oxr"),
+                    r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/card.oxt
+      with:
+        value: wrong
+---
+"#,
+                )
+                .expect("OXR can be written");
+            }
+            let error = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("invalid parameter contract must fail during compilation");
+            let message = error.to_string();
+            if parameter == "safe_html" {
+                assert!(message.contains("trusted HTML provenance"));
+                assert!(message.contains("use `string`"));
+            } else {
+                assert!(message.contains("expects int, received string"));
+            }
         }
     }
 }
