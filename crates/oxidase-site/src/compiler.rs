@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 
 use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
-    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, RedirectQuery,
-    SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
+    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, HeaderPolicyLayer,
+    RedirectQuery, SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
 };
 use crate::source::{
     EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource, MissingSource, OutputSource,
@@ -150,14 +150,11 @@ impl SiteCompiler {
             if is_private(relative, &source, &template_roots, &root) {
                 continue;
             }
+            let headers = compile_resource_base_policy(relative, &source, asset)?;
             let logical_path = logical_path(relative);
             let plan = SiteResponsePlan {
                 status: StatusCode::OK,
-                headers: compile_response_policy(
-                    &source.defaults.response,
-                    &manifest,
-                    "defaults.response",
-                )?,
+                headers,
                 content_type: None,
                 page: BTreeMap::new(),
                 kind: SiteResponseKind::Asset(Box::new(compile_asset(asset, &source)?)),
@@ -352,6 +349,17 @@ fn validate_manifest(
         .chain(source.defaults.by_extension.values())
     {
         validate_cache_policy(path, policy)?;
+    }
+    compile_response_policy(&source.defaults.response, path, "defaults.response")?;
+    for (extension, policy) in &source.defaults.by_extension {
+        compile_response_policy(
+            policy,
+            path,
+            &format!("defaults.by_extension[\"{extension}\"]"),
+        )?;
+    }
+    for (name, policy) in &source.profiles {
+        compile_response_policy(policy, path, &format!("profiles.{name}"))?;
     }
     Ok(())
 }
@@ -626,20 +634,7 @@ fn compile_oxr(
             .ok_or_else(|| SiteCompileError::source(path, "OXR must end with `.oxr`"))?,
     );
     let logical_path = logical_path(&relative_without_oxr);
-    let extension = relative_without_oxr
-        .extension()
-        .map(|extension| format!(".{}", extension.to_string_lossy()));
-    let mut headers =
-        compile_response_policy(&manifest.defaults.response, path, "defaults.response")?;
-    if let Some(extension) = extension.as_ref()
-        && let Some(policy) = manifest.defaults.by_extension.get(extension)
-    {
-        headers.merge(compile_response_policy(
-            policy,
-            path,
-            &format!("defaults.by_extension.{extension}"),
-        )?);
-    }
+    let mut headers = compile_resource_base_policy(&relative_without_oxr, manifest, path)?;
     for profile in &source.apply {
         let policy = manifest.profiles.get(profile).ok_or_else(|| {
             SiteCompileError::source(path, format!("unknown response profile `{profile}`"))
@@ -949,7 +944,11 @@ fn compile_response_policy(
             directives.push("immutable".to_owned());
         }
         if !directives.is_empty() {
-            headers.set.push((
+            let layer = headers
+                .layers
+                .last_mut()
+                .expect("compiled header policy always has one layer");
+            layer.set.push((
                 HeaderName::from_static("cache-control"),
                 CompiledTemplate::compile(directives.join(", "))
                     .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
@@ -965,17 +964,43 @@ fn compile_headers(
     field_path: &str,
 ) -> Result<HeaderPlan, SiteCompileError> {
     Ok(HeaderPlan {
-        set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
-        add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
-        remove: source
-            .remove
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        layers: vec![HeaderPolicyLayer {
+            set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
+            add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
+            remove: source
+                .remove
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }],
     })
+}
+
+fn compile_resource_base_policy(
+    logical_relative_path: &Path,
+    manifest: &ManifestSource,
+    source_path: &Path,
+) -> Result<HeaderPlan, SiteCompileError> {
+    let mut headers = compile_response_policy(
+        &manifest.defaults.response,
+        source_path,
+        "defaults.response",
+    )?;
+    if let Some(extension) = logical_relative_path
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        && let Some(policy) = manifest.defaults.by_extension.get(&extension)
+    {
+        headers.merge(compile_response_policy(
+            policy,
+            source_path,
+            &format!("defaults.by_extension[\"{extension}\"]"),
+        )?);
+    }
+    Ok(headers)
 }
 
 fn compile_header_map(
@@ -1617,6 +1642,167 @@ response:
         );
     }
 
+    #[test]
+    fn preserves_header_layers_and_applies_logical_extension_defaults() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+assets:
+  precompressed:
+    brotli: .br
+    gzip: .gz
+defaults:
+  response:
+    headers:
+      set:
+        X-Policy: global
+        X-Override: global
+  by_extension:
+    ".css":
+      cache:
+        visibility: public
+        max_age: 1h
+      headers:
+        set:
+          X-Asset: css
+          X-Override: extension
+    ".html":
+      headers:
+        set:
+          X-Html: applied
+    ".txt":
+      headers:
+        set:
+          X-Extension: present
+          X-Override: extension
+profiles:
+  remove_policy:
+    headers:
+      remove: [X-Policy]
+      add:
+        Set-Cookie: profile=one
+  first:
+    headers:
+      set:
+        X-Profile: first
+  second:
+    headers:
+      set:
+        X-Profile: second
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(root.join("style.css"), "identity").expect("CSS can be written");
+        fs::write(root.join("style.css.br"), "brotli").expect("Brotli can be written");
+        fs::write(root.join("style.css.gz"), "gzip").expect("gzip can be written");
+        fs::write(root.join("page.html"), "html").expect("HTML can be written");
+        fs::write(root.join("plain.bin"), "bin").expect("binary can be written");
+        fs::write(root.join("theme.css"), "theme").expect("sibling CSS can be written");
+        fs::write(
+            root.join("theme.css.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  headers:
+    set:
+      X-Asset: local
+  body:
+    asset: sibling
+---
+"#,
+        )
+        .expect("CSS OXR can be written");
+        fs::write(
+            root.join("policy.txt.oxr"),
+            r#"---
+oxista: response/v1
+apply: [remove_policy, first, second]
+response:
+  headers:
+    remove: [X-Extension]
+    set:
+      X-Combined: base
+    add:
+      X-Combined: extra
+      Set-Cookie: local=two
+  body:
+    text: policy
+---
+"#,
+        )
+        .expect("policy OXR can be written");
+
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("site compiles");
+
+        let css = snapshot
+            .execute(&request("/style.css"))
+            .expect("CSS executes")
+            .expect("CSS is handled");
+        assert_eq!(css.headers["cache-control"], "public, max-age=3600");
+        assert_eq!(css.headers["x-asset"], "css");
+        assert_eq!(css.headers["x-override"], "extension");
+        let PreparedSiteBody::Asset(asset) = css.body else {
+            panic!("CSS uses the asset fast path");
+        };
+        assert!(asset.brotli.is_some());
+        assert!(asset.gzip.is_some());
+
+        let html = snapshot
+            .execute(&request("/page.html"))
+            .expect("HTML executes")
+            .expect("HTML is handled");
+        assert_eq!(html.headers["x-html"], "applied");
+        let plain = snapshot
+            .execute(&request("/plain.bin"))
+            .expect("binary executes")
+            .expect("binary is handled");
+        assert!(!plain.headers.contains_key("cache-control"));
+        assert!(!plain.headers.contains_key("x-asset"));
+
+        let theme = snapshot
+            .execute(&request("/theme.css"))
+            .expect("OXR CSS executes")
+            .expect("OXR CSS is handled");
+        assert_eq!(theme.headers["cache-control"], "public, max-age=3600");
+        assert_eq!(theme.headers["x-asset"], "local");
+
+        let policy = snapshot
+            .execute(&request("/policy.txt"))
+            .expect("policy executes")
+            .expect("policy is handled");
+        assert!(!policy.headers.contains_key("x-policy"));
+        assert!(!policy.headers.contains_key("x-extension"));
+        assert_eq!(policy.headers["x-override"], "extension");
+        assert_eq!(policy.headers["x-profile"], "second");
+        assert_eq!(
+            policy
+                .headers
+                .get_all("x-combined")
+                .iter()
+                .map(|value| value.to_str().expect("header is text"))
+                .collect::<Vec<_>>(),
+            ["base", "extra"]
+        );
+        assert_eq!(
+            policy
+                .headers
+                .get_all("set-cookie")
+                .iter()
+                .map(|value| value.to_str().expect("cookie is text"))
+                .collect::<Vec<_>>(),
+            ["profile=one", "local=two"]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
@@ -1685,6 +1871,18 @@ response:
 "#,
                 ),
                 "response.headers.remove[0]",
+            ),
+            (
+                r#"oxista: site/v1
+defaults:
+  by_extension:
+    ".css":
+      headers:
+        set:
+          Upgrade: websocket
+"#,
+                None,
+                "defaults.by_extension[\".css\"].headers.set.Upgrade",
             ),
         ];
 

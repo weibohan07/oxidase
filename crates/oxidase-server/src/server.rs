@@ -1627,12 +1627,20 @@ defaults:
       set:
         Vary: Origin
         Cache-Control: "public, max-age=60"
+  by_extension:
+    ".css":
+      headers:
+        set:
+          X-Logical-Extension: css
 "#,
         )
         .expect("manifest can be written");
         fs::write(site.join("asset.txt"), "identity-v1").expect("identity can be written");
         fs::write(site.join("asset.txt.br"), "brotli-v1").expect("Brotli can be written");
         fs::write(site.join("asset.txt.gz"), "gzip-v1").expect("gzip can be written");
+        fs::write(site.join("style.css"), "style-identity").expect("CSS can be written");
+        fs::write(site.join("style.css.br"), "style-brotli")
+            .expect("compressed CSS can be written");
         fs::write(
             site.join("asset.txt.oxr"),
             r#"---
@@ -1675,6 +1683,12 @@ listeners:
             .expect("gateway binds")
             .spawn();
         let address = running.local_addresses()[0].1;
+
+        let compressed_css = request(address, "/style.css", "Accept-Encoding: br\r\n").await;
+        assert!(compressed_css.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(raw_header(&compressed_css, "content-encoding"), "br");
+        assert_eq!(raw_header(&compressed_css, "x-logical-extension"), "css");
+        assert!(compressed_css.ends_with("style-brotli"));
 
         let identity = request(address, "/asset.txt", "").await;
         assert!(identity.starts_with("HTTP/1.1 200 OK"));

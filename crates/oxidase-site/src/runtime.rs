@@ -360,6 +360,11 @@ pub(crate) enum RedirectQuery {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HeaderPlan {
+    pub layers: Vec<HeaderPolicyLayer>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HeaderPolicyLayer {
     pub set: Vec<(HeaderName, CompiledTemplate)>,
     pub add: Vec<(HeaderName, CompiledTemplate)>,
     pub remove: Vec<HeaderName>,
@@ -367,9 +372,7 @@ pub(crate) struct HeaderPlan {
 
 impl HeaderPlan {
     pub(crate) fn merge(&mut self, other: Self) {
-        self.remove.extend(other.remove);
-        self.set.extend(other.set);
-        self.add.extend(other.add);
+        self.layers.extend(other.layers);
     }
 }
 
@@ -378,28 +381,30 @@ fn apply_headers(
     context: &EvalContext,
     headers: &mut HeaderMap,
 ) -> Result<(), SiteError> {
-    for name in &plan.remove {
-        headers.remove(name);
-    }
-    for (name, value) in &plan.set {
-        headers.insert(
-            name.clone(),
-            header_value(
-                value
-                    .render(context)
-                    .map_err(|error| SiteError::Response(error.to_string()))?,
-            )?,
-        );
-    }
-    for (name, value) in &plan.add {
-        headers.append(
-            name.clone(),
-            header_value(
-                value
-                    .render(context)
-                    .map_err(|error| SiteError::Response(error.to_string()))?,
-            )?,
-        );
+    for layer in &plan.layers {
+        for name in &layer.remove {
+            headers.remove(name);
+        }
+        for (name, value) in &layer.set {
+            headers.insert(
+                name.clone(),
+                header_value(
+                    value
+                        .render(context)
+                        .map_err(|error| SiteError::Response(error.to_string()))?,
+                )?,
+            );
+        }
+        for (name, value) in &layer.add {
+            headers.append(
+                name.clone(),
+                header_value(
+                    value
+                        .render(context)
+                        .map_err(|error| SiteError::Response(error.to_string()))?,
+                )?,
+            );
+        }
     }
     Ok(())
 }
