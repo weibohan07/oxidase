@@ -139,41 +139,52 @@ pub struct Compiler;
 
 impl Compiler {
     pub fn compile_path(path: impl AsRef<Path>) -> Result<CompiledGateway, CompileError> {
-        let path = canonical_input(path.as_ref())?;
+        let requested = path.as_ref();
+        let path = canonical_input(requested).map_err(|error| {
+            error.with_discovered_dependencies(candidate_dependencies(requested))
+        })?;
         let mut loader = Loader::default();
-        loader.load(&path)?;
-        let merged = loader.finish(path.clone());
-        validate_document_identity(&merged)?;
-        let resources = compile_resources(&merged)?;
-
-        let mut builder = ProgramBuilder::new(&merged, &resources);
-        let listeners = builder.compile_listeners()?;
-        builder.compile_all_named()?;
-        let graph = Arc::new(ServiceGraph::new(builder.nodes));
-        for listener in &listeners {
-            ServiceProgram::new(listener.service.clone(), Arc::clone(&graph))
-                .validate()
-                .map_err(|error| {
-                    CompileError::one(Diagnostic::new(
-                        "service.graph",
-                        error.to_string(),
-                        listener.source.clone(),
-                    ))
-                })?;
+        if let Err(error) = loader.load(&path) {
+            return Err(error.with_discovered_dependencies(loader.discovered_dependencies()));
         }
+        let discovered_dependencies = loader.discovered_dependencies();
+        let merged = loader.finish(path.clone());
+        let result = (|| {
+            validate_document_identity(&merged)?;
+            let resources = compile_resources(&merged)?;
 
-        Ok(CompiledGateway {
-            source: path,
-            config_version: ConfigVersion::new(format!("v2-{:016x}", merged.hash)),
-            dependencies: merged.dependencies,
-            graph,
-            resources,
-            listeners,
-            tests: merged
-                .tests
-                .into_iter()
-                .map(|located| located.value)
-                .collect(),
+            let mut builder = ProgramBuilder::new(&merged, &resources);
+            let listeners = builder.compile_listeners()?;
+            builder.compile_all_named()?;
+            let graph = Arc::new(ServiceGraph::new(builder.nodes));
+            for listener in &listeners {
+                ServiceProgram::new(listener.service.clone(), Arc::clone(&graph))
+                    .validate()
+                    .map_err(|error| {
+                        CompileError::one(Diagnostic::new(
+                            "service.graph",
+                            error.to_string(),
+                            listener.source.clone(),
+                        ))
+                    })?;
+            }
+
+            Ok(CompiledGateway {
+                source: path,
+                config_version: ConfigVersion::new(format!("v2-{:016x}", merged.hash)),
+                dependencies: merged.dependencies,
+                graph,
+                resources,
+                listeners,
+                tests: merged
+                    .tests
+                    .into_iter()
+                    .map(|located| located.value)
+                    .collect(),
+            })
+        })();
+        result.map_err(|error: CompileError| {
+            error.with_discovered_dependencies(discovered_dependencies)
         })
     }
 
@@ -200,6 +211,16 @@ fn canonical_input(path: &Path) -> Result<PathBuf, CompileError> {
             span(path, ""),
         ))
     })
+}
+
+fn candidate_dependencies(path: &Path) -> Vec<PathBuf> {
+    let mut dependencies = vec![path.to_path_buf()];
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dependencies.push(parent.to_path_buf());
+    }
+    dependencies
 }
 
 #[derive(Debug, Clone)]
@@ -245,11 +266,14 @@ struct Loader {
     stack: Vec<PathBuf>,
     documents: Vec<Located<GatewaySource>>,
     dependencies: Vec<PathBuf>,
+    discovered_dependencies: BTreeSet<PathBuf>,
     hash: u64,
 }
 
 impl Loader {
     fn load(&mut self, path: &Path) -> Result<(), CompileError> {
+        self.discovered_dependencies
+            .extend(candidate_dependencies(path));
         if let Some(position) = self.stack.iter().position(|candidate| candidate == path) {
             let mut chain = self.stack[position..]
                 .iter()
@@ -281,11 +305,14 @@ impl Loader {
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
         for import in &document.imports {
-            let import = directory.join(import).canonicalize().map_err(|error| {
+            let declared = directory.join(import);
+            self.discovered_dependencies
+                .extend(candidate_dependencies(&declared));
+            let import = declared.canonicalize().map_err(|error| {
                 CompileError::one(
                     Diagnostic::new(
                         "config.import_missing",
-                        format!("cannot resolve import `{}`: {error}", import.display()),
+                        format!("cannot resolve import `{}`: {error}", declared.display()),
                         span(path, "imports"),
                     )
                     .with_reference_chain(
@@ -310,6 +337,10 @@ impl Loader {
         });
         self.loaded.insert(path.to_path_buf());
         Ok(())
+    }
+
+    fn discovered_dependencies(&self) -> Vec<PathBuf> {
+        self.discovered_dependencies.iter().cloned().collect()
     }
 
     fn finish(self, root: PathBuf) -> MergedSource {
@@ -504,7 +535,10 @@ fn validate_document_identity(merged: &MergedSource) -> Result<(), CompileError>
     if diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(CompileError { diagnostics })
+        Err(CompileError {
+            diagnostics,
+            discovered_dependencies: Vec::new(),
+        })
     }
 }
 
@@ -1766,5 +1800,46 @@ listeners:
         let error = Compiler::compile_path(path).expect_err("duplicate Gateway key must fail");
         assert_eq!(error.diagnostics[0].code, "source.duplicate_key");
         assert_eq!(error.diagnostics[0].source.line, 3);
+    }
+
+    #[test]
+    fn compile_failures_report_discovered_and_missing_import_candidates() {
+        let directory = tempdir().expect("temporary directory is available");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("temporary directory canonicalizes");
+        let root = directory.path().join("root.yaml");
+        let imported = directory.path().join("candidate.yaml");
+        fs::write(
+            &imported,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices: invalid\n",
+        )
+        .expect("invalid import can be written");
+        fs::write(
+            &root,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [candidate.yaml]\n",
+        )
+        .expect("root can be written");
+        let error = Compiler::compile_path(&root).expect_err("invalid import must fail");
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&imported.canonicalize().expect("import canonicalizes"))
+        );
+        assert!(error.discovered_dependencies.contains(&canonical_directory));
+
+        fs::write(
+            &root,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [missing.yaml]\n",
+        )
+        .expect("root can be updated");
+        let error = Compiler::compile_path(&root).expect_err("missing import must fail");
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical_directory.join("missing.yaml"))
+        );
+        assert!(error.discovered_dependencies.contains(&canonical_directory));
     }
 }

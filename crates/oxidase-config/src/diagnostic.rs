@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use oxidase_core::SourceSpan;
 
@@ -60,6 +61,7 @@ impl fmt::Display for Diagnostic {
 #[derive(Debug, Clone)]
 pub struct CompileError {
     pub diagnostics: Vec<Diagnostic>,
+    pub discovered_dependencies: Vec<PathBuf>,
 }
 
 impl CompileError {
@@ -67,7 +69,19 @@ impl CompileError {
     pub fn one(diagnostic: Diagnostic) -> Self {
         Self {
             diagnostics: vec![diagnostic],
+            discovered_dependencies: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_discovered_dependencies(
+        mut self,
+        dependencies: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.discovered_dependencies.extend(dependencies);
+        self.discovered_dependencies.sort();
+        self.discovered_dependencies.dedup();
+        self
     }
 }
 

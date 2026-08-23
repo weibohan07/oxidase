@@ -431,12 +431,12 @@ fn compare_leaf(
                 .as_ref()
                 .map(|name| ("site", format!("site:{name}")))
         });
-    if let Some((kind, resource)) = expected_resource {
-        if !leaf.is_some_and(|(actual_kind, actual_resource, _)| {
+    if let Some((kind, resource)) = expected_resource
+        && !leaf.is_some_and(|(actual_kind, actual_resource, _)| {
             actual_kind == kind && actual_resource == &resource
-        }) {
-            mismatches.push(format!("expected {kind} resource `{resource}`"));
-        }
+        })
+    {
+        mismatches.push(format!("expected {kind} resource `{resource}`"));
     }
     if let Some(path) = &expected.rewritten_path
         && !leaf.is_some_and(|(_, _, actual_path)| actual_path == path)
@@ -448,10 +448,27 @@ fn compare_leaf(
 async fn watch_dependencies(
     config: PathBuf,
     reload: oxidase_server::ReloadHandle,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut last = dependency_stamp(&reload.current_snapshot()).await;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    watch_dependencies_with_timing(
+        config,
+        reload,
+        stop,
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+}
+
+async fn watch_dependencies_with_timing(
+    config: PathBuf,
+    reload: oxidase_server::ReloadHandle,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    poll_interval: std::time::Duration,
+    debounce: std::time::Duration,
+) {
+    let mut last = current_dependency_stamp(&reload).await;
+    let mut interval = tokio::time::interval(poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -461,11 +478,11 @@ async fn watch_dependencies(
                 }
             }
             _ = interval.tick() => {
-                let observed = dependency_stamp(&reload.current_snapshot()).await;
+                let observed = current_dependency_stamp(&reload).await;
                 if observed == last {
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tokio::time::sleep(debounce).await;
                 match reload.reload_path(&config).await {
                     Ok(report) => {
                         tracing::info!(
@@ -483,15 +500,20 @@ async fn watch_dependencies(
                 // Record the observed filesystem state even after failure so an
                 // unchanged invalid source does not cause an error loop. A later
                 // edit triggers another full prepare attempt.
-                last = dependency_stamp(&reload.current_snapshot()).await;
+                last = current_dependency_stamp(&reload).await;
             }
         }
     }
 }
 
-async fn dependency_stamp(snapshot: &RuntimeSnapshot) -> u64 {
+async fn current_dependency_stamp(reload: &oxidase_server::ReloadHandle) -> u64 {
+    let dependencies = reload.watched_dependencies();
+    dependency_stamp(&dependencies).await
+}
+
+async fn dependency_stamp(dependencies: &[PathBuf]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for path in &snapshot.dependencies {
+    for path in dependencies {
         update_stamp(&mut hash, path.to_string_lossy().as_bytes());
         match tokio::fs::metadata(path).await {
             Ok(metadata) => {
@@ -513,5 +535,135 @@ fn update_stamp(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
         *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::Duration;
+
+    use oxidase_config::Compiler;
+    use oxidase_core::{RespondBody, ServiceKind};
+    use oxidase_runtime::RuntimeSnapshot;
+    use tempfile::tempdir;
+
+    use super::watch_dependencies_with_timing;
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if condition() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition becomes true before timeout");
+    }
+
+    #[tokio::test]
+    async fn watcher_recovers_when_only_failed_import_is_fixed() {
+        let directory = tempdir().expect("temporary directory is available");
+        let root = directory.path().join("oxidase.yaml");
+        fs::write(
+            &root,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: respond
+    body:
+      text: old
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("initial config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&root).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let reload = running.reload_handle();
+        let initial_version = reload.current_snapshot().config_version.to_string();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn(watch_dependencies_with_timing(
+            root.clone(),
+            reload.clone(),
+            receiver,
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let imported = directory.path().join("candidate.yaml");
+        fs::write(
+            &imported,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices: invalid\n",
+        )
+        .expect("invalid import can be written");
+        fs::write(
+            &root,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [candidate.yaml]
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: candidate
+"#,
+        )
+        .expect("candidate root can be written");
+
+        let canonical_import = imported.canonicalize().expect("import path canonicalizes");
+        wait_until(|| reload.watched_dependencies().contains(&canonical_import)).await;
+        assert_eq!(
+            reload.current_snapshot().config_version.as_str(),
+            initial_version
+        );
+
+        fs::write(
+            &imported,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  candidate:
+    type: respond
+    body:
+      text: recovered
+"#,
+        )
+        .expect("import can be fixed");
+
+        wait_until(|| reload.current_snapshot().config_version.as_str() != initial_version).await;
+        let snapshot = reload.current_snapshot();
+        let program = snapshot
+            .program_for("test")
+            .expect("listener program exists");
+        let node = program
+            .graph
+            .get(&program.entry)
+            .expect("entry service exists");
+        let ServiceKind::Respond {
+            body: RespondBody::Text(body),
+            ..
+        } = &node.kind
+        else {
+            panic!("recovered listener enters Respond");
+        };
+        assert_eq!(body.source(), "recovered");
+
+        let _ = stop.send(true);
+        watcher.await.expect("watcher task stops");
+        running.shutdown().await.expect("gateway shuts down");
     }
 }

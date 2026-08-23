@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -158,6 +159,9 @@ impl GatewayServer {
         let admin_address = self.admin_address();
         let store = self.store.clone();
         let metrics = self.metrics.clone();
+        let reload_dependencies = Arc::new(Mutex::new(ReloadDependencyState::new(
+            store.pin().dependencies.clone(),
+        )));
         let (control, receiver) = mpsc::channel(8);
         let task = tokio::spawn(self.run(receiver));
         RunningServer {
@@ -166,6 +170,7 @@ impl GatewayServer {
                 store,
                 metrics,
                 control: control.clone(),
+                dependencies: reload_dependencies,
             },
             admin_address,
             control,
@@ -316,6 +321,7 @@ pub struct ReloadHandle {
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
     control: mpsc::Sender<Control>,
+    dependencies: Arc<Mutex<ReloadDependencyState>>,
 }
 
 impl ReloadHandle {
@@ -330,10 +336,17 @@ impl ReloadHandle {
 
     async fn reload_path_inner(&self, path: &std::path::Path) -> Result<ReloadReport, ServerError> {
         let current = self.store.pin();
-        let gateway = oxidase_config::Compiler::compile_path(path)
-            .map_err(|error| ServerError::Reload(error.to_string()))?;
+        let gateway = match oxidase_config::Compiler::compile_path(path) {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                self.record_attempt_dependencies(error.discovered_dependencies.clone());
+                return Err(ServerError::Reload(error.to_string()));
+            }
+        };
+        self.record_attempt_dependencies(candidate_gateway_dependencies(&gateway));
         let (snapshot, reuse) = RuntimeSnapshot::prepare_reusing(gateway, Some(&current))
             .map_err(|error| ServerError::Reload(error.to_string()))?;
+        let published_dependencies = snapshot.dependencies.clone();
         let (response, received) = oneshot::channel();
         self.control
             .send(Control::Reload {
@@ -343,13 +356,82 @@ impl ReloadHandle {
             })
             .await
             .map_err(|_| ServerError::ControlClosed)?;
-        received.await.map_err(|_| ServerError::ControlClosed)?
+        let report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        self.record_published_dependencies(published_dependencies);
+        Ok(report)
     }
 
     #[must_use]
     pub fn current_snapshot(&self) -> Arc<RuntimeSnapshot> {
         self.store.pin()
     }
+
+    #[must_use]
+    pub fn watched_dependencies(&self) -> Vec<PathBuf> {
+        self.dependencies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .watched()
+    }
+
+    fn record_attempt_dependencies(&self, dependencies: Vec<PathBuf>) {
+        self.dependencies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_attempt(dependencies);
+    }
+
+    fn record_published_dependencies(&self, dependencies: Vec<PathBuf>) {
+        self.dependencies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_published(dependencies);
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReloadDependencyState {
+    published: BTreeSet<PathBuf>,
+    last_attempt: BTreeSet<PathBuf>,
+}
+
+impl ReloadDependencyState {
+    fn new(published: Vec<PathBuf>) -> Self {
+        let published = published.into_iter().collect::<BTreeSet<_>>();
+        Self {
+            last_attempt: published.clone(),
+            published,
+        }
+    }
+
+    fn record_attempt(&mut self, dependencies: Vec<PathBuf>) {
+        self.last_attempt = dependencies.into_iter().collect();
+    }
+
+    fn record_published(&mut self, dependencies: Vec<PathBuf>) {
+        self.published = dependencies.into_iter().collect();
+        self.last_attempt = self.published.clone();
+    }
+
+    fn watched(&self) -> Vec<PathBuf> {
+        self.published.union(&self.last_attempt).cloned().collect()
+    }
+}
+
+fn candidate_gateway_dependencies(gateway: &oxidase_config::CompiledGateway) -> Vec<PathBuf> {
+    let mut dependencies = gateway
+        .dependencies
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for site in gateway.resources.sites.values() {
+        dependencies.insert(site.root.clone());
+        dependencies.insert(site.manifest.clone());
+        if let Some(parent) = site.manifest.parent() {
+            dependencies.insert(parent.to_path_buf());
+        }
+    }
+    dependencies.into_iter().collect()
 }
 
 #[derive(Debug, Clone)]
