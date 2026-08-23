@@ -909,14 +909,25 @@ async fn handle_request(
         .uri
         .path_and_query()
         .map_or_else(|| "/".to_owned(), |value| value.as_str().to_owned());
-    let mut metadata = RequestMetadata::new(
+    let mut metadata = match RequestMetadata::try_new(
         parts.method,
         "http",
         authority,
         path_and_query,
         parts.headers,
-    );
-    metadata.peer_address = Some(peer_address.to_string());
+    ) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(request_id, error = %error, "request metadata is invalid");
+            metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
+            return Ok(safe_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request",
+                &request_method,
+            ));
+        }
+    };
+    metadata.peer_address = Some(peer_address);
     let leaves = HyperLeaves::new(snapshot.clone(), proxy);
     let report = Executor::new(&program, &leaves)
         .execute(RequestFrame::new(metadata), Some(body))
@@ -1148,6 +1159,10 @@ mod tests {
                                     .and_then(|value| value.to_str().ok())
                                     .unwrap_or("")
                                     .to_owned();
+                                let standardized_forwarded = request
+                                    .headers()
+                                    .get("forwarded")
+                                    .cloned();
                                 let has_hop_header = request.headers().contains_key("x-hop");
                                 if path.starts_with("/slow") {
                                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1175,6 +1190,12 @@ mod tests {
                                     HeaderName::from_static("x-keep"),
                                     HeaderValue::from_static("kept"),
                                 );
+                                if let Some(forwarded) = standardized_forwarded {
+                                    response.headers_mut().insert(
+                                        HeaderName::from_static("x-seen-forwarded"),
+                                        forwarded,
+                                    );
+                                }
                                 Ok::<_, Infallible>(response)
                             });
                             let _ = http1::Builder::new()
@@ -1740,8 +1761,13 @@ resources:
       response_timeout: 25ms
 services:
   root:
-    type: proxy
-    cluster: api
+    type: transform
+    request:
+      scheme: https
+      authority: "[::1]:8443"
+    service:
+      type: proxy
+      cluster: api
 listeners:
   - name: test
     bind: 127.0.0.1:0
@@ -1773,6 +1799,10 @@ listeners:
         let first_lower = first.to_ascii_lowercase();
         assert!(first_lower.contains("x-keep: kept"));
         assert!(!first_lower.contains("x-remove: secret"));
+        assert!(
+            first_lower
+                .contains("x-seen-forwarded: for=\"127.0.0.1\";proto=https;host=\"[::1]:8443\"")
+        );
 
         let second = request(address, "/second", "").await;
         assert!(second.starts_with("HTTP/1.1 200 OK"));

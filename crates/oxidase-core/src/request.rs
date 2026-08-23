@@ -1,49 +1,113 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use percent_encoding::percent_decode_str;
+use thiserror::Error;
 
 use crate::{EvalContext, Value};
 
 #[derive(Debug, Clone)]
 pub struct RequestMetadata {
     pub method: Method,
-    pub scheme: String,
-    pub authority: String,
+    pub scheme: Scheme,
+    pub authority: Authority,
     /// The untouched origin-form path and query. It is retained byte-for-byte until
     /// a Transform deliberately replaces it.
-    pub path_and_query: String,
+    pub path_and_query: PathAndQuery,
     pub headers: HeaderMap,
-    pub peer_address: Option<String>,
+    pub peer_address: Option<SocketAddr>,
 }
 
 impl RequestMetadata {
-    #[must_use]
-    pub fn new(
+    pub fn try_new(
         method: Method,
-        scheme: impl Into<String>,
-        authority: impl Into<String>,
-        path_and_query: impl Into<String>,
+        scheme: impl AsRef<str>,
+        authority: impl AsRef<str>,
+        path_and_query: impl AsRef<str>,
         headers: HeaderMap,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RequestMetadataError> {
+        Ok(Self {
             method,
-            scheme: scheme.into(),
-            authority: authority.into(),
-            path_and_query: path_and_query.into(),
+            scheme: parse_transform_scheme(scheme.as_ref())?,
+            authority: parse_transform_authority(authority.as_ref())?,
+            path_and_query: parse_transform_path_and_query(path_and_query.as_ref())?,
             headers,
             peer_address: None,
-        }
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RequestMetadataError {
+    #[error("scheme must be `http` or `https`")]
+    Scheme,
+    #[error("authority must be a host or IP literal with an optional valid port and no userinfo")]
+    Authority,
+    #[error("path_and_query must be a valid origin-form value beginning with `/`")]
+    PathAndQuery,
+}
+
+pub fn parse_transform_scheme(source: &str) -> Result<Scheme, RequestMetadataError> {
+    if source.eq_ignore_ascii_case("http") {
+        Ok(Scheme::HTTP)
+    } else if source.eq_ignore_ascii_case("https") {
+        Ok(Scheme::HTTPS)
+    } else {
+        Err(RequestMetadataError::Scheme)
+    }
+}
+
+pub fn parse_transform_authority(source: &str) -> Result<Authority, RequestMetadataError> {
+    if source.is_empty() || source.contains('@') || source.contains(['\r', '\n']) {
+        return Err(RequestMetadataError::Authority);
+    }
+    let port = if let Some(rest) = source.strip_prefix('[') {
+        let end = rest.find(']').ok_or(RequestMetadataError::Authority)?;
+        let suffix = &rest[end + 1..];
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or(RequestMetadataError::Authority)?,
+            )
+        }
+    } else if let Some((host, port)) = source.split_once(':') {
+        if host.is_empty() || port.contains(':') {
+            return Err(RequestMetadataError::Authority);
+        }
+        Some(port)
+    } else {
+        None
+    };
+    if port.is_some_and(|port| port.is_empty() || port.parse::<u16>().is_err()) {
+        return Err(RequestMetadataError::Authority);
+    }
+    let authority = Authority::from_str(source).map_err(|_| RequestMetadataError::Authority)?;
+    if authority.host().is_empty() {
+        return Err(RequestMetadataError::Authority);
+    }
+    Ok(authority)
+}
+
+pub fn parse_transform_path_and_query(source: &str) -> Result<PathAndQuery, RequestMetadataError> {
+    if !source.starts_with('/') || source.contains(['\r', '\n', '#']) {
+        return Err(RequestMetadataError::PathAndQuery);
+    }
+    PathAndQuery::from_str(source).map_err(|_| RequestMetadataError::PathAndQuery)
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestOverlay {
     pub method: Option<Method>,
-    pub scheme: Option<String>,
-    pub authority: Option<String>,
-    pub path_and_query: Option<String>,
+    pub scheme: Option<Scheme>,
+    pub authority: Option<Authority>,
+    pub path_and_query: Option<PathAndQuery>,
     header_mutations: Vec<HeaderMutation>,
 }
 
@@ -157,43 +221,54 @@ impl RequestFrame {
     pub fn scheme(&self) -> &str {
         self.overlay
             .scheme
-            .as_deref()
+            .as_ref()
             .unwrap_or(&self.original.scheme)
+            .as_str()
     }
 
     #[must_use]
     pub fn authority(&self) -> &str {
         self.overlay
             .authority
-            .as_deref()
+            .as_ref()
             .unwrap_or(&self.original.authority)
+            .as_str()
     }
 
     #[must_use]
     pub fn host(&self) -> &str {
-        authority_host(self.authority())
+        self.overlay
+            .authority
+            .as_ref()
+            .unwrap_or(&self.original.authority)
+            .host()
     }
 
     #[must_use]
     pub fn path_and_query(&self) -> &str {
         self.overlay
             .path_and_query
-            .as_deref()
+            .as_ref()
             .unwrap_or(&self.original.path_and_query)
+            .as_str()
     }
 
     #[must_use]
     pub fn path(&self) -> &str {
-        self.path_and_query()
-            .split_once('?')
-            .map_or(self.path_and_query(), |(path, _)| path)
+        self.overlay
+            .path_and_query
+            .as_ref()
+            .unwrap_or(&self.original.path_and_query)
+            .path()
     }
 
     #[must_use]
     pub fn raw_query(&self) -> Option<&str> {
-        self.path_and_query()
-            .split_once('?')
-            .map(|(_, query)| query)
+        self.overlay
+            .path_and_query
+            .as_ref()
+            .unwrap_or(&self.original.path_and_query)
+            .query()
     }
 
     #[must_use]
@@ -237,7 +312,10 @@ impl RequestFrame {
         request.insert("query".to_owned(), query_value(self.raw_query()));
         request.insert("headers".to_owned(), headers_value(&self.headers()));
         if let Some(peer_address) = &self.original.peer_address {
-            request.insert("peer_address".to_owned(), Value::from(peer_address.clone()));
+            request.insert(
+                "peer_address".to_owned(),
+                Value::from(peer_address.to_string()),
+            );
         }
 
         let mut roots = BTreeMap::new();
@@ -248,18 +326,6 @@ impl RequestFrame {
         );
         EvalContext::new(roots)
     }
-}
-
-fn authority_host(authority: &str) -> &str {
-    if let Some(rest) = authority.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        return &rest[..end];
-    }
-    authority
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|character| character.is_ascii_digit()))
-        .map_or(authority, |(host, _)| host)
 }
 
 fn headers_value(headers: &HeaderMap) -> Value {
@@ -335,14 +401,52 @@ mod tests {
 
     #[test]
     fn untouched_query_keeps_exact_wire_representation() {
-        let frame = RequestFrame::new(RequestMetadata::new(
-            Method::GET,
-            "http",
-            "[::1]:7589",
-            "/search?b=two%20words&a=1&a=2",
-            HeaderMap::new(),
-        ));
+        let frame = RequestFrame::new(
+            RequestMetadata::try_new(
+                Method::GET,
+                "http",
+                "[::1]:7589",
+                "/search?b=two%20words&a=1&a=2",
+                HeaderMap::new(),
+            )
+            .expect("valid request metadata"),
+        );
         assert_eq!(frame.path_and_query(), "/search?b=two%20words&a=1&a=2");
         assert_eq!(frame.authority(), "[::1]:7589");
+        assert_eq!(frame.host(), "[::1]");
+    }
+
+    #[test]
+    fn validates_typed_request_metadata_boundaries() {
+        for authority in [
+            "example.com",
+            "example.com:443",
+            "127.0.0.1:80",
+            "[::1]:8080",
+        ] {
+            assert!(super::parse_transform_authority(authority).is_ok());
+        }
+        for authority in [
+            "user@example.com",
+            "example.com:99999",
+            "example.com:not-a-port",
+            "example.com\r\nforwarded: evil",
+        ] {
+            assert!(super::parse_transform_authority(authority).is_err());
+        }
+        for scheme in ["ftp", "javascript", "http\r\n"] {
+            assert!(super::parse_transform_scheme(scheme).is_err());
+        }
+        for path in [
+            "https://evil.test/path",
+            "relative",
+            "/ok#fragment",
+            "/ok\r\n",
+        ] {
+            assert!(super::parse_transform_path_and_query(path).is_err());
+        }
+        let path = super::parse_transform_path_and_query("/ok?b=2&a=1&a=3")
+            .expect("origin-form path is valid");
+        assert_eq!(path.as_str(), "/ok?b=2&a=1&a=3");
     }
 }

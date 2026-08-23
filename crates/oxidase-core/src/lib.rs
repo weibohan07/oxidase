@@ -16,10 +16,13 @@ pub use ids::{ConfigVersion, ListenerId, ResourceId, RouteId, ServiceId, SourceS
 pub use outcome::{ErrorClass, ResponseHead, ServiceError, ServiceOutcome};
 pub use pattern::{CompiledPattern, PatternContext, PatternError};
 pub use program::{
-    HeaderPredicate, HeaderTransform, HeaderTransforms, PredicatePlan, RecoverHandler,
-    RequestTransform, RespondBody, ResponseTransform, RouteCase, ServiceGraph, ServiceKind,
-    ServiceNode, ServiceProgram, ServiceProgramError,
+    CompiledMetadata, HeaderPredicate, HeaderTransform, HeaderTransforms, PredicatePlan,
+    RecoverHandler, RequestTransform, RespondBody, ResponseTransform, RouteCase, ServiceGraph,
+    ServiceKind, ServiceNode, ServiceProgram, ServiceProgramError,
 };
-pub use request::{Bindings, BodyState, RequestFrame, RequestMetadata, RequestOverlay};
+pub use request::{
+    Bindings, BodyState, RequestFrame, RequestMetadata, RequestMetadataError, RequestOverlay,
+    parse_transform_authority, parse_transform_path_and_query, parse_transform_scheme,
+};
 pub use template::{CompiledTemplate, TemplateError};
 pub use value::Value;

@@ -9,11 +9,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_core::{
-    CompiledPattern, CompiledTemplate, ConfigVersion, ErrorClass, Expression, HeaderPredicate,
-    HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
-    RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase, RouteId, ServiceGraph,
-    ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
-    is_forbidden_user_header,
+    CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ErrorClass, Expression,
+    HeaderPredicate, HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan,
+    RecoverHandler, RequestMetadataError, RequestTransform, ResourceId, RespondBody,
+    ResponseTransform, RouteCase, RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode,
+    ServiceProgram, SourceSpan, Value, is_forbidden_user_header, parse_transform_authority,
+    parse_transform_path_and_query, parse_transform_scheme,
 };
 use serde::Serialize;
 use url::Url;
@@ -1001,9 +1002,27 @@ fn compile_request_transform(
                     field_path,
                 )
             })?,
-        scheme: optional_template(&source.scheme, file, field_path)?,
-        authority: optional_template(&source.authority, file, field_path)?,
-        path_and_query: optional_template(&source.path, file, field_path)?,
+        scheme: compile_metadata_template(
+            &source.scheme,
+            file,
+            &format!("{field_path}.request.scheme"),
+            "service.transform_scheme",
+            parse_transform_scheme,
+        )?,
+        authority: compile_metadata_template(
+            &source.authority,
+            file,
+            &format!("{field_path}.request.authority"),
+            "service.transform_authority",
+            parse_transform_authority,
+        )?,
+        path_and_query: compile_metadata_template(
+            &source.path,
+            file,
+            &format!("{field_path}.request.path"),
+            "service.transform_path_and_query",
+            parse_transform_path_and_query,
+        )?,
         headers: compile_headers(
             &source.headers,
             file,
@@ -1202,15 +1221,28 @@ fn redirect_template(
     Ok(template)
 }
 
-fn optional_template(
+fn compile_metadata_template<T>(
     source: &Option<String>,
     file: &Path,
     field_path: &str,
-) -> Result<Option<CompiledTemplate>, CompileError> {
-    source
-        .as_ref()
-        .map(|source| template(source, file, field_path))
-        .transpose()
+    code: &'static str,
+    parse: fn(&str) -> Result<T, RequestMetadataError>,
+) -> Result<Option<CompiledMetadata<T>>, CompileError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let template = template(source, file, field_path)?;
+    if template.is_constant() {
+        let rendered = template
+            .render(&oxidase_core::EvalContext::default())
+            .map_err(|error| diagnostic_at(code, error.to_string(), file, field_path))?;
+        parse(&rendered)
+            .map(CompiledMetadata::Constant)
+            .map(Some)
+            .map_err(|error| diagnostic_at(code, error.to_string(), file, field_path))
+    } else {
+        Ok(Some(CompiledMetadata::Dynamic(template)))
+    }
 }
 
 fn status_code(status: u16, file: &Path, field_path: &str) -> Result<StatusCode, CompileError> {
@@ -1841,5 +1873,83 @@ listeners:
                 .contains(&canonical_directory.join("missing.yaml"))
         );
         assert!(error.discovered_dependencies.contains(&canonical_directory));
+    }
+
+    #[test]
+    fn validates_constant_transformed_request_metadata() {
+        for (field, value, code) in [
+            ("scheme", "ftp", "service.transform_scheme"),
+            (
+                "authority",
+                "user@example.com",
+                "service.transform_authority",
+            ),
+            (
+                "authority",
+                "example.com:99999",
+                "service.transform_authority",
+            ),
+            (
+                "path",
+                "https://evil.test/path",
+                "service.transform_path_and_query",
+            ),
+            (
+                "path",
+                "\"/safe\\r\\nX-Evil: yes\"",
+                "service.transform_path_and_query",
+            ),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: transform
+    request:
+      {field}: {value}
+    service:
+      type: respond
+      body:
+        text: ok
+listeners:
+  - name: test
+    bind: 127.0.0.1:7589
+    service:
+      ref: root
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid metadata must fail");
+            assert_eq!(error.diagnostics[0].code, code);
+            assert!(
+                error.diagnostics[0]
+                    .source
+                    .field_path
+                    .contains(&format!("request.{field}"))
+            );
+        }
+
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: transform
+    request:
+      scheme: https
+      authority: "[::1]:8443"
+      path: /rewritten?b=2&a=1&a=3
+    service:
+      type: respond
+      body:
+        text: ok
+listeners:
+  - name: test
+    bind: 127.0.0.1:7589
+    service:
+      ref: root
+"#,
+        );
+        Compiler::compile_path(path).expect("valid typed metadata compiles");
     }
 }

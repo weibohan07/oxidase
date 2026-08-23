@@ -1381,13 +1381,10 @@ response:
     }
 
     fn request(path: &str) -> RequestFrame {
-        RequestFrame::new(RequestMetadata::new(
-            Method::GET,
-            "http",
-            "example.com",
-            path,
-            HeaderMap::new(),
-        ))
+        RequestFrame::new(
+            RequestMetadata::try_new(Method::GET, "http", "example.com", path, HeaderMap::new())
+                .expect("valid fixture request metadata"),
+        )
     }
 
     #[test]

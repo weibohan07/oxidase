@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderName, Method, StatusCode};
 use thiserror::Error;
 
@@ -281,10 +282,16 @@ pub enum RespondBody {
 #[derive(Debug, Clone, Default)]
 pub struct RequestTransform {
     pub method: Option<Method>,
-    pub scheme: Option<CompiledTemplate>,
-    pub authority: Option<CompiledTemplate>,
-    pub path_and_query: Option<CompiledTemplate>,
+    pub scheme: Option<CompiledMetadata<Scheme>>,
+    pub authority: Option<CompiledMetadata<Authority>>,
+    pub path_and_query: Option<CompiledMetadata<PathAndQuery>>,
     pub headers: HeaderTransforms,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompiledMetadata<T> {
+    Constant(T),
+    Dynamic(CompiledTemplate),
 }
 
 #[derive(Debug, Clone, Default)]

@@ -66,13 +66,16 @@ async fn main() {
         );
     }
     let program = ServiceProgram::from_nodes(id, nodes);
-    let request = RequestFrame::new(RequestMetadata::new(
-        Method::GET,
-        "http",
-        "example.test",
-        "/benchmark",
-        HeaderMap::new(),
-    ));
+    let request = RequestFrame::new(
+        RequestMetadata::try_new(
+            Method::GET,
+            "http",
+            "example.test",
+            "/benchmark",
+            HeaderMap::new(),
+        )
+        .expect("benchmark request metadata is valid"),
+    );
     let leaves = NoLeaves;
     let executor = Executor::new(&program, &leaves);
     let iterations = 100_000u32;

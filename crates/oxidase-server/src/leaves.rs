@@ -238,8 +238,7 @@ fn apply_forwarding_headers(headers: &mut HeaderMap, request: &RequestFrame, end
     let peer_ip = request
         .original()
         .peer_address
-        .as_deref()
-        .and_then(|peer| peer.parse::<std::net::SocketAddr>().ok())
+        .as_ref()
         .map(|peer| peer.ip().to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     if let Ok(value) = HeaderValue::from_str(&peer_ip) {

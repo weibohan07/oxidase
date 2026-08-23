@@ -6,9 +6,10 @@ use std::pin::Pin;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use oxidase_core::{
-    BodyState, ErrorClass, HeaderTransforms, RequestFrame, RequestTransform, ResourceId,
-    RespondBody, ResponseHead, ResponseTransform, RouteId, ServiceError, ServiceId, ServiceKind,
-    ServiceOutcome, ServiceProgram, SourceSpan, Value,
+    BodyState, CompiledMetadata, ErrorClass, HeaderTransforms, RequestFrame, RequestMetadataError,
+    RequestTransform, ResourceId, RespondBody, ResponseHead, ResponseTransform, RouteId,
+    ServiceError, ServiceId, ServiceKind, ServiceOutcome, ServiceProgram, SourceSpan, Value,
+    parse_transform_authority, parse_transform_path_and_query, parse_transform_scheme,
 };
 
 pub type BoxLeafFuture<'a, B> = Pin<Box<dyn Future<Output = ServiceOutcome<B>> + Send + 'a>>;
@@ -525,9 +526,24 @@ fn apply_request_transform(
 ) -> Result<(), ServiceError> {
     let context = request.evaluation_context();
     request.overlay.method.clone_from(&transform.method);
-    request.overlay.scheme = render_optional(&transform.scheme, &context)?;
-    request.overlay.authority = render_optional(&transform.authority, &context)?;
-    request.overlay.path_and_query = render_optional(&transform.path_and_query, &context)?;
+    request.overlay.scheme = render_metadata(
+        &transform.scheme,
+        &context,
+        "scheme",
+        parse_transform_scheme,
+    )?;
+    request.overlay.authority = render_metadata(
+        &transform.authority,
+        &context,
+        "authority",
+        parse_transform_authority,
+    )?;
+    request.overlay.path_and_query = render_metadata(
+        &transform.path_and_query,
+        &context,
+        "path_and_query",
+        parse_transform_path_and_query,
+    )?;
     for name in &transform.headers.remove {
         request.overlay.remove_header(name.clone());
     }
@@ -577,21 +593,32 @@ fn apply_response_headers(
     Ok(())
 }
 
-fn render_optional(
-    template: &Option<oxidase_core::CompiledTemplate>,
+fn render_metadata<T: Clone>(
+    template: &Option<CompiledMetadata<T>>,
     context: &oxidase_core::EvalContext,
-) -> Result<Option<String>, ServiceError> {
-    template
-        .as_ref()
-        .map(|template| {
-            template.render(context).map_err(|error| {
+    kind: &'static str,
+    parse: fn(&str) -> Result<T, RequestMetadataError>,
+) -> Result<Option<T>, ServiceError> {
+    let Some(template) = template else {
+        return Ok(None);
+    };
+    match template {
+        CompiledMetadata::Constant(value) => Ok(Some(value.clone())),
+        CompiledMetadata::Dynamic(template) => {
+            let rendered = template.render(context).map_err(|error| {
                 ServiceError::new(
                     ErrorClass::InvalidState,
-                    format!("request transform failed: {error}"),
+                    format!("request transform `{kind}` rendering failed: {error}"),
+                )
+            })?;
+            parse(&rendered).map(Some).map_err(|error| {
+                ServiceError::new(
+                    ErrorClass::InvalidState,
+                    format!("request transform produced invalid `{kind}`: {error}"),
                 )
             })
-        })
-        .transpose()
+        }
+    }
 }
 
 fn render_header(
@@ -630,10 +657,10 @@ mod tests {
     use http::{HeaderMap, HeaderName, Method, StatusCode};
     use oxidase_config::Compiler;
     use oxidase_core::{
-        CompiledTemplate, ErrorClass, HeaderTransform, HeaderTransforms, PredicatePlan,
-        RecoverHandler, RequestFrame, RequestMetadata, RequestTransform, RespondBody, ResponseHead,
-        ResponseTransform, RouteCase, RouteId, ServiceId, ServiceKind, ServiceNode, ServiceOutcome,
-        ServiceProgram, SourceSpan,
+        CompiledMetadata, CompiledTemplate, ErrorClass, HeaderTransform, HeaderTransforms,
+        PredicatePlan, RecoverHandler, RequestFrame, RequestMetadata, RequestTransform,
+        RespondBody, ResponseHead, ResponseTransform, RouteCase, RouteId, ServiceId, ServiceKind,
+        ServiceNode, ServiceOutcome, ServiceProgram, SourceSpan, parse_transform_path_and_query,
     };
     use tempfile::tempdir;
 
@@ -698,13 +725,10 @@ mod tests {
     }
 
     fn request(path: &str) -> RequestFrame {
-        RequestFrame::new(RequestMetadata::new(
-            Method::GET,
-            "http",
-            "example.com",
-            path,
-            HeaderMap::new(),
-        ))
+        RequestFrame::new(
+            RequestMetadata::try_new(Method::GET, "http", "example.com", path, HeaderMap::new())
+                .expect("valid fixture request metadata"),
+        )
     }
 
     fn node(id: &str, kind: ServiceKind) -> ServiceNode {
@@ -855,9 +879,9 @@ mod tests {
             "transform",
             ServiceKind::Transform {
                 request: Box::new(RequestTransform {
-                    path_and_query: Some(
-                        CompiledTemplate::compile("/changed").expect("valid template"),
-                    ),
+                    path_and_query: Some(CompiledMetadata::Constant(
+                        parse_transform_path_and_query("/changed").expect("valid transformed path"),
+                    )),
                     ..RequestTransform::default()
                 }),
                 response: Box::new(ResponseTransform::default()),
@@ -880,6 +904,101 @@ mod tests {
             panic!("second fallback candidate must handle");
         };
         assert_eq!(response.body, Bytes::from_static(b"/original"));
+    }
+
+    #[tokio::test]
+    async fn validates_dynamic_transformed_request_metadata() {
+        let transforms = [
+            RequestTransform {
+                scheme: Some(CompiledMetadata::Dynamic(
+                    CompiledTemplate::compile("{{ request.path }}")
+                        .expect("valid dynamic template"),
+                )),
+                ..RequestTransform::default()
+            },
+            RequestTransform {
+                authority: Some(CompiledMetadata::Dynamic(
+                    CompiledTemplate::compile("user@{{ request.host }}")
+                        .expect("valid dynamic template"),
+                )),
+                ..RequestTransform::default()
+            },
+            RequestTransform {
+                authority: Some(CompiledMetadata::Dynamic(
+                    CompiledTemplate::compile("example.com:{{ request.path }}")
+                        .expect("valid dynamic template"),
+                )),
+                ..RequestTransform::default()
+            },
+            RequestTransform {
+                authority: Some(CompiledMetadata::Dynamic(
+                    CompiledTemplate::compile("example.com{{ request.path }}\r\ninvalid")
+                        .expect("valid dynamic template"),
+                )),
+                ..RequestTransform::default()
+            },
+            RequestTransform {
+                path_and_query: Some(CompiledMetadata::Dynamic(
+                    CompiledTemplate::compile("https://evil.test{{ request.path }}")
+                        .expect("valid dynamic template"),
+                )),
+                ..RequestTransform::default()
+            },
+        ];
+        let leaves = MemoryLeaves::default();
+        for transform in transforms {
+            let response = text_response("response", StatusCode::OK, "unreachable");
+            let transformed = node(
+                "transform",
+                ServiceKind::Transform {
+                    request: Box::new(transform),
+                    response: Box::new(ResponseTransform::default()),
+                    service: response.id.clone(),
+                },
+            );
+            let program = program("transform", vec![response, transformed]);
+            let report = Executor::new(&program, &leaves)
+                .execute(request("/original"), None)
+                .await;
+            let ServiceOutcome::Failed(error) = report.outcome else {
+                panic!("invalid dynamic metadata must fail");
+            };
+            assert_eq!(error.class, ErrorClass::InvalidState);
+            assert!(error.internal_detail.contains("request transform"));
+        }
+    }
+
+    #[tokio::test]
+    async fn transformed_origin_form_preserves_query_wire_order() {
+        let response = text_response("response", StatusCode::OK, "{{ request.path_and_query }}");
+        let transform = node(
+            "transform",
+            ServiceKind::Transform {
+                request: Box::new(RequestTransform {
+                    path_and_query: Some(CompiledMetadata::Dynamic(
+                        CompiledTemplate::compile(
+                            "/rewritten?b=2&a=1&a=3&from={{ request.path | url_encode }}",
+                        )
+                        .expect("valid dynamic path template"),
+                    )),
+                    ..RequestTransform::default()
+                }),
+                response: Box::new(ResponseTransform::default()),
+                service: response.id.clone(),
+            },
+        );
+        let program = program("transform", vec![response, transform]);
+        let leaves = MemoryLeaves::default();
+        let report = Executor::new(&program, &leaves)
+            .execute(request("/original?untouched=1"), None)
+            .await;
+        let ServiceOutcome::Handled(response) = report.outcome else {
+            panic!("valid transformed path must handle");
+        };
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"/rewritten?b=2&a=1&a=3&from=%2Foriginal")
+        );
     }
 
     #[tokio::test]

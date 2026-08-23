@@ -294,13 +294,13 @@ fn request_frame(source: &ExplainRequestSource) -> Result<RequestFrame, Box<dyn 
     for (name, value) in &source.headers {
         headers.insert(name.parse::<HeaderName>()?, value.parse::<HeaderValue>()?);
     }
-    Ok(RequestFrame::new(RequestMetadata::new(
+    Ok(RequestFrame::new(RequestMetadata::try_new(
         method,
         &source.scheme,
         &source.host,
         &source.path,
         headers,
-    )))
+    )?))
 }
 
 fn describe_report(
