@@ -80,6 +80,7 @@ impl SiteCompiler {
             ));
         }
         validate_manifest(&manifest, &source, &inputs)?;
+        let deny_patterns = compile_deny_patterns(&manifest, &source.visibility.deny)?;
         let limits = compile_limits(&manifest, &source)?;
         let mut data = source
             .data
@@ -95,9 +96,9 @@ impl SiteCompiler {
             }
         }
 
-        let mut files = collect_files(&root, &source)?;
-        files.sort();
         let template_roots = template_roots(&root, &source)?;
+        let mut files = collect_files(&root, &source, &template_roots, &deny_patterns)?;
+        files.sort();
         for path in &files {
             track_site_dependency(dependencies, path, &root);
         }
@@ -130,7 +131,7 @@ impl SiteCompiler {
                     path: oxr.clone(),
                     message: "OXR escapes the site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root) {
+            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
                 continue;
             }
             dependencies.push(oxr.clone());
@@ -154,7 +155,7 @@ impl SiteCompiler {
                     path: asset.clone(),
                     message: "asset is outside the canonical site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root) {
+            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
                 continue;
             }
             let headers = compile_resource_base_policy(relative, &source, asset)?;
@@ -311,16 +312,6 @@ fn validate_manifest(
             ),
         ));
     }
-    for (index, pattern) in source.visibility.deny.iter().enumerate() {
-        if !supported_deny_pattern(pattern) {
-            return Err(SiteCompileError::source(
-                path,
-                format!(
-                    "visibility.deny[{index}] uses unsupported glob `{pattern}`; use an exact relative path, `**/name`, or `**/*.ext`"
-                ),
-            ));
-        }
-    }
     for (name, contract) in &source.inputs {
         validate_input_kind(path, name, &contract.kind)?;
         match inputs.get(name) {
@@ -381,18 +372,106 @@ fn validate_manifest(
     Ok(())
 }
 
-fn supported_deny_pattern(pattern: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DenyPattern {
+    ExactPath(Vec<String>),
+    ComponentName(String),
+    FileExtension(String),
+}
+
+impl DenyPattern {
+    fn matches(&self, relative: &Path) -> bool {
+        let components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match self {
+            Self::ExactPath(expected) => {
+                components.len() >= expected.len()
+                    && components
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual == expected)
+            }
+            Self::ComponentName(expected) => {
+                components.iter().any(|component| component == expected)
+            }
+            Self::FileExtension(extension) => components
+                .last()
+                .is_some_and(|name| name.ends_with(extension)),
+        }
+    }
+}
+
+fn compile_deny_patterns(
+    path: &Path,
+    patterns: &[String],
+) -> Result<Vec<DenyPattern>, SiteCompileError> {
+    patterns
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            compile_deny_pattern(pattern).map_err(|message| {
+                SiteCompileError::source(
+                    path,
+                    format!(
+                        "visibility.deny[{index}] `{pattern}` is invalid: {message}; use an exact relative path, `**/name`, or `**/*.ext`"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn compile_deny_pattern(pattern: &str) -> Result<DenyPattern, &'static str> {
     if pattern.is_empty() {
-        return false;
+        return Err("pattern cannot be empty");
     }
-    let has_glob = pattern.contains(['*', '?', '[', ']']);
-    if !has_glob {
-        return true;
+    if pattern.contains('\\') {
+        return Err("backslashes are not allowed");
     }
-    pattern
-        .strip_prefix("**/*")
-        .or_else(|| pattern.strip_prefix("**/"))
-        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains(['*', '?', '[', ']']))
+    if pattern.starts_with('/') || looks_like_windows_absolute(pattern) {
+        return Err("absolute paths are not allowed");
+    }
+    if let Some(extension) = pattern.strip_prefix("**/*.") {
+        if !valid_pattern_component(extension) || extension.contains('/') {
+            return Err("extension pattern must contain one non-empty extension");
+        }
+        return Ok(DenyPattern::FileExtension(format!(".{extension}")));
+    }
+    if let Some(name) = pattern.strip_prefix("**/") {
+        if !valid_pattern_component(name) || name.contains('/') {
+            return Err("component pattern must contain one exact path component");
+        }
+        return Ok(DenyPattern::ComponentName(name.to_owned()));
+    }
+    if pattern.contains(['*', '?', '[', ']']) {
+        return Err("unsupported wildcard syntax");
+    }
+    let components = pattern.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| !valid_pattern_component(component))
+    {
+        return Err("exact paths cannot contain empty, `.` or `..` components");
+    }
+    Ok(DenyPattern::ExactPath(
+        components.into_iter().map(str::to_owned).collect(),
+    ))
+}
+
+fn valid_pattern_component(component: &str) -> bool {
+    !component.is_empty()
+        && !matches!(component, "." | "..")
+        && !component.contains(['*', '?', '[', ']'])
+}
+
+fn looks_like_windows_absolute(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn validate_input_kind(path: &Path, name: &str, kind: &str) -> Result<(), SiteCompileError> {
@@ -472,9 +551,15 @@ fn compile_limits(
     })
 }
 
-fn collect_files(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, SiteCompileError> {
+fn collect_files(
+    root: &Path,
+    source: &ManifestSource,
+    template_roots: &[PathBuf],
+    deny_patterns: &[DenyPattern],
+) -> Result<Vec<PathBuf>, SiteCompileError> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    let mut entries = WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -484,31 +569,78 @@ fn collect_files(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, S
         if entry.path() == root {
             continue;
         }
-        if entry.file_type().is_symlink() {
-            let canonical = entry
+        let relative =
+            entry
                 .path()
-                .canonicalize()
-                .map_err(|error| SiteCompileError::io(entry.path(), error))?;
-            if source.visibility.symlinks == SymlinkModeSource::Deny
-                || !path_is_within(&canonical, root)
-            {
-                return Err(SiteCompileError::UnsafePath {
+                .strip_prefix(root)
+                .map_err(|_| SiteCompileError::UnsafePath {
                     path: entry.path().to_path_buf(),
-                    message: "symlink is denied or escapes the site root".to_owned(),
-                });
-            }
-            if canonical.is_dir() {
-                return Err(SiteCompileError::UnsafePath {
-                    path: entry.path().to_path_buf(),
-                    message: "directory symlinks are not traversed in Oxista v1".to_owned(),
-                });
-            }
+                    message: "site scan escaped the canonical root".to_owned(),
+                })?;
+        if entry.file_type().is_dir()
+            && !is_template_scan_path(entry.path(), template_roots)
+            && denied_by_visibility(relative, source, deny_patterns, true)
+        {
+            validate_pruned_subtree_symlinks(entry.path(), source, root)?;
+            entries.skip_current_dir();
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            let canonical = validate_symlink(entry.path(), source, root)?;
             files.push(canonical);
         } else if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
         }
     }
     Ok(files)
+}
+
+fn is_template_scan_path(path: &Path, template_roots: &[PathBuf]) -> bool {
+    template_roots
+        .iter()
+        .any(|root| path.starts_with(root) || root.starts_with(path))
+}
+
+fn validate_pruned_subtree_symlinks(
+    directory: &Path,
+    source: &ManifestSource,
+    root: &Path,
+) -> Result<(), SiteCompileError> {
+    for entry in WalkDir::new(directory).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| {
+            let path = error
+                .path()
+                .map_or_else(|| directory.to_path_buf(), Path::to_path_buf);
+            SiteCompileError::source(path, error.to_string())
+        })?;
+        if entry.file_type().is_symlink() {
+            validate_symlink(entry.path(), source, root)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_symlink(
+    path: &Path,
+    source: &ManifestSource,
+    root: &Path,
+) -> Result<PathBuf, SiteCompileError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| SiteCompileError::io(path, error))?;
+    if source.visibility.symlinks == SymlinkModeSource::Deny || !path_is_within(&canonical, root) {
+        return Err(SiteCompileError::UnsafePath {
+            path: path.to_path_buf(),
+            message: "symlink is denied or escapes the site root".to_owned(),
+        });
+    }
+    if canonical.is_dir() {
+        return Err(SiteCompileError::UnsafePath {
+            path: path.to_path_buf(),
+            message: "directory symlinks are not traversed in Oxista v1".to_owned(),
+        });
+    }
+    Ok(canonical)
 }
 
 fn template_roots(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, SiteCompileError> {
@@ -1275,6 +1407,7 @@ fn is_private(
     source: &ManifestSource,
     template_roots: &[PathBuf],
     site_root: &Path,
+    deny_patterns: &[DenyPattern],
 ) -> bool {
     if template_roots
         .iter()
@@ -1283,6 +1416,15 @@ fn is_private(
     {
         return true;
     }
+    denied_by_visibility(relative, source, deny_patterns, false)
+}
+
+fn denied_by_visibility(
+    relative: &Path,
+    source: &ManifestSource,
+    deny_patterns: &[DenyPattern],
+    is_directory: bool,
+) -> bool {
     let components = relative
         .components()
         .filter_map(|component| match component {
@@ -1300,21 +1442,18 @@ fn is_private(
     if source.visibility.underscore_directories != VisibilityModeSource::Allow
         && components
             .iter()
-            .take(components.len().saturating_sub(1))
+            .take(if is_directory {
+                components.len()
+            } else {
+                components.len().saturating_sub(1)
+            })
             .any(|component| component.starts_with('_'))
     {
         return true;
     }
-    let value = relative.to_string_lossy().replace('\\', "/");
-    source.visibility.deny.iter().any(|pattern| {
-        pattern
-            .strip_prefix("**/*")
-            .is_some_and(|suffix| value.ends_with(suffix))
-            || pattern
-                .strip_prefix("**/")
-                .is_some_and(|suffix| value.ends_with(suffix))
-            || value == *pattern
-    })
+    deny_patterns
+        .iter()
+        .any(|pattern| pattern.matches(relative))
 }
 
 fn logical_path(relative: &Path) -> String {
@@ -1432,7 +1571,7 @@ mod tests {
     use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, Value};
     use tempfile::tempdir;
 
-    use super::SiteCompiler;
+    use super::{SiteCompiler, compile_deny_pattern};
     use crate::{PreparedSiteBody, SiteError};
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1826,6 +1965,121 @@ response:
                 .collect::<Vec<_>>(),
             ["profile=one", "local=two"]
         );
+    }
+
+    #[test]
+    fn visibility_deny_matches_exact_components_extensions_and_subtrees() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        for directory in ["foo/secret", "a/b", "private-dir"] {
+            fs::create_dir_all(root.join(directory)).expect("fixture directory can be created");
+        }
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+visibility:
+  deny:
+    - "**/secret"
+    - "**/*.pem"
+    - exact-file.txt
+    - private-dir
+"#,
+        )
+        .expect("manifest can be written");
+        for path in [
+            "foo/mysecret",
+            "foo/secret/key.txt",
+            "secret",
+            "foo/secret.txt",
+            "key.pem",
+            "a/b/key.pem",
+            "key.pem.bak",
+            "notpem",
+            "exact-file.txt",
+            "private-dir/child.txt",
+        ] {
+            fs::write(root.join(path), path).expect("fixture file can be written");
+        }
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("site compiles");
+        let paths = snapshot.public_paths().collect::<Vec<_>>();
+        for allowed in [
+            "/foo/mysecret",
+            "/foo/secret.txt",
+            "/key.pem.bak",
+            "/notpem",
+        ] {
+            assert!(paths.contains(&allowed), "{allowed} should remain public");
+        }
+        for denied in [
+            "/foo/secret/key.txt",
+            "/secret",
+            "/key.pem",
+            "/a/b/key.pem",
+            "/exact-file.txt",
+            "/private-dir/child.txt",
+        ] {
+            assert!(!paths.contains(&denied), "{denied} should be denied");
+        }
+        let component = compile_deny_pattern("**/secret").expect("pattern compiles");
+        assert!(component.matches(std::path::Path::new("foo/secret/key")));
+        assert!(!component.matches(std::path::Path::new("foo/Secret/key")));
+
+        for pattern in [
+            "/absolute",
+            "../escape",
+            "empty//component",
+            "back\\slash",
+            "**/nested/name",
+            "assets/*.pem",
+        ] {
+            fs::write(
+                root.join("site.oxsite"),
+                format!("oxista: site/v1\nvisibility:\n  deny:\n    - '{pattern}'\n"),
+            )
+            .expect("invalid manifest can be written");
+            let failure = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("invalid deny pattern must fail");
+            assert!(
+                failure.to_string().contains("visibility.deny[0]"),
+                "{failure}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruned_private_directories_still_validate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("private")).expect("private directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            "oxista: site/v1\nvisibility:\n  deny: [private]\n",
+        )
+        .expect("manifest can be written");
+        symlink("/etc/passwd", root.join("private/escape"))
+            .expect("escaping symlink can be created");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("private subtree symlink escape must still fail");
+        assert!(failure.to_string().contains("symlink"), "{failure}");
     }
 
     #[cfg(unix)]
