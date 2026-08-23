@@ -157,7 +157,7 @@ pub struct PreparationError {
 #[derive(Debug)]
 pub enum PreparationErrorKind {
     Fingerprint(String),
-    Site(SiteCompileError),
+    Site(Box<SiteCompileError>),
 }
 
 fn preparation_error_from_site(
@@ -170,7 +170,7 @@ fn preparation_error_from_site(
     normalize_dependencies(&mut candidate_dependencies);
     PreparationError {
         resource: resource.clone(),
-        kind: PreparationErrorKind::Site(failure.error),
+        kind: PreparationErrorKind::Site(Box::new(failure.error)),
         candidate_dependencies,
     }
 }
