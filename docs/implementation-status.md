@@ -23,17 +23,23 @@ Last updated: 2026-08-23
   Observe, Timeout, Recover, Reenter, Site and Proxy leaf boundaries.
 - Graph validation rejects implicit reference cycles, zero Reenter budgets, missing
   nodes, and body-consuming fallback candidates before later alternatives.
+- Phase 2 strict `oxidase.dev/v1alpha1` source AST and compiler with maintained YAML
+  parsing, duplicate/unknown-key rejection, relative imports, import-cycle checks,
+  named and inline Services, resource references, and Router-to-Route lowering.
+- `oxidase check`, symbolic `explain`, deterministic `compile` manifest, and
+  declarative `test` commands all use the same compiler and normalized plans.
 
 ## Currently runnable
 
-- A complete Service graph can be executed against an in-memory leaf adapter and
-  produces a node/route trace. Twenty-four workspace tests pass. It is not yet a
-  network gateway because no source compiler or production leaf adapter exists.
+- A v1alpha1 config can be compiled into normalized IR, checked, symbolically
+  executed with a full node/route trace, and tested without opening a socket.
+  Thirty-two workspace tests pass. It is not yet a network gateway because no
+  production leaf adapter exists.
 
 ## Not implemented
 
-- Configuration compiler, Oxista compiler, listener, production Proxy, atomic
-  reload, and the v0.2 CLI.
+- Oxista compiler, listener, production Proxy, and atomic reload. `serve` currently
+  performs compilation and returns an explicit not-implemented error.
 
 ## Known limitations
 
@@ -42,8 +48,12 @@ Last updated: 2026-08-23
   Oxista strict-undefined policy is not wired yet.
 - Site and Proxy are real Service nodes but only their runtime leaf boundary exists;
   no production I/O implementation is advertised yet.
+- `compile` writes a deterministic inspection manifest, not a portable executable
+  snapshot containing site assets or connection state.
+- Semantic diagnostics retain file and field path but do not yet recover exact
+  scalar lines for every lowering error.
 
 ## Next concrete work
 
-Implement the strict v1alpha1 source AST, imports/references, diagnostics, lowering,
-and `check`/`explain` commands through the same compilation pipeline.
+Implement `.oxsite`, `.oxr`, and the initial `.oxt` compiler; build a secure,
+immutable `SiteSnapshot`; and add the required Oxista example site.
