@@ -9,12 +9,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_core::{
-    CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ErrorClass, Expression,
-    HeaderPredicate, HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan,
-    RecoverHandler, RequestMetadataError, RequestTransform, ResourceId, RespondBody,
-    ResponseTransform, RouteCase, RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode,
-    ServiceProgram, SourceSpan, Value, is_forbidden_user_header, parse_transform_authority,
-    parse_transform_path_and_query, parse_transform_scheme,
+    CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ContentDigest,
+    ContentDigestBuilder, ErrorClass, Expression, HeaderPredicate, HeaderTransform,
+    HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
+    RequestMetadataError, RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase,
+    RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
+    is_forbidden_user_header, parse_transform_authority, parse_transform_path_and_query,
+    parse_transform_scheme,
 };
 use serde::Serialize;
 use url::Url;
@@ -172,7 +173,7 @@ impl Compiler {
 
             Ok(CompiledGateway {
                 source: path,
-                config_version: ConfigVersion::new(format!("v2-{:016x}", merged.hash)),
+                config_version: ConfigVersion::new(format!("v2-sha256-{}", merged.hash)),
                 dependencies: merged.dependencies,
                 graph,
                 resources,
@@ -268,7 +269,7 @@ struct Loader {
     documents: Vec<Located<GatewaySource>>,
     dependencies: Vec<PathBuf>,
     discovered_dependencies: BTreeSet<PathBuf>,
-    hash: u64,
+    source_digests: BTreeMap<PathBuf, ContentDigest>,
 }
 
 impl Loader {
@@ -328,8 +329,8 @@ impl Loader {
         }
         self.stack.pop();
 
-        hash_bytes(&mut self.hash, path.to_string_lossy().as_bytes());
-        hash_bytes(&mut self.hash, source.as_bytes());
+        self.source_digests
+            .insert(path.to_path_buf(), canonical_yaml_digest(path, &source)?);
         self.dependencies.push(path.to_path_buf());
         self.documents.push(Located {
             value: document,
@@ -353,11 +354,21 @@ impl Loader {
             .enumerate()
             .map(|(index, path)| (path.clone(), SourceFileId(index)))
             .collect();
+        let mut identity = ContentDigestBuilder::new("oxidase/config-source/v1");
+        identity.field_u64("source_count", dependencies.len() as u64);
+        if let Some(root_digest) = self.source_digests.get(&root) {
+            identity.field_digest("root", *root_digest);
+        }
+        for dependency in &dependencies {
+            if let Some(digest) = self.source_digests.get(dependency) {
+                identity.field_digest("source", *digest);
+            }
+        }
         let mut merged = MergedSource {
             root,
             dependencies,
             source_files,
-            hash: self.hash,
+            hash: identity.finish(),
             ..MergedSource::default()
         };
         for document in self.documents {
@@ -418,7 +429,7 @@ struct MergedSource {
     root: PathBuf,
     dependencies: Vec<PathBuf>,
     source_files: BTreeMap<PathBuf, SourceFileId>,
-    hash: u64,
+    hash: ContentDigest,
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
     clusters: BTreeMap<String, Located<ClusterSource>>,
@@ -1395,14 +1406,29 @@ fn parse_yaml<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    if *hash == 0 {
-        *hash = 0xcbf2_9ce4_8422_2325;
-    }
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+fn canonical_yaml_digest(path: &Path, source: &str) -> Result<ContentDigest, CompileError> {
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).map_err(|error| {
+        CompileError::one(Diagnostic::new(
+            "yaml.deserialize",
+            error.to_string(),
+            span(path, ""),
+        ))
+    })?;
+    let value = serde_json::to_value(value).map_err(|error| {
+        CompileError::one(Diagnostic::new(
+            "yaml.canonicalize",
+            format!("cannot canonicalize configuration: {error}"),
+            span(path, ""),
+        ))
+    })?;
+    let bytes = serde_json::to_vec(&value).map_err(|error| {
+        CompileError::one(Diagnostic::new(
+            "yaml.canonicalize",
+            format!("cannot encode canonical configuration: {error}"),
+            span(path, ""),
+        ))
+    })?;
+    Ok(ContentDigest::of_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -1951,5 +1977,46 @@ listeners:
 "#,
         );
         Compiler::compile_path(path).expect("valid typed metadata compiles");
+    }
+
+    #[test]
+    fn config_digest_is_stable_across_mapping_order_and_repeated_compilation() {
+        let first = r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: respond
+    status: 201
+    body:
+      text: stable
+listeners:
+  - name: test
+    bind: 127.0.0.1:7589
+    service:
+      ref: root
+"#;
+        let second = r#"listeners:
+  - service:
+      ref: root
+    bind: 127.0.0.1:7589
+    name: test
+services:
+  root:
+    body:
+      text: stable
+    status: 201
+    type: respond
+kind: gateway
+api_version: oxidase.dev/v1alpha1
+"#;
+        let (_first_directory, first_path) = write_config(first);
+        let (_second_directory, second_path) = write_config(second);
+        let first = Compiler::compile_path(&first_path).expect("first config compiles");
+        let repeated = Compiler::compile_path(&first_path).expect("repeat config compiles");
+        let second = Compiler::compile_path(&second_path).expect("reordered config compiles");
+        assert_eq!(first.config_version, repeated.config_version);
+        assert_eq!(first.config_version, second.config_version);
+        assert!(first.config_version.as_str().starts_with("v2-sha256-"));
+        assert_eq!(first.config_version.as_str().len(), "v2-sha256-".len() + 64);
     }
 }

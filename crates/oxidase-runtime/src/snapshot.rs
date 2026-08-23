@@ -8,7 +8,10 @@ use arc_swap::ArcSwap;
 use oxidase_config::{
     ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
 };
-use oxidase_core::{ConfigVersion, ResourceId, ServiceGraph, ServiceProgram};
+use oxidase_core::{
+    ConfigVersion, ContentDigest, ContentDigestBuilder, ContentHasher, ResourceId, ServiceGraph,
+    ServiceProgram,
+};
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
 #[derive(Debug, Clone, Default)]
@@ -26,8 +29,8 @@ pub struct RuntimeSnapshot {
     pub listeners: Vec<CompiledListener>,
     pub tests: Vec<ConfigTestSource>,
     summary: GatewaySummary,
-    site_fingerprints: BTreeMap<ResourceId, u64>,
-    cluster_fingerprints: BTreeMap<ResourceId, u64>,
+    site_fingerprints: BTreeMap<ResourceId, ContentDigest>,
+    cluster_fingerprints: BTreeMap<ResourceId, ContentDigest>,
 }
 
 impl RuntimeSnapshot {
@@ -96,17 +99,19 @@ impl RuntimeSnapshot {
             clusters.insert(id, cluster);
         }
         normalize_dependencies(&mut dependencies);
-        let mut version_hash = Fnv::new();
-        version_hash.update(gateway.config_version.as_str().as_bytes());
+        let mut version_hash = ContentDigestBuilder::new("oxidase/runtime-snapshot/v1");
+        version_hash.field_bytes("gateway", gateway.config_version.as_str().as_bytes());
         for (id, fingerprint) in &site_fingerprints {
-            version_hash.update(id.as_str().as_bytes());
-            version_hash.update(&fingerprint.to_le_bytes());
+            version_hash
+                .field_bytes("site_id", id.as_str().as_bytes())
+                .field_digest("site_digest", *fingerprint);
         }
         for (id, fingerprint) in &cluster_fingerprints {
-            version_hash.update(id.as_str().as_bytes());
-            version_hash.update(&fingerprint.to_le_bytes());
+            version_hash
+                .field_bytes("cluster_id", id.as_str().as_bytes())
+                .field_digest("cluster_digest", *fingerprint);
         }
-        let config_version = ConfigVersion::new(format!("v2-{:016x}", version_hash.finish()));
+        let config_version = ConfigVersion::new(format!("v2-sha256-{}", version_hash.finish()));
         summary.config_version = config_version.to_string();
         summary.dependencies = dependencies
             .iter()
@@ -199,12 +204,21 @@ fn discover_site_dependencies(source: &oxidase_config::SiteSpec) -> Vec<std::pat
     dependencies
 }
 
-fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<u64, String> {
-    let mut hash = Fnv::new();
-    hash.update(source.root.to_string_lossy().as_bytes());
-    hash.update(source.manifest.to_string_lossy().as_bytes());
-    hash.update(
-        &serde_json::to_vec(&source.inputs)
+fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<ContentDigest, String> {
+    let mut hash = ContentDigestBuilder::new("oxidase/site-source/v1");
+    hash.field_bytes(
+        "manifest",
+        source
+            .manifest
+            .strip_prefix(&source.root)
+            .unwrap_or(&source.manifest)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .as_bytes(),
+    );
+    hash.field_bytes(
+        "inputs",
+        serde_json::to_vec(&source.inputs)
             .map_err(|error| format!("cannot fingerprint site inputs: {error}"))?,
     );
     let mut entries = walkdir::WalkDir::new(&source.root)
@@ -215,11 +229,18 @@ fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<u64, String> {
     entries.sort_by(|left, right| left.path().cmp(right.path()));
     for entry in entries {
         let path = entry.path();
-        hash.update(path.to_string_lossy().as_bytes());
+        let relative = path
+            .strip_prefix(&source.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        hash.field_bytes("path", relative.as_bytes());
         if entry.file_type().is_file() {
+            hash.field_bytes("kind", b"file");
             let mut file = fs::File::open(path)
                 .map_err(|error| format!("cannot fingerprint `{}`: {error}", path.display()))?;
             let mut buffer = [0u8; 16 * 1024];
+            let mut content = ContentHasher::new();
             loop {
                 let read = file
                     .read(&mut buffer)
@@ -227,25 +248,32 @@ fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<u64, String> {
                 if read == 0 {
                     break;
                 }
-                hash.update(&buffer[..read]);
+                content.update(&buffer[..read]);
             }
+            hash.field_digest("content", content.finish());
         } else if entry.file_type().is_symlink() {
+            hash.field_bytes("kind", b"symlink");
             let target = fs::read_link(path).map_err(|error| {
                 format!("cannot fingerprint symlink `{}`: {error}", path.display())
             })?;
-            hash.update(target.to_string_lossy().as_bytes());
+            hash.field_bytes("target", target.to_string_lossy().as_bytes());
+        } else if entry.file_type().is_dir() {
+            hash.field_bytes("kind", b"directory");
+        } else {
+            hash.field_bytes("kind", b"other");
         }
     }
     Ok(hash.finish())
 }
 
-fn cluster_fingerprint(source: &ClusterSpec) -> u64 {
-    let mut hash = Fnv::new();
+fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
+    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v1");
+    hash.field_u64("endpoint_count", source.endpoints.len() as u64);
     for endpoint in &source.endpoints {
-        hash.update(endpoint.as_str().as_bytes());
+        hash.field_bytes("endpoint", endpoint.as_str().as_bytes());
     }
-    hash.update(&source.connect_timeout.as_nanos().to_le_bytes());
-    hash.update(&source.response_timeout.as_nanos().to_le_bytes());
+    hash.field_u128("connect_timeout_ns", source.connect_timeout.as_nanos());
+    hash.field_u128("response_timeout_ns", source.response_timeout.as_nanos());
     hash.finish()
 }
 
@@ -266,25 +294,6 @@ fn site_directories(site: &SiteSnapshot) -> Vec<std::path::PathBuf> {
         }
     }
     directories.into_keys().collect()
-}
-
-struct Fnv(u64);
-
-impl Fnv {
-    const fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    const fn finish(self) -> u64 {
-        self.0
-    }
 }
 
 impl fmt::Display for PreparationError {
@@ -335,12 +344,33 @@ impl SnapshotStore {
 mod tests {
     use std::fs;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use oxidase_config::Compiler;
-    use oxidase_core::ResourceId;
+    use oxidase_config::{ClusterSpec, Compiler};
+    use oxidase_core::{ResourceId, SourceSpan};
     use tempfile::tempdir;
+    use url::Url;
 
-    use super::RuntimeSnapshot;
+    use super::{RuntimeSnapshot, cluster_fingerprint};
+
+    #[test]
+    fn cluster_digest_is_stable_and_preserves_endpoint_preference_order() {
+        let cluster = |endpoints: &[&str]| ClusterSpec {
+            id: ResourceId::new("cluster:api"),
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint| Url::parse(endpoint).expect("fixture endpoint is valid"))
+                .collect(),
+            connect_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(2),
+            source: SourceSpan::synthetic("clusters.api"),
+        };
+        let first = cluster(&["http://127.0.0.1:3000", "https://example.test/"]);
+        let same = cluster(&["http://127.0.0.1:3000", "https://example.test/"]);
+        let reordered = cluster(&["https://example.test/", "http://127.0.0.1:3000"]);
+        assert_eq!(cluster_fingerprint(&first), cluster_fingerprint(&same));
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&reordered));
+    }
 
     #[test]
     fn reuses_unchanged_sites_and_clusters_by_content() {

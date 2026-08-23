@@ -6,7 +6,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, StatusCode};
-use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value, is_forbidden_user_header};
+use oxidase_core::{
+    CompiledTemplate, ContentDigest, ContentHasher, Expression, ResourceId, Value,
+    is_forbidden_user_header,
+};
 use walkdir::WalkDir;
 
 use crate::error::{SiteCompileError, SiteCompileFailure};
@@ -1260,7 +1263,7 @@ fn compile_representation(
         EtagSource::None => None,
         EtagSource::Weak | EtagSource::Strong => Some(EntityTag::new(
             matches!(source.assets.etag, EtagSource::Weak),
-            format!("{:016x}", hash_file(path)?),
+            format!("sha256-{}", hash_file(path)?),
         )),
     };
     Ok(AssetRepresentation {
@@ -1316,9 +1319,9 @@ fn precompressed_paths(files: &[PathBuf], source: &ManifestSource) -> BTreeSet<P
         .collect()
 }
 
-fn hash_file(path: &Path) -> Result<u64, SiteCompileError> {
+fn hash_file(path: &Path) -> Result<ContentDigest, SiteCompileError> {
     let mut file = fs::File::open(path).map_err(|error| SiteCompileError::io(path, error))?;
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut hash = ContentHasher::new();
     let mut buffer = [0u8; 16 * 1024];
     loop {
         let read = file
@@ -1327,12 +1330,9 @@ fn hash_file(path: &Path) -> Result<u64, SiteCompileError> {
         if read == 0 {
             break;
         }
-        for byte in &buffer[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hash.update(&buffer[..read]);
     }
-    Ok(hash)
+    Ok(hash.finish())
 }
 
 fn insert_with_index_aliases(

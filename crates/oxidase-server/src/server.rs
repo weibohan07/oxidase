@@ -1737,6 +1737,7 @@ defaults:
         )
         .expect("manifest can be written");
         fs::write(site.join("asset.txt"), "identity-v1").expect("identity can be written");
+        fs::write(site.join("copy.txt"), "identity-v1").expect("copy can be written");
         fs::write(site.join("asset.txt.br"), "brotli-v1").expect("Brotli can be written");
         fs::write(site.join("asset.txt.gz"), "gzip-v1").expect("gzip can be written");
         fs::write(site.join("style.css"), "style-identity").expect("CSS can be written");
@@ -1796,6 +1797,10 @@ listeners:
         assert!(identity.ends_with("identity-v1"));
         assert_eq!(raw_header(&identity, "content-type"), "application/x-asset");
         let identity_etag = raw_header(&identity, "etag");
+        assert!(identity_etag.starts_with("\"sha256-"));
+        assert_eq!(identity_etag.len(), "\"sha256-\"".len() + 64);
+        let copy = request(address, "/copy.txt", "").await;
+        assert_eq!(raw_header(&copy, "etag"), identity_etag);
         let identity_modified = raw_header(&identity, "last-modified");
 
         let brotli = request(address, "/asset.txt", "Accept-Encoding: br\r\n").await;
