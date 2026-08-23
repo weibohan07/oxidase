@@ -7,8 +7,21 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
+http.workspace = true
+httpdate.workspace = true
+mime_guess.workspace = true
 oxidase-core = { path = "../oxidase-core" }
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+url.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
-

@@ -28,18 +28,29 @@ Last updated: 2026-08-23
   named and inline Services, resource references, and Router-to-Route lowering.
 - `oxidase check`, symbolic `explain`, deterministic `compile` manifest, and
   declarative `test` commands all use the same compiler and normalized plans.
+- Phase 3 Oxista compiler for strict `.oxsite`, `.oxr`, and `.oxt` sources. Site
+  preparation validates typed inputs, scans once, builds a private/public index,
+  compiles template dependencies, and produces an immutable `SiteSnapshot`.
+- OXR supports Redirect, sibling/relative streaming Asset plans, text, empty,
+  structured JSON, inline templates, and external templates with parameter
+  contracts. OXT supports interpolation, `if/elif/else`, `for/else`, `with`, static
+  `include`, comments, and raw blocks with autoescape and bounded execution.
+- Required `basic-gateway` and `oxista-site` examples compile and their three
+  declarative gateway tests pass. `check` now prepares every Site through the same
+  path that reload will use.
 
 ## Currently runnable
 
-- A v1alpha1 config can be compiled into normalized IR, checked, symbolically
-  executed with a full node/route trace, and tested without opening a socket.
-  Thirty-two workspace tests pass. It is not yet a network gateway because no
-  production leaf adapter exists.
+- A v1alpha1 config and real Oxista site can be fully prepared, executed in memory,
+  explained with a node/route trace, and tested without opening a socket. Forty
+  workspace tests pass. It is not yet a network gateway because no production body
+  adapter exists.
 
 ## Not implemented
 
-- Oxista compiler, listener, production Proxy, and atomic reload. `serve` currently
-  performs compilation and returns an explicit not-implemented error.
+- Listener, production Proxy, and listener-aware atomic reload. `serve` currently
+  performs full configuration and Site preparation, then returns an explicit
+  not-implemented error.
 
 ## Known limitations
 
@@ -52,8 +63,13 @@ Last updated: 2026-08-23
   snapshot containing site assets or connection state.
 - Semantic diagnostics retain file and field path but do not yet recover exact
   scalar lines for every lowering error.
+- OXT `extends`/`block` is explicitly rejected; inheritance is not claimed.
+- Symlinked files are checked against the canonical root, but their alias path is not
+  indexed in this release; directory symlinks are rejected rather than traversed.
+- Asset range and precompressed metadata is compiled, but actual range/content
+  negotiation awaits the HTTP data-plane adapter.
 
 ## Next concrete work
 
-Implement `.oxsite`, `.oxr`, and the initial `.oxt` compiler; build a secure,
-immutable `SiteSnapshot`; and add the required Oxista example site.
+Implement the Hyper HTTP/1.1 listener, root outcome mapping, streaming asset body,
+range/precompressed negotiation, graceful shutdown, and real `oxidase serve`.

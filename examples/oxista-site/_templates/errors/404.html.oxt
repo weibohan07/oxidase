@@ -1,0 +1,7 @@
+---
+oxista: template/v1
+output: html
+autoescape: html
+---
+<!doctype html><title>Not Found</title><h1>Not Found</h1>
+

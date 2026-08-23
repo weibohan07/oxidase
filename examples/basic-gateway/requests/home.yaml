@@ -1,0 +1,5 @@
+method: GET
+scheme: http
+host: example.test
+path: /
+

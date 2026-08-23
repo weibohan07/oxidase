@@ -1,0 +1,101 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://127.0.0.1:3000
+      connect_timeout: 3s
+      response_timeout: 30s
+
+  sites:
+    web:
+      root: ../oxista-site
+      manifest: site.oxsite
+      with:
+        canonical_origin: https://example.test
+
+services:
+  public:
+    type: observe
+    name: public
+    service:
+      type: transform
+      response:
+        headers:
+          set:
+            X-Content-Type-Options: nosniff
+      service:
+        type: route
+        cases:
+          - when:
+              path: /api/<rest:path>
+            service:
+              type: transform
+              request:
+                path: "/{{ bindings.rest }}"
+              service:
+                type: proxy
+                cluster: api
+
+          - when:
+              path: /legacy
+            service:
+              type: redirect
+              status: 308
+              location: /new
+
+        default:
+          type: fallback
+          services:
+            - type: site
+              site: web
+            - type: respond
+              status: 404
+              body:
+                text: Not Found
+
+listeners:
+  - name: public-http
+    bind: 127.0.0.1:7589
+    protocol: http
+    service:
+      ref: public
+
+tests:
+  - name: api rewrite
+    listener: public-http
+    request:
+      method: GET
+      scheme: http
+      host: example.test
+      path: /api/users
+    expect:
+      service: public
+      cluster: api
+      rewritten_path: /users
+
+  - name: site asset
+    listener: public-http
+    request:
+      method: GET
+      scheme: http
+      host: example.test
+      path: /about.html
+    expect:
+      service: public
+      site: web
+      status: 200
+
+  - name: explicit fallback 404
+    listener: public-http
+    request:
+      method: GET
+      scheme: http
+      host: example.test
+      path: /missing
+    expect:
+      service: public
+      status: 404
+

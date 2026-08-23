@@ -1,0 +1,20 @@
+---
+oxista: response/v1
+apply:
+  - html_page
+page:
+  heading: Oxista
+response:
+  status: 200
+  content_type: text/html; charset=utf-8
+  body:
+    template:
+      source: _templates/home.html.oxt
+      with:
+        greeting: "Hello <Oxista>"
+        features:
+          - compiled responses
+          - lexical bindings
+          - streaming assets
+---
+

@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use oxidase_config::{CompiledGateway, Compiler, ExplainRequestSource, TestExpectationSource};
+use oxidase_config::{Compiler, ExplainRequestSource, TestExpectationSource};
 use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, ResponseHead, ServiceOutcome};
-use oxidase_runtime::{BoxLeafFuture, ExecutionReport, Executor, LeafExecutor};
+use oxidase_runtime::{BoxLeafFuture, ExecutionReport, Executor, LeafExecutor, RuntimeSnapshot};
+use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -55,7 +56,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Check { config } => {
-            let gateway = Compiler::compile_path(config)?;
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             println!(
                 "configuration {} is valid: {} listener(s), {} service node(s), {} resource(s)",
                 gateway.config_version,
@@ -70,27 +71,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             request,
             listener,
         } => {
-            let gateway = Compiler::compile_path(config)?;
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             let request = Compiler::parse_request_file(request)?;
             let output = explain(&gateway, listener.as_deref(), &request).await?;
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(())
         }
         Command::Compile { config, output } => {
-            let gateway = Compiler::compile_path(config)?;
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             let manifest = CompilationManifest {
                 format: "oxidase.snapshot-manifest/v1",
-                summary: gateway.summary(),
+                summary: gateway.summary().clone(),
             };
             std::fs::write(output, serde_json::to_vec_pretty(&manifest)?)?;
             Ok(())
         }
         Command::Test { config } => {
-            let gateway = Compiler::compile_path(config)?;
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             run_config_tests(&gateway).await
         }
         Command::Serve { config } => {
-            let _gateway = Compiler::compile_path(config)?;
+            let _gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             Err(
                 "`oxidase serve` requires the HTTP data-plane phase, which is not implemented yet"
                     .into(),
@@ -112,13 +113,15 @@ enum ExplainBody {
         kind: &'static str,
         resource: String,
         request_path: String,
+        symbolic: bool,
     },
 }
 
-#[derive(Default)]
-struct ExplainLeaves;
+struct ExplainLeaves<'a> {
+    snapshot: &'a RuntimeSnapshot,
+}
 
-impl LeafExecutor<(), ExplainBody> for ExplainLeaves {
+impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
     fn body_from_bytes(&self, bytes: Bytes) -> ExplainBody {
         ExplainBody::Bytes(bytes)
     }
@@ -128,15 +131,39 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves {
         resource: &'a ResourceId,
         request: &'a RequestFrame,
     ) -> BoxLeafFuture<'a, ExplainBody> {
+        let snapshot = self.snapshot.resources.sites.get(resource).cloned();
         Box::pin(async move {
-            ServiceOutcome::Handled(ResponseHead::new(
-                StatusCode::OK,
-                ExplainBody::Leaf {
-                    kind: "site",
-                    resource: resource.to_string(),
-                    request_path: request.path_and_query().to_owned(),
-                },
-            ))
+            let Some(snapshot) = snapshot else {
+                return ServiceOutcome::Failed(oxidase_core::ServiceError::new(
+                    oxidase_core::ErrorClass::InvalidState,
+                    format!("prepared site `{resource}` is missing"),
+                ));
+            };
+            match snapshot.execute(request) {
+                Ok(Some(response)) => {
+                    let _body_length = match response.body {
+                        PreparedSiteBody::Empty => 0,
+                        PreparedSiteBody::Bytes(bytes) => bytes.len(),
+                        PreparedSiteBody::Asset(asset) => asset.length as usize,
+                    };
+                    let mut output = ResponseHead::new(
+                        response.status,
+                        ExplainBody::Leaf {
+                            kind: "site",
+                            resource: resource.to_string(),
+                            request_path: request.path_and_query().to_owned(),
+                            symbolic: false,
+                        },
+                    );
+                    output.headers = response.headers;
+                    ServiceOutcome::Handled(output)
+                }
+                Ok(None) => ServiceOutcome::Declined,
+                Err(error) => ServiceOutcome::Failed(oxidase_core::ServiceError::new(
+                    oxidase_core::ErrorClass::SiteIo,
+                    error.to_string(),
+                )),
+            }
         })
     }
 
@@ -153,6 +180,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves {
                     kind: "proxy",
                     resource: resource.to_string(),
                     request_path: request.path_and_query().to_owned(),
+                    symbolic: true,
                 },
             ))
         })
@@ -194,7 +222,7 @@ struct TraceDescription {
 }
 
 async fn explain(
-    gateway: &CompiledGateway,
+    gateway: &RuntimeSnapshot,
     listener_name: Option<&str>,
     request: &ExplainRequestSource,
 ) -> Result<ExplainOutput, Box<dyn Error>> {
@@ -213,7 +241,7 @@ async fn explain(
         .program_for(&listener.name)
         .ok_or("listener root program is unavailable")?;
     let frame = request_frame(request)?;
-    let leaves = ExplainLeaves;
+    let leaves = ExplainLeaves { snapshot: gateway };
     let report = Executor::new(&program, &leaves).execute(frame, None).await;
     Ok(describe_report(gateway, &listener.name, report))
 }
@@ -234,7 +262,7 @@ fn request_frame(source: &ExplainRequestSource) -> Result<RequestFrame, Box<dyn 
 }
 
 fn describe_report(
-    gateway: &CompiledGateway,
+    gateway: &RuntimeSnapshot,
     listener: &str,
     report: ExecutionReport<ExplainBody>,
 ) -> ExplainOutput {
@@ -249,11 +277,12 @@ fn describe_report(
                     kind,
                     resource,
                     request_path,
+                    symbolic,
                 } => BodyDescription::Leaf {
                     service: kind,
                     resource,
                     request_path,
-                    symbolic: true,
+                    symbolic,
                 },
             };
             ("handled", response.status.as_u16(), body)
@@ -289,7 +318,7 @@ fn describe_report(
     }
 }
 
-async fn run_config_tests(gateway: &CompiledGateway) -> Result<(), Box<dyn Error>> {
+async fn run_config_tests(gateway: &RuntimeSnapshot) -> Result<(), Box<dyn Error>> {
     if gateway.tests.is_empty() {
         return Err("configuration contains no declarative tests".into());
     }

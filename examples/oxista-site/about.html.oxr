@@ -1,0 +1,13 @@
+---
+oxista: response/v1
+apply:
+  - html_page
+response:
+  headers:
+    set:
+      Cache-Control: public, max-age=300
+      X-Page-Version: "2"
+  body:
+    asset: sibling
+---
+

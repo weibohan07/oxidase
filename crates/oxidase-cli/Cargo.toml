@@ -17,6 +17,7 @@ http.workspace = true
 oxidase-config = { path = "../oxidase-config" }
 oxidase-core = { path = "../oxidase-core" }
 oxidase-runtime = { path = "../oxidase-runtime" }
+oxidase-site = { path = "../oxidase-site" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

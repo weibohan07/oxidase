@@ -1,0 +1,15 @@
+---
+oxista: response/v1
+response:
+  content_type: application/json
+  body:
+    json:
+      ok: true
+      site_title:
+        $expr: site.title
+      request_path: "{{ request.path }}"
+      links:
+        - /
+        - /about.html
+---
+

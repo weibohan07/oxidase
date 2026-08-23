@@ -1,0 +1,12 @@
+---
+oxista: response/v1
+response:
+  redirect:
+    status: 308
+    location: /new
+    query: preserve
+  headers:
+    set:
+      Cache-Control: public, max-age=86400
+---
+

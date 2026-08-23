@@ -1,0 +1,9 @@
+---
+oxista: template/v1
+output: html
+autoescape: html
+---
+<!doctype html>
+<meta charset="utf-8">
+<nav><a href="/">Home</a> <a href="/about.html">About</a></nav>
+

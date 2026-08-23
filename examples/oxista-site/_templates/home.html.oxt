@@ -1,0 +1,23 @@
+---
+oxista: template/v1
+output: html
+autoescape: html
+params:
+  greeting: string
+  features: list<string>
+---
+{% include "_templates/base.html.oxt" %}
+<html lang="{{ site.language }}">
+  <head><title>{{ site.title }}</title></head>
+  <body>
+    <h1>{{ greeting }}</h1>
+    <ul>
+    {% for feature in features %}
+      <li>{{ feature }}</li>
+    {% else %}
+      <li>No features</li>
+    {% endfor %}
+    </ul>
+  </body>
+</html>
+

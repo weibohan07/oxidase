@@ -1,0 +1,79 @@
+oxista: site/v1
+
+paths:
+  indexes:
+    - index.html
+    - index.htm
+  index_canonical: directory
+  clean_html_urls: false
+  trailing_slash: canonical
+  directory_listing: false
+  missing: decline
+
+visibility:
+  dotfiles: deny
+  underscore_directories: private
+  symlinks: within_root
+  deny:
+    - "**/*.pem"
+    - "**/*.key"
+    - "**/*.secret"
+
+assets:
+  range_requests: true
+  etag: strong
+  last_modified: true
+  precompressed:
+    brotli: .br
+    gzip: .gz
+  mime_overrides:
+    .wasm: application/wasm
+
+templates:
+  roots:
+    - _templates
+  strict_undefined: true
+  default_output: html
+  default_autoescape: html
+  limits:
+    render_time: 25ms
+    output_size: 2MiB
+    loop_iterations: 10000
+    include_depth: 32
+    expression_steps: 100000
+
+inputs:
+  canonical_origin:
+    type: url
+    required: true
+
+data:
+  title: Oxista Example
+  language: zh-CN
+
+defaults:
+  response:
+    headers:
+      set:
+        X-Content-Type-Options: nosniff
+  by_extension:
+    .html:
+      headers:
+        set:
+          Cache-Control: no-cache
+
+profiles:
+  immutable:
+    cache:
+      visibility: public
+      max_age: 365d
+      immutable: true
+  html_page:
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+
+errors:
+  404:
+    template: _templates/errors/404.html.oxt
+
