@@ -190,8 +190,11 @@ Last updated: 2026-08-23
 - The release-mode shared-graph smoke benchmark executed 100,000 short paths through
   a 4,097-node graph in about 171ms on this machine. This is a local regression
   smoke result, not a performance guarantee.
-- Hosted CI is configured but has not run in this work session. Branch-protection
-  settings were not changed or independently verified.
+- Hosted CI run `32653982248` passed all four jobs on the semantic-closure branch,
+  including Ubuntu loopback tests and the stable release build. `main` branch
+  protection was enabled and read back with strict/up-to-date required checks for
+  `MSRV 1.88`, `Stable workspace`, `Dependency policy`, and
+  `Fuzz harness compile smoke`; signed commits and admin enforcement remain off.
 
 ## Next concrete work
 
