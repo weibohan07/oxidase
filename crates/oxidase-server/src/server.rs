@@ -2028,8 +2028,16 @@ resources:
       root: site
 services:
   root:
-    type: site
-    site: web
+    type: recover
+    service:
+      type: site
+      site: web
+    handlers:
+      - classes: [template_limit]
+        service:
+          type: respond
+          body:
+            text: unexpected-limit-recovery
 listeners:
   - name: test
     bind: 127.0.0.1:0
@@ -2051,8 +2059,119 @@ listeners:
         let response = request(address, "/index", "").await;
         assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
         assert!(response.ends_with("Internal Server Error"));
+        assert!(!response.contains("unexpected-limit-recovery"));
         assert!(!response.contains("parameter `count`"));
         assert!(!response.contains("expects int"));
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn recover_catches_only_structured_template_limits() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+templates:
+  roots: [_templates]
+  limits:
+    output_size: 16B
+    loop_iterations: 1
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("_templates/output.oxt"),
+            "---\noxista: template/v1\noutput: text\n---\nthis-output-is-longer-than-sixteen-bytes\n",
+        )
+        .expect("output template can be written");
+        fs::write(
+            site.join("_templates/loop.oxt"),
+            r#"---
+oxista: template/v1
+output: text
+---
+{% for item in page.items %}x{% endfor %}
+"#,
+        )
+        .expect("loop template can be written");
+        fs::write(
+            site.join("output.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/output.oxt
+---
+"#,
+        )
+        .expect("output OXR can be written");
+        fs::write(
+            site.join("loop.oxr"),
+            r#"---
+oxista: response/v1
+page:
+  items: [one, two]
+response:
+  body:
+    template:
+      source: _templates/loop.oxt
+---
+"#,
+        )
+        .expect("loop OXR can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: recover
+    service:
+      type: site
+      site: web
+    handlers:
+      - classes: [template_limit]
+        service:
+          type: respond
+          status: 503
+          body:
+            text: recovered-template-limit
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        for path in ["/output", "/loop"] {
+            let response = request(address, path, "").await;
+            assert!(
+                response.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "{path}: {response}"
+            );
+            assert!(response.ends_with("recovered-template-limit"));
+            assert!(!response.contains("_templates/"));
+        }
 
         running.shutdown().await.expect("gateway shuts down");
     }

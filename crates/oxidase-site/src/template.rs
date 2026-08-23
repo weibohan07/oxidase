@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use oxidase_core::expression::html_escape;
 use oxidase_core::{EvalContext, Expression, Value};
 
-use crate::SiteCompileError;
 use crate::source::{AutoescapeSource, OutputSource, OxtMetadataSource};
+use crate::{SiteCompileError, TemplateArgumentError, TemplateLimitKind, TemplateRenderError};
 
 #[derive(Debug, Clone)]
 pub struct TemplateLimits {
@@ -195,40 +195,42 @@ impl CompiledOxt {
         &self,
         arguments: &BTreeMap<String, CompiledValue>,
         context: &EvalContext,
-    ) -> Result<BTreeMap<String, Value>, String> {
+    ) -> Result<BTreeMap<String, Value>, TemplateArgumentError> {
         let mut values = BTreeMap::new();
         for (name, kind) in &self.params {
             let Some(argument) = arguments.get(name) else {
                 if kind.optional() {
                     continue;
                 }
-                return Err(format!(
-                    "template `{}` is missing required parameter `{name}`",
-                    self.name
-                ));
+                return Err(TemplateArgumentError::Missing {
+                    template: self.name.clone(),
+                    parameter: name.clone(),
+                    expected: kind.describe().to_owned(),
+                });
             };
-            let value = argument.evaluate(context).map_err(|error| {
-                format!(
-                    "template `{}` parameter `{name}` evaluation failed: {error}",
-                    self.name
-                )
+            let value = argument.evaluate(context).map_err(|message| {
+                TemplateArgumentError::Evaluation {
+                    template: self.name.clone(),
+                    parameter: name.clone(),
+                    message,
+                }
             })?;
             if !kind.accepts(&value) {
-                return Err(format!(
-                    "template `{}` parameter `{name}` expects {}, received {}",
-                    self.name,
-                    kind.describe(),
-                    kind.actual_description(&value)
-                ));
+                return Err(TemplateArgumentError::Type {
+                    template: self.name.clone(),
+                    parameter: name.clone(),
+                    expected: kind.describe().to_owned(),
+                    actual: kind.actual_description(&value),
+                });
             }
             values.insert(name.clone(), value);
         }
         for name in arguments.keys() {
             if !self.params.contains_key(name) {
-                return Err(format!(
-                    "template `{}` received unknown parameter `{name}`",
-                    self.name
-                ));
+                return Err(TemplateArgumentError::Unknown {
+                    template: self.name.clone(),
+                    parameter: name.clone(),
+                });
             }
         }
         Ok(values)
@@ -239,7 +241,7 @@ impl CompiledOxt {
         templates: &BTreeMap<String, Self>,
         context: &EvalContext,
         limits: &TemplateLimits,
-    ) -> Result<String, String> {
+    ) -> Result<String, TemplateRenderError> {
         let mut state = RenderState {
             started: Instant::now(),
             output: String::new(),
@@ -593,13 +595,19 @@ fn render_template(
     limits: &TemplateLimits,
     depth: usize,
     state: &mut RenderState,
-) -> Result<(), String> {
+) -> Result<(), TemplateRenderError> {
     if depth > limits.include_depth {
-        return Err("template include depth limit exceeded".to_owned());
+        return Err(TemplateRenderError::Limit {
+            template: template.name.clone(),
+            kind: TemplateLimitKind::IncludeDepth,
+        });
     }
     render_nodes(
         &template.nodes,
-        template.autoescape_html,
+        ActiveTemplate {
+            name: &template.name,
+            autoescape_html: template.autoescape_html,
+        },
         templates,
         context,
         limits,
@@ -608,35 +616,51 @@ fn render_template(
     )
 }
 
+#[derive(Clone, Copy)]
+struct ActiveTemplate<'a> {
+    name: &'a str,
+    autoescape_html: bool,
+}
+
 fn render_nodes(
     nodes: &[TemplateNode],
-    autoescape_html: bool,
+    active: ActiveTemplate<'_>,
     templates: &BTreeMap<String, CompiledOxt>,
     context: &EvalContext,
     limits: &TemplateLimits,
     depth: usize,
     state: &mut RenderState,
-) -> Result<(), String> {
+) -> Result<(), TemplateRenderError> {
     for node in nodes {
-        check_limits(limits, state)?;
+        check_limits(active.name, limits, state)?;
         match node {
-            TemplateNode::Text(value) => push_output(value, limits, state)?,
+            TemplateNode::Text(value) => push_output(active.name, value, limits, state)?,
             TemplateNode::Interpolation(expression) => {
                 state.expression_steps += 1;
-                let value = expression
-                    .evaluate(context)
-                    .map_err(|error| error.to_string())?;
+                let value = expression.evaluate(context).map_err(|error| {
+                    TemplateRenderError::Evaluation {
+                        template: active.name.to_owned(),
+                        expression: expression.source().to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
                 if value.is_null() && limits.strict_undefined {
-                    return Err(format!(
-                        "strict undefined value in expression `{}`",
-                        expression.source()
-                    ));
+                    return Err(TemplateRenderError::MissingValue {
+                        template: active.name.to_owned(),
+                        expression: expression.source().to_owned(),
+                    });
                 }
-                let value = value.render().map_err(str::to_owned)?;
-                if autoescape_html {
-                    push_output(&html_escape(&value), limits, state)?;
+                let value = value
+                    .render()
+                    .map_err(|message| TemplateRenderError::Evaluation {
+                        template: active.name.to_owned(),
+                        expression: expression.source().to_owned(),
+                        message: message.to_owned(),
+                    })?;
+                if active.autoescape_html {
+                    push_output(active.name, &html_escape(&value), limits, state)?;
                 } else {
-                    push_output(&value, limits, state)?;
+                    push_output(active.name, &value, limits, state)?;
                 }
             }
             TemplateNode::If {
@@ -646,39 +670,28 @@ fn render_nodes(
                 let mut rendered = false;
                 for (condition, body) in branches {
                     state.expression_steps += 1;
-                    let value = condition
-                        .evaluate(context)
-                        .map_err(|error| error.to_string())?;
+                    let value = condition.evaluate(context).map_err(|error| {
+                        TemplateRenderError::Evaluation {
+                            template: active.name.to_owned(),
+                            expression: condition.source().to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?;
                     let Some(value) = value.as_bool() else {
-                        return Err(format!(
-                            "if expression `{}` did not return bool",
-                            condition.source()
-                        ));
+                        return Err(TemplateRenderError::Evaluation {
+                            template: active.name.to_owned(),
+                            expression: condition.source().to_owned(),
+                            message: "if condition did not return bool".to_owned(),
+                        });
                     };
                     if value {
-                        render_nodes(
-                            body,
-                            autoescape_html,
-                            templates,
-                            context,
-                            limits,
-                            depth,
-                            state,
-                        )?;
+                        render_nodes(body, active, templates, context, limits, depth, state)?;
                         rendered = true;
                         break;
                     }
                 }
                 if !rendered {
-                    render_nodes(
-                        otherwise,
-                        autoescape_html,
-                        templates,
-                        context,
-                        limits,
-                        depth,
-                        state,
-                    )?;
+                    render_nodes(otherwise, active, templates, context, limits, depth, state)?;
                 }
             }
             TemplateNode::For {
@@ -688,37 +701,31 @@ fn render_nodes(
                 otherwise,
             } => {
                 state.expression_steps += 1;
-                let values = values
-                    .evaluate(context)
-                    .map_err(|error| error.to_string())?;
+                let expression_source = values.source().to_owned();
+                let values =
+                    values
+                        .evaluate(context)
+                        .map_err(|error| TemplateRenderError::Evaluation {
+                            template: active.name.to_owned(),
+                            expression: expression_source.clone(),
+                            message: error.to_string(),
+                        })?;
                 let Value::List(values) = values else {
-                    return Err("for expression must return a list".to_owned());
+                    return Err(TemplateRenderError::Evaluation {
+                        template: active.name.to_owned(),
+                        expression: expression_source,
+                        message: "for expression did not return a list".to_owned(),
+                    });
                 };
                 if values.is_empty() {
-                    render_nodes(
-                        otherwise,
-                        autoescape_html,
-                        templates,
-                        context,
-                        limits,
-                        depth,
-                        state,
-                    )?;
+                    render_nodes(otherwise, active, templates, context, limits, depth, state)?;
                 } else {
                     for value in values {
                         state.iterations += 1;
-                        check_limits(limits, state)?;
+                        check_limits(active.name, limits, state)?;
                         let mut child = context.clone();
                         child.insert(binding, value);
-                        render_nodes(
-                            body,
-                            autoescape_html,
-                            templates,
-                            &child,
-                            limits,
-                            depth,
-                            state,
-                        )?;
+                        render_nodes(body, active, templates, &child, limits, depth, state)?;
                     }
                 }
             }
@@ -728,23 +735,26 @@ fn render_nodes(
                 body,
             } => {
                 state.expression_steps += 1;
-                let value = value.evaluate(context).map_err(|error| error.to_string())?;
+                let value =
+                    value
+                        .evaluate(context)
+                        .map_err(|error| TemplateRenderError::Evaluation {
+                            template: active.name.to_owned(),
+                            expression: value.source().to_owned(),
+                            message: error.to_string(),
+                        })?;
                 let mut child = context.clone();
                 child.insert(binding, value);
-                render_nodes(
-                    body,
-                    autoescape_html,
-                    templates,
-                    &child,
-                    limits,
-                    depth,
-                    state,
-                )?;
+                render_nodes(body, active, templates, &child, limits, depth, state)?;
             }
             TemplateNode::Include(name) => {
-                let template = templates
-                    .get(name)
-                    .ok_or_else(|| format!("compiled include `{name}` is missing"))?;
+                let template =
+                    templates
+                        .get(name)
+                        .ok_or_else(|| TemplateRenderError::MissingValue {
+                            template: active.name.to_owned(),
+                            expression: format!("include {name}"),
+                        })?;
                 render_template(template, templates, context, limits, depth + 1, state)?;
             }
         }
@@ -760,24 +770,41 @@ struct RenderState {
 }
 
 fn push_output(
+    template_name: &str,
     value: &str,
     limits: &TemplateLimits,
     state: &mut RenderState,
-) -> Result<(), String> {
+) -> Result<(), TemplateRenderError> {
     if state.output.len().saturating_add(value.len()) > limits.output_size {
-        return Err("template output size limit exceeded".to_owned());
+        return Err(TemplateRenderError::Limit {
+            template: template_name.to_owned(),
+            kind: TemplateLimitKind::OutputSize,
+        });
     }
     state.output.push_str(value);
     Ok(())
 }
 
-fn check_limits(limits: &TemplateLimits, state: &RenderState) -> Result<(), String> {
+fn check_limits(
+    template_name: &str,
+    limits: &TemplateLimits,
+    state: &RenderState,
+) -> Result<(), TemplateRenderError> {
     if state.started.elapsed() > limits.render_time {
-        Err("template render time limit exceeded".to_owned())
+        Err(TemplateRenderError::Limit {
+            template: template_name.to_owned(),
+            kind: TemplateLimitKind::RenderTime,
+        })
     } else if state.iterations > limits.loop_iterations {
-        Err("template loop iteration limit exceeded".to_owned())
+        Err(TemplateRenderError::Limit {
+            template: template_name.to_owned(),
+            kind: TemplateLimitKind::LoopIterations,
+        })
     } else if state.expression_steps > limits.expression_steps {
-        Err("template expression step limit exceeded".to_owned())
+        Err(TemplateRenderError::Limit {
+            template: template_name.to_owned(),
+            kind: TemplateLimitKind::ExpressionSteps,
+        })
     } else {
         Ok(())
     }
@@ -910,6 +937,7 @@ mod tests {
     use oxidase_core::{EvalContext, Value};
 
     use super::{CompiledOxt, TemplateLimits};
+    use crate::{TemplateLimitKind, TemplateRenderError};
 
     fn limits() -> TemplateLimits {
         TemplateLimits {
@@ -988,19 +1016,25 @@ mod tests {
         )]));
         let mut strict_limits = limits();
         strict_limits.output_size = 6;
-        assert!(
+        assert!(matches!(
             template
                 .render(&BTreeMap::new(), &context, &strict_limits)
-                .expect_err("output must be bounded")
-                .contains("output size")
-        );
+                .expect_err("output must be bounded"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::OutputSize,
+                ..
+            }
+        ));
         strict_limits.output_size = 1024;
         strict_limits.loop_iterations = 1;
-        assert!(
+        assert!(matches!(
             template
                 .render(&BTreeMap::new(), &context, &strict_limits)
-                .expect_err("loop count must be bounded")
-                .contains("loop iteration")
-        );
+                .expect_err("loop count must be bounded"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::LoopIterations,
+                ..
+            }
+        ));
     }
 }

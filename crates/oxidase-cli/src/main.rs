@@ -199,10 +199,17 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                     ServiceOutcome::Handled(output)
                 }
                 Ok(None) => ServiceOutcome::Declined,
-                Err(error) => ServiceOutcome::Failed(oxidase_core::ServiceError::new(
-                    oxidase_core::ErrorClass::SiteIo,
-                    error.to_string(),
-                )),
+                Err(error) => {
+                    let class = if matches!(error, oxidase_site::SiteError::TemplateLimit { .. }) {
+                        oxidase_core::ErrorClass::TemplateLimit
+                    } else {
+                        oxidase_core::ErrorClass::InvalidState
+                    };
+                    ServiceOutcome::Failed(oxidase_core::ServiceError::new(
+                        class,
+                        error.to_string(),
+                    ))
+                }
             }
         })
     }

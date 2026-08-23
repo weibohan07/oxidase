@@ -172,6 +172,9 @@ impl LeafExecutor<Incoming, GatewayBodyPlan> for HyperLeaves {
                         GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
                     ))
                 }
+                Err(error @ SiteError::TemplateLimit { .. }) => ServiceOutcome::Failed(
+                    ServiceError::new(ErrorClass::TemplateLimit, error.to_string()),
+                ),
                 Err(error) => ServiceOutcome::Failed(ServiceError::new(
                     ErrorClass::InvalidState,
                     error.to_string(),

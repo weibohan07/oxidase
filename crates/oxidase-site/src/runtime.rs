@@ -7,8 +7,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use oxidase_core::{CompiledTemplate, EvalContext, RequestFrame, ResourceId, Value};
 use percent_encoding::percent_decode_str;
 
-use crate::SiteError;
 use crate::template::{CompiledOxt, CompiledValue, TemplateLimits};
+use crate::{SiteError, TemplateRenderError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteMissing {
@@ -168,16 +168,21 @@ impl SiteSnapshot {
             return Ok(None);
         }
         if let Some(error_page) = &self.error_404 {
-            let context = self.context(request, &BTreeMap::new(), &BTreeMap::new())?;
+            let context = self.context(
+                request,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &error_page.template,
+            )?;
             let template = self.templates.get(&error_page.template).ok_or_else(|| {
-                SiteError::Template(format!(
-                    "compiled 404 template `{}` is missing",
-                    error_page.template
-                ))
+                SiteError::TemplateRender(TemplateRenderError::MissingValue {
+                    template: error_page.template.clone(),
+                    expression: "compiled 404 template".to_owned(),
+                })
             })?;
             let body = template
                 .render(&self.templates, &context, &self.limits)
-                .map_err(SiteError::Template)?;
+                .map_err(SiteError::from_template_render)?;
             let mut headers = HeaderMap::new();
             apply_headers(&error_page.headers, &context, &mut headers)?;
             headers.insert(
@@ -209,7 +214,8 @@ impl SiteSnapshot {
         request: &RequestFrame,
     ) -> Result<PreparedSiteResponse, SiteError> {
         let mut headers = HeaderMap::new();
-        let base_context = self.context(request, &plan.page, &BTreeMap::new())?;
+        let source_name = plan.source.to_string_lossy();
+        let base_context = self.context(request, &plan.page, &BTreeMap::new(), &source_name)?;
         apply_headers(&plan.headers, &base_context, &mut headers)?;
         let head_only = request.method() == Method::HEAD;
 
@@ -224,9 +230,9 @@ impl SiteSnapshot {
             }
             SiteResponseKind::Empty => (plan.status, PreparedSiteBody::Empty),
             SiteResponseKind::Text(template) => {
-                let body = template
-                    .render(&base_context)
-                    .map_err(|error| SiteError::Template(error.to_string()))?;
+                let body = template.render(&base_context).map_err(|error| {
+                    template_evaluation_error(&source_name, "response.body.text", error.to_string())
+                })?;
                 ensure_content_type(
                     &mut headers,
                     plan.content_type.as_deref(),
@@ -239,9 +245,11 @@ impl SiteSnapshot {
                 (plan.status, PreparedSiteBody::Bytes(Bytes::from(body)))
             }
             SiteResponseKind::Json(value) => {
-                let value = value.evaluate(&base_context).map_err(SiteError::Template)?;
+                let value = value.evaluate(&base_context).map_err(|message| {
+                    template_evaluation_error(&source_name, "response.body.json", message)
+                })?;
                 let body = serde_json::to_vec(&value)
-                    .map_err(|error| SiteError::Template(error.to_string()))?;
+                    .map_err(|error| SiteError::Response(error.to_string()))?;
                 ensure_content_type(
                     &mut headers,
                     plan.content_type.as_deref(),
@@ -255,15 +263,18 @@ impl SiteSnapshot {
             }
             SiteResponseKind::Template { name, arguments } => {
                 let template = self.templates.get(name).ok_or_else(|| {
-                    SiteError::Template(format!("compiled template `{name}` is missing"))
+                    SiteError::TemplateRender(TemplateRenderError::MissingValue {
+                        template: name.clone(),
+                        expression: "compiled template".to_owned(),
+                    })
                 })?;
                 let values = template
                     .evaluate_arguments(arguments, &base_context)
                     .map_err(SiteError::TemplateArgument)?;
-                let context = self.context(request, &plan.page, &values)?;
+                let context = self.context(request, &plan.page, &values, name)?;
                 let body = template
                     .render(&self.templates, &context, &self.limits)
-                    .map_err(SiteError::Template)?;
+                    .map_err(SiteError::from_template_render)?;
                 ensure_content_type(
                     &mut headers,
                     plan.content_type.as_deref(),
@@ -317,6 +328,7 @@ impl SiteSnapshot {
         request: &RequestFrame,
         page: &BTreeMap<String, CompiledValue>,
         arguments: &BTreeMap<String, Value>,
+        source_name: &str,
     ) -> Result<EvalContext, SiteError> {
         let mut context = request.evaluation_context();
         context.insert("site", Value::Map(self.data.clone()));
@@ -324,7 +336,9 @@ impl SiteSnapshot {
         for (name, value) in page {
             page_values.insert(
                 name.clone(),
-                value.evaluate(&context).map_err(SiteError::Template)?,
+                value.evaluate(&context).map_err(|message| {
+                    template_evaluation_error(source_name, &format!("page.{name}"), message)
+                })?,
             );
         }
         context.insert("page", Value::Map(page_values));
@@ -333,6 +347,14 @@ impl SiteSnapshot {
         }
         Ok(context)
     }
+}
+
+fn template_evaluation_error(template: &str, expression: &str, message: String) -> SiteError {
+    SiteError::TemplateRender(TemplateRenderError::Evaluation {
+        template: template.to_owned(),
+        expression: expression.to_owned(),
+        message,
+    })
 }
 
 #[derive(Debug, Clone)]

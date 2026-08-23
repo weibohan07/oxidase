@@ -1572,7 +1572,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{SiteCompiler, compile_deny_pattern};
-    use crate::{PreparedSiteBody, SiteError};
+    use crate::{PreparedSiteBody, SiteError, TemplateArgumentError};
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary site directory is available");
@@ -2605,22 +2605,35 @@ response:
         let error = snapshot
             .execute(&request("/bad-count"))
             .expect_err("wrong dynamic integer must fail at runtime");
-        let SiteError::TemplateArgument(message) = error else {
+        let SiteError::TemplateArgument(TemplateArgumentError::Type {
+            template,
+            parameter,
+            expected,
+            actual,
+        }) = error
+        else {
             panic!("wrong type must be a template argument error");
         };
-        assert!(message.contains("_templates/card.oxt"));
-        assert!(message.contains("parameter `count`"));
-        assert!(message.contains("expects int, received string"));
+        assert_eq!(template, "_templates/card.oxt");
+        assert_eq!(parameter, "count");
+        assert_eq!(expected, "int");
+        assert_eq!(actual, "string");
 
         let error = snapshot
             .execute(&request("/bad-url"))
             .expect_err("relative URL must fail at runtime");
-        let SiteError::TemplateArgument(message) = error else {
+        let SiteError::TemplateArgument(TemplateArgumentError::Type {
+            parameter,
+            expected,
+            actual,
+            ..
+        }) = error
+        else {
             panic!("wrong URL must be a template argument error");
         };
-        assert!(message.contains("parameter `target`"));
-        assert!(message.contains("expects url"));
-        assert!(message.contains("not an absolute URL"));
+        assert_eq!(parameter, "target");
+        assert_eq!(expected, "url");
+        assert_eq!(actual, "string (not an absolute URL)");
 
         let response = snapshot
             .execute(&request("/good"))
