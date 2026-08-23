@@ -1322,6 +1322,49 @@ listeners:
         .expect("response arrives before timeout")
     }
 
+    async fn read_http1_response(stream: &mut tokio::net::TcpStream) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut expected_length = None;
+            let mut chunked = false;
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("response is readable");
+                assert!(read > 0, "connection closed before complete response");
+                response.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = response.windows(4).position(|value| value == b"\r\n\r\n")
+                {
+                    let body_start = header_end + 4;
+                    if expected_length.is_none() && !chunked {
+                        let headers = String::from_utf8_lossy(&response[..header_end]);
+                        expected_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        chunked = headers.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)| {
+                                name.eq_ignore_ascii_case("transfer-encoding")
+                                    && value.trim().eq_ignore_ascii_case("chunked")
+                            })
+                        });
+                    }
+                    if expected_length.is_some_and(|length| response.len() >= body_start + length)
+                        || chunked && response[body_start..].ends_with(b"0\r\n\r\n")
+                    {
+                        return String::from_utf8(response).expect("response is UTF-8");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("complete HTTP/1 response arrives before timeout")
+    }
+
     fn available_address() -> std::net::SocketAddr {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("temporary port can be reserved");
@@ -2631,6 +2674,129 @@ listeners:
         let metrics = request(admin, "/metrics", "").await;
         assert!(metrics.contains("oxidase_active_requests 0"));
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual proxy/reload/fd soak; set OXIDASE_SOAK_ITERATIONS and use --nocapture"]
+    async fn manual_proxy_reload_keepalive_and_cancellation_soak() {
+        let iterations = std::env::var("OXIDASE_SOAK_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100);
+        let (upstream, _, upstream_shutdown, upstream_task) = spawn_upstream().await;
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        fs::write(site.join("site.oxsite"), "oxista: site/v1\n")
+            .expect("site manifest can be written");
+        fs::write(site.join("large.bin"), vec![b'a'; 8 * 1024 * 1024])
+            .expect("large soak asset can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    upstream:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+  sites:
+    files:
+      root: site
+services:
+  root:
+    type: route
+    cases:
+      - when:
+          path: /large.bin
+        service:
+          type: site
+          site: files
+    default:
+      type: proxy
+      cluster: upstream
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("soak gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("soak config compiles"),
+        )
+        .expect("soak snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("soak gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+        let mut keep_alive = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("keep-alive client connects");
+
+        for iteration in 0..iterations {
+            keep_alive
+                .write_all(
+                    format!(
+                        "GET /soak/{iteration} HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("keep-alive request can be written");
+            let response = read_http1_response(&mut keep_alive).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+            if iteration % 10 == 9 {
+                running
+                    .reload_path(&config)
+                    .await
+                    .expect("unchanged soak reload succeeds");
+            }
+            if iteration % 20 == 19 {
+                let mut cancelled = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("cancel client connects");
+                cancelled
+                    .write_all(
+                        b"GET /slow HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .expect("cancel request can be written");
+                drop(cancelled);
+
+                let mut asset_client = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("asset client connects");
+                asset_client
+                    .write_all(
+                        b"GET /large.bin HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .expect("asset request can be written");
+                let _ = read_until_contains(&mut asset_client, "aaaa").await;
+                drop(asset_client);
+            }
+        }
+        drop(keep_alive);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let metrics = request(admin, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_active_requests 0"), "{metrics}");
+        eprintln!("completed {iterations} keep-alive proxy iterations with periodic reload/cancel");
+        running.shutdown().await.expect("soak gateway shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("soak upstream shuts down");
     }
 
     #[tokio::test]
