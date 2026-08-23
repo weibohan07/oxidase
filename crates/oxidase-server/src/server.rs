@@ -1957,6 +1957,16 @@ listeners:
         assert!(second.starts_with("HTTP/1.1 200 OK"));
         assert_eq!(accepts.load(Ordering::Relaxed), 1);
 
+        let head = raw_request(
+            address,
+            "HEAD /second HTTP/1.1\r\nHost: incoming.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&head);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(!headers.to_ascii_lowercase().contains("content-length:"));
+        assert!(body.is_empty());
+
         let timeout = request(address, "/slow", "").await;
         assert!(timeout.starts_with("HTTP/1.1 504 Gateway Timeout"));
         assert!(timeout.ends_with("Gateway Timeout"));

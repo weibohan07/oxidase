@@ -122,15 +122,10 @@ impl ProxyClient {
         };
         let (mut parts, body) = response.into_parts();
         remove_hop_by_hop(&mut parts.headers);
-        let representation_length = parts
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
         parts.headers.remove(header::CONTENT_LENGTH);
         let body = if request.method() == Method::HEAD {
             GatewayBodyPlan::Head {
-                representation_length,
+                representation_length: None,
             }
         } else {
             GatewayBodyPlan::Stream {
