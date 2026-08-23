@@ -20,9 +20,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::body::{GatewayBody, GatewayBodyPlan};
+use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body};
 use crate::leaves::{HyperLeaves, ProxyClient};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ProductionObserver};
 use crate::response::ResponseFinalizer;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -990,7 +990,7 @@ async fn handle_request(
     proxy: Arc<ProxyClient>,
     metrics: Arc<Metrics>,
 ) -> Result<Response<GatewayBody>, Infallible> {
-    let _active_request = metrics.request_started();
+    let active_request = metrics.request_started();
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
     let snapshot = store.pin();
@@ -1008,11 +1008,12 @@ async fn handle_request(
             StatusCode::INTERNAL_SERVER_ERROR,
             started.elapsed(),
         );
-        return Ok(safe_response(
+        let response = safe_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
             request.method(),
-        ));
+        );
+        return Ok(instrument_response_body(response, metrics, active_request));
     };
 
     let (parts, body) = request.into_parts();
@@ -1039,17 +1040,15 @@ async fn handle_request(
         Err(error) => {
             tracing::warn!(request_id, error = %error, "request metadata is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
-            return Ok(safe_response(
-                StatusCode::BAD_REQUEST,
-                "Bad Request",
-                &request_method,
-            ));
+            let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
+            return Ok(instrument_response_body(response, metrics, active_request));
         }
     };
     metadata.peer_address = Some(peer_address);
     let leaves = HyperLeaves::new(snapshot.clone(), proxy);
+    let observer = ProductionObserver::new(&metrics, &config_version, &listener_name, request_id);
     let report = Executor::new(&program, &leaves)
-        .execute(RequestFrame::new(metadata), Some(body))
+        .execute_observed(RequestFrame::new(metadata), Some(body), &observer)
         .await;
 
     let (outcome, status, response) = match report.outcome {
@@ -1096,7 +1095,7 @@ async fn handle_request(
         "request complete"
     );
     metrics.record_request(outcome, status, started.elapsed());
-    Ok(response)
+    Ok(instrument_response_body(response, metrics, active_request))
 }
 
 fn response_from_head(
@@ -1408,11 +1407,16 @@ services:
       status: 404
       body:
         text: missing
+  observed:
+    type: observe
+    name: public
+    service:
+      ref: root
 listeners:
   - name: test
     bind: 127.0.0.1:0
     service:
-      ref: root
+      ref: observed
 "#,
         )
         .expect("config can be written");
@@ -1444,6 +1448,16 @@ listeners:
         let metrics = request(admin_address, "/metrics", "").await;
         assert!(metrics.contains("oxidase_requests_total 3"));
         assert!(metrics.contains("oxidase_request_outcomes_total{outcome=\"handled\"} 3"));
+        assert!(
+            metrics.contains("oxidase_observe_total{observe=\"public\",outcome=\"handled\"} 3")
+        );
+        assert!(metrics.contains(
+            "oxidase_observe_response_head_duration_seconds_bucket{observe=\"public\",le=\"+Inf\"} 3"
+        ));
+        assert!(
+            metrics.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 3"),
+            "{metrics}"
+        );
         running.shutdown().await.expect("server shuts down cleanly");
     }
 
