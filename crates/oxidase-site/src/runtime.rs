@@ -132,7 +132,13 @@ pub struct SiteSnapshot {
     pub limits: TemplateLimits,
     pub(crate) templates: BTreeMap<String, CompiledOxt>,
     pub(crate) entries: BTreeMap<String, SiteResponsePlan>,
-    pub(crate) error_404_template: Option<String>,
+    pub(crate) error_404: Option<ErrorPagePlan>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ErrorPagePlan {
+    pub template: String,
+    pub headers: HeaderPlan,
 }
 
 impl SiteSnapshot {
@@ -161,18 +167,22 @@ impl SiteSnapshot {
         if self.missing == SiteMissing::Decline {
             return Ok(None);
         }
-        if let Some(template) = &self.error_404_template {
+        if let Some(error_page) = &self.error_404 {
             let context = self.context(request, &BTreeMap::new(), &BTreeMap::new())?;
-            let template = self.templates.get(template).ok_or_else(|| {
-                SiteError::Template(format!("compiled 404 template `{template}` is missing"))
+            let template = self.templates.get(&error_page.template).ok_or_else(|| {
+                SiteError::Template(format!(
+                    "compiled 404 template `{}` is missing",
+                    error_page.template
+                ))
             })?;
             let body = template
                 .render(&self.templates, &context, &self.limits)
                 .map_err(SiteError::Template)?;
             let mut headers = HeaderMap::new();
+            apply_headers(&error_page.headers, &context, &mut headers)?;
             headers.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
+                HeaderValue::from_static(template.content_type()),
             );
             headers.insert(
                 header::CONTENT_LENGTH,

@@ -105,7 +105,14 @@ impl SiteCompiler {
             track_site_dependency(dependencies, path, &root);
         }
         track_precompressed_candidates(&files, &source, &root, dependencies);
-        let mut templates = compile_templates(&root, &files, &template_roots, dependencies)?;
+        let mut templates = compile_templates(
+            &root,
+            &files,
+            &template_roots,
+            source.templates.default_output,
+            source.templates.default_autoescape,
+            dependencies,
+        )?;
         track_template_dependencies(&root, &templates, dependencies);
         validate_template_graph(&templates)?;
 
@@ -165,19 +172,29 @@ impl SiteCompiler {
         }
         validate_template_graph(&templates)?;
 
-        let error_404_template = source
+        let error_404 = source
             .errors
             .get(&404)
-            .map(|error| normalize_template_name(&error.template))
+            .map(|error| {
+                let name = normalize_template_name(&error.template)?;
+                track_site_dependency(dependencies, &root.join(&name), &root);
+                let template = templates.get(&name).ok_or_else(|| {
+                    SiteCompileError::source(
+                        &manifest,
+                        format!("404 error template `{name}` does not exist"),
+                    )
+                })?;
+                template.validate_arguments(&BTreeMap::new())?;
+                Ok(crate::runtime::ErrorPagePlan {
+                    template: name,
+                    headers: compile_response_policy(
+                        &source.defaults.response,
+                        &manifest,
+                        "defaults.response",
+                    )?,
+                })
+            })
             .transpose()?;
-        if let Some(name) = &error_404_template
-            && !templates.contains_key(name)
-        {
-            return Err(SiteCompileError::source(
-                &manifest,
-                format!("404 error template `{name}` does not exist"),
-            ));
-        }
 
         dependencies.sort();
         dependencies.dedup();
@@ -194,7 +211,7 @@ impl SiteCompiler {
             limits,
             templates,
             entries,
-            error_404_template,
+            error_404,
         })
     }
 }
@@ -520,6 +537,8 @@ fn compile_templates(
     root: &Path,
     files: &[PathBuf],
     template_roots: &[PathBuf],
+    default_output: OutputSource,
+    default_autoescape: Option<crate::source::AutoescapeSource>,
     dependencies: &mut Vec<PathBuf>,
 ) -> Result<BTreeMap<String, CompiledOxt>, SiteCompileError> {
     let mut templates = BTreeMap::new();
@@ -550,7 +569,13 @@ fn compile_templates(
                 format!("expected `oxista: {TEMPLATE_API_VERSION}`"),
             ));
         }
-        let template = CompiledOxt::compile(name.clone(), &metadata, body)?;
+        let template = CompiledOxt::compile(
+            name.clone(),
+            &metadata,
+            body,
+            default_output,
+            default_autoescape,
+        )?;
         if templates.insert(name.clone(), template).is_some() {
             return Err(SiteCompileError::source(
                 path,
@@ -1985,6 +2010,7 @@ response:
 templates:
   roots: [_templates]
   default_output: text
+  default_autoescape: none
 "#,
         )
         .expect("manifest can be written");
@@ -1992,7 +2018,6 @@ templates:
             root.join("_templates/plain.oxt"),
             r#"---
 oxista: template/v1
-output: text
 params:
   value: string
 ---
@@ -2005,6 +2030,7 @@ params:
             r#"---
 oxista: template/v1
 output: html
+autoescape: html
 params:
   value: string
 ---
@@ -2067,6 +2093,115 @@ response:
             };
             assert_eq!(String::from_utf8_lossy(&body), expected);
         }
+    }
+
+    #[test]
+    fn custom_404_uses_effective_template_settings_and_default_headers() {
+        for (output, autoescape, expected_content_type, expected_body) in [
+            (
+                "text",
+                "none",
+                "text/plain; charset=utf-8",
+                "missing <value>\n",
+            ),
+            (
+                "html",
+                "html",
+                "text/html; charset=utf-8",
+                "missing &lt;value&gt;\n",
+            ),
+        ] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+            fs::write(
+                root.join("site.oxsite"),
+                format!(
+                    r#"oxista: site/v1
+paths:
+  missing: respond
+templates:
+  roots: [_templates]
+  default_output: {output}
+  default_autoescape: {autoescape}
+data:
+  marker: "<value>"
+defaults:
+  response:
+    headers:
+      set:
+        X-Error-Policy: applied
+errors:
+  404:
+    template: _templates/404.oxt
+"#
+                ),
+            )
+            .expect("manifest can be written");
+            fs::write(
+                root.join("_templates/404.oxt"),
+                r#"---
+oxista: template/v1
+---
+missing {{ site.marker }}
+"#,
+            )
+            .expect("404 template can be written");
+            let snapshot = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect("site compiles");
+            let response = snapshot
+                .execute(&request("/missing"))
+                .expect("404 executes")
+                .expect("404 is handled");
+            assert_eq!(response.status, StatusCode::NOT_FOUND);
+            assert_eq!(response.headers["content-type"], expected_content_type);
+            assert_eq!(response.headers["x-error-policy"], "applied");
+            let PreparedSiteBody::Bytes(body) = response.body else {
+                panic!("404 template renders bytes");
+            };
+            assert_eq!(String::from_utf8_lossy(&body), expected_body);
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+paths:
+  missing: respond
+errors:
+  404:
+    template: _templates/404.oxt
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/404.oxt"),
+            r#"---
+oxista: template/v1
+params:
+  reason: string
+---
+{{ reason }}
+"#,
+        )
+        .expect("parameterized 404 template can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("404 with a required parameter is not callable");
+        let message = failure.to_string();
+        assert!(message.contains("_templates/404.oxt"), "{message}");
+        assert!(message.contains("reason"), "{message}");
     }
 
     #[test]

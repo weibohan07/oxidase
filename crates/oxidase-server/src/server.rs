@@ -1550,6 +1550,93 @@ listeners:
     }
 
     #[tokio::test]
+    async fn custom_site_404_preserves_template_metadata_for_head() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+paths:
+  missing: respond
+templates:
+  roots: [_templates]
+  default_output: text
+defaults:
+  response:
+    headers:
+      set:
+        X-Error-Policy: applied
+errors:
+  404:
+    template: _templates/404.oxt
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("_templates/404.oxt"),
+            "---\noxista: template/v1\n---\nnot-found\n",
+        )
+        .expect("404 template can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let get = request(address, "/missing", "").await;
+        assert!(get.starts_with("HTTP/1.1 404 Not Found"));
+        assert_eq!(
+            raw_header(&get, "content-type"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(raw_header(&get, "x-error-policy"), "applied");
+        assert!(get.ends_with("not-found\n"));
+
+        let head = raw_request(
+            address,
+            "HEAD /missing HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&head);
+        assert!(headers.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 10"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-error-policy: applied")
+        );
+        assert!(body.is_empty());
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn streams_asset_and_honors_single_range() {
         let directory = tempdir().expect("temporary directory is available");
         let site = directory.path().join("site");

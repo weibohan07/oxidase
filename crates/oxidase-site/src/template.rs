@@ -32,9 +32,11 @@ impl CompiledOxt {
         name: impl Into<String>,
         metadata: &OxtMetadataSource,
         source: &str,
+        default_output: OutputSource,
+        default_autoescape: Option<AutoescapeSource>,
     ) -> Result<Self, SiteCompileError> {
         let name = name.into();
-        let output = TemplateOutput::from(metadata.output);
+        let output = TemplateOutput::from(metadata.output.unwrap_or(default_output));
         if output == TemplateOutput::Json {
             return Err(SiteCompileError::source(
                 &name,
@@ -55,8 +57,11 @@ impl CompiledOxt {
             params,
             metadata
                 .autoescape
+                .or(default_autoescape)
                 .is_some_and(|value| matches!(value, AutoescapeSource::Html))
-                || metadata.autoescape.is_none() && output == TemplateOutput::Html,
+                || metadata.autoescape.is_none()
+                    && default_autoescape.is_none()
+                    && output == TemplateOutput::Html,
             output,
             source,
         )
