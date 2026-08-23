@@ -6,7 +6,7 @@ mod runtime;
 mod source;
 mod template;
 
-pub use compiler::SiteCompiler;
+pub use compiler::{SiteCompiler, SiteSourceEntry, SiteSourceIndex, SiteSourceKind};
 pub use error::{
     SiteCompileError, SiteCompileFailure, SiteError, TemplateArgumentError, TemplateLimitKind,
     TemplateRenderError,

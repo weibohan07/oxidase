@@ -3,12 +3,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{
-    CompiledTemplate, ContentDigest, ContentHasher, Expression, ResourceId, Value,
-    is_forbidden_user_header,
+    CompiledTemplate, ContentDigest, ContentDigestBuilder, ContentHasher, Expression, ResourceId,
+    Value, is_forbidden_user_header,
 };
 use walkdir::WalkDir;
 
@@ -28,21 +29,134 @@ use crate::{RESPONSE_API_VERSION, SITE_API_VERSION, TEMPLATE_API_VERSION};
 #[derive(Debug, Default)]
 pub struct SiteCompiler;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteSourceKind {
+    Manifest,
+    Response,
+    Template,
+    Asset,
+}
+
+#[derive(Debug, Clone)]
+pub struct SiteSourceEntry {
+    pub source_path: PathBuf,
+    pub canonical_path: PathBuf,
+    pub kind: SiteSourceKind,
+    pub length: u64,
+    pub modified: Option<SystemTime>,
+    pub digest: ContentDigest,
+    text: Option<Arc<str>>,
+}
+
+#[derive(Debug)]
+pub struct SiteSourceIndex {
+    root: PathBuf,
+    manifest: PathBuf,
+    source: ManifestSource,
+    files: Vec<PathBuf>,
+    entries: BTreeMap<PathBuf, SiteSourceEntry>,
+    directories: BTreeSet<PathBuf>,
+    dependencies: Vec<PathBuf>,
+    source_digest: ContentDigest,
+    #[cfg(test)]
+    file_reads: BTreeMap<PathBuf, usize>,
+}
+
+impl SiteSourceIndex {
+    #[must_use]
+    pub const fn source_digest(&self) -> ContentDigest {
+        self.source_digest
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &SiteSourceEntry> {
+        self.files.iter().filter_map(|path| self.entries.get(path))
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &[PathBuf] {
+        &self.dependencies
+    }
+
+    pub fn fingerprint(&self, inputs: &BTreeMap<String, Value>) -> Result<ContentDigest, String> {
+        let mut digest = ContentDigestBuilder::new("oxidase/site/v1");
+        digest.field_digest("source", self.source_digest);
+        digest.field_bytes(
+            "inputs",
+            serde_json::to_vec(inputs)
+                .map_err(|error| format!("cannot fingerprint site inputs: {error}"))?,
+        );
+        Ok(digest.finish())
+    }
+
+    fn text(&self, path: &Path) -> Result<&str, SiteCompileError> {
+        self.indexed_entry(path)
+            .and_then(|entry| entry.text.as_deref())
+            .ok_or_else(|| {
+                SiteCompileError::source(path, "indexed Oxista source text is unavailable")
+            })
+    }
+
+    fn entry(&self, path: &Path) -> Result<&SiteSourceEntry, SiteCompileError> {
+        self.indexed_entry(path).ok_or_else(|| {
+            SiteCompileError::source(
+                path,
+                "file was not present in the prepared Site source index",
+            )
+        })
+    }
+
+    fn indexed_entry(&self, path: &Path) -> Option<&SiteSourceEntry> {
+        self.entries.get(path).or_else(|| {
+            path.canonicalize()
+                .ok()
+                .and_then(|canonical| self.entries.get(&canonical))
+        })
+    }
+
+    #[cfg(test)]
+    fn file_read_count(&self, path: &Path) -> usize {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.file_reads.get(&canonical).copied().unwrap_or(0)
+    }
+}
+
 impl SiteCompiler {
+    pub fn scan(
+        root: impl AsRef<Path>,
+        manifest: impl AsRef<Path>,
+    ) -> Result<SiteSourceIndex, SiteCompileFailure> {
+        let root = root.as_ref().to_path_buf();
+        let manifest = manifest.as_ref().to_path_buf();
+        let mut dependencies = Vec::new();
+        track_candidate(&mut dependencies, &root);
+        track_candidate(&mut dependencies, &manifest);
+        scan_site_source(&root, &manifest, &mut dependencies).map_err(|error| {
+            normalize_paths(&mut dependencies);
+            SiteCompileFailure {
+                error,
+                discovered_dependencies: dependencies,
+            }
+        })
+    }
+
     pub fn compile(
         id: ResourceId,
         root: impl AsRef<Path>,
         manifest: impl AsRef<Path>,
         inputs: BTreeMap<String, Value>,
     ) -> Result<SiteSnapshot, SiteCompileFailure> {
-        let root = root.as_ref().to_path_buf();
-        let manifest = manifest.as_ref().to_path_buf();
-        let mut dependencies = Vec::new();
-        track_candidate(&mut dependencies, &root);
-        track_candidate(&mut dependencies, &manifest);
-        Self::compile_inner(id, &root, &manifest, inputs, &mut dependencies).map_err(|error| {
-            dependencies.sort();
-            dependencies.dedup();
+        let index = Self::scan(root, manifest)?;
+        Self::compile_indexed(id, &index, inputs)
+    }
+
+    pub fn compile_indexed(
+        id: ResourceId,
+        index: &SiteSourceIndex,
+        inputs: BTreeMap<String, Value>,
+    ) -> Result<SiteSnapshot, SiteCompileFailure> {
+        let mut dependencies = index.dependencies.clone();
+        Self::compile_inner(id, index, inputs, &mut dependencies).map_err(|error| {
+            normalize_paths(&mut dependencies);
             SiteCompileFailure {
                 error,
                 discovered_dependencies: dependencies,
@@ -52,39 +166,17 @@ impl SiteCompiler {
 
     fn compile_inner(
         id: ResourceId,
-        root: &Path,
-        manifest: &Path,
+        index: &SiteSourceIndex,
         inputs: BTreeMap<String, Value>,
         dependencies: &mut Vec<PathBuf>,
     ) -> Result<SiteSnapshot, SiteCompileError> {
-        let root = root
-            .canonicalize()
-            .map_err(|error| SiteCompileError::io(root, error))?;
-        track_site_dependency(dependencies, &root, &root);
-        let manifest = manifest
-            .canonicalize()
-            .map_err(|error| SiteCompileError::io(manifest, error))?;
-        track_site_dependency(dependencies, &manifest, &root);
-        if !path_is_within(&manifest, &root) {
-            return Err(SiteCompileError::UnsafePath {
-                path: manifest,
-                message: "manifest escapes the site root".to_owned(),
-            });
-        }
-        let manifest_text = read_text(&manifest)?;
-        let source: ManifestSource = parse_yaml(&manifest, &manifest_text)?;
-        if source.oxista != SITE_API_VERSION {
-            return Err(SiteCompileError::source(
-                &manifest,
-                format!(
-                    "unsupported Oxista version `{}`; expected `{SITE_API_VERSION}`",
-                    source.oxista
-                ),
-            ));
-        }
-        validate_manifest(&manifest, &source, &inputs)?;
-        let deny_patterns = compile_deny_patterns(&manifest, &source.visibility.deny)?;
-        let limits = compile_limits(&manifest, &source)?;
+        let root = &index.root;
+        let manifest = &index.manifest;
+        let source = &index.source;
+        let files = &index.files;
+        validate_manifest(manifest, source, &inputs)?;
+        let deny_patterns = compile_deny_patterns(manifest, &source.visibility.deny)?;
+        let limits = compile_limits(manifest, source)?;
         let mut data = source
             .data
             .iter()
@@ -99,25 +191,17 @@ impl SiteCompiler {
             }
         }
 
-        let template_roots = template_roots(&root, &source)?;
-        let mut files = collect_files(&root, &source, &template_roots, &deny_patterns)?;
-        files.sort();
-        for path in &files {
-            track_site_dependency(dependencies, path, &root);
-        }
-        for path in &template_roots {
-            track_site_dependency(dependencies, path, &root);
-        }
-        track_precompressed_candidates(&files, &source, &root, dependencies);
+        let template_roots = template_roots(root, source)?;
         let mut templates = compile_templates(
-            &root,
-            &files,
+            index,
+            root,
+            files,
             &template_roots,
             source.templates.default_output,
             source.templates.default_autoescape,
             dependencies,
         )?;
-        track_template_dependencies(&root, &templates, dependencies);
+        track_template_dependencies(root, &templates, dependencies);
         validate_template_graph(&templates)?;
 
         let oxr_files = files
@@ -129,50 +213,50 @@ impl SiteCompiler {
         let mut entries = BTreeMap::new();
         for oxr in &oxr_files {
             let relative = oxr
-                .strip_prefix(&root)
+                .strip_prefix(root)
                 .map_err(|_| SiteCompileError::UnsafePath {
                     path: oxr.clone(),
                     message: "OXR escapes the site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
+            if is_private(relative, source, &template_roots, root, &deny_patterns) {
                 continue;
             }
             dependencies.push(oxr.clone());
             let (logical_path, plan, backing) =
-                compile_oxr(&root, oxr, &source, &mut templates, dependencies)?;
+                compile_oxr(index, root, oxr, source, &mut templates, dependencies)?;
             if let Some(backing) = backing {
                 backing_assets.insert(backing);
             }
-            insert_with_index_aliases(&mut entries, logical_path, plan, &source)?;
+            insert_with_index_aliases(&mut entries, logical_path, plan, source)?;
         }
 
-        let precompressed = precompressed_paths(&files, &source);
+        let precompressed = precompressed_paths(files, source);
         for asset in files.iter().filter(|path| {
             !has_source_extension(path)
                 && !backing_assets.contains(*path)
                 && !precompressed.contains(*path)
         }) {
             let relative = asset
-                .strip_prefix(&root)
+                .strip_prefix(root)
                 .map_err(|_| SiteCompileError::UnsafePath {
                     path: asset.clone(),
                     message: "asset is outside the canonical site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
+            if is_private(relative, source, &template_roots, root, &deny_patterns) {
                 continue;
             }
-            let headers = compile_resource_base_policy(relative, &source, asset)?;
+            let headers = compile_resource_base_policy(relative, source, asset)?;
             let logical_path = logical_path(relative);
             let plan = SiteResponsePlan {
                 status: StatusCode::OK,
                 headers,
                 content_type: None,
                 page: BTreeMap::new(),
-                kind: SiteResponseKind::Asset(Box::new(compile_asset(asset, &source)?)),
+                kind: SiteResponseKind::Asset(Box::new(compile_asset(index, asset, source)?)),
                 source: asset.clone(),
             };
-            insert_with_index_aliases(&mut entries, logical_path, plan, &source)?;
-            track_site_dependency(dependencies, asset, &root);
+            insert_with_index_aliases(&mut entries, logical_path, plan, source)?;
+            track_site_dependency(dependencies, asset, root);
         }
         validate_template_graph(&templates)?;
 
@@ -181,10 +265,10 @@ impl SiteCompiler {
             .get(&404)
             .map(|error| {
                 let name = normalize_template_name(&error.template)?;
-                track_site_dependency(dependencies, &root.join(&name), &root);
+                track_site_dependency(dependencies, &root.join(&name), root);
                 let template = templates.get(&name).ok_or_else(|| {
                     SiteCompileError::source(
-                        &manifest,
+                        manifest,
                         format!("404 error template `{name}` does not exist"),
                     )
                 })?;
@@ -193,19 +277,18 @@ impl SiteCompiler {
                     template: name,
                     headers: compile_response_policy(
                         &source.defaults.response,
-                        &manifest,
+                        manifest,
                         "defaults.response",
                     )?,
                 })
             })
             .transpose()?;
 
-        dependencies.sort();
-        dependencies.dedup();
+        normalize_paths(dependencies);
         Ok(SiteSnapshot {
             id,
-            root,
-            manifest,
+            root: root.clone(),
+            manifest: manifest.clone(),
             dependencies: dependencies.clone(),
             missing: match source.paths.missing {
                 MissingSource::Decline => SiteMissing::Decline,
@@ -218,6 +301,226 @@ impl SiteCompiler {
             error_404,
         })
     }
+}
+
+#[derive(Debug)]
+struct CollectedFiles {
+    files: Vec<PathBuf>,
+    symlinks: Vec<(PathBuf, PathBuf)>,
+    directories: BTreeSet<PathBuf>,
+}
+
+fn scan_site_source(
+    root: &Path,
+    manifest: &Path,
+    dependencies: &mut Vec<PathBuf>,
+) -> Result<SiteSourceIndex, SiteCompileError> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| SiteCompileError::io(root, error))?;
+    track_site_dependency(dependencies, &root, &root);
+    let manifest = manifest
+        .canonicalize()
+        .map_err(|error| SiteCompileError::io(manifest, error))?;
+    track_site_dependency(dependencies, &manifest, &root);
+    if !path_is_within(&manifest, &root) {
+        return Err(SiteCompileError::UnsafePath {
+            path: manifest,
+            message: "manifest escapes the site root".to_owned(),
+        });
+    }
+
+    let manifest_entry = read_site_source_entry(&manifest, &manifest, SiteSourceKind::Manifest)?;
+    let manifest_text = manifest_entry
+        .text
+        .as_deref()
+        .expect("manifest entries retain source text");
+    let source: ManifestSource = parse_yaml(&manifest, manifest_text)?;
+    if source.oxista != SITE_API_VERSION {
+        return Err(SiteCompileError::source(
+            &manifest,
+            format!(
+                "unsupported Oxista version `{}`; expected `{SITE_API_VERSION}`",
+                source.oxista
+            ),
+        ));
+    }
+    let deny_patterns = compile_deny_patterns(&manifest, &source.visibility.deny)?;
+    let template_roots = template_roots(&root, &source)?;
+    let collection = collect_files(
+        &root,
+        &source,
+        &template_roots,
+        &deny_patterns,
+        dependencies,
+    )?;
+    let mut files = collection.files;
+    files.sort();
+    files.dedup();
+    for path in &files {
+        track_site_dependency(dependencies, path, &root);
+    }
+    for (link, target) in &collection.symlinks {
+        track_site_dependency(dependencies, link, &root);
+        track_site_dependency(dependencies, target, &root);
+    }
+    for path in &template_roots {
+        track_site_dependency(dependencies, path, &root);
+    }
+    track_precompressed_candidates(&files, &source, &root, dependencies);
+
+    let mut entries = BTreeMap::new();
+    entries.insert(manifest.clone(), manifest_entry);
+    #[cfg(test)]
+    let mut file_reads = BTreeMap::from([(manifest.clone(), 1usize)]);
+    for path in &files {
+        if entries.contains_key(path) {
+            continue;
+        }
+        let entry = read_site_source_entry(path, path, site_source_kind(path, &manifest))?;
+        #[cfg(test)]
+        {
+            *file_reads.entry(path.clone()).or_default() += 1;
+        }
+        entries.insert(path.clone(), entry);
+    }
+    for (link, target) in &collection.symlinks {
+        if let Some(target_entry) = entries.get(target).cloned() {
+            entries.insert(
+                link.clone(),
+                SiteSourceEntry {
+                    source_path: link.clone(),
+                    ..target_entry
+                },
+            );
+        }
+    }
+
+    let mut digest = ContentDigestBuilder::new("oxidase/site-source-index/v1");
+    digest.field_bytes(
+        "manifest",
+        relative_source_name(&manifest, &root).as_bytes(),
+    );
+    digest.field_u64("file_count", files.len() as u64);
+    for path in &files {
+        let entry = entries
+            .get(path)
+            .expect("every collected file has an indexed entry");
+        digest
+            .field_bytes("path", relative_source_name(path, &root).as_bytes())
+            .field_bytes("kind", site_source_kind_name(entry.kind).as_bytes())
+            .field_u64("length", entry.length)
+            .field_digest("content", entry.digest);
+    }
+    let mut symlinks = collection.symlinks;
+    symlinks.sort();
+    for (link, target) in symlinks {
+        digest
+            .field_bytes("symlink", relative_source_name(&link, &root).as_bytes())
+            .field_bytes("target", relative_source_name(&target, &root).as_bytes());
+    }
+    normalize_paths(dependencies);
+
+    Ok(SiteSourceIndex {
+        root,
+        manifest,
+        source,
+        files,
+        entries,
+        directories: collection.directories,
+        dependencies: dependencies.clone(),
+        source_digest: digest.finish(),
+        #[cfg(test)]
+        file_reads,
+    })
+}
+
+fn read_site_source_entry(
+    source_path: &Path,
+    canonical_path: &Path,
+    kind: SiteSourceKind,
+) -> Result<SiteSourceEntry, SiteCompileError> {
+    let metadata = canonical_path
+        .metadata()
+        .map_err(|error| SiteCompileError::io(source_path, error))?;
+    if !metadata.is_file() {
+        return Err(SiteCompileError::source(
+            source_path,
+            "indexed Site source is not a regular file",
+        ));
+    }
+    let mut file =
+        fs::File::open(canonical_path).map_err(|error| SiteCompileError::io(source_path, error))?;
+    let retain_text = kind != SiteSourceKind::Asset;
+    let mut text_bytes = retain_text.then(|| Vec::with_capacity(metadata.len() as usize));
+    let mut hasher = ContentHasher::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| SiteCompileError::io(source_path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        if let Some(text) = &mut text_bytes {
+            text.extend_from_slice(&buffer[..read]);
+        }
+    }
+    let text = text_bytes
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map(Arc::<str>::from)
+                .map_err(|error| {
+                    SiteCompileError::io(
+                        source_path,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(SiteSourceEntry {
+        source_path: source_path.to_path_buf(),
+        canonical_path: canonical_path.to_path_buf(),
+        kind,
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        digest: hasher.finish(),
+        text,
+    })
+}
+
+fn site_source_kind(path: &Path, manifest: &Path) -> SiteSourceKind {
+    if path == manifest || has_extension(path, "oxsite") {
+        SiteSourceKind::Manifest
+    } else if has_extension(path, "oxr") {
+        SiteSourceKind::Response
+    } else if has_extension(path, "oxt") {
+        SiteSourceKind::Template
+    } else {
+        SiteSourceKind::Asset
+    }
+}
+
+const fn site_source_kind_name(kind: SiteSourceKind) -> &'static str {
+    match kind {
+        SiteSourceKind::Manifest => "manifest",
+        SiteSourceKind::Response => "response",
+        SiteSourceKind::Template => "template",
+        SiteSourceKind::Asset => "asset",
+    }
+}
+
+fn relative_source_name(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn normalize_paths(paths: &mut Vec<PathBuf>) {
+    paths.sort();
+    paths.dedup();
 }
 
 fn track_candidate(dependencies: &mut Vec<PathBuf>, path: &Path) {
@@ -559,8 +862,11 @@ fn collect_files(
     source: &ManifestSource,
     template_roots: &[PathBuf],
     deny_patterns: &[DenyPattern],
-) -> Result<Vec<PathBuf>, SiteCompileError> {
+    dependencies: &mut Vec<PathBuf>,
+) -> Result<CollectedFiles, SiteCompileError> {
     let mut files = Vec::new();
+    let mut symlinks = Vec::new();
+    let mut directories = BTreeSet::new();
     let mut entries = WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| {
@@ -572,6 +878,7 @@ fn collect_files(
         if entry.path() == root {
             continue;
         }
+        track_site_dependency(dependencies, entry.path(), root);
         let relative =
             entry
                 .path()
@@ -580,6 +887,9 @@ fn collect_files(
                     path: entry.path().to_path_buf(),
                     message: "site scan escaped the canonical root".to_owned(),
                 })?;
+        if entry.file_type().is_dir() {
+            directories.insert(entry.path().to_path_buf());
+        }
         if entry.file_type().is_dir()
             && !is_template_scan_path(entry.path(), template_roots)
             && denied_by_visibility(relative, source, deny_patterns, true)
@@ -590,12 +900,18 @@ fn collect_files(
         }
         if entry.file_type().is_symlink() {
             let canonical = validate_symlink(entry.path(), source, root)?;
+            track_site_dependency(dependencies, &canonical, root);
+            symlinks.push((entry.path().to_path_buf(), canonical.clone()));
             files.push(canonical);
         } else if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
         }
     }
-    Ok(files)
+    Ok(CollectedFiles {
+        files,
+        symlinks,
+        directories,
+    })
 }
 
 fn is_template_scan_path(path: &Path, template_roots: &[PathBuf]) -> bool {
@@ -669,6 +985,7 @@ fn template_roots(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, 
 }
 
 fn compile_templates(
+    index: &SiteSourceIndex,
     root: &Path,
     files: &[PathBuf],
     template_roots: &[PathBuf],
@@ -695,8 +1012,8 @@ fn compile_templates(
             })?
             .to_string_lossy()
             .replace('\\', "/");
-        let text = read_text(path)?;
-        let (front_matter, body) = split_front_matter(path, &text)?;
+        let text = index.text(path)?;
+        let (front_matter, body) = split_front_matter(path, text)?;
         let metadata: crate::source::OxtMetadataSource = parse_yaml(path, front_matter)?;
         if metadata.oxista != TEMPLATE_API_VERSION {
             return Err(SiteCompileError::source(
@@ -760,14 +1077,15 @@ fn validate_template_graph(
 }
 
 fn compile_oxr(
+    index: &SiteSourceIndex,
     root: &Path,
     path: &Path,
     manifest: &ManifestSource,
     templates: &mut BTreeMap<String, CompiledOxt>,
     dependencies: &mut Vec<PathBuf>,
 ) -> Result<(String, SiteResponsePlan, Option<PathBuf>), SiteCompileError> {
-    let text = read_text(path)?;
-    let (front_matter, inline_body) = split_front_matter(path, &text)?;
+    let text = index.text(path)?;
+    let (front_matter, inline_body) = split_front_matter(path, text)?;
     let source: OxrSource = parse_yaml(path, front_matter)?;
     if source.oxista != RESPONSE_API_VERSION {
         return Err(SiteCompileError::source(
@@ -862,7 +1180,7 @@ fn compile_oxr(
             SiteCompileError::source(path, "OXR response requires `redirect` or `body`")
         })?;
         compile_oxr_body(
-            root,
+            index,
             path,
             body,
             inline_body,
@@ -886,7 +1204,7 @@ fn compile_oxr(
 }
 
 fn compile_oxr_body(
-    root: &Path,
+    index: &SiteSourceIndex,
     oxr: &Path,
     body: &OxrBodySource,
     inline_body: &str,
@@ -894,6 +1212,7 @@ fn compile_oxr_body(
     templates: &mut BTreeMap<String, CompiledOxt>,
     dependencies: &mut Vec<PathBuf>,
 ) -> Result<(SiteResponseKind, Option<PathBuf>), SiteCompileError> {
+    let root = &index.root;
     let selected = usize::from(body.asset.is_some())
         + usize::from(body.template.is_some())
         + usize::from(body.json.is_some())
@@ -934,7 +1253,7 @@ fn compile_oxr_body(
         }
         dependencies.push(asset.clone());
         return Ok((
-            SiteResponseKind::Asset(Box::new(compile_asset(&asset, manifest)?)),
+            SiteResponseKind::Asset(Box::new(compile_asset(index, &asset, manifest)?)),
             Some(asset),
         ));
     }
@@ -1213,7 +1532,11 @@ fn compile_user_header_name(
     Ok(name)
 }
 
-fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, SiteCompileError> {
+fn compile_asset(
+    index: &SiteSourceIndex,
+    path: &Path,
+    source: &ManifestSource,
+) -> Result<AssetPlan, SiteCompileError> {
     let extension = path
         .extension()
         .map(|extension| format!(".{}", extension.to_string_lossy()));
@@ -1227,14 +1550,16 @@ fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, Site
                 .to_string()
         });
     Ok(AssetPlan {
-        identity: compile_representation(path, None, source)?,
+        identity: compile_representation(index, path, None, source)?,
         brotli: compressed_representation(
+            index,
             path,
             source.assets.precompressed.brotli.as_deref(),
             ContentEncoding::Brotli,
             source,
         )?,
         gzip: compressed_representation(
+            index,
             path,
             source.assets.precompressed.gzip.as_deref(),
             ContentEncoding::Gzip,
@@ -1246,40 +1571,34 @@ fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, Site
 }
 
 fn compile_representation(
+    index: &SiteSourceIndex,
     path: &Path,
     encoding: Option<ContentEncoding>,
     source: &ManifestSource,
 ) -> Result<AssetRepresentation, SiteCompileError> {
-    let metadata = path
-        .metadata()
-        .map_err(|error| SiteCompileError::io(path, error))?;
-    if !metadata.is_file() {
-        return Err(SiteCompileError::source(
-            path,
-            "asset representation is not a regular file",
-        ));
-    }
+    let entry = index.entry(path)?;
     let etag = match source.assets.etag {
         EtagSource::None => None,
         EtagSource::Weak | EtagSource::Strong => Some(EntityTag::new(
             matches!(source.assets.etag, EtagSource::Weak),
-            format!("sha256-{}", hash_file(path)?),
+            format!("sha256-{}", entry.digest),
         )),
     };
     Ok(AssetRepresentation {
         encoding,
         path: path.to_path_buf(),
-        length: metadata.len(),
+        length: entry.length,
         etag,
         modified: source
             .assets
             .last_modified
-            .then(|| metadata.modified().ok())
+            .then_some(entry.modified)
             .flatten(),
     })
 }
 
 fn compressed_representation(
+    index: &SiteSourceIndex,
     path: &Path,
     suffix: Option<&str>,
     encoding: ContentEncoding,
@@ -1289,16 +1608,15 @@ fn compressed_representation(
         return Ok(None);
     };
     let candidate = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
-    match candidate.metadata() {
-        Ok(metadata) if metadata.is_file() => {
-            compile_representation(&candidate, Some(encoding), source).map(Some)
-        }
-        Ok(_) => Err(SiteCompileError::source(
+    if index.entries.contains_key(&candidate) {
+        compile_representation(index, &candidate, Some(encoding), source).map(Some)
+    } else if index.directories.contains(&candidate) {
+        Err(SiteCompileError::source(
             candidate,
             "precompressed asset is not a regular file",
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(SiteCompileError::io(candidate, error)),
+        ))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1317,22 +1635,6 @@ fn precompressed_paths(files: &[PathBuf], source: &ManifestSource) -> BTreeSet<P
         })
         .cloned()
         .collect()
-}
-
-fn hash_file(path: &Path) -> Result<ContentDigest, SiteCompileError> {
-    let mut file = fs::File::open(path).map_err(|error| SiteCompileError::io(path, error))?;
-    let mut hash = ContentHasher::new();
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| SiteCompileError::io(path, error))?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(hash.finish())
 }
 
 fn insert_with_index_aliases(
@@ -1472,10 +1774,6 @@ fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some(extension)
 }
 
-fn read_text(path: &Path) -> Result<String, SiteCompileError> {
-    fs::read_to_string(path).map_err(|error| SiteCompileError::io(path, error))
-}
-
 fn split_front_matter<'a>(
     path: &Path,
     source: &'a str,
@@ -1572,7 +1870,7 @@ mod tests {
     use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, Value};
     use tempfile::tempdir;
 
-    use super::{SiteCompiler, compile_deny_pattern};
+    use super::{SiteCompiler, SiteSourceKind, compile_deny_pattern};
     use crate::{PreparedSiteBody, SiteError, TemplateArgumentError};
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -2826,5 +3124,153 @@ params:
         assert!(failure.to_string().contains("template dependency cycle"));
         assert!(failure.to_string().contains("a.oxt"));
         assert!(failure.to_string().contains("b.oxt"));
+    }
+
+    #[test]
+    fn source_index_reads_each_representation_once_and_keeps_large_assets_bounded() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            r#"oxista: site/v1
+assets:
+  precompressed:
+    brotli: .br
+    gzip: .gz
+templates:
+  roots: [_templates]
+"#,
+        )
+        .expect("manifest can be written");
+        let asset = root.join("large.bin");
+        let brotli = root.join("large.bin.br");
+        let gzip = root.join("large.bin.gz");
+        let template = root.join("_templates/page.oxt");
+        fs::write(&asset, vec![0x5a; 2 * 1024 * 1024]).expect("large asset can be written");
+        fs::write(&brotli, b"brotli").expect("Brotli representation can be written");
+        fs::write(&gzip, b"gzip").expect("gzip representation can be written");
+        fs::write(
+            &template,
+            "---\noxista: template/v1\n---\n{{ request.path }}\n",
+        )
+        .expect("template can be written");
+
+        let index = SiteCompiler::scan(&root, &manifest).expect("site source scan succeeds");
+        for path in [&manifest, &asset, &brotli, &gzip, &template] {
+            assert_eq!(index.file_read_count(path), 1, "{}", path.display());
+        }
+        let large = index.entry(&asset).expect("large asset is indexed");
+        assert_eq!(large.kind, SiteSourceKind::Asset);
+        assert_eq!(large.length, 2 * 1024 * 1024);
+        assert!(
+            large.text.is_none(),
+            "large asset bytes must not be retained"
+        );
+        assert!(
+            index
+                .entry(&template)
+                .expect("template is indexed")
+                .text
+                .is_some(),
+            "small Oxista source text is retained for compilation"
+        );
+
+        SiteCompiler::compile_indexed(ResourceId::new("site:web"), &index, BTreeMap::new())
+            .expect("snapshot compiles from the existing index");
+        for path in [&manifest, &asset, &brotli, &gzip, &template] {
+            assert_eq!(
+                index.file_read_count(path),
+                1,
+                "compilation re-read {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn source_index_digest_tracks_source_compressed_and_path_changes() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        let asset = root.join("asset.txt");
+        let compressed = root.join("asset.txt.br");
+        let template = root.join("_templates/page.oxt");
+        fs::write(&asset, "asset").expect("asset can be written");
+        fs::write(&compressed, "compressed-v1").expect("compressed asset can be written");
+        fs::write(&template, "---\noxista: template/v1\n---\nversion one\n")
+            .expect("template can be written");
+        let initial = SiteCompiler::scan(&root, &manifest)
+            .expect("initial scan succeeds")
+            .source_digest();
+        assert_eq!(
+            initial,
+            SiteCompiler::scan(&root, &manifest)
+                .expect("repeat scan succeeds")
+                .source_digest()
+        );
+
+        fs::write(&template, "---\noxista: template/v1\n---\nversion two\n")
+            .expect("template can change");
+        let template_changed = SiteCompiler::scan(&root, &manifest)
+            .expect("changed template scan succeeds")
+            .source_digest();
+        assert_ne!(initial, template_changed);
+
+        fs::write(&compressed, "compressed-v2").expect("compressed asset can change");
+        let compressed_changed = SiteCompiler::scan(&root, &manifest)
+            .expect("changed compressed scan succeeds")
+            .source_digest();
+        assert_ne!(template_changed, compressed_changed);
+
+        let added = root.join("added.txt");
+        fs::write(&added, "added").expect("asset can be added");
+        let added_digest = SiteCompiler::scan(&root, &manifest)
+            .expect("added file scan succeeds")
+            .source_digest();
+        assert_ne!(compressed_changed, added_digest);
+        let renamed = root.join("renamed.txt");
+        fs::rename(&added, &renamed).expect("asset can be renamed");
+        let renamed_digest = SiteCompiler::scan(&root, &manifest)
+            .expect("renamed file scan succeeds")
+            .source_digest();
+        assert_ne!(added_digest, renamed_digest);
+        fs::remove_file(&renamed).expect("asset can be removed");
+        let removed_digest = SiteCompiler::scan(&root, &manifest)
+            .expect("removed file scan succeeds")
+            .source_digest();
+        assert_eq!(compressed_changed, removed_digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_index_digest_tracks_symlink_target_identity() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(&manifest, "oxista: site/v1\n").expect("manifest can be written");
+        fs::write(root.join("a.txt"), "same bytes").expect("first target can be written");
+        fs::write(root.join("b.txt"), "same bytes").expect("second target can be written");
+        let link = root.join("alias.txt");
+        symlink("a.txt", &link).expect("first symlink can be created");
+        let first = SiteCompiler::scan(&root, &manifest)
+            .expect("first symlink scan succeeds")
+            .source_digest();
+        fs::remove_file(&link).expect("first symlink can be removed");
+        symlink("b.txt", &link).expect("second symlink can be created");
+        let second = SiteCompiler::scan(&root, &manifest)
+            .expect("second symlink scan succeeds")
+            .source_digest();
+        assert_ne!(first, second);
     }
 }

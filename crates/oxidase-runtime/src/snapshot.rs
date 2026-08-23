@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::Read;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -9,8 +7,7 @@ use oxidase_config::{
     ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
 };
 use oxidase_core::{
-    ConfigVersion, ContentDigest, ContentDigestBuilder, ContentHasher, ResourceId, ServiceGraph,
-    ServiceProgram,
+    ConfigVersion, ContentDigest, ContentDigestBuilder, ResourceId, ServiceGraph, ServiceProgram,
 };
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
@@ -48,19 +45,18 @@ impl RuntimeSnapshot {
         let mut reuse = ResourceReuse::default();
         let mut dependencies = gateway.dependencies.clone();
         for (id, source) in &gateway.resources.sites {
-            let fingerprint = match site_fingerprint(source) {
-                Ok(fingerprint) => fingerprint,
-                Err(message) => {
-                    let mut candidate_dependencies = dependencies.clone();
-                    candidate_dependencies.extend(discover_site_dependencies(source));
-                    normalize_dependencies(&mut candidate_dependencies);
-                    return Err(PreparationError {
-                        resource: id.clone(),
-                        kind: PreparationErrorKind::Fingerprint(message),
-                        candidate_dependencies,
-                    });
+            let index = SiteCompiler::scan(&source.root, &source.manifest)
+                .map_err(|failure| preparation_error_from_site(id, &dependencies, failure))?;
+            let fingerprint = index.fingerprint(&source.inputs).map_err(|message| {
+                let mut candidate_dependencies = dependencies.clone();
+                candidate_dependencies.extend(index.dependencies().iter().cloned());
+                normalize_dependencies(&mut candidate_dependencies);
+                PreparationError {
+                    resource: id.clone(),
+                    kind: PreparationErrorKind::Fingerprint(message),
+                    candidate_dependencies,
                 }
-            };
+            })?;
             let snapshot = previous
                 .filter(|previous| previous.site_fingerprints.get(id) == Some(&fingerprint))
                 .and_then(|previous| previous.resources.sites.get(id).cloned());
@@ -68,16 +64,14 @@ impl RuntimeSnapshot {
                 reuse.sites += 1;
                 snapshot
             } else {
-                let compiled = SiteCompiler::compile(
-                    id.clone(),
-                    &source.root,
-                    &source.manifest,
-                    source.inputs.clone(),
-                )
-                .map_err(|failure| preparation_error_from_site(id, &dependencies, failure))?;
+                let compiled =
+                    SiteCompiler::compile_indexed(id.clone(), &index, source.inputs.clone())
+                        .map_err(|failure| {
+                            preparation_error_from_site(id, &dependencies, failure)
+                        })?;
                 Arc::new(compiled)
             };
-            dependencies.extend(snapshot.dependencies.iter().cloned());
+            dependencies.extend(index.dependencies().iter().cloned());
             dependencies.extend(site_directories(&snapshot));
             site_fingerprints.insert(id.clone(), fingerprint);
             sites.insert(id.clone(), snapshot);
@@ -184,86 +178,6 @@ fn preparation_error_from_site(
 fn normalize_dependencies(dependencies: &mut Vec<std::path::PathBuf>) {
     dependencies.sort();
     dependencies.dedup();
-}
-
-fn discover_site_dependencies(source: &oxidase_config::SiteSpec) -> Vec<std::path::PathBuf> {
-    let mut dependencies = vec![source.root.clone(), source.manifest.clone()];
-    for path in [&source.root, &source.manifest] {
-        if let Some(parent) = path.parent() {
-            dependencies.push(parent.to_path_buf());
-        }
-    }
-    for entry in walkdir::WalkDir::new(&source.root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        dependencies.push(entry.path().to_path_buf());
-    }
-    normalize_dependencies(&mut dependencies);
-    dependencies
-}
-
-fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<ContentDigest, String> {
-    let mut hash = ContentDigestBuilder::new("oxidase/site-source/v1");
-    hash.field_bytes(
-        "manifest",
-        source
-            .manifest
-            .strip_prefix(&source.root)
-            .unwrap_or(&source.manifest)
-            .to_string_lossy()
-            .replace('\\', "/")
-            .as_bytes(),
-    );
-    hash.field_bytes(
-        "inputs",
-        serde_json::to_vec(&source.inputs)
-            .map_err(|error| format!("cannot fingerprint site inputs: {error}"))?,
-    );
-    let mut entries = walkdir::WalkDir::new(&source.root)
-        .follow_links(false)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("cannot scan site for reuse: {error}"))?;
-    entries.sort_by(|left, right| left.path().cmp(right.path()));
-    for entry in entries {
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(&source.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        hash.field_bytes("path", relative.as_bytes());
-        if entry.file_type().is_file() {
-            hash.field_bytes("kind", b"file");
-            let mut file = fs::File::open(path)
-                .map_err(|error| format!("cannot fingerprint `{}`: {error}", path.display()))?;
-            let mut buffer = [0u8; 16 * 1024];
-            let mut content = ContentHasher::new();
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .map_err(|error| format!("cannot fingerprint `{}`: {error}", path.display()))?;
-                if read == 0 {
-                    break;
-                }
-                content.update(&buffer[..read]);
-            }
-            hash.field_digest("content", content.finish());
-        } else if entry.file_type().is_symlink() {
-            hash.field_bytes("kind", b"symlink");
-            let target = fs::read_link(path).map_err(|error| {
-                format!("cannot fingerprint symlink `{}`: {error}", path.display())
-            })?;
-            hash.field_bytes("target", target.to_string_lossy().as_bytes());
-        } else if entry.file_type().is_dir() {
-            hash.field_bytes("kind", b"directory");
-        } else {
-            hash.field_bytes("kind", b"other");
-        }
-    }
-    Ok(hash.finish())
 }
 
 fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
@@ -437,6 +351,89 @@ listeners:
         assert!(!Arc::ptr_eq(
             &second.resources.sites[&site_id],
             &third.resources.sites[&site_id]
+        ));
+    }
+
+    #[test]
+    fn site_reuse_digest_includes_templates_and_compressed_representations() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+assets:
+  precompressed:
+    brotli: .br
+templates:
+  roots: [_templates]
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(site.join("index.html"), "identity").expect("asset can be written");
+        fs::write(site.join("index.html.br"), "compressed-v1")
+            .expect("compressed asset can be written");
+        fs::write(
+            site.join("_templates/page.oxt"),
+            "---\noxista: template/v1\n---\ntemplate-v1\n",
+        )
+        .expect("template can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("config can be written");
+        let prepare = |previous: Option<&RuntimeSnapshot>| {
+            RuntimeSnapshot::prepare_reusing(
+                Compiler::compile_path(&config).expect("config compiles"),
+                previous,
+            )
+            .expect("snapshot prepares")
+        };
+        let (first, _) = prepare(None);
+        let site_id = ResourceId::new("site:web");
+        let (unchanged, reuse) = prepare(Some(&first));
+        assert_eq!(reuse.sites, 1);
+        assert!(Arc::ptr_eq(
+            &first.resources.sites[&site_id],
+            &unchanged.resources.sites[&site_id]
+        ));
+
+        fs::write(
+            site.join("_templates/page.oxt"),
+            "---\noxista: template/v1\n---\ntemplate-v2\n",
+        )
+        .expect("template can change");
+        let (template_changed, reuse) = prepare(Some(&unchanged));
+        assert_eq!(reuse.sites, 0);
+        assert!(!Arc::ptr_eq(
+            &unchanged.resources.sites[&site_id],
+            &template_changed.resources.sites[&site_id]
+        ));
+
+        fs::write(site.join("index.html.br"), "compressed-v2")
+            .expect("compressed asset can change");
+        let (compressed_changed, reuse) = prepare(Some(&template_changed));
+        assert_eq!(reuse.sites, 0);
+        assert!(!Arc::ptr_eq(
+            &template_changed.resources.sites[&site_id],
+            &compressed_changed.resources.sites[&site_id]
         ));
     }
 }
