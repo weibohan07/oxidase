@@ -4,7 +4,8 @@ mod executor;
 mod snapshot;
 
 pub use executor::{
-    BoxLeafFuture, ExecutionReport, ExecutionTrace, Executor, LeafExecutor, TraceEvent,
+    BoxLeafFuture, ExecutionReport, ExecutionTrace, Executor, ExplainTraceCollector, LeafExecutor,
+    NoopTraceSink, TraceDetail, TraceEvent, TraceSink,
 };
 pub use snapshot::{
     PreparationError, ResourceRegistry, ResourceReuse, RuntimeSnapshot, SnapshotStore,

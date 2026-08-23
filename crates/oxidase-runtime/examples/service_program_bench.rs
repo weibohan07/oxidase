@@ -49,10 +49,23 @@ async fn main() {
             ),
         },
     };
-    let program = ServiceProgram {
-        entry: id.clone(),
-        nodes: BTreeMap::from([(id, node)]),
-    };
+    let mut nodes = BTreeMap::from([(id.clone(), node)]);
+    for index in 0..4_096 {
+        let unused_id = ServiceId::new(format!("bench:unused:{index}"));
+        nodes.insert(
+            unused_id.clone(),
+            ServiceNode {
+                id: unused_id,
+                source: SourceSpan::synthetic("bench.unused"),
+                kind: ServiceKind::Respond {
+                    status: StatusCode::OK,
+                    headers: HeaderTransforms::default(),
+                    body: RespondBody::Empty,
+                },
+            },
+        );
+    }
+    let program = ServiceProgram::from_nodes(id, nodes);
     let request = RequestFrame::new(RequestMetadata::new(
         Method::GET,
         "http",
@@ -72,7 +85,8 @@ async fn main() {
     }
     let elapsed = started.elapsed();
     println!(
-        "executed {iterations} in-memory Service programs in {elapsed:?} ({:.0} programs/s)",
+        "executed {iterations} short paths through one shared {}-node graph in {elapsed:?} ({:.0} programs/s)",
+        program.graph.len(),
         f64::from(iterations) / elapsed.as_secs_f64()
     );
 }

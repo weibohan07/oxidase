@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use oxidase_config::{
     ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
 };
-use oxidase_core::{ConfigVersion, ResourceId, ServiceId, ServiceNode, ServiceProgram};
+use oxidase_core::{ConfigVersion, ResourceId, ServiceGraph, ServiceProgram};
 use oxidase_site::{SiteCompiler, SiteSnapshot};
 
 #[derive(Debug, Clone, Default)]
@@ -21,7 +21,7 @@ pub struct ResourceRegistry {
 pub struct RuntimeSnapshot {
     pub config_version: ConfigVersion,
     pub dependencies: Vec<std::path::PathBuf>,
-    pub nodes: BTreeMap<ServiceId, ServiceNode>,
+    pub graph: Arc<ServiceGraph>,
     pub resources: ResourceRegistry,
     pub listeners: Vec<CompiledListener>,
     pub tests: Vec<ConfigTestSource>,
@@ -112,7 +112,7 @@ impl RuntimeSnapshot {
             Self {
                 config_version,
                 dependencies,
-                nodes: gateway.nodes,
+                graph: gateway.graph,
                 resources: ResourceRegistry { clusters, sites },
                 listeners: gateway.listeners,
                 tests: gateway.tests,
@@ -134,10 +134,7 @@ impl RuntimeSnapshot {
         self.listeners
             .iter()
             .find(|candidate| candidate.id.as_str() == listener || candidate.name == listener)
-            .map(|listener| ServiceProgram {
-                entry: listener.service.clone(),
-                nodes: self.nodes.clone(),
-            })
+            .map(|listener| ServiceProgram::new(listener.service.clone(), Arc::clone(&self.graph)))
     }
 }
 

@@ -69,7 +69,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 "configuration {} is valid: {} listener(s), {} service node(s), {} resource(s)",
                 gateway.config_version,
                 gateway.listeners.len(),
-                gateway.nodes.len(),
+                gateway.graph.len(),
                 gateway.resources.clusters.len() + gateway.resources.sites.len()
             );
             Ok(())
@@ -282,7 +282,9 @@ async fn explain(
         .ok_or("listener root program is unavailable")?;
     let frame = request_frame(request)?;
     let leaves = ExplainLeaves { snapshot: gateway };
-    let report = Executor::new(&program, &leaves).execute(frame, None).await;
+    let report = Executor::new(&program, &leaves)
+        .execute_traced(frame, None)
+        .await;
     Ok(describe_report(gateway, &listener.name, report))
 }
 

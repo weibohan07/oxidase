@@ -3,6 +3,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,8 +11,8 @@ use http::{HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_core::{
     CompiledPattern, CompiledTemplate, ConfigVersion, ErrorClass, Expression, HeaderPredicate,
     HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
-    RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase, RouteId, ServiceId,
-    ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
+    RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase, RouteId, ServiceGraph,
+    ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
 };
 use serde::Serialize;
 use url::Url;
@@ -30,7 +31,7 @@ pub struct CompiledGateway {
     pub source: PathBuf,
     pub config_version: ConfigVersion,
     pub dependencies: Vec<PathBuf>,
-    pub nodes: BTreeMap<ServiceId, ServiceNode>,
+    pub graph: Arc<ServiceGraph>,
     pub resources: CompiledResources,
     pub listeners: Vec<CompiledListener>,
     pub tests: Vec<ConfigTestSource>,
@@ -42,10 +43,7 @@ impl CompiledGateway {
         self.listeners
             .iter()
             .find(|candidate| candidate.id.as_str() == listener || candidate.name == listener)
-            .map(|listener| ServiceProgram {
-                entry: listener.service.clone(),
-                nodes: self.nodes.clone(),
-            })
+            .map(|listener| ServiceProgram::new(listener.service.clone(), Arc::clone(&self.graph)))
     }
 
     #[must_use]
@@ -67,7 +65,7 @@ impl CompiledGateway {
                     service: listener.service.to_string(),
                 })
                 .collect(),
-            services: self.nodes.keys().map(ToString::to_string).collect(),
+            services: self.graph.keys().map(ToString::to_string).collect(),
             clusters: self
                 .resources
                 .clusters
@@ -150,27 +148,24 @@ impl Compiler {
         let mut builder = ProgramBuilder::new(&merged, &resources);
         let listeners = builder.compile_listeners()?;
         builder.compile_all_named()?;
-        let nodes = builder.nodes;
+        let graph = Arc::new(ServiceGraph::new(builder.nodes));
         for listener in &listeners {
-            ServiceProgram {
-                entry: listener.service.clone(),
-                nodes: nodes.clone(),
-            }
-            .validate()
-            .map_err(|error| {
-                CompileError::one(Diagnostic::new(
-                    "service.graph",
-                    error.to_string(),
-                    listener.source.clone(),
-                ))
-            })?;
+            ServiceProgram::new(listener.service.clone(), Arc::clone(&graph))
+                .validate()
+                .map_err(|error| {
+                    CompileError::one(Diagnostic::new(
+                        "service.graph",
+                        error.to_string(),
+                        listener.source.clone(),
+                    ))
+                })?;
         }
 
         Ok(CompiledGateway {
             source: path,
             config_version: ConfigVersion::new(format!("v2-{:016x}", merged.hash)),
             dependencies: merged.dependencies,
-            nodes,
+            graph,
             resources,
             listeners,
             tests: merged
@@ -1332,7 +1327,12 @@ mod tests {
             .iter()
             .find(|candidate| candidate.name == listener)
             .expect("listener exists");
-        match &gateway.nodes[&listener.service].kind {
+        match &gateway
+            .graph
+            .get(&listener.service)
+            .expect("listener entry exists")
+            .kind
+        {
             ServiceKind::Respond {
                 body: RespondBody::Text(body),
                 ..
@@ -1370,7 +1370,11 @@ listeners:
             .program_for("public")
             .expect("listener program exists");
         assert!(matches!(
-            program.nodes[&program.entry].kind,
+            program
+                .graph
+                .get(&program.entry)
+                .expect("entry node exists")
+                .kind,
             ServiceKind::Transform { .. }
         ));
         assert_eq!(gateway.listeners.len(), 1);
@@ -1403,7 +1407,11 @@ listeners:
             .program_for("public")
             .expect("listener program exists");
         assert!(matches!(
-            program.nodes[&program.entry].kind,
+            program
+                .graph
+                .get(&program.entry)
+                .expect("entry node exists")
+                .kind,
             ServiceKind::Route { .. }
         ));
     }
@@ -1542,7 +1550,7 @@ imports:
         let gateway = Compiler::compile_path(directory.path().join("root.yaml"))
             .expect("import graph compiles");
         assert_ne!(gateway.listeners[0].service, gateway.listeners[1].service);
-        assert_eq!(gateway.nodes.len(), 2);
+        assert_eq!(gateway.graph.len(), 2);
         assert_eq!(response_text(&gateway, "a"), "A");
         assert_eq!(response_text(&gateway, "b"), "B");
     }
@@ -1593,7 +1601,12 @@ imports: [a.yaml, b.yaml]
 
         let route = |gateway: &super::CompiledGateway, index: usize| {
             let entry = &gateway.listeners[index].service;
-            let ServiceKind::Route { cases, .. } = &gateway.nodes[entry].kind else {
+            let ServiceKind::Route { cases, .. } = &gateway
+                .graph
+                .get(entry)
+                .expect("listener entry exists")
+                .kind
+            else {
                 panic!("listener entry must be a Route");
             };
             (entry.clone(), cases[0].id.clone(), cases[0].service.clone())
@@ -1603,13 +1616,13 @@ imports: [a.yaml, b.yaml]
         assert_ne!(first_a.0, first_b.0);
         assert_ne!(first_a.1, first_b.1);
         assert_ne!(first_a.2, first_b.2);
-        assert_eq!(first.nodes.len(), 4);
+        assert_eq!(first.graph.len(), 4);
 
         assert_eq!(first_a, route(&second, 0));
         assert_eq!(first_b, route(&second, 1));
         assert_eq!(
-            first.nodes.keys().collect::<Vec<_>>(),
-            second.nodes.keys().collect::<Vec<_>>()
+            first.graph.keys().collect::<Vec<_>>(),
+            second.graph.keys().collect::<Vec<_>>()
         );
         assert_eq!(
             serde_json::to_value(first.summary()).expect("summary serializes"),

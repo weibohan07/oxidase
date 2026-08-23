@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -7,7 +8,7 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use oxidase_core::{
     BodyState, ErrorClass, HeaderTransforms, RequestFrame, RequestTransform, ResourceId,
     RespondBody, ResponseHead, ResponseTransform, RouteId, ServiceError, ServiceId, ServiceKind,
-    ServiceOutcome, ServiceProgram, Value,
+    ServiceOutcome, ServiceProgram, SourceSpan, Value,
 };
 
 pub type BoxLeafFuture<'a, B> = Pin<Box<dyn Future<Output = ServiceOutcome<B>> + Send + 'a>>;
@@ -45,19 +46,89 @@ pub struct TraceEvent {
     pub detail: String,
 }
 
-impl ExecutionTrace {
-    fn push(
+#[derive(Debug, Clone, Copy)]
+pub enum TraceDetail<'a> {
+    Source(&'a SourceSpan),
+    Text(&'a str),
+    Bindings(usize),
+    Service(&'a ServiceId),
+    Recovery {
+        class: ErrorClass,
+        service: &'a ServiceId,
+    },
+    Reentry {
+        target: &'a ServiceId,
+        count: u32,
+        budget: u32,
+    },
+}
+
+impl fmt::Display for TraceDetail<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::Text(text) => formatter.write_str(text),
+            Self::Bindings(count) => write!(formatter, "{count} binding(s)"),
+            Self::Service(service) => service.fmt(formatter),
+            Self::Recovery { class, service } => write!(formatter, "{class:?} -> {service}"),
+            Self::Reentry {
+                target,
+                count,
+                budget,
+            } => write!(formatter, "{target} ({count}/{budget})"),
+        }
+    }
+}
+
+pub trait TraceSink: Send {
+    fn record(
         &mut self,
         service: &ServiceId,
         route: Option<&RouteId>,
         event: &'static str,
-        detail: impl Into<String>,
+        detail: TraceDetail<'_>,
+    );
+}
+
+#[derive(Debug, Default)]
+pub struct NoopTraceSink;
+
+impl TraceSink for NoopTraceSink {
+    fn record(
+        &mut self,
+        _service: &ServiceId,
+        _route: Option<&RouteId>,
+        _event: &'static str,
+        _detail: TraceDetail<'_>,
     ) {
-        self.events.push(TraceEvent {
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ExplainTraceCollector {
+    trace: ExecutionTrace,
+}
+
+impl ExplainTraceCollector {
+    #[must_use]
+    pub fn into_trace(self) -> ExecutionTrace {
+        self.trace
+    }
+}
+
+impl TraceSink for ExplainTraceCollector {
+    fn record(
+        &mut self,
+        service: &ServiceId,
+        route: Option<&RouteId>,
+        event: &'static str,
+        detail: TraceDetail<'_>,
+    ) {
+        self.trace.events.push(TraceEvent {
             service: service.clone(),
             route: route.cloned(),
             event,
-            detail: detail.into(),
+            detail: detail.to_string(),
         });
     }
 }
@@ -93,42 +164,62 @@ where
     pub async fn execute(
         &self,
         request: RequestFrame,
-        mut body: Option<RequestBody>,
+        body: Option<RequestBody>,
     ) -> ExecutionReport<ResponseBody> {
+        let mut trace = NoopTraceSink;
+        self.execute_with_sink(request, body, &mut trace).await
+    }
+
+    pub async fn execute_traced(
+        &self,
+        request: RequestFrame,
+        body: Option<RequestBody>,
+    ) -> ExecutionReport<ResponseBody> {
+        let mut trace = ExplainTraceCollector::default();
+        let mut report = self.execute_with_sink(request, body, &mut trace).await;
+        report.trace = trace.into_trace();
+        report
+    }
+
+    pub async fn execute_with_sink<Sink>(
+        &self,
+        request: RequestFrame,
+        mut body: Option<RequestBody>,
+        trace: &mut Sink,
+    ) -> ExecutionReport<ResponseBody>
+    where
+        Sink: TraceSink,
+    {
         let mut state = ExecutionState::default();
-        let mut trace = ExecutionTrace::default();
         let outcome = self
-            .execute_node(
-                &self.program.entry,
-                request,
-                &mut body,
-                &mut state,
-                &mut trace,
-            )
+            .execute_node(&self.program.entry, request, &mut body, &mut state, trace)
             .await;
         ExecutionReport {
             outcome,
-            trace,
+            trace: ExecutionTrace::default(),
             body_state: state.body_state,
         }
     }
 
-    fn execute_node<'b>(
+    fn execute_node<'b, Sink>(
         &'b self,
         id: &'b ServiceId,
         request: RequestFrame,
         body: &'b mut Option<RequestBody>,
         state: &'b mut ExecutionState,
-        trace: &'b mut ExecutionTrace,
-    ) -> BoxLeafFuture<'b, ResponseBody> {
+        trace: &'b mut Sink,
+    ) -> BoxLeafFuture<'b, ResponseBody>
+    where
+        Sink: TraceSink + 'b,
+    {
         Box::pin(async move {
-            let Some(node) = self.program.nodes.get(id) else {
+            let Some(node) = self.program.graph.get(id) else {
                 return ServiceOutcome::Failed(ServiceError::new(
                     ErrorClass::InvalidState,
                     format!("runtime plan references missing service `{id}`"),
                 ));
             };
-            trace.push(id, None, "enter", node.source.to_string());
+            trace.record(id, None, "enter", TraceDetail::Source(&node.source));
 
             let outcome = match &node.kind {
                 ServiceKind::Respond {
@@ -199,11 +290,16 @@ where
                     }
                 }
                 ServiceKind::Observe { name, service } => {
-                    trace.push(id, None, "observe_start", name);
+                    trace.record(id, None, "observe_start", TraceDetail::Text(name));
                     let outcome = self
                         .execute_node(service, request, body, state, trace)
                         .await;
-                    trace.push(id, None, "observe_finish", outcome.kind());
+                    trace.record(
+                        id,
+                        None,
+                        "observe_finish",
+                        TraceDetail::Text(outcome.kind()),
+                    );
                     outcome
                 }
                 ServiceKind::Timeout { duration, service } => {
@@ -229,11 +325,14 @@ where
                             .iter()
                             .find(|handler| handler.classes.contains(&error.class))
                         {
-                            trace.push(
+                            trace.record(
                                 id,
                                 None,
                                 "recover",
-                                format!("{:?} -> {}", error.class, handler.service),
+                                TraceDetail::Recovery {
+                                    class: error.class,
+                                    service: &handler.service,
+                                },
                             );
                             let mut bindings = BTreeMap::new();
                             bindings.insert(
@@ -264,20 +363,20 @@ where
                     for case in cases {
                         match case.predicate.evaluate(&request) {
                             Ok(Some(bindings)) => {
-                                trace.push(
+                                trace.record(
                                     id,
                                     Some(&case.id),
                                     "route_match",
-                                    format!("{} binding(s)", bindings.len()),
+                                    TraceDetail::Bindings(bindings.len()),
                                 );
                                 selected = Some((case.service.clone(), bindings));
                                 break;
                             }
-                            Ok(None) => trace.push(
+                            Ok(None) => trace.record(
                                 id,
                                 Some(&case.id),
                                 "route_miss",
-                                "predicate did not match",
+                                TraceDetail::Text("predicate did not match"),
                             ),
                             Err(error) => {
                                 return ServiceOutcome::Failed(ServiceError::new(
@@ -297,7 +396,7 @@ where
                         )
                         .await
                     } else if let Some(default) = default {
-                        trace.push(id, None, "route_default", default.to_string());
+                        trace.record(id, None, "route_default", TraceDetail::Service(default));
                         self.execute_node(default, request, body, state, trace)
                             .await
                     } else {
@@ -320,7 +419,7 @@ where
                                     ),
                                 ));
                             }
-                            trace.push(id, None, "fallback_next", service.to_string());
+                            trace.record(id, None, "fallback_next", TraceDetail::Service(service));
                         } else {
                             break;
                         }
@@ -336,13 +435,22 @@ where
                         ))
                     } else {
                         *count += 1;
-                        trace.push(id, None, "reenter", format!("{target} ({count}/{budget})"));
+                        trace.record(
+                            id,
+                            None,
+                            "reenter",
+                            TraceDetail::Reentry {
+                                target,
+                                count: *count,
+                                budget: *budget,
+                            },
+                        );
                         self.execute_node(target, request, body, state, trace).await
                     }
                 }
             };
 
-            trace.push(id, None, "outcome", outcome.kind());
+            trace.record(id, None, "outcome", TraceDetail::Text(outcome.kind()));
             outcome
         })
     }
@@ -513,7 +621,9 @@ struct ExecutionState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
     use std::fs;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     use bytes::Bytes;
@@ -528,6 +638,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{BoxLeafFuture, Executor, LeafExecutor};
+    use crate::RuntimeSnapshot;
 
     #[derive(Default)]
     struct MemoryLeaves {
@@ -605,13 +716,13 @@ mod tests {
     }
 
     fn program(entry: &str, nodes: Vec<ServiceNode>) -> ServiceProgram {
-        ServiceProgram {
-            entry: ServiceId::new(entry),
-            nodes: nodes
+        ServiceProgram::from_nodes(
+            ServiceId::new(entry),
+            nodes
                 .into_iter()
                 .map(|node| (node.id.clone(), node))
                 .collect(),
-        }
+        )
     }
 
     fn text_response(id: &str, status: StatusCode, text: &str) -> ServiceNode {
@@ -891,6 +1002,89 @@ imports: [a.yaml, b.yaml]
                 panic!("listener must handle request");
             };
             assert_eq!(response.body.as_ref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_execution_skips_explain_trace_collection() {
+        let response = text_response("response", StatusCode::OK, "ok");
+        let observe = node(
+            "observe",
+            ServiceKind::Observe {
+                name: "request".to_owned(),
+                service: response.id.clone(),
+            },
+        );
+        let program = program("observe", vec![response, observe]);
+        let leaves = MemoryLeaves::default();
+
+        let report = Executor::new(&program, &leaves)
+            .execute(request("/"), None)
+            .await;
+        assert!(report.trace.events.is_empty());
+
+        let report = Executor::new(&program, &leaves)
+            .execute_traced(request("/"), None)
+            .await;
+        assert!(report.trace.events.len() >= 6);
+        assert!(
+            report
+                .trace
+                .events
+                .iter()
+                .any(|event| event.event == "observe_start" && event.detail == "request")
+        );
+    }
+
+    #[tokio::test]
+    async fn large_snapshot_program_views_share_one_graph() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = directory.path().join("oxidase.yaml");
+        let mut source = String::from(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  entry:
+    type: respond
+    body:
+      text: short
+"#,
+        );
+        for index in 0..1_024 {
+            writeln!(
+                source,
+                "  unused_{index}:\n    type: respond\n    body:\n      text: unused"
+            )
+            .expect("writing to a String cannot fail");
+        }
+        source.push_str(
+            r#"listeners:
+  - name: hot
+    bind: 127.0.0.1:7589
+    service:
+      ref: entry
+"#,
+        );
+        fs::write(&path, source).expect("large fixture can be written");
+        let snapshot =
+            RuntimeSnapshot::prepare(Compiler::compile_path(path).expect("large graph compiles"))
+                .expect("large snapshot prepares");
+        let first = snapshot.program_for("hot").expect("program view exists");
+        assert_eq!(first.graph.len(), 1_025);
+        assert!(Arc::ptr_eq(&snapshot.graph, &first.graph));
+        let leaves = MemoryLeaves::default();
+
+        for _ in 0..32 {
+            let view = snapshot.program_for("hot").expect("program view exists");
+            assert!(Arc::ptr_eq(&first.graph, &view.graph));
+            let report = Executor::new(&view, &leaves)
+                .execute(request("/"), None)
+                .await;
+            let ServiceOutcome::Handled(response) = report.outcome else {
+                panic!("entry service must handle the request");
+            };
+            assert_eq!(response.body, Bytes::from_static(b"short"));
+            assert!(report.trace.events.is_empty());
         }
     }
 }

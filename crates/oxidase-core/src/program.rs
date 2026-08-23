@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -11,20 +12,65 @@ use crate::{
 };
 use crate::{RequestFrame, pattern::PatternError};
 
+#[derive(Debug)]
+pub struct ServiceGraph {
+    nodes: BTreeMap<ServiceId, ServiceNode>,
+}
+
+impl ServiceGraph {
+    #[must_use]
+    pub fn new(nodes: BTreeMap<ServiceId, ServiceNode>) -> Self {
+        Self { nodes }
+    }
+
+    #[must_use]
+    pub fn get(&self, id: &ServiceId) -> Option<&ServiceNode> {
+        self.nodes.get(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ServiceId, &ServiceNode)> {
+        self.nodes.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &ServiceId> {
+        self.nodes.keys()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceProgram {
     pub entry: ServiceId,
-    pub nodes: BTreeMap<ServiceId, ServiceNode>,
+    pub graph: Arc<ServiceGraph>,
 }
 
 impl ServiceProgram {
+    #[must_use]
+    pub fn new(entry: ServiceId, graph: Arc<ServiceGraph>) -> Self {
+        Self { entry, graph }
+    }
+
+    #[must_use]
+    pub fn from_nodes(entry: ServiceId, nodes: BTreeMap<ServiceId, ServiceNode>) -> Self {
+        Self::new(entry, Arc::new(ServiceGraph::new(nodes)))
+    }
+
     pub fn validate(&self) -> Result<(), ServiceProgramError> {
-        if !self.nodes.contains_key(&self.entry) {
+        if self.graph.get(&self.entry).is_none() {
             return Err(ServiceProgramError::MissingService(self.entry.clone()));
         }
-        for (id, node) in &self.nodes {
+        for (id, node) in self.graph.iter() {
             for referenced in node.kind.references() {
-                if !self.nodes.contains_key(referenced) {
+                if self.graph.get(referenced).is_none() {
                     return Err(ServiceProgramError::MissingReference {
                         owner: id.clone(),
                         target: referenced.clone(),
@@ -50,7 +96,7 @@ impl ServiceProgram {
 
         let mut visiting = BTreeSet::new();
         let mut visited = BTreeSet::new();
-        for id in self.nodes.keys() {
+        for id in self.graph.keys() {
             self.visit_acyclic(id, &mut visiting, &mut visited)?;
         }
         Ok(())
@@ -69,7 +115,7 @@ impl ServiceProgram {
             return Err(ServiceProgramError::ReferenceCycle(id.clone()));
         }
         let node = self
-            .nodes
+            .graph
             .get(id)
             .ok_or_else(|| ServiceProgramError::MissingService(id.clone()))?;
         for child in node.kind.non_reenter_references() {
@@ -91,7 +137,7 @@ impl ServiceProgram {
             return Ok(true);
         }
         let node = self
-            .nodes
+            .graph
             .get(id)
             .ok_or_else(|| ServiceProgramError::MissingService(id.clone()))?;
         let consumes = match &node.kind {
@@ -408,10 +454,10 @@ mod tests {
                 services: vec![ServiceId::new("first")],
             },
         );
-        let program = ServiceProgram {
-            entry: ServiceId::new("first"),
-            nodes: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
-        };
+        let program = ServiceProgram::from_nodes(
+            ServiceId::new("first"),
+            BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+        );
         assert!(program.validate().is_err());
     }
 
@@ -432,10 +478,10 @@ mod tests {
                 budget: 2,
             },
         );
-        let program = ServiceProgram {
-            entry: ServiceId::new("again"),
-            nodes: BTreeMap::from([(respond.id.clone(), respond), (reenter.id.clone(), reenter)]),
-        };
+        let program = ServiceProgram::from_nodes(
+            ServiceId::new("again"),
+            BTreeMap::from([(respond.id.clone(), respond), (reenter.id.clone(), reenter)]),
+        );
         assert!(program.validate().is_ok());
     }
 
@@ -461,14 +507,14 @@ mod tests {
                 services: vec![proxy.id.clone(), respond.id.clone()],
             },
         );
-        let program = ServiceProgram {
-            entry: fallback.id.clone(),
-            nodes: BTreeMap::from([
+        let program = ServiceProgram::from_nodes(
+            fallback.id.clone(),
+            BTreeMap::from([
                 (proxy.id.clone(), proxy),
                 (respond.id.clone(), respond),
                 (fallback.id.clone(), fallback),
             ]),
-        };
+        );
         assert!(program.validate().is_err());
     }
 }
