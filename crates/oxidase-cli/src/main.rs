@@ -483,6 +483,8 @@ async fn watch_dependencies_with_timing(
                     continue;
                 }
                 tokio::time::sleep(debounce).await;
+                let dependencies_before = reload.watched_dependencies();
+                let before_attempt = dependency_stamp(&dependencies_before).await;
                 match reload.reload_path(&config).await {
                     Ok(report) => {
                         tracing::info!(
@@ -497,10 +499,19 @@ async fn watch_dependencies_with_timing(
                         tracing::error!(error = %error, "configuration reload rejected; retaining last-known-good snapshot");
                     }
                 }
-                // Record the observed filesystem state even after failure so an
-                // unchanged invalid source does not cause an error loop. A later
-                // edit triggers another full prepare attempt.
-                last = current_dependency_stamp(&reload).await;
+                let dependencies_after = reload.watched_dependencies();
+                let after_attempt = dependency_stamp(&dependencies_after).await;
+                // A dependency discovered by the attempt, or a source changed
+                // while the blocking compiler was running, leaves one latest
+                // dirty state for the next tick. Otherwise this failed/successful
+                // state becomes the baseline and cannot create an error loop.
+                last = if dependencies_before == dependencies_after
+                    && before_attempt == after_attempt
+                {
+                    after_attempt
+                } else {
+                    before_attempt
+                };
             }
         }
     }

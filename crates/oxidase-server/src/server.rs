@@ -17,7 +17,7 @@ use oxidase_core::{RequestFrame, RequestMetadata, ServiceOutcome};
 use oxidase_runtime::{Executor, ResourceReuse, RuntimeSnapshot, SnapshotStore};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::body::{GatewayBody, GatewayBodyPlan};
@@ -162,6 +162,7 @@ impl GatewayServer {
         let reload_dependencies = Arc::new(Mutex::new(ReloadDependencyState::new(
             store.pin().dependencies.clone(),
         )));
+        let compile_gate = Arc::new(Semaphore::new(1));
         let (control, receiver) = mpsc::channel(8);
         let task = tokio::spawn(self.run(receiver));
         RunningServer {
@@ -171,6 +172,11 @@ impl GatewayServer {
                 metrics,
                 control: control.clone(),
                 dependencies: reload_dependencies,
+                compile_gate,
+                #[cfg(test)]
+                preparation_delay: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                preparation_started: Arc::new(tokio::sync::Notify::new()),
             },
             admin_address,
             control,
@@ -322,6 +328,11 @@ pub struct ReloadHandle {
     metrics: Arc<Metrics>,
     control: mpsc::Sender<Control>,
     dependencies: Arc<Mutex<ReloadDependencyState>>,
+    compile_gate: Arc<Semaphore>,
+    #[cfg(test)]
+    preparation_delay: Arc<Mutex<Option<Duration>>>,
+    #[cfg(test)]
+    preparation_started: Arc<tokio::sync::Notify>,
 }
 
 impl ReloadHandle {
@@ -335,17 +346,50 @@ impl ReloadHandle {
     }
 
     async fn reload_path_inner(&self, path: &std::path::Path) -> Result<ReloadReport, ServerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
         let current = self.store.pin();
-        let gateway = match oxidase_config::Compiler::compile_path(path) {
-            Ok(gateway) => gateway,
-            Err(error) => {
-                self.record_attempt_dependencies(error.discovered_dependencies.clone());
-                return Err(ServerError::Reload(error.to_string()));
+        let path = path.to_path_buf();
+        let preparation_delay = self.test_preparation_delay();
+        #[cfg(test)]
+        let preparation_started = Some(self.preparation_started.clone());
+        #[cfg(not(test))]
+        let preparation_started: Option<Arc<tokio::sync::Notify>> = None;
+        let prepared = tokio::task::spawn_blocking(move || {
+            if let Some(started) = preparation_started {
+                started.notify_one();
+            }
+            if let Some(delay) = preparation_delay {
+                std::thread::sleep(delay);
+            }
+            let gateway = match oxidase_config::Compiler::compile_path(path) {
+                Ok(gateway) => gateway,
+                Err(error) => {
+                    return Err((
+                        ServerError::Reload(error.to_string()),
+                        error.discovered_dependencies,
+                    ));
+                }
+            };
+            let attempt_dependencies = candidate_gateway_dependencies(&gateway);
+            match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
+                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies)),
+                Err(error) => Err((ServerError::Reload(error.to_string()), attempt_dependencies)),
+            }
+        })
+        .await
+        .map_err(|error| ServerError::Task(format!("reload compiler worker failed: {error}")))?;
+        let (snapshot, reuse, attempt_dependencies) = match prepared {
+            Ok(prepared) => prepared,
+            Err((error, dependencies)) => {
+                self.record_attempt_dependencies(dependencies);
+                return Err(error);
             }
         };
-        self.record_attempt_dependencies(candidate_gateway_dependencies(&gateway));
-        let (snapshot, reuse) = RuntimeSnapshot::prepare_reusing(gateway, Some(&current))
-            .map_err(|error| ServerError::Reload(error.to_string()))?;
+        self.record_attempt_dependencies(attempt_dependencies);
         let published_dependencies = snapshot.dependencies.clone();
         let (response, received) = oneshot::channel();
         self.control
@@ -386,6 +430,33 @@ impl ReloadHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_published(dependencies);
+    }
+
+    fn test_preparation_delay(&self) -> Option<Duration> {
+        #[cfg(test)]
+        {
+            *self
+                .preparation_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_preparation_delay(&self, delay: Duration) {
+        *self
+            .preparation_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(delay);
+    }
+
+    #[cfg(test)]
+    async fn wait_test_preparation_started(&self) {
+        self.preparation_started.notified().await;
     }
 }
 
@@ -1875,6 +1946,49 @@ listeners:
             .expect("removed listener drains");
         assert_eq!(removed.listeners_removed, vec!["extra"]);
         assert!(request(address, "/", "").await.ends_with("four"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn slow_blocking_preparation_does_not_stall_existing_requests() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "old", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let reload = running.reload_handle();
+        reload.set_test_preparation_delay(Duration::from_millis(300));
+        write_respond_gateway(&config, "new", None);
+
+        let reload_task = tokio::spawn({
+            let reload = reload.clone();
+            let config = config.clone();
+            async move { reload.reload_path(config).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            reload.wait_test_preparation_started(),
+        )
+        .await
+        .expect("blocking preparation starts");
+
+        let response = tokio::time::timeout(Duration::from_millis(100), request(address, "/", ""))
+            .await
+            .expect("existing request is not blocked by preparation");
+        assert!(response.ends_with("old"));
+
+        reload_task
+            .await
+            .expect("reload task joins")
+            .expect("reload commits");
+        assert!(request(address, "/", "").await.ends_with("new"));
         running.shutdown().await.expect("gateway shuts down");
     }
 
