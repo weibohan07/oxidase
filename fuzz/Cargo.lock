@@ -324,6 +324,7 @@ dependencies = [
  "http",
  "indexmap",
  "oxidase-core",
+ "oxidase-source",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -364,6 +365,7 @@ dependencies = [
  "httpdate",
  "mime_guess",
  "oxidase-core",
+ "oxidase-source",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -371,6 +373,15 @@ dependencies = [
  "thiserror",
  "url",
  "walkdir",
+]
+
+[[package]]
+name = "oxidase-source"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "serde",
+ "serde_yaml_ng",
+ "thiserror",
 ]
 
 [[package]]
