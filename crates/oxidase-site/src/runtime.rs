@@ -218,6 +218,15 @@ impl SiteSnapshot {
                     location.push('?');
                     location.push_str(query);
                 }
+                if !location.starts_with('/')
+                    || location.starts_with("//")
+                    || location.contains('\\')
+                    || location.parse::<http::Uri>().is_err()
+                {
+                    return Err(SiteError::Response(
+                        "redirect Location must be a local absolute path".to_owned(),
+                    ));
+                }
                 headers.insert(header::LOCATION, header_value(location)?);
                 (*status, PreparedSiteBody::Empty)
             }
@@ -466,5 +475,24 @@ mod tests {
             normalize_request_path("//docs///index.html").expect("path is safe"),
             "/docs/index.html"
         );
+    }
+
+    #[test]
+    fn generated_paths_never_normalize_to_dot_segments() {
+        const ALPHABET: &[u8] = b"abc./%25\\09";
+        for seed in 0usize..512 {
+            let suffix = (0..(seed % 40))
+                .map(|index| {
+                    ALPHABET[(seed.wrapping_mul(13) + index.wrapping_mul(29)) % ALPHABET.len()]
+                        as char
+                })
+                .collect::<String>();
+            let source = format!("/{suffix}");
+            let result = std::panic::catch_unwind(|| normalize_request_path(&source));
+            assert!(result.is_ok(), "path resolver panicked for {source:?}");
+            if let Ok(Ok(path)) = result {
+                assert!(!path.split('/').any(|segment| matches!(segment, "." | "..")));
+            }
+        }
     }
 }

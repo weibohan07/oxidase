@@ -145,7 +145,7 @@ where
                     let context = request.evaluation_context();
                     match location.render(&context).and_then(|location| {
                         let location = append_query(location, *preserve_query, &request);
-                        HeaderValue::from_str(&location)
+                        validate_redirect_location(&location)
                             .map(|value| (location, value))
                             .map_err(|_| oxidase_core::TemplateError::Render("invalid Location"))
                     }) {
@@ -401,6 +401,14 @@ fn append_query(mut location: String, preserve_query: bool, request: &RequestFra
         location.push_str(query);
     }
     location
+}
+
+fn validate_redirect_location(location: &str) -> Result<HeaderValue, ()> {
+    if !location.starts_with('/') || location.starts_with("//") || location.contains('\\') {
+        return Err(());
+    }
+    location.parse::<http::Uri>().map_err(|_| ())?;
+    HeaderValue::from_str(location).map_err(|_| ())
 }
 
 fn apply_request_transform(
@@ -809,5 +817,27 @@ mod tests {
             panic!("reentry budget must stop the loop");
         };
         assert_eq!(error.class, ErrorClass::InvalidState);
+    }
+
+    #[tokio::test]
+    async fn redirect_rejects_network_path_and_header_injection() {
+        for location in ["//evil.example/path", "/safe\r\nX-Evil: yes"] {
+            let redirect = node(
+                "redirect",
+                ServiceKind::Redirect {
+                    status: StatusCode::TEMPORARY_REDIRECT,
+                    location: CompiledTemplate::compile(location)
+                        .expect("template syntax is valid"),
+                    preserve_query: false,
+                    headers: HeaderTransforms::default(),
+                },
+            );
+            let program = program("redirect", vec![redirect]);
+            let leaves = MemoryLeaves::default();
+            let report = Executor::new(&program, &leaves)
+                .execute(request("/"), None)
+                .await;
+            assert!(matches!(report.outcome, ServiceOutcome::Failed(_)));
+        }
     }
 }

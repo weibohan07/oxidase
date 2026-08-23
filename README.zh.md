@@ -32,8 +32,9 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2 的 Proxy。Asset 使用异步文件流，支持
 单 Range、ETag/Last-Modified 条件请求与预压缩表示选择。
 
-入站 TLS/HTTP/2、管理接口及 OXT `extends/block` 尚未实现。使用 `serve --watch`
-可以启用保留 last-known-good 的原子 reload。准确边界见
+入站 TLS/HTTP/2 及 OXT `extends/block` 尚未实现。使用 `serve --watch` 可以启用
+保留 last-known-good 的原子 reload；通过独立、显式的 `--admin-bind` 可启用健康检查
+与有界指标。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
 ## 运行垂直切片
@@ -45,6 +46,8 @@ cargo run -p oxidase-cli -- explain examples/basic-gateway/oxidase.yaml \
   --request examples/basic-gateway/requests/home.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch
+cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch \
+  --admin-bind 127.0.0.1:7590
 ```
 
 示例覆盖：

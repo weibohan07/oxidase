@@ -10,17 +10,18 @@ members = [
     "crates/oxidase-testkit",
 ]
 default-members = ["crates/oxidase-cli"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.2.0-alpha.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/weibohan07/oxidase"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 arc-swap = "1.7"
-bytes = "1"
+bytes = "1.11.1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 http = "1"

@@ -870,4 +870,37 @@ mod tests {
         assert!(CompiledOxt::inline("bad.oxt", "{% include page.template %}", true).is_err());
         assert!(CompiledOxt::inline("bad.oxt", "{% extends \"base.oxt\" %}", true).is_err());
     }
+
+    #[test]
+    fn enforces_output_and_loop_limits() {
+        let template = CompiledOxt::inline(
+            "bounded.oxt",
+            "{% for item in page.items %}{{ item }}{% endfor %}",
+            false,
+        )
+        .expect("valid bounded template");
+        let context = EvalContext::new(BTreeMap::from([(
+            "page".to_owned(),
+            Value::Map(BTreeMap::from([(
+                "items".to_owned(),
+                Value::List(vec![Value::from("abcd"), Value::from("efgh")]),
+            )])),
+        )]));
+        let mut strict_limits = limits();
+        strict_limits.output_size = 6;
+        assert!(
+            template
+                .render(&BTreeMap::new(), &context, &strict_limits)
+                .expect_err("output must be bounded")
+                .contains("output size")
+        );
+        strict_limits.output_size = 1024;
+        strict_limits.loop_iterations = 1;
+        assert!(
+            template
+                .render(&BTreeMap::new(), &context, &strict_limits)
+                .expect_err("loop count must be bounded")
+                .contains("loop iteration")
+        );
+    }
 }

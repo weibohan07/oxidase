@@ -1,0 +1,24 @@
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

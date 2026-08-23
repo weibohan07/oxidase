@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use bytes::Bytes;
@@ -46,6 +47,9 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         watch: bool,
+        /// Explicit bind for the separate health/metrics listener.
+        #[arg(long)]
+        admin_bind: Option<SocketAddr>,
     },
 }
 
@@ -94,7 +98,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
             run_config_tests(&gateway).await
         }
-        Command::Serve { config, watch } => {
+        Command::Serve {
+            config,
+            watch,
+            admin_bind,
+        } => {
             let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(&config)?)?;
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
@@ -102,9 +110,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                         .unwrap_or_else(|_| "oxidase=info".into()),
                 )
                 .try_init();
-            let server = oxidase_server::GatewayServer::bind(gateway).await?;
+            let mut server = oxidase_server::GatewayServer::bind(gateway).await?;
+            if let Some(admin_bind) = admin_bind {
+                server = server.with_admin_listener(admin_bind).await?;
+            }
             for (name, address) in server.local_addresses() {
                 println!("listener {name} accepting HTTP/1.1 on {address}");
+            }
+            if let Some(address) = server.admin_address() {
+                println!("admin listener accepting HTTP/1.1 on {address}");
             }
             let running = server.spawn();
             let (stop_watcher, watcher_stopped) = tokio::sync::watch::channel(false);

@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
 
-use http::{HeaderName, StatusCode};
+use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value};
 use walkdir::WalkDir;
 
@@ -501,6 +501,16 @@ fn compile_oxr(
                 "redirect status must be 3xx",
             ));
         }
+        if !redirect.location.contains("{{")
+            && (!redirect.location.starts_with('/')
+                || redirect.location.starts_with("//")
+                || redirect.location.contains('\\'))
+        {
+            return Err(SiteCompileError::source(
+                path,
+                "redirect Location must be a local absolute path",
+            ));
+        }
         (
             SiteResponseKind::Redirect {
                 status,
@@ -791,11 +801,23 @@ fn compile_header_map(
     source
         .iter()
         .map(|(name, value)| {
+            let template = CompiledTemplate::compile(value)
+                .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+            if template.is_constant() {
+                let rendered = template
+                    .render(&oxidase_core::EvalContext::default())
+                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+                HeaderValue::from_str(&rendered).map_err(|_| {
+                    SiteCompileError::source(
+                        path,
+                        format!("header `{name}` has an invalid constant value"),
+                    )
+                })?;
+            }
             Ok((
                 HeaderName::from_str(name)
                     .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
-                CompiledTemplate::compile(value)
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
+                template,
             ))
         })
         .collect()

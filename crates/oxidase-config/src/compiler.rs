@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderName, Method, StatusCode};
+use http::{HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_core::{
     CompiledPattern, CompiledTemplate, ConfigVersion, ErrorClass, Expression, HeaderPredicate,
     HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
@@ -715,7 +715,7 @@ impl<'a> ProgramBuilder<'a> {
                 }
                 Ok(ServiceKind::Redirect {
                     status,
-                    location: template(location, file, field_path)?,
+                    location: redirect_template(location, file, field_path)?,
                     preserve_query: matches!(query, RedirectQuerySource::Preserve),
                     headers: compile_headers(headers, file, field_path)?,
                 })
@@ -952,6 +952,22 @@ fn compile_header_values(
     source
         .iter()
         .map(|(name, value)| {
+            let value = template(value, file, field_path)?;
+            if value.is_constant() {
+                let rendered = value
+                    .render(&oxidase_core::EvalContext::default())
+                    .map_err(|error| {
+                        diagnostic_at("service.header_value", error.to_string(), file, field_path)
+                    })?;
+                HeaderValue::from_str(&rendered).map_err(|_| {
+                    diagnostic_at(
+                        "service.header_value",
+                        format!("header `{name}` has an invalid constant value"),
+                        file,
+                        field_path,
+                    )
+                })?;
+            }
             Ok(HeaderTransform {
                 name: HeaderName::from_str(name).map_err(|error| {
                     diagnostic_at(
@@ -961,7 +977,7 @@ fn compile_header_values(
                         field_path,
                     )
                 })?,
-                value: template(value, file, field_path)?,
+                value,
             })
         })
         .collect()
@@ -1048,6 +1064,25 @@ fn compile_predicate(
 fn template(source: &str, file: &Path, field_path: &str) -> Result<CompiledTemplate, CompileError> {
     CompiledTemplate::compile(source)
         .map_err(|error| diagnostic_at("service.template", error.to_string(), file, field_path))
+}
+
+fn redirect_template(
+    source: &str,
+    file: &Path,
+    field_path: &str,
+) -> Result<CompiledTemplate, CompileError> {
+    let template = template(source, file, field_path)?;
+    if template.is_constant()
+        && (!source.starts_with('/') || source.starts_with("//") || source.contains('\\'))
+    {
+        return Err(diagnostic_at(
+            "service.redirect_location",
+            "redirect Location must be a local absolute path",
+            file,
+            field_path,
+        ));
+    }
+    Ok(template)
 }
 
 fn optional_template(

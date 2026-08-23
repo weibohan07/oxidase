@@ -385,4 +385,24 @@ mod tests {
             PatternError::InvalidCaptureName("bad-name".to_owned())
         );
     }
+
+    #[test]
+    fn parser_does_not_panic_for_generated_ascii_inputs() {
+        const ALPHABET: &[u8] = b"abc<>:\\\"()[]{}*+?/-_09";
+        for seed in 0usize..512 {
+            let length = seed % 48;
+            let source = (0..length)
+                .map(|index| {
+                    ALPHABET[(seed.wrapping_mul(31) + index.wrapping_mul(17)) % ALPHABET.len()]
+                        as char
+                })
+                .collect::<String>();
+            let result = std::panic::catch_unwind(|| {
+                let _ = CompiledPattern::compile(&source, PatternContext::Path);
+                let _ = CompiledPattern::compile(&source, PatternContext::Host);
+                let _ = CompiledPattern::compile(&source, PatternContext::Value);
+            });
+            assert!(result.is_ok(), "pattern parser panicked for {source:?}");
+        }
+    }
 }

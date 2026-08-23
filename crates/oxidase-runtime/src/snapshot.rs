@@ -104,6 +104,10 @@ impl RuntimeSnapshot {
         }
         let config_version = ConfigVersion::new(format!("v2-{:016x}", version_hash.finish()));
         summary.config_version = config_version.to_string();
+        summary.dependencies = dependencies
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
         Ok((
             Self {
                 config_version,

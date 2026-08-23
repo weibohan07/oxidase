@@ -1,0 +1,63 @@
+[package]
+name = "oxidase-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxidase-config = { path = "../crates/oxidase-config" }
+oxidase-core = { path = "../crates/oxidase-core" }
+oxidase-site = { path = "../crates/oxidase-site" }
+tempfile = "3"
+
+[[bin]]
+name = "pattern"
+path = "fuzz_targets/pattern.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "expression"
+path = "fuzz_targets/expression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_graph"
+path = "fuzz_targets/import_graph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oxr_front_matter"
+path = "fuzz_targets/oxr_front_matter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oxt_parser"
+path = "fuzz_targets/oxt_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "site_path"
+path = "fuzz_targets/site_path.rs"
+test = false
+doc = false
+bench = false

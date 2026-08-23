@@ -21,14 +21,22 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::body::{GatewayBody, GatewayBodyPlan, full_body};
 use crate::leaves::{HyperLeaves, ProxyClient};
+use crate::metrics::Metrics;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayServer {
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
     listeners: Vec<BoundListener>,
+    admin: Option<BoundAdmin>,
     drain_timeout: Duration,
+}
+
+struct BoundAdmin {
+    listener: TcpListener,
+    local_address: SocketAddr,
 }
 
 struct ActiveListener {
@@ -37,6 +45,11 @@ struct ActiveListener {
     generation: u64,
     shutdown: watch::Sender<bool>,
     accept_stopped: Option<oneshot::Receiver<()>>,
+    task: JoinHandle<()>,
+}
+
+struct ActiveAdmin {
+    shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
 
@@ -93,9 +106,37 @@ impl GatewayServer {
         Ok(Self {
             store: Arc::new(SnapshotStore::new(snapshot)),
             proxy: Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?),
+            metrics: Arc::new(Metrics::default()),
             listeners,
+            admin: None,
             drain_timeout: Duration::from_secs(10),
         })
+    }
+
+    pub async fn with_admin_listener(mut self, bind: SocketAddr) -> Result<Self, ServerError> {
+        let listener = TcpListener::bind(bind)
+            .await
+            .map_err(|source| ServerError::Bind {
+                listener: "@admin".to_owned(),
+                address: bind,
+                source,
+            })?;
+        let local_address = listener
+            .local_addr()
+            .map_err(|source| ServerError::LocalAddress {
+                listener: "@admin".to_owned(),
+                source,
+            })?;
+        self.admin = Some(BoundAdmin {
+            listener,
+            local_address,
+        });
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn admin_address(&self) -> Option<SocketAddr> {
+        self.admin.as_ref().map(|admin| admin.local_address)
     }
 
     #[must_use]
@@ -113,15 +154,19 @@ impl GatewayServer {
 
     pub fn spawn(self) -> RunningServer {
         let addresses = self.local_addresses();
+        let admin_address = self.admin_address();
         let store = self.store.clone();
+        let metrics = self.metrics.clone();
         let (control, receiver) = mpsc::channel(8);
         let task = tokio::spawn(self.run(receiver));
         RunningServer {
             addresses,
             reload: ReloadHandle {
                 store,
+                metrics,
                 control: control.clone(),
             },
+            admin_address,
             control,
             task,
         }
@@ -149,12 +194,21 @@ impl GatewayServer {
                     generation,
                     self.store.clone(),
                     self.proxy.clone(),
+                    self.metrics.clone(),
                     self.drain_timeout,
                     completion_sender.clone(),
                 ),
             );
             generation = generation.saturating_add(1);
         }
+        let mut admin = self.admin.take().map(|admin| {
+            start_admin_listener(
+                admin,
+                self.store.clone(),
+                self.metrics.clone(),
+                self.drain_timeout,
+            )
+        });
 
         loop {
             tokio::select! {
@@ -164,6 +218,7 @@ impl GatewayServer {
                             let environment = ReloadEnvironment {
                                 store: &self.store,
                                 proxy: &self.proxy,
+                                metrics: &self.metrics,
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
                             };
@@ -178,11 +233,13 @@ impl GatewayServer {
                         }
                         Some(Control::Shutdown { response }) => {
                             stop_all_listeners(&mut listeners).await;
+                            stop_admin_listener(&mut admin).await;
                             let _ = response.send(());
                             return Ok(());
                         }
                         None => {
                             stop_all_listeners(&mut listeners).await;
+                            stop_admin_listener(&mut admin).await;
                             return Ok(());
                         }
                     }
@@ -211,6 +268,7 @@ impl GatewayServer {
 
 pub struct RunningServer {
     addresses: Vec<(String, SocketAddr)>,
+    admin_address: Option<SocketAddr>,
     reload: ReloadHandle,
     control: mpsc::Sender<Control>,
     task: JoinHandle<Result<(), ServerError>>,
@@ -220,6 +278,11 @@ impl RunningServer {
     #[must_use]
     pub fn local_addresses(&self) -> &[(String, SocketAddr)] {
         &self.addresses
+    }
+
+    #[must_use]
+    pub const fn admin_address(&self) -> Option<SocketAddr> {
+        self.admin_address
     }
 
     #[must_use]
@@ -250,6 +313,7 @@ impl RunningServer {
 #[derive(Clone)]
 pub struct ReloadHandle {
     store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
     control: mpsc::Sender<Control>,
 }
 
@@ -258,6 +322,12 @@ impl ReloadHandle {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<ReloadReport, ServerError> {
+        let result = self.reload_path_inner(path.as_ref()).await;
+        self.metrics.record_reload(result.is_ok());
+        result
+    }
+
+    async fn reload_path_inner(&self, path: &std::path::Path) -> Result<ReloadReport, ServerError> {
         let current = self.store.pin();
         let gateway = oxidase_config::Compiler::compile_path(path)
             .map_err(|error| ServerError::Reload(error.to_string()))?;
@@ -298,6 +368,7 @@ fn start_listener(
     generation: u64,
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
     drain_timeout: Duration,
     completion: mpsc::UnboundedSender<ListenerCompletion>,
 ) -> ActiveListener {
@@ -312,6 +383,7 @@ fn start_listener(
             listener,
             store,
             proxy,
+            metrics,
             receiver,
             drain_timeout,
             accept_stopped,
@@ -414,6 +486,7 @@ async fn apply_reload(
                 *generation,
                 environment.store.clone(),
                 environment.proxy.clone(),
+                environment.metrics.clone(),
                 environment.drain_timeout,
                 environment.completion.clone(),
             ),
@@ -442,6 +515,7 @@ async fn apply_reload(
 struct ReloadEnvironment<'a> {
     store: &'a Arc<SnapshotStore>,
     proxy: &'a Arc<ProxyClient>,
+    metrics: &'a Arc<Metrics>,
     drain_timeout: Duration,
     completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
 }
@@ -461,10 +535,166 @@ async fn stop_all_listeners(active: &mut BTreeMap<String, ActiveListener>) {
     }
 }
 
+fn start_admin_listener(
+    admin: BoundAdmin,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+    drain_timeout: Duration,
+) -> ActiveAdmin {
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(run_admin_listener(
+        admin,
+        store,
+        metrics,
+        receiver,
+        drain_timeout,
+    ));
+    ActiveAdmin { shutdown, task }
+}
+
+async fn stop_admin_listener(admin: &mut Option<ActiveAdmin>) {
+    if let Some(admin) = admin.take() {
+        let _ = admin.shutdown.send(true);
+        let _ = admin.task.await;
+    }
+}
+
+async fn run_admin_listener(
+    admin: BoundAdmin,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+    drain_timeout: Duration,
+) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = admin.listener.accept() => {
+                let Ok((stream, _)) = accepted else {
+                    tracing::error!("admin listener failed while accepting a connection");
+                    break;
+                };
+                let store = store.clone();
+                let metrics = metrics.clone();
+                connections.spawn(async move {
+                    let service = service_fn(move |request| {
+                        handle_admin_request(request, store.clone(), metrics.clone())
+                    });
+                    if let Err(error) = http1::Builder::new()
+                        .keep_alive(true)
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        tracing::debug!(error = %error, "admin HTTP connection ended with an error");
+                    }
+                });
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::warn!(error = %error, "admin connection task failed");
+                }
+            }
+        }
+    }
+    if tokio::time::timeout(drain_timeout, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+}
+
+async fn handle_admin_request(
+    request: Request<Incoming>,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+) -> Result<Response<GatewayBody>, Infallible> {
+    let head_only = request.method() == Method::HEAD;
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return Ok(admin_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"Method Not Allowed"),
+            head_only,
+        ));
+    }
+    let response = match request.uri().path() {
+        "/health/live" => admin_response(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"live\n"),
+            head_only,
+        ),
+        "/health/ready" => {
+            let ready = !store.pin().listeners.is_empty();
+            admin_response(
+                if ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                "text/plain; charset=utf-8",
+                Bytes::from_static(if ready { b"ready\n" } else { b"not ready\n" }),
+                head_only,
+            )
+        }
+        "/metrics" => admin_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            Bytes::from(metrics.render_prometheus()),
+            head_only,
+        ),
+        _ => admin_response(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"Not Found"),
+            head_only,
+        ),
+    };
+    Ok(response)
+}
+
+fn admin_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Bytes,
+    head_only: bool,
+) -> Response<GatewayBody> {
+    let length = body.len();
+    let mut response = Response::new(if head_only {
+        GatewayBodyPlan::Empty.into_body(true)
+    } else {
+        full_body(body)
+    });
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(length) = HeaderValue::from_str(&length.to_string()) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, length);
+    }
+    response
+}
+
 async fn run_listener(
     listener: BoundListener,
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
     accept_stopped: oneshot::Sender<()>,
@@ -493,8 +723,16 @@ async fn run_listener(
                 let listener_name = listener.name.clone();
                 let store = store.clone();
                 let proxy = proxy.clone();
+                let metrics = metrics.clone();
                 connections.spawn(async move {
-                    serve_connection(stream, peer_address, listener_name, store, proxy).await;
+                    serve_connection(
+                        stream,
+                        peer_address,
+                        listener_name,
+                        store,
+                        proxy,
+                        metrics,
+                    ).await;
                 });
             }
             result = connections.join_next(), if !connections.is_empty() => {
@@ -532,6 +770,7 @@ async fn serve_connection(
     listener_name: String,
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
 ) {
     let service = service_fn(move |request| {
         handle_request(
@@ -540,6 +779,7 @@ async fn serve_connection(
             listener_name.clone(),
             store.clone(),
             proxy.clone(),
+            metrics.clone(),
         )
     });
     if let Err(error) = http1::Builder::new()
@@ -557,8 +797,11 @@ async fn handle_request(
     listener_name: String,
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
 ) -> Result<Response<GatewayBody>, Infallible> {
+    let _active_request = metrics.request_started();
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
     let snapshot = store.pin();
     let config_version = snapshot.config_version.to_string();
     let Some(program) = snapshot.program_for(&listener_name) else {
@@ -568,6 +811,11 @@ async fn handle_request(
             listener = listener_name,
             error_class = "invalid_state",
             "listener root is missing from pinned snapshot"
+        );
+        metrics.record_request(
+            "failed",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            started.elapsed(),
         );
         return Ok(safe_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -598,7 +846,6 @@ async fn handle_request(
     );
     metadata.peer_address = Some(peer_address.to_string());
     let leaves = HyperLeaves::new(snapshot.clone(), proxy);
-    let started = std::time::Instant::now();
     let report = Executor::new(&program, &leaves)
         .execute(RequestFrame::new(metadata), Some(body))
         .await;
@@ -642,6 +889,7 @@ async fn handle_request(
         latency_micros = started.elapsed().as_micros(),
         "request complete"
     );
+    metrics.record_request(outcome, status, started.elapsed());
     Ok(response)
 }
 
@@ -918,9 +1166,15 @@ listeners:
         let snapshot =
             RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("config compiles"))
                 .expect("snapshot prepares");
-        let server = GatewayServer::bind(snapshot).await.expect("server binds");
+        let server = GatewayServer::bind(snapshot)
+            .await
+            .expect("server binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("valid admin bind"))
+            .await
+            .expect("admin server binds");
         let running = server.spawn();
         let address = running.local_addresses()[0].1;
+        let admin_address = running.admin_address().expect("admin address is available");
 
         let hello = request(address, "/hello", "").await;
         assert!(hello.starts_with("HTTP/1.1 200 OK"));
@@ -931,6 +1185,12 @@ listeners:
         let missing = request(address, "/missing", "").await;
         assert!(missing.starts_with("HTTP/1.1 404 Not Found"));
         assert!(missing.ends_with("missing"));
+        let live = request(admin_address, "/health/live", "").await;
+        assert!(live.starts_with("HTTP/1.1 200 OK"));
+        assert!(live.ends_with("live\n"));
+        let metrics = request(admin_address, "/metrics", "").await;
+        assert!(metrics.contains("oxidase_requests_total 3"));
+        assert!(metrics.contains("oxidase_request_outcomes_total{outcome=\"handled\"} 3"));
         running.shutdown().await.expect("server shuts down cleanly");
     }
 
