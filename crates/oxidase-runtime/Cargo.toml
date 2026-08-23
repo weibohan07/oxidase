@@ -1,0 +1,16 @@
+[package]
+name = "oxidase-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oxidase-config = { path = "../oxidase-config" }
+oxidase-core = { path = "../oxidase-core" }
+oxidase-site = { path = "../oxidase-site" }
+
+[lints]
+workspace = true
+

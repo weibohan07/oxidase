@@ -1,20 +1,54 @@
-[package]
-name = "oxidase"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = [
+    "crates/oxidase-cli",
+    "crates/oxidase-config",
+    "crates/oxidase-core",
+    "crates/oxidase-runtime",
+    "crates/oxidase-server",
+    "crates/oxidase-site",
+    "crates/oxidase-testkit",
+]
+default-members = ["crates/oxidase-cli"]
+
+[workspace.package]
+version = "0.2.0-alpha.1"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/weibohan07/oxidase"
+rust-version = "1.85"
 
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+[workspace.dependencies]
+arc-swap = "1.7"
 bytes = "1"
-http-body-util = "0.1"
-percent-encoding = "2"
-mime_guess = "2"
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-thiserror = "1"
-regex = "1.12.2"
 clap = { version = "4", features = ["derive"] }
-notify = "6.1.1"
+futures-util = "0.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httpdate = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
+indexmap = { version = "2", features = ["serde"] }
+mime_guess = "2"
+percent-encoding = "2"
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+walkdir = "2"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
