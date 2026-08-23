@@ -20,6 +20,8 @@ use oxidase_core::{
 use serde::Serialize;
 use url::Url;
 
+use oxidase_source::{FieldSpanIndex, SourceDocument};
+
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
@@ -230,11 +232,16 @@ struct Located<T> {
     value: T,
     file: PathBuf,
     field_path: String,
+    spans: Arc<FieldSpanIndex>,
 }
 
 impl<T> Located<T> {
     fn span(&self) -> SourceSpan {
-        span(&self.file, &self.field_path)
+        indexed_span(&self.file, &self.field_path, &self.spans)
+    }
+
+    fn span_at(&self, field_path: &str) -> SourceSpan {
+        indexed_span(&self.file, field_path, &self.spans)
     }
 }
 
@@ -252,6 +259,21 @@ struct SourceNodeKey<'a> {
     field_path: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct SourceContext<'a> {
+    file: &'a Path,
+    spans: Option<&'a FieldSpanIndex>,
+}
+
+impl SourceContext<'_> {
+    fn span(self, field_path: &str) -> SourceSpan {
+        self.spans.map_or_else(
+            || span(self.file, field_path),
+            |spans| indexed_span(self.file, field_path, spans),
+        )
+    }
+}
+
 impl SourceNodeKey<'_> {
     fn inline_service_id(self) -> ServiceId {
         ServiceId::new(format!("inline:s{:08}:{}", self.file.0, self.field_path))
@@ -266,7 +288,7 @@ impl SourceNodeKey<'_> {
 struct Loader {
     loaded: BTreeSet<PathBuf>,
     stack: Vec<PathBuf>,
-    documents: Vec<Located<GatewaySource>>,
+    documents: Vec<SourceDocument<GatewaySource>>,
     dependencies: Vec<PathBuf>,
     discovered_dependencies: BTreeSet<PathBuf>,
     source_digests: BTreeMap<PathBuf, ContentDigest>,
@@ -302,11 +324,11 @@ impl Loader {
                 span(path, ""),
             ))
         })?;
-        let document: GatewaySource = parse_yaml(path, &source, "")?;
+        let document: SourceDocument<GatewaySource> = parse_yaml_document(path, &source, "")?;
 
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        for import in &document.imports {
+        for import in &document.value.imports {
             let declared = directory.join(import);
             self.discovered_dependencies
                 .extend(candidate_dependencies(&declared));
@@ -332,11 +354,7 @@ impl Loader {
         self.source_digests
             .insert(path.to_path_buf(), canonical_yaml_digest(path, &source)?);
         self.dependencies.push(path.to_path_buf());
-        self.documents.push(Located {
-            value: document,
-            file: path.to_path_buf(),
-            field_path: String::new(),
-        });
+        self.documents.push(document);
         self.loaded.insert(path.to_path_buf());
         Ok(())
     }
@@ -372,25 +390,32 @@ impl Loader {
             ..MergedSource::default()
         };
         for document in self.documents {
+            let file = document.path;
+            let spans = Arc::new(document.spans);
+            let document = document.value;
+            merged.span_indexes.insert(file.clone(), spans.clone());
             merged.api_versions.push(Located {
-                value: document.value.api_version,
-                file: document.file.clone(),
+                value: document.api_version,
+                file: file.clone(),
                 field_path: "api_version".to_owned(),
+                spans: spans.clone(),
             });
             merged.kinds.push(Located {
-                value: document.value.kind,
-                file: document.file.clone(),
+                value: document.kind,
+                file: file.clone(),
                 field_path: "kind".to_owned(),
+                spans: spans.clone(),
             });
-            merge_resources(&mut merged, document.value.resources, &document.file);
-            for (name, service) in document.value.services {
+            merge_resources(&mut merged, document.resources, &file, Arc::clone(&spans));
+            for (name, service) in document.services {
                 insert_located(
                     &mut merged.services,
                     name.clone(),
                     Located {
                         value: service,
-                        file: document.file.clone(),
+                        file: file.clone(),
                         field_path: format!("services.{name}"),
+                        spans: spans.clone(),
                     },
                     &mut merged.merge_errors,
                     "service",
@@ -398,25 +423,30 @@ impl Loader {
             }
             merged
                 .listeners
-                .extend(document.value.listeners.into_iter().enumerate().map(
-                    |(index, listener)| Located {
-                        value: listener,
-                        file: document.file.clone(),
-                        field_path: format!("listeners[{index}]"),
-                    },
-                ));
+                .extend(
+                    document
+                        .listeners
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, listener)| Located {
+                            value: listener,
+                            file: file.clone(),
+                            field_path: format!("listeners[{index}]"),
+                            spans: spans.clone(),
+                        }),
+                );
             merged
                 .tests
                 .extend(
                     document
-                        .value
                         .tests
                         .into_iter()
                         .enumerate()
                         .map(|(index, test)| Located {
                             value: test,
-                            file: document.file.clone(),
+                            file: file.clone(),
                             field_path: format!("tests[{index}]"),
+                            spans: spans.clone(),
                         }),
                 );
         }
@@ -429,6 +459,7 @@ struct MergedSource {
     root: PathBuf,
     dependencies: Vec<PathBuf>,
     source_files: BTreeMap<PathBuf, SourceFileId>,
+    span_indexes: BTreeMap<PathBuf, Arc<FieldSpanIndex>>,
     hash: ContentDigest,
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
@@ -446,19 +477,32 @@ impl MergedSource {
         file: &Path,
         field_path: &'a str,
     ) -> Result<SourceNodeKey<'a>, CompileError> {
+        let context = self.context(file);
         let file = self.source_files.get(file).copied().ok_or_else(|| {
             diagnostic_at(
                 "service.source_identity",
                 "internal compiler error: source file has no assigned identity",
-                file,
+                context,
                 field_path,
             )
         })?;
         Ok(SourceNodeKey { file, field_path })
     }
+
+    fn context<'a>(&'a self, file: &'a Path) -> SourceContext<'a> {
+        SourceContext {
+            file,
+            spans: self.span_indexes.get(file).map(Arc::as_ref),
+        }
+    }
 }
 
-fn merge_resources(merged: &mut MergedSource, resources: ResourcesSource, file: &Path) {
+fn merge_resources(
+    merged: &mut MergedSource,
+    resources: ResourcesSource,
+    file: &Path,
+    spans: Arc<FieldSpanIndex>,
+) {
     for (name, cluster) in resources.clusters {
         insert_located(
             &mut merged.clusters,
@@ -467,6 +511,7 @@ fn merge_resources(merged: &mut MergedSource, resources: ResourcesSource, file: 
                 value: cluster,
                 file: file.to_path_buf(),
                 field_path: format!("resources.clusters.{name}"),
+                spans: spans.clone(),
             },
             &mut merged.merge_errors,
             "cluster resource",
@@ -480,6 +525,7 @@ fn merge_resources(merged: &mut MergedSource, resources: ResourcesSource, file: 
                 value: site,
                 file: file.to_path_buf(),
                 field_path: format!("resources.sites.{name}"),
+                spans: spans.clone(),
             },
             &mut merged.merge_errors,
             "site resource",
@@ -501,10 +547,7 @@ fn insert_located<T>(
                 format!("duplicate {kind} definition `{name}`"),
                 value.span(),
             )
-            .with_reference_chain(vec![
-                previous.file.display().to_string(),
-                value.file.display().to_string(),
-            ]),
+            .with_reference_chain(vec![previous.span().to_string(), value.span().to_string()]),
         );
     } else {
         target.insert(name, value);
@@ -558,19 +601,21 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
     let mut resources = CompiledResources::default();
     for (name, located) in &merged.clusters {
         if located.value.endpoints.is_empty() {
-            return Err(semantic_error(
+            return Err(semantic_error_at(
                 "resource.cluster_empty",
                 "cluster must contain at least one endpoint",
-                located,
+                located.span_at(&format!("{}.endpoints", located.field_path)),
             ));
         }
         let mut endpoints = Vec::new();
-        for endpoint in &located.value.endpoints {
+        for (index, endpoint) in located.value.endpoints.iter().enumerate() {
+            let endpoint_span =
+                located.span_at(&format!("{}.endpoints[{index}]", located.field_path));
             let url = Url::parse(endpoint).map_err(|error| {
-                semantic_error(
+                semantic_error_at(
                     "resource.endpoint",
                     format!("invalid endpoint `{endpoint}`: {error}"),
-                    located,
+                    endpoint_span.clone(),
                 )
             })?;
             if !matches!(url.scheme(), "http" | "https")
@@ -580,12 +625,12 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
-                return Err(semantic_error(
+                return Err(semantic_error_at(
                     "resource.endpoint",
                     format!(
                         "endpoint `{endpoint}` must be an http(s) origin/path without credentials, query, or fragment"
                     ),
-                    located,
+                    endpoint_span,
                 ));
             }
             endpoints.push(url);
@@ -596,8 +641,14 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
             ClusterSpec {
                 id,
                 endpoints,
-                connect_timeout: parse_duration(&located.value.connect_timeout, &located.span())?,
-                response_timeout: parse_duration(&located.value.response_timeout, &located.span())?,
+                connect_timeout: parse_duration(
+                    &located.value.connect_timeout,
+                    &located.span_at(&format!("{}.connect_timeout", located.field_path)),
+                )?,
+                response_timeout: parse_duration(
+                    &located.value.response_timeout,
+                    &located.span_at(&format!("{}.response_timeout", located.field_path)),
+                )?,
                 source: located.span(),
             },
         );
@@ -613,7 +664,13 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
             .map(|(name, value)| {
                 yaml_value(value)
                     .map(|value| (name.clone(), value))
-                    .map_err(|message| semantic_error("resource.site_input", message, located))
+                    .map_err(|message| {
+                        semantic_error_at(
+                            "resource.site_input",
+                            message,
+                            located.span_at(&format!("{}.with.{name}", located.field_path)),
+                        )
+                    })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let id = ResourceId::new(format!("site:{name}"));
@@ -654,32 +711,33 @@ impl<'a> ProgramBuilder<'a> {
         let mut listeners = Vec::new();
         for located in &self.source.listeners {
             if located.value.name.trim().is_empty() {
-                return Err(semantic_error(
+                return Err(semantic_error_at(
                     "listener.name",
                     "listener name cannot be empty",
-                    located,
+                    located.span_at(&format!("{}.name", located.field_path)),
                 ));
             }
             if !self.listener_names.insert(located.value.name.clone()) {
-                return Err(semantic_error(
+                return Err(semantic_error_at(
                     "listener.duplicate",
                     format!("duplicate listener name `{}`", located.value.name),
-                    located,
+                    located.span_at(&format!("{}.name", located.field_path)),
                 ));
             }
             let bind = located.value.bind.parse::<SocketAddr>().map_err(|error| {
-                semantic_error(
+                semantic_error_at(
                     "listener.bind",
                     format!("invalid listener address `{}`: {error}", located.value.bind),
-                    located,
+                    located.span_at(&format!("{}.bind", located.field_path)),
                 )
             })?;
             match located.value.protocol {
                 ListenerProtocolSource::Http => {}
             }
+            let context = self.source.context(&located.file);
             let service = self.compile_service(
                 &located.value.service,
-                &located.file,
+                context,
                 &format!("{}.service", located.field_path),
             )?;
             listeners.push(CompiledListener {
@@ -714,10 +772,11 @@ impl<'a> ProgramBuilder<'a> {
             ))
         })?;
         self.compiling.insert(name.to_owned());
+        let context = self.source.context(&located.file);
         self.compile_inline_or_reference_as(
             id.clone(),
             &located.value,
-            &located.file,
+            context,
             &located.field_path,
         )?;
         self.compiling.remove(name);
@@ -727,14 +786,26 @@ impl<'a> ProgramBuilder<'a> {
     fn compile_service(
         &mut self,
         source: &ServiceSource,
-        file: &Path,
+        context: SourceContext<'_>,
         field_path: &str,
     ) -> Result<ServiceId, CompileError> {
         match source {
-            ServiceSource::Reference(reference) => self.compile_named(&reference.reference),
+            ServiceSource::Reference(reference) => {
+                if !self.source.services.contains_key(&reference.reference) {
+                    return Err(CompileError::one(Diagnostic::new(
+                        "service.reference",
+                        format!("named service `{}` does not exist", reference.reference),
+                        context.span(&format!("{field_path}.ref")),
+                    )));
+                }
+                self.compile_named(&reference.reference)
+            }
             ServiceSource::Inline(_) => {
-                let id = self.source.node_key(file, field_path)?.inline_service_id();
-                self.compile_inline_or_reference_as(id.clone(), source, file, field_path)?;
+                let id = self
+                    .source
+                    .node_key(context.file, field_path)?
+                    .inline_service_id();
+                self.compile_inline_or_reference_as(id.clone(), source, context, field_path)?;
                 Ok(id)
             }
         }
@@ -744,7 +815,7 @@ impl<'a> ProgramBuilder<'a> {
         &mut self,
         id: ServiceId,
         source: &ServiceSource,
-        file: &Path,
+        context: SourceContext<'_>,
         field_path: &str,
     ) -> Result<(), CompileError> {
         let ServiceSource::Inline(source) = source else {
@@ -754,17 +825,17 @@ impl<'a> ProgramBuilder<'a> {
             let target = self.compile_named(&reference.reference)?;
             let node = ServiceNode {
                 id: id.clone(),
-                source: span(file, field_path),
+                source: context.span(field_path),
                 kind: ServiceKind::Fallback {
                     services: vec![target],
                 },
             };
             return self.insert_node(node);
         };
-        let kind = self.compile_inline(source, file, field_path)?;
+        let kind = self.compile_inline(source, context, field_path)?;
         self.insert_node(ServiceNode {
             id,
-            source: span(file, field_path),
+            source: context.span(field_path),
             kind,
         })
     }
@@ -795,7 +866,7 @@ impl<'a> ProgramBuilder<'a> {
     fn compile_inline(
         &mut self,
         source: &InlineServiceSource,
-        file: &Path,
+        context: SourceContext<'_>,
         field_path: &str,
     ) -> Result<ServiceKind, CompileError> {
         match source {
@@ -804,9 +875,9 @@ impl<'a> ProgramBuilder<'a> {
                 headers,
                 body,
             } => Ok(ServiceKind::Respond {
-                status: status_code(*status, file, field_path)?,
-                headers: compile_headers(headers, file, &format!("{field_path}.headers"))?,
-                body: compile_body(body, file, field_path)?,
+                status: status_code(*status, context, field_path)?,
+                headers: compile_headers(headers, context, &format!("{field_path}.headers"))?,
+                body: compile_body(body, context, field_path)?,
             }),
             InlineServiceSource::Redirect {
                 status,
@@ -814,43 +885,40 @@ impl<'a> ProgramBuilder<'a> {
                 query,
                 headers,
             } => {
-                let status = status_code(*status, file, field_path)?;
+                let status = status_code(*status, context, field_path)?;
                 if !status.is_redirection() {
-                    return Err(diagnostic_at(
+                    return Err(CompileError::one(Diagnostic::new(
                         "service.redirect_status",
                         format!("redirect status `{status}` is not 3xx"),
-                        file,
-                        field_path,
-                    ));
+                        context.span(&format!("{field_path}.status")),
+                    )));
                 }
                 Ok(ServiceKind::Redirect {
                     status,
-                    location: redirect_template(location, file, field_path)?,
+                    location: redirect_template(location, context, field_path)?,
                     preserve_query: matches!(query, RedirectQuerySource::Preserve),
-                    headers: compile_headers(headers, file, &format!("{field_path}.headers"))?,
+                    headers: compile_headers(headers, context, &format!("{field_path}.headers"))?,
                 })
             }
             InlineServiceSource::Site { site } => {
                 let resource = ResourceId::new(format!("site:{site}"));
                 if !self.resources.sites.contains_key(&resource) {
-                    return Err(diagnostic_at(
+                    return Err(CompileError::one(Diagnostic::new(
                         "service.site_reference",
                         format!("site resource `{site}` does not exist"),
-                        file,
-                        field_path,
-                    ));
+                        context.span(&format!("{field_path}.site")),
+                    )));
                 }
                 Ok(ServiceKind::Site { resource })
             }
             InlineServiceSource::Proxy { cluster } => {
                 let resource = ResourceId::new(format!("cluster:{cluster}"));
                 if !self.resources.clusters.contains_key(&resource) {
-                    return Err(diagnostic_at(
+                    return Err(CompileError::one(Diagnostic::new(
                         "service.cluster_reference",
                         format!("cluster resource `{cluster}` does not exist"),
-                        file,
-                        field_path,
-                    ));
+                        context.span(&format!("{field_path}.cluster")),
+                    )));
                 }
                 Ok(ServiceKind::Proxy { cluster: resource })
             }
@@ -859,21 +927,36 @@ impl<'a> ProgramBuilder<'a> {
                 response,
                 service,
             } => Ok(ServiceKind::Transform {
-                request: Box::new(compile_request_transform(request, file, field_path)?),
-                response: Box::new(compile_response_transform(response, file, field_path)?),
-                service: self.compile_service(service, file, &format!("{field_path}.service"))?,
+                request: Box::new(compile_request_transform(request, context, field_path)?),
+                response: Box::new(compile_response_transform(response, context, field_path)?),
+                service: self.compile_service(
+                    service,
+                    context,
+                    &format!("{field_path}.service"),
+                )?,
             }),
             InlineServiceSource::Observe { name, service } => Ok(ServiceKind::Observe {
                 name: name.clone(),
-                service: self.compile_service(service, file, &format!("{field_path}.service"))?,
+                service: self.compile_service(
+                    service,
+                    context,
+                    &format!("{field_path}.service"),
+                )?,
             }),
             InlineServiceSource::Timeout { duration, service } => Ok(ServiceKind::Timeout {
-                duration: parse_duration(duration, &span(file, field_path))?,
-                service: self.compile_service(service, file, &format!("{field_path}.service"))?,
+                duration: parse_duration(
+                    duration,
+                    &context.span(&format!("{field_path}.duration")),
+                )?,
+                service: self.compile_service(
+                    service,
+                    context,
+                    &format!("{field_path}.service"),
+                )?,
             }),
             InlineServiceSource::Recover { service, handlers } => {
                 let service =
-                    self.compile_service(service, file, &format!("{field_path}.service"))?;
+                    self.compile_service(service, context, &format!("{field_path}.service"))?;
                 let handlers = handlers
                     .iter()
                     .enumerate()
@@ -882,7 +965,7 @@ impl<'a> ProgramBuilder<'a> {
                             classes: handler.classes.iter().copied().map(error_class).collect(),
                             service: self.compile_service(
                                 &handler.service,
-                                file,
+                                context,
                                 &format!("{field_path}.handlers[{index}].service"),
                             )?,
                         })
@@ -901,37 +984,36 @@ impl<'a> ProgramBuilder<'a> {
                     .map(|(index, case)| {
                         let case_path = format!("{field_path}.cases[{index}]");
                         Ok(RouteCase {
-                            id: self.source.node_key(file, &case_path)?.route_id(),
+                            id: self.source.node_key(context.file, &case_path)?.route_id(),
                             predicate: compile_predicate(
                                 &case.predicate,
-                                file,
+                                context,
                                 &format!("{case_path}.when"),
                             )?,
                             service: self.compile_service(
                                 &case.service,
-                                file,
+                                context,
                                 &format!("{case_path}.service"),
                             )?,
-                            source: span(file, case_path),
+                            source: context.span(&case_path),
                         })
                     })
                     .collect::<Result<Vec<_>, CompileError>>()?;
                 let default = default
                     .as_ref()
                     .map(|service| {
-                        self.compile_service(service, file, &format!("{field_path}.default"))
+                        self.compile_service(service, context, &format!("{field_path}.default"))
                     })
                     .transpose()?;
                 Ok(ServiceKind::Route { cases, default })
             }
             InlineServiceSource::Fallback { services } => {
                 if services.is_empty() {
-                    return Err(diagnostic_at(
+                    return Err(CompileError::one(Diagnostic::new(
                         "service.fallback_empty",
                         "fallback requires at least one candidate",
-                        file,
-                        field_path,
-                    ));
+                        context.span(&format!("{field_path}.services")),
+                    )));
                 }
                 Ok(ServiceKind::Fallback {
                     services: services
@@ -940,7 +1022,7 @@ impl<'a> ProgramBuilder<'a> {
                         .map(|(index, service)| {
                             self.compile_service(
                                 service,
-                                file,
+                                context,
                                 &format!("{field_path}.services[{index}]"),
                             )
                         })
@@ -949,12 +1031,11 @@ impl<'a> ProgramBuilder<'a> {
             }
             InlineServiceSource::Reenter { target, budget } => {
                 if !self.source.services.contains_key(target) {
-                    return Err(diagnostic_at(
+                    return Err(CompileError::one(Diagnostic::new(
                         "service.reenter_target",
                         format!("Reenter target `{target}` is not a named service"),
-                        file,
-                        field_path,
-                    ));
+                        context.span(&format!("{field_path}.target")),
+                    )));
                 }
                 Ok(ServiceKind::Reenter {
                     target: ServiceId::new(format!("service:{target}")),
@@ -967,7 +1048,7 @@ impl<'a> ProgramBuilder<'a> {
 
 fn compile_body(
     source: &BodySource,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<RespondBody, CompileError> {
     let selected = usize::from(source.empty)
@@ -977,15 +1058,24 @@ fn compile_body(
         return Err(diagnostic_at(
             "service.respond_body",
             "response body must select exactly one of `empty`, `text`, or `json`",
-            file,
+            context,
             field_path,
         ));
     }
     if let Some(text) = &source.text {
-        Ok(RespondBody::Text(template(text, file, field_path)?))
+        Ok(RespondBody::Text(template(
+            text,
+            context,
+            &format!("{field_path}.body.text"),
+        )?))
     } else if let Some(json) = &source.json {
         Ok(RespondBody::Json(yaml_value(json).map_err(|message| {
-            diagnostic_at("service.respond_json", message, file, field_path)
+            diagnostic_at(
+                "service.respond_json",
+                message,
+                context,
+                &format!("{field_path}.body.json"),
+            )
         })?))
     } else if source.empty || selected == 0 {
         Ok(RespondBody::Empty)
@@ -996,7 +1086,7 @@ fn compile_body(
 
 fn compile_request_transform(
     source: &RequestTransformSource,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<RequestTransform, CompileError> {
     Ok(RequestTransform {
@@ -1009,34 +1099,34 @@ fn compile_request_transform(
                 diagnostic_at(
                     "service.transform_method",
                     format!("invalid HTTP method: {error}"),
-                    file,
-                    field_path,
+                    context,
+                    &format!("{field_path}.request.method"),
                 )
             })?,
         scheme: compile_metadata_template(
             &source.scheme,
-            file,
+            context,
             &format!("{field_path}.request.scheme"),
             "service.transform_scheme",
             parse_transform_scheme,
         )?,
         authority: compile_metadata_template(
             &source.authority,
-            file,
+            context,
             &format!("{field_path}.request.authority"),
             "service.transform_authority",
             parse_transform_authority,
         )?,
         path_and_query: compile_metadata_template(
             &source.path,
-            file,
+            context,
             &format!("{field_path}.request.path"),
             "service.transform_path_and_query",
             parse_transform_path_and_query,
         )?,
         headers: compile_headers(
             &source.headers,
-            file,
+            context,
             &format!("{field_path}.request.headers"),
         )?,
     })
@@ -1044,13 +1134,13 @@ fn compile_request_transform(
 
 fn compile_response_transform(
     source: &ResponseTransformSource,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<ResponseTransform, CompileError> {
     Ok(ResponseTransform {
         headers: compile_headers(
             &source.headers,
-            file,
+            context,
             &format!("{field_path}.response.headers"),
         )?,
     })
@@ -1058,18 +1148,18 @@ fn compile_response_transform(
 
 fn compile_headers(
     source: &HeadersSource,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<HeaderTransforms, CompileError> {
     Ok(HeaderTransforms {
-        set: compile_header_values(&source.set, file, &format!("{field_path}.set"))?,
-        add: compile_header_values(&source.add, file, &format!("{field_path}.add"))?,
+        set: compile_header_values(&source.set, context, &format!("{field_path}.set"))?,
+        add: compile_header_values(&source.add, context, &format!("{field_path}.add"))?,
         remove: source
             .remove
             .iter()
             .enumerate()
             .map(|(index, name)| {
-                compile_user_header_name(name, file, &format!("{field_path}.remove[{index}]"))
+                compile_user_header_name(name, context, &format!("{field_path}.remove[{index}]"))
             })
             .collect::<Result<Vec<_>, _>>()?,
     })
@@ -1077,26 +1167,31 @@ fn compile_headers(
 
 fn compile_header_values(
     source: &BTreeMap<String, String>,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<Vec<HeaderTransform>, CompileError> {
     source
         .iter()
         .map(|(name, value)| {
             let header_path = format!("{field_path}.{name}");
-            let name = compile_user_header_name(name, file, &header_path)?;
-            let value = template(value, file, &header_path)?;
+            let name = compile_user_header_name(name, context, &header_path)?;
+            let value = template(value, context, &header_path)?;
             if value.is_constant() {
                 let rendered = value
                     .render(&oxidase_core::EvalContext::default())
                     .map_err(|error| {
-                        diagnostic_at("service.header_value", error.to_string(), file, field_path)
+                        diagnostic_at(
+                            "service.header_value",
+                            error.to_string(),
+                            context,
+                            &header_path,
+                        )
                     })?;
                 HeaderValue::from_str(&rendered).map_err(|_| {
                     diagnostic_at(
                         "service.header_value",
                         format!("header `{name}` has an invalid constant value"),
-                        file,
+                        context,
                         &header_path,
                     )
                 })?;
@@ -1108,14 +1203,14 @@ fn compile_header_values(
 
 fn compile_user_header_name(
     source: &str,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<HeaderName, CompileError> {
     let name = HeaderName::from_str(source).map_err(|error| {
         diagnostic_at(
             "service.header_name",
             format!("invalid header name `{source}`: {error}"),
-            file,
+            context,
             field_path,
         )
     })?;
@@ -1123,7 +1218,7 @@ fn compile_user_header_name(
         return Err(diagnostic_at(
             "service.forbidden_header",
             format!("header `{name}` is managed by the HTTP response finalizer"),
-            file,
+            context,
             field_path,
         ));
     }
@@ -1132,7 +1227,7 @@ fn compile_user_header_name(
 
 fn compile_predicate(
     source: &PredicateSource,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<PredicatePlan, CompileError> {
     Ok(PredicatePlan {
@@ -1145,8 +1240,8 @@ fn compile_predicate(
                 diagnostic_at(
                     "service.predicate_method",
                     format!("invalid HTTP method: {error}"),
-                    file,
-                    field_path,
+                    context,
+                    &format!("{field_path}.methods"),
                 )
             })?,
         host: source
@@ -1155,7 +1250,12 @@ fn compile_predicate(
             .map(|pattern| CompiledPattern::compile(pattern, PatternContext::Host))
             .transpose()
             .map_err(|error| {
-                diagnostic_at("service.host_pattern", error.to_string(), file, field_path)
+                diagnostic_at(
+                    "service.host_pattern",
+                    error.to_string(),
+                    context,
+                    &format!("{field_path}.host"),
+                )
             })?,
         path: source
             .path
@@ -1163,7 +1263,12 @@ fn compile_predicate(
             .map(|pattern| CompiledPattern::compile(pattern, PatternContext::Path))
             .transpose()
             .map_err(|error| {
-                diagnostic_at("service.path_pattern", error.to_string(), file, field_path)
+                diagnostic_at(
+                    "service.path_pattern",
+                    error.to_string(),
+                    context,
+                    &format!("{field_path}.path"),
+                )
             })?,
         headers: source
             .headers
@@ -1174,8 +1279,8 @@ fn compile_predicate(
                         diagnostic_at(
                             "service.header_name",
                             format!("invalid header name `{name}`: {error}"),
-                            file,
-                            field_path,
+                            context,
+                            &format!("{field_path}.headers.{name}"),
                         )
                     })?,
                     pattern: CompiledPattern::compile(pattern, PatternContext::Value).map_err(
@@ -1183,8 +1288,8 @@ fn compile_predicate(
                             diagnostic_at(
                                 "service.header_pattern",
                                 error.to_string(),
-                                file,
-                                field_path,
+                                context,
+                                &format!("{field_path}.headers.{name}"),
                             )
                         },
                     )?,
@@ -1201,32 +1306,36 @@ fn compile_predicate(
                 diagnostic_at(
                     "service.predicate_expression",
                     error.to_string(),
-                    file,
-                    field_path,
+                    context,
+                    &format!("{field_path}.expression"),
                 )
             })?,
     })
 }
 
-fn template(source: &str, file: &Path, field_path: &str) -> Result<CompiledTemplate, CompileError> {
+fn template(
+    source: &str,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<CompiledTemplate, CompileError> {
     CompiledTemplate::compile(source)
-        .map_err(|error| diagnostic_at("service.template", error.to_string(), file, field_path))
+        .map_err(|error| diagnostic_at("service.template", error.to_string(), context, field_path))
 }
 
 fn redirect_template(
     source: &str,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> Result<CompiledTemplate, CompileError> {
-    let template = template(source, file, field_path)?;
+    let template = template(source, context, &format!("{field_path}.location"))?;
     if template.is_constant()
         && (!source.starts_with('/') || source.starts_with("//") || source.contains('\\'))
     {
         return Err(diagnostic_at(
             "service.redirect_location",
             "redirect Location must be a local absolute path",
-            file,
-            field_path,
+            context,
+            &format!("{field_path}.location"),
         ));
     }
     Ok(template)
@@ -1234,7 +1343,7 @@ fn redirect_template(
 
 fn compile_metadata_template<T>(
     source: &Option<String>,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
     code: &'static str,
     parse: fn(&str) -> Result<T, RequestMetadataError>,
@@ -1242,27 +1351,31 @@ fn compile_metadata_template<T>(
     let Some(source) = source else {
         return Ok(None);
     };
-    let template = template(source, file, field_path)?;
+    let template = template(source, context, field_path)?;
     if template.is_constant() {
         let rendered = template
             .render(&oxidase_core::EvalContext::default())
-            .map_err(|error| diagnostic_at(code, error.to_string(), file, field_path))?;
+            .map_err(|error| diagnostic_at(code, error.to_string(), context, field_path))?;
         parse(&rendered)
             .map(CompiledMetadata::Constant)
             .map(Some)
-            .map_err(|error| diagnostic_at(code, error.to_string(), file, field_path))
+            .map_err(|error| diagnostic_at(code, error.to_string(), context, field_path))
     } else {
         Ok(Some(CompiledMetadata::Dynamic(template)))
     }
 }
 
-fn status_code(status: u16, file: &Path, field_path: &str) -> Result<StatusCode, CompileError> {
+fn status_code(
+    status: u16,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<StatusCode, CompileError> {
     StatusCode::from_u16(status).map_err(|error| {
         diagnostic_at(
             "service.status",
             format!("invalid HTTP status `{status}`: {error}"),
-            file,
-            field_path,
+            context,
+            &format!("{field_path}.status"),
         )
     })
 }
@@ -1357,29 +1470,50 @@ fn yaml_value(source: &serde_yaml_ng::Value) -> Result<Value, String> {
     }
 }
 
-fn semantic_error<T>(
+fn semantic_error_at(
     code: &'static str,
     message: impl Into<String>,
-    located: &Located<T>,
+    source: SourceSpan,
 ) -> CompileError {
-    CompileError::one(Diagnostic::new(code, message, located.span()))
+    CompileError::one(Diagnostic::new(code, message, source))
 }
 
 fn diagnostic_at(
     code: &'static str,
     message: impl Into<String>,
-    file: &Path,
+    context: SourceContext<'_>,
     field_path: &str,
 ) -> CompileError {
-    CompileError::one(Diagnostic::new(code, message, span(file, field_path)))
+    CompileError::one(Diagnostic::new(code, message, context.span(field_path)))
 }
 
 fn span(path: &Path, field_path: impl Into<String>) -> SourceSpan {
     SourceSpan {
         file: path.to_path_buf(),
+        start_byte: 0,
+        end_byte: 0,
         line: 1,
         column: 1,
+        end_line: 1,
+        end_column: 1,
         field_path: field_path.into(),
+    }
+}
+
+fn indexed_span(path: &Path, field_path: &str, spans: &FieldSpanIndex) -> SourceSpan {
+    let Some(source) = spans.nearest(field_path) else {
+        return span(path, field_path);
+    };
+    let source = &source.value;
+    SourceSpan {
+        file: path.to_path_buf(),
+        start_byte: source.start_byte,
+        end_byte: source.end_byte,
+        line: source.start_line,
+        column: source.start_column,
+        end_line: source.end_line,
+        end_column: source.end_column,
+        field_path: field_path.to_owned(),
     }
 }
 
@@ -1388,14 +1522,26 @@ fn parse_yaml<T: serde::de::DeserializeOwned>(
     source: &str,
     field_path: &str,
 ) -> Result<T, CompileError> {
-    oxidase_source::parse(path, source).map_err(|error| {
+    parse_yaml_document(path, source, field_path).map(|document| document.value)
+}
+
+fn parse_yaml_document<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    source: &str,
+    field_path: &str,
+) -> Result<SourceDocument<T>, CompileError> {
+    oxidase_source::parse_document(path, source).map_err(|error| {
         let mut diagnostic = Diagnostic::new(
             error.code,
             error.message,
             SourceSpan {
                 file: error.path,
+                start_byte: 0,
+                end_byte: 0,
                 line: error.line,
                 column: error.column,
+                end_line: error.line,
+                end_column: error.column,
                 field_path: field_path.to_owned(),
             },
         );
@@ -2018,5 +2164,79 @@ api_version: oxidase.dev/v1alpha1
         assert_eq!(first.config_version, second.config_version);
         assert!(first.config_version.as_str().starts_with("v2-sha256-"));
         assert_eq!(first.config_version.as_str().len(), "v2-sha256-".len() + 64);
+    }
+
+    #[test]
+    fn semantic_diagnostics_use_exact_field_spans_after_crlf_block_scalars() {
+        let (_directory, path) = write_config(concat!(
+            "api_version: oxidase.dev/v1alpha1\r\n",
+            "kind: gateway\r\n",
+            "services:\r\n",
+            "  root:\r\n",
+            "    type: respond\r\n",
+            "    body:\r\n",
+            "      text: |-\r\n",
+            "        雪: remains template text\r\n",
+            "        duplicate: remains text\r\n",
+            "listeners:\r\n",
+            "  - name: public\r\n",
+            "    bind: not-an-address\r\n",
+            "    service:\r\n",
+            "      ref: root\r\n",
+        ));
+        let error = Compiler::compile_path(path).expect_err("invalid bind must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "listener.bind");
+        assert_eq!((diagnostic.source.line, diagnostic.source.column), (12, 11));
+        assert_eq!(diagnostic.source.field_path, "listeners[0].bind");
+        assert!(diagnostic.source.end_byte > diagnostic.source.start_byte);
+    }
+
+    #[test]
+    fn missing_service_reference_points_to_the_reference_value() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      ref: missing
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("missing service must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "service.reference");
+        assert_eq!((diagnostic.source.line, diagnostic.source.column), (7, 12));
+        assert_eq!(diagnostic.source.field_path, "listeners[0].service.ref");
+    }
+
+    #[test]
+    fn duplicate_imported_definitions_report_both_exact_spans() {
+        let directory = tempdir().expect("temporary directory is available");
+        for name in ["a.yaml", "b.yaml"] {
+            fs::write(
+                directory.path().join(name),
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices:\n  duplicate:\n    type: respond\n",
+            )
+            .expect("import can be written");
+        }
+        let root = directory.path().join("oxidase.yaml");
+        fs::write(
+            &root,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [a.yaml, b.yaml]\n",
+        )
+        .expect("root config can be written");
+        let error = Compiler::compile_path(root).expect_err("duplicate service must fail");
+        let diagnostic = error
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "config.duplicate_definition")
+            .expect("duplicate diagnostic is present");
+        assert_eq!((diagnostic.source.line, diagnostic.source.column), (4, 3));
+        assert!(diagnostic.source.file.ends_with("b.yaml"));
+        assert_eq!(diagnostic.reference_chain.len(), 2);
+        assert!(diagnostic.reference_chain[0].contains("a.yaml:4:3"));
+        assert!(diagnostic.reference_chain[1].contains("b.yaml:4:3"));
     }
 }

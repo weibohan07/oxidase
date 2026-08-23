@@ -1014,6 +1014,11 @@ fn compile_templates(
             .replace('\\', "/");
         let text = index.text(path)?;
         let (front_matter, body) = split_front_matter(path, text)?;
+        let body_offset = text.len() - body.len();
+        let body_line_offset = text[..body_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
         let metadata: crate::source::OxtMetadataSource = parse_yaml(path, front_matter)?;
         if metadata.oxista != TEMPLATE_API_VERSION {
             return Err(SiteCompileError::source(
@@ -1023,8 +1028,10 @@ fn compile_templates(
         }
         let template = CompiledOxt::compile(
             name.clone(),
+            path,
             &metadata,
             body,
+            (body_offset, body_line_offset),
             default_output,
             default_autoescape,
         )?;
@@ -1054,7 +1061,19 @@ fn validate_template_graph(
         if let Some(position) = visiting.iter().position(|candidate| candidate == name) {
             let mut cycle = visiting[position..].to_vec();
             cycle.push(name.to_owned());
-            return Err(SiteCompileError::TemplateCycle(cycle.join(" -> ")));
+            let edges = cycle
+                .windows(2)
+                .map(|edge| {
+                    templates
+                        .get(&edge[0])
+                        .and_then(|template| template.include_span(&edge[1]))
+                        .map_or_else(
+                            || format!("{} -> {}", edge[0], edge[1]),
+                            |span| format!("{} -> {} at {span}", edge[0], edge[1]),
+                        )
+                })
+                .collect::<Vec<_>>();
+            return Err(SiteCompileError::TemplateCycle(edges.join("; ")));
         }
         let template = templates.get(name).ok_or_else(|| {
             SiteCompileError::source(name, format!("included template `{name}` does not exist"))
@@ -3272,5 +3291,55 @@ templates:
             .expect("second symlink scan succeeds")
             .source_digest();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn oxt_expression_and_include_contract_errors_report_template_spans() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        let page = root.join("_templates/page.oxt");
+        fs::write(&page, "---\noxista: template/v1\n---\n雪 {{ page. }}\n")
+            .expect("invalid expression template can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("invalid interpolation must fail");
+        let message = failure.to_string();
+        assert!(
+            message.contains(page.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(message.contains("at 4:6-4:11"), "{message}");
+
+        fs::write(
+            root.join("_templates/child.oxt"),
+            "---\noxista: template/v1\nparams:\n  value: string\n---\n{{ value }}\n",
+        )
+        .expect("typed child can be written");
+        fs::write(
+            &page,
+            "---\noxista: template/v1\n---\n雪 {% include \"_templates/child.oxt\" with extra=1 %}\n",
+        )
+        .expect("invalid include caller can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("unknown include argument must fail");
+        let message = failure.to_string();
+        assert!(message.contains("unknown parameter `extra`"), "{message}");
+        assert!(message.contains("at 4:6-4:"), "{message}");
     }
 }

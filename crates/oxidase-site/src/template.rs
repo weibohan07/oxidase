@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use oxidase_core::expression::html_escape;
-use oxidase_core::{EvalContext, Expression, Value};
+use oxidase_core::{EvalContext, Expression, SourceSpan, Value};
 
 use crate::source::{AutoescapeSource, OutputSource, OxtMetadataSource};
 use crate::{SiteCompileError, TemplateArgumentError, TemplateLimitKind, TemplateRenderError};
@@ -67,12 +68,15 @@ impl TemplateContext {
 impl CompiledOxt {
     pub(crate) fn compile(
         name: impl Into<String>,
+        source_path: impl Into<PathBuf>,
         metadata: &OxtMetadataSource,
         source: &str,
+        source_origin: (usize, usize),
         default_output: OutputSource,
         default_autoescape: Option<AutoescapeSource>,
     ) -> Result<Self, SiteCompileError> {
         let name = name.into();
+        let source_path = source_path.into();
         let output = TemplateOutput::from(metadata.output.unwrap_or(default_output));
         if output == TemplateOutput::Json {
             return Err(SiteCompileError::source(
@@ -90,6 +94,7 @@ impl CompiledOxt {
         }
         Self::compile_parts(
             name,
+            source_path,
             params,
             metadata
                 .autoescape
@@ -100,6 +105,7 @@ impl CompiledOxt {
                     && output == TemplateOutput::Html,
             output,
             source,
+            source_origin,
         )
     }
 
@@ -109,12 +115,15 @@ impl CompiledOxt {
         source: &str,
         autoescape_html: bool,
     ) -> Result<Self, SiteCompileError> {
+        let name = name.into();
         Self::compile_parts(
-            name.into(),
+            name.clone(),
+            PathBuf::from(name),
             BTreeMap::new(),
             autoescape_html,
             TemplateOutput::Html,
             source,
+            (0, 0),
         )
     }
 
@@ -133,24 +142,28 @@ impl CompiledOxt {
             ));
         }
         Self::compile_parts(
-            name,
+            name.clone(),
+            PathBuf::from(name),
             BTreeMap::new(),
             autoescape.is_some_and(|value| matches!(value, AutoescapeSource::Html))
                 || autoescape.is_none() && output == TemplateOutput::Html,
             output,
             source,
+            (0, 0),
         )
     }
 
     fn compile_parts(
         name: String,
+        source_path: PathBuf,
         params: BTreeMap<String, ValueType>,
         autoescape_html: bool,
         output: TemplateOutput,
         source: &str,
+        source_origin: (usize, usize),
     ) -> Result<Self, SiteCompileError> {
-        let tokens =
-            tokenize(source).map_err(|message| SiteCompileError::source(&name, message))?;
+        let tokens = tokenize(&source_path, source, source_origin.0, source_origin.1)
+            .map_err(|error| SiteCompileError::source_span(error.span, error.message))?;
         let (nodes, stop, dependencies) = {
             let mut parser = TemplateParser {
                 name: &name,
@@ -185,7 +198,11 @@ impl CompiledOxt {
         &self,
         templates: &BTreeMap<String, Self>,
     ) -> Result<(), SiteCompileError> {
-        validate_include_nodes(&self.name, &self.nodes, templates)
+        validate_include_nodes(&self.nodes, templates)
+    }
+
+    pub(crate) fn include_span(&self, target: &str) -> Option<&SourceSpan> {
+        find_include_span(&self.nodes, target)
     }
 
     pub(crate) const fn content_type(&self) -> &'static str {
@@ -330,6 +347,7 @@ struct IncludeCall {
     name: String,
     arguments: BTreeMap<String, Expression>,
     only: bool,
+    span: SourceSpan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,15 +531,15 @@ impl TemplateParser<'_> {
                     nodes.push(TemplateNode::Text(value.clone()));
                     self.position += 1;
                 }
-                TemplateToken::Expression(source) => {
+                TemplateToken::Expression(source, span) => {
                     nodes.push(TemplateNode::Interpolation(
                         Expression::compile(source).map_err(|error| {
-                            SiteCompileError::source(self.name, error.to_string())
+                            SiteCompileError::source_span(span.clone(), error.to_string())
                         })?,
                     ));
                     self.position += 1;
                 }
-                TemplateToken::Tag(tag) => {
+                TemplateToken::Tag(tag, span) => {
                     let keyword = tag.split_whitespace().next().unwrap_or("");
                     if stops.contains(&keyword) {
                         self.position += 1;
@@ -529,19 +547,19 @@ impl TemplateParser<'_> {
                     }
                     self.position += 1;
                     match keyword {
-                        "if" => nodes.push(self.parse_if(tag)?),
-                        "for" => nodes.push(self.parse_for(tag)?),
-                        "with" => nodes.push(self.parse_with(tag)?),
-                        "include" => nodes.push(self.parse_include(tag)?),
+                        "if" => nodes.push(self.parse_if(tag, span)?),
+                        "for" => nodes.push(self.parse_for(tag, span)?),
+                        "with" => nodes.push(self.parse_with(tag, span)?),
+                        "include" => nodes.push(self.parse_include(tag, span)?),
                         "extends" | "block" | "endblock" => {
-                            return Err(SiteCompileError::source(
-                                self.name,
+                            return Err(SiteCompileError::source_span(
+                                span.clone(),
                                 "`extends`/`block` is not implemented; use static `include` in this release",
                             ));
                         }
                         _ => {
-                            return Err(SiteCompileError::source(
-                                self.name,
+                            return Err(SiteCompileError::source_span(
+                                span.clone(),
                                 format!("unknown or misplaced template tag `{tag}`"),
                             ));
                         }
@@ -552,11 +570,16 @@ impl TemplateParser<'_> {
         Ok((nodes, None))
     }
 
-    fn parse_if(&mut self, opening: &str) -> Result<TemplateNode, SiteCompileError> {
+    fn parse_if(
+        &mut self,
+        opening: &str,
+        opening_span: &SourceSpan,
+    ) -> Result<TemplateNode, SiteCompileError> {
         let condition = tag_argument(opening, "if")?;
         let mut branches = Vec::new();
-        let mut current = Expression::compile(condition)
-            .map_err(|error| SiteCompileError::source(self.name, error.to_string()))?;
+        let mut current = Expression::compile(condition).map_err(|error| {
+            SiteCompileError::source_span(opening_span.clone(), error.to_string())
+        })?;
         loop {
             let (body, stop) = self.parse_nodes(&["elif", "else", "endif"])?;
             branches.push((current, body));
@@ -586,15 +609,20 @@ impl TemplateParser<'_> {
         }
     }
 
-    fn parse_for(&mut self, opening: &str) -> Result<TemplateNode, SiteCompileError> {
+    fn parse_for(
+        &mut self,
+        opening: &str,
+        opening_span: &SourceSpan,
+    ) -> Result<TemplateNode, SiteCompileError> {
         let source = tag_argument(opening, "for")?;
         let (binding, values) = source.split_once(" in ").ok_or_else(|| {
             SiteCompileError::source(self.name, "`for` syntax is `for name in expression`")
         })?;
         validate_binding(binding, self.name)?;
         validate_local_binding(binding, self.name)?;
-        let values = Expression::compile(values)
-            .map_err(|error| SiteCompileError::source(self.name, error.to_string()))?;
+        let values = Expression::compile(values).map_err(|error| {
+            SiteCompileError::source_span(opening_span.clone(), error.to_string())
+        })?;
         let (body, stop) = self.parse_nodes(&["else", "endfor"])?;
         let otherwise = if stop.as_deref() == Some("else") {
             let (otherwise, stop) = self.parse_nodes(&["endfor"])?;
@@ -615,7 +643,11 @@ impl TemplateParser<'_> {
         })
     }
 
-    fn parse_with(&mut self, opening: &str) -> Result<TemplateNode, SiteCompileError> {
+    fn parse_with(
+        &mut self,
+        opening: &str,
+        opening_span: &SourceSpan,
+    ) -> Result<TemplateNode, SiteCompileError> {
         let source = tag_argument(opening, "with")?;
         let (binding, value) = source.split_once('=').ok_or_else(|| {
             SiteCompileError::source(self.name, "`with` syntax is `with name = expression`")
@@ -623,8 +655,9 @@ impl TemplateParser<'_> {
         let binding = binding.trim();
         validate_binding(binding, self.name)?;
         validate_local_binding(binding, self.name)?;
-        let value = Expression::compile(value.trim())
-            .map_err(|error| SiteCompileError::source(self.name, error.to_string()))?;
+        let value = Expression::compile(value.trim()).map_err(|error| {
+            SiteCompileError::source_span(opening_span.clone(), error.to_string())
+        })?;
         let (body, stop) = self.parse_nodes(&["endwith"])?;
         if stop.as_deref() != Some("endwith") {
             return Err(SiteCompileError::source(self.name, "unclosed `with` block"));
@@ -636,9 +669,19 @@ impl TemplateParser<'_> {
         })
     }
 
-    fn parse_include(&mut self, tag: &str) -> Result<TemplateNode, SiteCompileError> {
+    fn parse_include(
+        &mut self,
+        tag: &str,
+        span: &SourceSpan,
+    ) -> Result<TemplateNode, SiteCompileError> {
         let source = tag_argument(tag, "include")?;
-        let include = parse_include_call(source, self.name)?;
+        let mut include = parse_include_call(source, self.name).map_err(|_| {
+            SiteCompileError::source_span(
+                span.clone(),
+                "invalid include syntax; expected a static path, named expressions, and optional trailing `only`",
+            )
+        })?;
+        include.span = span.clone();
         self.dependencies.insert(include.name.clone());
         Ok(TemplateNode::Include(include))
     }
@@ -658,6 +701,7 @@ fn parse_include_call(source: &str, template: &str) -> Result<IncludeCall, SiteC
             name,
             arguments,
             only,
+            span: SourceSpan::synthetic("include"),
         });
     }
     if let Some(after_only) = strip_tag_keyword(rest, "only") {
@@ -671,6 +715,7 @@ fn parse_include_call(source: &str, template: &str) -> Result<IncludeCall, SiteC
             name,
             arguments,
             only: true,
+            span: SourceSpan::synthetic("include"),
         });
     }
     rest = strip_tag_keyword(rest, "with").ok_or_else(|| {
@@ -750,6 +795,7 @@ fn parse_include_call(source: &str, template: &str) -> Result<IncludeCall, SiteC
         name,
         arguments,
         only,
+        span: SourceSpan::synthetic("include"),
     })
 }
 
@@ -845,7 +891,6 @@ fn looks_like_include_assignment(source: &str) -> bool {
 }
 
 fn validate_include_nodes(
-    owner: &str,
     nodes: &[TemplateNode],
     templates: &BTreeMap<String, CompiledOxt>,
 ) -> Result<(), SiteCompileError> {
@@ -853,15 +898,15 @@ fn validate_include_nodes(
         match node {
             TemplateNode::Include(include) => {
                 let target = templates.get(&include.name).ok_or_else(|| {
-                    SiteCompileError::source(
-                        owner,
+                    SiteCompileError::source_span(
+                        include.span.clone(),
                         format!("included template `{}` does not exist", include.name),
                     )
                 })?;
                 for parameter in include.arguments.keys() {
                     if !target.params.contains_key(parameter) {
-                        return Err(SiteCompileError::source(
-                            owner,
+                        return Err(SiteCompileError::source_span(
+                            include.span.clone(),
                             format!(
                                 "include `{}` has unknown parameter `{parameter}`",
                                 include.name
@@ -874,8 +919,8 @@ fn validate_include_nodes(
                         if kind.optional() {
                             continue;
                         }
-                        return Err(SiteCompileError::source(
-                            owner,
+                        return Err(SiteCompileError::source_span(
+                            include.span.clone(),
                             format!(
                                 "include `{}` is missing required parameter `{parameter}` ({})",
                                 include.name,
@@ -886,8 +931,8 @@ fn validate_include_nodes(
                     if let Some(value) = argument.constant_value()
                         && !kind.accepts(value)
                     {
-                        return Err(SiteCompileError::source(
-                            owner,
+                        return Err(SiteCompileError::source_span(
+                            include.span.clone(),
                             format!(
                                 "include `{}` parameter `{parameter}` expects {}, received {}",
                                 include.name,
@@ -903,23 +948,49 @@ fn validate_include_nodes(
                 otherwise,
             } => {
                 for (_, body) in branches {
-                    validate_include_nodes(owner, body, templates)?;
+                    validate_include_nodes(body, templates)?;
                 }
-                validate_include_nodes(owner, otherwise, templates)?;
+                validate_include_nodes(otherwise, templates)?;
             }
             TemplateNode::For {
                 body, otherwise, ..
             } => {
-                validate_include_nodes(owner, body, templates)?;
-                validate_include_nodes(owner, otherwise, templates)?;
+                validate_include_nodes(body, templates)?;
+                validate_include_nodes(otherwise, templates)?;
             }
             TemplateNode::With { body, .. } => {
-                validate_include_nodes(owner, body, templates)?;
+                validate_include_nodes(body, templates)?;
             }
             TemplateNode::Text(_) | TemplateNode::Interpolation(_) => {}
         }
     }
     Ok(())
+}
+
+fn find_include_span<'a>(nodes: &'a [TemplateNode], target: &str) -> Option<&'a SourceSpan> {
+    for node in nodes {
+        let found = match node {
+            TemplateNode::Include(include) if include.name == target => Some(&include.span),
+            TemplateNode::If {
+                branches,
+                otherwise,
+            } => branches
+                .iter()
+                .find_map(|(_, body)| find_include_span(body, target))
+                .or_else(|| find_include_span(otherwise, target)),
+            TemplateNode::For {
+                body, otherwise, ..
+            } => find_include_span(body, target).or_else(|| find_include_span(otherwise, target)),
+            TemplateNode::With { body, .. } => find_include_span(body, target),
+            TemplateNode::Text(_) | TemplateNode::Interpolation(_) | TemplateNode::Include(_) => {
+                None
+            }
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 fn evaluate_include_arguments(
@@ -1257,11 +1328,31 @@ fn limit_error(template: &str, kind: TemplateLimitKind) -> TemplateRenderError {
 #[derive(Debug)]
 enum TemplateToken {
     Text(String),
-    Expression(String),
-    Tag(String),
+    Expression(String, SourceSpan),
+    Tag(String, SourceSpan),
 }
 
-fn tokenize(source: &str) -> Result<Vec<TemplateToken>, String> {
+struct TokenizeError {
+    message: String,
+    span: SourceSpan,
+}
+
+fn tokenize(
+    path: &Path,
+    source: &str,
+    source_byte_offset: usize,
+    source_line_offset: usize,
+) -> Result<Vec<TemplateToken>, TokenizeError> {
+    let span = |start, end| {
+        template_source_span(
+            path,
+            source,
+            source_byte_offset,
+            source_line_offset,
+            start,
+            end,
+        )
+    };
     let mut tokens = Vec::new();
     let mut cursor = 0;
     while cursor < source.len() {
@@ -1275,9 +1366,10 @@ fn tokenize(source: &str) -> Result<Vec<TemplateToken>, String> {
         }
         let rest = &source[start..];
         if let Some(raw) = rest.strip_prefix("{% raw %}") {
-            let end = raw
-                .find("{% endraw %}")
-                .ok_or_else(|| "unclosed `raw` block".to_owned())?;
+            let end = raw.find("{% endraw %}").ok_or_else(|| TokenizeError {
+                message: "unclosed `raw` block".to_owned(),
+                span: span(start, source.len()),
+            })?;
             tokens.push(TemplateToken::Text(raw[..end].to_owned()));
             cursor = start + "{% raw %}".len() + end + "{% endraw %}".len();
         } else if rest.starts_with("{{") {
@@ -1285,31 +1377,58 @@ fn tokenize(source: &str) -> Result<Vec<TemplateToken>, String> {
             let end = source[expression_start..]
                 .find("}}")
                 .map(|end| expression_start + end)
-                .ok_or_else(|| "unclosed interpolation".to_owned())?;
-            let expression = source[expression_start..end].trim();
+                .ok_or_else(|| TokenizeError {
+                    message: "unclosed interpolation".to_owned(),
+                    span: span(start, source.len()),
+                })?;
+            let raw_expression = &source[expression_start..end];
+            let expression = raw_expression.trim();
             if expression.is_empty() {
-                return Err("empty interpolation".to_owned());
+                return Err(TokenizeError {
+                    message: "empty interpolation".to_owned(),
+                    span: span(start, end + 2),
+                });
             }
-            tokens.push(TemplateToken::Expression(expression.to_owned()));
+            let leading = raw_expression.len() - raw_expression.trim_start().len();
+            let expression_offset = expression_start + leading;
+            tokens.push(TemplateToken::Expression(
+                expression.to_owned(),
+                span(expression_offset, expression_offset + expression.len()),
+            ));
             cursor = end + 2;
         } else if rest.starts_with("{#") {
             let comment_start = start + 2;
             let end = source[comment_start..]
                 .find("#}")
                 .map(|end| comment_start + end)
-                .ok_or_else(|| "unclosed template comment".to_owned())?;
+                .ok_or_else(|| TokenizeError {
+                    message: "unclosed template comment".to_owned(),
+                    span: span(start, source.len()),
+                })?;
             cursor = end + 2;
         } else if rest.starts_with("{%") {
             let tag_start = start + 2;
             let end = source[tag_start..]
                 .find("%}")
                 .map(|end| tag_start + end)
-                .ok_or_else(|| "unclosed template tag".to_owned())?;
-            let tag = source[tag_start..end].trim();
+                .ok_or_else(|| TokenizeError {
+                    message: "unclosed template tag".to_owned(),
+                    span: span(start, source.len()),
+                })?;
+            let raw_tag = &source[tag_start..end];
+            let tag = raw_tag.trim();
             if tag.is_empty() {
-                return Err("empty template tag".to_owned());
+                return Err(TokenizeError {
+                    message: "empty template tag".to_owned(),
+                    span: span(start, end + 2),
+                });
             }
-            tokens.push(TemplateToken::Tag(tag.to_owned()));
+            let leading = raw_tag.len() - raw_tag.trim_start().len();
+            let tag_offset = tag_start + leading;
+            tokens.push(TemplateToken::Tag(
+                tag.to_owned(),
+                span(tag_offset, tag_offset + tag.len()),
+            ));
             cursor = end + 2;
         } else {
             tokens.push(TemplateToken::Text("{".to_owned()));
@@ -1317,6 +1436,36 @@ fn tokenize(source: &str) -> Result<Vec<TemplateToken>, String> {
         }
     }
     Ok(tokens)
+}
+
+fn template_source_span(
+    path: &Path,
+    source: &str,
+    source_byte_offset: usize,
+    source_line_offset: usize,
+    start: usize,
+    end: usize,
+) -> SourceSpan {
+    let (line, column) = template_position(source, start);
+    let (end_line, end_column) = template_position(source, end);
+    SourceSpan {
+        file: path.to_path_buf(),
+        start_byte: source_byte_offset + start,
+        end_byte: source_byte_offset + end,
+        line: source_line_offset + line,
+        column,
+        end_line: source_line_offset + end_line,
+        end_column,
+        field_path: "template".to_owned(),
+    }
+}
+
+fn template_position(source: &str, offset: usize) -> (usize, usize) {
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let column = source[line_start..offset].chars().count() + 1;
+    (line, column)
 }
 
 fn tag_argument<'a>(tag: &'a str, keyword: &str) -> Result<&'a str, SiteCompileError> {
@@ -1375,6 +1524,7 @@ pub(crate) fn normalize_template_name(source: &str) -> Result<String, SiteCompil
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use oxidase_core::{EvalContext, Value};
@@ -1411,8 +1561,16 @@ mod tests {
                 )
             })
             .collect();
-        CompiledOxt::compile_parts(name.to_owned(), params, autoescape_html, output, source)
-            .expect("fixture template compiles")
+        CompiledOxt::compile_parts(
+            name.to_owned(),
+            PathBuf::from(name),
+            params,
+            autoescape_html,
+            output,
+            source,
+            (0, 0),
+        )
+        .expect("fixture template compiles")
     }
 
     fn public_context() -> EvalContext {
