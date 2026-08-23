@@ -2,253 +2,128 @@
 
 English | [简体中文](README.zh.md)
 
-Oxidase is a lightweight HTTP gateway built on Rust / Tokio / Hyper, supporting route matching, rewrites, reverse proxying, and static file serving.
+Oxidase is a declarative HTTP Service program compiler and runtime written in Rust.
 
-## TL;DR
+Gateway configuration is treated as source code. Oxidase resolves imports and
+references, validates the complete program, compiles patterns, expressions,
+templates, and Oxista sites, prepares shared resources, then publishes an immutable
+runtime snapshot. Each listener binds network traffic to any root Service.
 
-With just a handful of lines of config you can spin up the following!
+## The model
 
-- **Static service (`Static`)**: Safely launch a static site or file server from any folder. Evil paths get filtered automatically! Options include directory strategy, `index` / `404` pages, and more.
-- **Reverse proxy service (`Forward`)**: Forward requests to upstream HTTP(S) and return whatever the upstream returns. Options like `pass_host` strategy, `X-Forwarded` controls, etc.
-- **Programmable routing pipeline service (`Router`)**:
-  - The whole pipeline is rule-driven, and each rule can capture variables from headers while matching (see **Pattern**).
-  - After a rule matches, you can branch based on the captured header variables.
-  - Leaf nodes of the branch tree can edit headers (and can use captured variables, see **Template**), return an error page directly, or delegate to other services.
-  - You can set a fallback service that takes over when rules are exhausted.
+- **Listener** owns transport metadata and points to a root Service.
+- **Service Program** composes terminal (`Respond`, `Redirect`, `Site`, `Proxy`),
+  wrapper (`Transform`, `Observe`, `Timeout`, `Recover`), and composition (`Route`,
+  `Fallback`, `Reenter`) nodes.
+- **Resource Registry** owns reusable state such as compiled Site snapshots and
+  Cluster definitions. Resources are not Services.
+- **Router DSL** is optional source syntax lowered to ordinary Service IR before
+  execution; the runtime has no privileged Router.
+- **Oxista** compiles `.oxsite`, `.oxr`, and `.oxt` sources into an immutable Site
+  index. Request handling never parses these files.
 
-We also have these exciting features:
+Every Service returns one of `Handled(response)`, `Declined`, or `Failed(error)`.
+Fallback advances only on `Declined`; HTTP 404 and 500 responses are still handled
+responses. Request overlays and route bindings are lexical, so a declined branch
+cannot leak captures or rewrites into its siblings.
 
-- **Config imports**: Any field that needs a `Service` object can read that service from another file via `import: ./foo.yaml`.
-- **Multiple instances**: A config can contain multiple `HttpServer` objects. If a `name` field is provided, you can start one by name with `--pick`.
-- **Live config watching**: Use the `--watch` flag to watch config changes in real time.
+## Current v0.2 alpha
 
-## Quick start
+The runnable HTTP/1.1 slice supports Respond, Redirect, Route, Fallback, Transform,
+Observe, Timeout, Recover, and compiled Site execution. Assets are streamed from
+async files and support single byte ranges, ETag/Last-Modified conditionals, and
+precompressed representation selection.
+
+Proxy is represented and validated in the Service plan but its production upstream
+adapter is the next implementation phase. TLS, HTTP/2, listener-aware reload,
+management endpoints, and OXT `extends`/`block` are not yet implemented. See
+[`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
+
+## Try the vertical slice
 
 ```bash
-cargo build --release
-./target/release/oxidase -c config.yaml
+cargo run -p oxidase-cli -- check examples/basic-gateway/oxidase.yaml
+cargo run -p oxidase-cli -- test examples/basic-gateway/oxidase.yaml
+cargo run -p oxidase-cli -- explain examples/basic-gateway/oxidase.yaml \
+  --request examples/basic-gateway/requests/home.yaml
+cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
 ```
 
-Say we want to start a service on one port; we can specify an `HttpServer` object in the config file.
+The example demonstrates:
 
-An `HttpServer` object has `bind`, `service`, and an optional `name` field—`bind` is a string for the bound port; `service` is the bound service, a `Service` object; `name` assigns a name so you can start it individually with `--pick`.
+- `/`: compiled OXT page;
+- `/about.html`: sibling asset governed by OXR headers;
+- `/old-page`: Oxista redirect;
+- `/feed.json`: structured JSON response;
+- `/legacy`: Service-level redirect;
+- a missing resource declining from Site into an explicit Respond 404;
+- an outer response Transform applied to every handled branch.
 
-```yaml
-# config.yaml
-bind: "127.0.0.1:7589"
-service:
-  handler: static
-  source_dir: "./public"
-```
+The `/api/*` route requires an upstream on `127.0.0.1:3000`; until the Proxy phase it
+returns a safe 502 while `explain` can still show the compiled rewrite and Cluster
+selection.
 
-When the config grows more complex, consider splitting some `Service` objects into separate files.
-
-```yaml
-# main.yaml
-bind: "127.0.0.1:7589"
-service:
-  import: "./service.yaml"
-
-# service.yaml
-handler: static
-source_dir: "./public"
-```
-
-We can also list multiple `HttpServer` objects directly in the config file; by default, all of them start.
+## Configuration sketch
 
 ```yaml
-# config.yaml
-servers:
-  - name: web
-    bind: "0.0.0.0:7589"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+services:
+  public:
+    type: transform
+    response:
+      headers:
+        set:
+          X-Content-Type-Options: nosniff
     service:
-      import: "./service_web.yaml"
-  - name: api
-    bind: "0.0.0.0:7588"
+      type: fallback
+      services:
+        - type: site
+          site: web
+        - type: respond
+          status: 404
+          body:
+            text: Not Found
+
+listeners:
+  - name: public-http
+    bind: 127.0.0.1:7589
     service:
-      handler: forward
-      target:
-        scheme: http
-        host: "localhost"
-        port: 3000
+      ref: public
 ```
 
-## CLI options
+The v1alpha1 YAML boundary is strict: unknown and duplicate keys fail, aliases and
+merge keys are unsupported, and imports/references are cycle checked. `check` and
+`serve` use the same compiler and Site preparation path.
 
-- `-c, --config <FILE>`: Start one or more services from a full config file.
-- `-f, --service-file <FILE>`: Start a service from a config file that only contains `Service`, together with `--bind`.
-- `-i, --service-inline <YAML/JSON>`: Start a service from inline `Service` config, together with `--bind`.
-- `-b, --bind <ADDR>`: Bind address/port when only a `Service` config is provided (default `127.0.0.1:7589`).
-- `-p, --pick <NAME>`: From multiple `HttpServer` objects in the config file, start the one with the specified name.
-- `-v, --validate-only`: Validate config only; do not start services.
-- `-w, --watch`: Watch config changes and restart services automatically.
+## CLI
 
-## Config structure
-
-- **HttpServer**
-  ```yaml
-  name?: (string)
-  bind: (string)
-  tls?: (TlsConfig) # WIP
-  service: (ServiceRef)
-  ```
-- **ServiceRef**
-  ```yaml
-  # Inline
-  handler: static | forward | router
-  ... # options for the specific service
-
-  # Or import from another file
-  import: (./path/to/service.yaml)
-  ```
-- **Service**
-  - **Router**
-    ```yaml
-    handler: router
-    rules: ([RouterRule...])
-    next?: (ServiceRef)
-    max_steps?: (u32)
-    ```
-  - **Forward**
-    ```yaml
-    handler: forward
-    target:
-      scheme: http | https
-      host: (host)
-      port: (u16)
-      path_prefix: (path)
-    pass_host: incoming | target | custom{(host)}
-    x_forwarded?: bool
-    tls?: ... # WIP
-    timeouts?: ... # WIP
-    http_version?: ... # WIP
-    ```
-  - **Static**
-    ```yaml
-    handler: static
-    source_dir: (string)
-    file_index: (string)
-    file_404?: (string)
-    file_500?: (string) # WIP
-    evil_dir_strategy?:
-      if_index_exists?: serve_index | redirect{(u16)} | not_found
-      if_index_missing?: redirect{(u16)} | not_found
-    index_strategy?: serve_index | redirect{(u16)} | not_found
-    ```
-- **RouterRule**
-  ```yaml
-  when?: (RouterMatch)
-  ops: ([RouterOp...])
-  on_match?: stop | continue | restart
-  ```
-- **RouterMatch**
-  ```yaml
-  scheme?: http | https
-  host?: (pattern)
-  path?: (pattern)
-  methods?: ([(GET | POST | ...)])
-  headers?:
-    - { name: (string), pattern: (pattern), not?: (bool) }
-    - ...
-  queries?:
-    - { key: (string), pattern: (pattern), not?: (bool) }
-    - ...
-  cookies?:
-    - { name: (string), pattern: (pattern), not?: (bool) }
-    - ...
-  ```
-- **RouterOp**
-  - Request header rewrites:
-    - `set_scheme`
-    - `set_host`
-    - `set_port`
-    - `set_path`
-    - `header_set/add/delete/clear`
-    - `query_set/add/delete/clear`
-  - Control flow:
-    - `branch { if, then, else }`
-    - `internal_rewrite`
-  - Final actions:
-    - `redirect { status, location }`
-    - `respond { status, body?, headers? }`
-    - `use { (ServiceRef) }`
-
-## Patterns (`Pattern`) and templates (`Template`)
-
-For example, suppose we're configuring a `Router` service and want to rewrite a friendly URL like `https://docs.example.com/rust/oxidase-web-server.html` into `http://192.168.12.34:5678/index.php?blog=docs&category=rust&post=oxidase-web-server` and forward it to an upstream PHP service.
-
-We can write the config below:
-
-```yaml
-# config.yaml
-bind: "0.0.0.0:443"
-service:
-  handler: router
-  rules:
-    - when:
-        scheme: https
-        host: '<blog_name:label>.example.com'
-        path: '/<category_slug:slug>/<post_slug:slug>.html'
-      ops:
-        - set_scheme: http
-        - set_host: "192.168.12.34"
-        - set_port: 5678
-        - set_path: 'index.php?blog=${blog_name|url_encode}&category=${category_slug|url_encode}&post=${post_slug|url_encode}'
-    - ... # other rules
-  next:
-    handler: forward
-    target:
-      scheme: http
-      host: "192.168.12.34"
-      port: 5678
+```text
+oxidase check <config>
+oxidase serve <config>
+oxidase explain <config> --request <request-file> [--listener <name>]
+oxidase compile <config> --output <manifest.json>
+oxidase test <config>
 ```
 
-HTTPS-related functionality is still under development, so real-world use can't handle HTTPS requests yet—this is just a demo.
-
-In this case you can see that with the powerful pattern and template engines, it's easy to capture variables from the request headers and use them in subsequent header rewrites.
-
-### Pattern syntax
-
-- **Context**: `host` / `path` / `value`, matches the whole field, no substring search.
-- **Placeholders**:
-  - Structural: `<:label>/<:labels>` (DNS label), `<:seg>` (single path segment), `<:any>` (greedy match of the rest).
-  - Types: `<:uint/int/slug/hex/uuid>`.
-  - Custom: `<:regex(...)>` (restricted subset to avoid catastrophic backtracking).
-  - If there's a name before the colon, a capture is created and can be referenced in templates.
-- **Restricted regex notes**: Only safe literals/character classes/finite quantifiers and non-capturing groups are allowed, with whole-field anchoring by default; compiled per context (e.g., label rules under host).
-
-### Template syntax
-
-- **Form**: `${var | filter(...) | filter2}`, filters applied left to right.
-- **Variables**: `method/scheme/host/port/path`, `header.<Name>` (case-insensitive), `query.<key>`, `cookie.<name>`, plus named captures from patterns.
-- **Filters**: `default(x)`, `lower/upper`, `url_encode`, `trim_prefix(x)/trim_suffix(x)`, `replace(a,b)`; missing variables expand to an empty string.
-
-## Runtime and concurrency
-
-Oxidase runs on a multi-threaded Tokio runtime.
+`compile` currently writes a deterministic inspection manifest, not a self-contained
+binary runtime snapshot.
 
 ## Development
 
-- Tests: `cargo test` (or module-level like `cargo test cli`).
-- Main modules:
-  - `config` (parsing / validation / `import`)
-  - `build` (runtime construction)
-  - `handler` (`router` / `forward` / `static`)
-  - `pattern`
-  - `template`
-  - `cli`
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo doc --workspace --no-deps
+```
 
-## Roadmap
+The HTTP end-to-end tests bind ephemeral loopback ports. Sandboxed environments may
+need permission to run those tests.
 
-- [ ] HTTPS support.
-- [ ] Better hot reload support.
-- [ ] Forward upstream HTTPS/HTTP2, TLS.
-- [ ] Better observability and logging (structured logs, metrics).
+Architecture starts at [`ARCHITECTURE.md`](ARCHITECTURE.md). The v0.1 prototype is
+described in [`docs/legacy/v0.1.md`](docs/legacy/v0.1.md) and remains available in
+Git history.
 
-## Contributing
-
-This project is open-sourced under the [MIT License](LICENSE).
-
-This project uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
-
-Please write tests when contributing.
+Oxidase is licensed under the [MIT License](LICENSE).

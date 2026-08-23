@@ -91,11 +91,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             run_config_tests(&gateway).await
         }
         Command::Serve { config } => {
-            let _gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
-            Err(
-                "`oxidase serve` requires the HTTP data-plane phase, which is not implemented yet"
-                    .into(),
-            )
+            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "oxidase=info".into()),
+                )
+                .try_init();
+            let server = oxidase_server::GatewayServer::bind(gateway).await?;
+            for (name, address) in server.local_addresses() {
+                println!("listener {name} accepting HTTP/1.1 on {address}");
+            }
+            server
+                .run_until(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
+            Ok(())
         }
     }
 }

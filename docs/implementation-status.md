@@ -38,19 +38,24 @@ Last updated: 2026-08-23
 - Required `basic-gateway` and `oxista-site` examples compile and their three
   declarative gateway tests pass. `check` now prepares every Site through the same
   path that reload will use.
+- Phase 4 Tokio + Hyper HTTP/1.1 data plane with prepare-all listener binding,
+  arbitrary root Service execution, connection-derived peer/scheme metadata, safe
+  root outcome mapping, structured tracing fields, and bounded graceful drain.
+- Site bytes and assets are adapted to HTTP without default collection. Asset files
+  use async streaming, single byte ranges, HEAD, ETag/Last-Modified conditionals,
+  and Brotli/gzip representation selection.
+- `oxidase serve` now runs the prepared gateway. Real loopback tests cover
+  Respond/Redirect/Route/fallback, streaming asset range responses, and shutdown.
 
 ## Currently runnable
 
-- A v1alpha1 config and real Oxista site can be fully prepared, executed in memory,
-  explained with a node/route trace, and tested without opening a socket. Forty
-  workspace tests pass. It is not yet a network gateway because no production body
-  adapter exists.
+- A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
+  executed in memory, explained, and tested. Forty-four workspace tests pass,
+  including two real listener tests that require permission to bind loopback ports.
 
 ## Not implemented
 
-- Listener, production Proxy, and listener-aware atomic reload. `serve` currently
-  performs full configuration and Site preparation, then returns an explicit
-  not-implemented error.
+- Production Proxy, TLS/HTTP2, and listener-aware atomic reload.
 
 ## Known limitations
 
@@ -67,9 +72,14 @@ Last updated: 2026-08-23
 - Symlinked files are checked against the canonical root, but their alias path is not
   indexed in this release; directory symlinks are rejected rather than traversed.
 - Asset range and precompressed metadata is compiled, but actual range/content
-  negotiation awaits the HTTP data-plane adapter.
+  negotiation is HTTP/1.1 only; multipart ranges are deliberately rejected.
+- Proxy currently returns a safe 502 from the production listener; no upstream I/O
+  is performed yet.
+- Listener serving supports HTTP/1.1 only. TLS, HTTP/2, upgrades, trailers, gRPC,
+  and `100-continue` policy remain unimplemented.
 
 ## Next concrete work
 
-Implement the Hyper HTTP/1.1 listener, root outcome mapping, streaming asset body,
-range/precompressed negotiation, graceful shutdown, and real `oxidase serve`.
+Implement reusable Cluster clients, streaming Proxy request/response bodies,
+hop-by-hop header policy, forwarding metadata, timeouts, and upstream integration
+tests.

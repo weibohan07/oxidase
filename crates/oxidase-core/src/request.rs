@@ -170,6 +170,11 @@ impl RequestFrame {
     }
 
     #[must_use]
+    pub fn host(&self) -> &str {
+        authority_host(self.authority())
+    }
+
+    #[must_use]
     pub fn path_and_query(&self) -> &str {
         self.overlay
             .path_and_query
@@ -223,10 +228,7 @@ impl RequestFrame {
         request.insert("method".to_owned(), Value::from(self.method().as_str()));
         request.insert("scheme".to_owned(), Value::from(self.scheme()));
         request.insert("authority".to_owned(), Value::from(self.authority()));
-        request.insert(
-            "host".to_owned(),
-            Value::from(authority_host(self.authority())),
-        );
+        request.insert("host".to_owned(), Value::from(self.host()));
         request.insert("path".to_owned(), Value::from(self.path()));
         request.insert(
             "path_and_query".to_owned(),

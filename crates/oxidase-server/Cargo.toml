@@ -7,9 +7,24 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 oxidase-core = { path = "../oxidase-core" }
 oxidase-runtime = { path = "../oxidase-runtime" }
+oxidase-site = { path = "../oxidase-site" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+oxidase-config = { path = "../oxidase-config" }
+tempfile.workspace = true
 
 [lints]
 workspace = true
-

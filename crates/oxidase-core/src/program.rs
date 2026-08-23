@@ -294,7 +294,7 @@ impl PredicatePlan {
 
         let mut captures = BTreeMap::new();
         if let Some(pattern) = &self.host {
-            let Some(values) = pattern.captures(request.authority()) else {
+            let Some(values) = pattern.captures(request.host()) else {
                 return Ok(None);
             };
             captures.extend(

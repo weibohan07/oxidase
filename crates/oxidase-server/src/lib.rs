@@ -1,3 +1,10 @@
 //! Hyper-based listener and proxy data plane.
 
+mod body;
+mod leaves;
+mod server;
+
+pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
+pub use server::{GatewayServer, RunningServer, ServerError};
+
 pub const DATA_PLANE: &str = "hyper";
