@@ -34,6 +34,13 @@ impl CompiledOxt {
         source: &str,
     ) -> Result<Self, SiteCompileError> {
         let name = name.into();
+        let output = TemplateOutput::from(metadata.output);
+        if output == TemplateOutput::Json {
+            return Err(SiteCompileError::source(
+                &name,
+                "OXT `output: json` is not supported because text templates cannot guarantee valid JSON; use an OXR structured JSON body",
+            ));
+        }
         let params = metadata
             .params
             .iter()
@@ -46,12 +53,16 @@ impl CompiledOxt {
         Self::compile_parts(
             name,
             params,
-            matches!(metadata.autoescape, AutoescapeSource::Html),
-            TemplateOutput::from(metadata.output),
+            metadata
+                .autoescape
+                .is_some_and(|value| matches!(value, AutoescapeSource::Html))
+                || metadata.autoescape.is_none() && output == TemplateOutput::Html,
+            output,
             source,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn inline(
         name: impl Into<String>,
         source: &str,
@@ -62,6 +73,30 @@ impl CompiledOxt {
             BTreeMap::new(),
             autoescape_html,
             TemplateOutput::Html,
+            source,
+        )
+    }
+
+    pub(crate) fn inline_with_output(
+        name: impl Into<String>,
+        source: &str,
+        output: OutputSource,
+        autoescape: Option<AutoescapeSource>,
+    ) -> Result<Self, SiteCompileError> {
+        let name = name.into();
+        let output = TemplateOutput::from(output);
+        if output == TemplateOutput::Json {
+            return Err(SiteCompileError::source(
+                name,
+                "inline template `output: json` is not supported; use an OXR structured JSON body",
+            ));
+        }
+        Self::compile_parts(
+            name,
+            BTreeMap::new(),
+            autoescape.is_some_and(|value| matches!(value, AutoescapeSource::Html))
+                || autoescape.is_none() && output == TemplateOutput::Html,
+            output,
             source,
         )
     }
@@ -103,6 +138,14 @@ impl CompiledOxt {
 
     pub(crate) fn dependencies(&self) -> &BTreeSet<String> {
         &self.dependencies
+    }
+
+    pub(crate) const fn content_type(&self) -> &'static str {
+        match self.output {
+            TemplateOutput::Html => "text/html; charset=utf-8",
+            TemplateOutput::Text => "text/plain; charset=utf-8",
+            TemplateOutput::Json => "application/json",
+        }
     }
 
     pub(crate) fn validate_arguments(
@@ -182,7 +225,7 @@ enum TemplateNode {
     Include(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TemplateOutput {
     Html,
     Text,
@@ -496,7 +539,6 @@ fn render_template(
     if depth > limits.include_depth {
         return Err("template include depth limit exceeded".to_owned());
     }
-    let _output_kind = template.output;
     render_nodes(
         &template.nodes,
         template.autoescape_html,

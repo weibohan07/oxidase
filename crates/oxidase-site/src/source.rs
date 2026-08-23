@@ -159,7 +159,7 @@ pub(crate) struct TemplatesSource {
     pub roots: Vec<String>,
     pub strict_undefined: bool,
     pub default_output: OutputSource,
-    pub default_autoescape: AutoescapeSource,
+    pub default_autoescape: Option<AutoescapeSource>,
     pub limits: LimitsSource,
 }
 
@@ -169,7 +169,7 @@ impl Default for TemplatesSource {
             roots: vec!["_templates".to_owned()],
             strict_undefined: true,
             default_output: OutputSource::Html,
-            default_autoescape: AutoescapeSource::Html,
+            default_autoescape: None,
             limits: LimitsSource::default(),
         }
     }
@@ -338,8 +338,7 @@ pub(crate) struct OxtMetadataSource {
     pub oxista: String,
     #[serde(default)]
     pub output: OutputSource,
-    #[serde(default)]
-    pub autoescape: AutoescapeSource,
+    pub autoescape: Option<AutoescapeSource>,
     #[serde(default)]
     pub params: BTreeMap<String, String>,
 }

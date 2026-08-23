@@ -15,9 +15,9 @@ use crate::runtime::{
     SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
 };
 use crate::source::{
-    AutoescapeSource, EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource,
-    MissingSource, OxrBodySource, OxrSource, RedirectQuerySource, ResponsePolicySource,
-    SymlinkModeSource, TemplateReferenceSource, VisibilityModeSource,
+    EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource, MissingSource, OutputSource,
+    OxrBodySource, OxrSource, RedirectQuerySource, ResponsePolicySource, SymlinkModeSource,
+    TemplateReferenceSource, TrailingSlashSource, VisibilityModeSource,
 };
 use crate::template::{CompiledOxt, CompiledValue, TemplateLimits, normalize_template_name};
 use crate::{RESPONSE_API_VERSION, SITE_API_VERSION, TEMPLATE_API_VERSION};
@@ -178,6 +178,12 @@ fn validate_manifest(
     source: &ManifestSource,
     inputs: &BTreeMap<String, Value>,
 ) -> Result<(), SiteCompileError> {
+    if !matches!(source.paths.trailing_slash, TrailingSlashSource::Canonical) {
+        return Err(SiteCompileError::source(
+            path,
+            "paths.trailing_slash only supports `canonical` in Oxista v1; remove the field or set it to `canonical`",
+        ));
+    }
     if source.paths.directory_listing {
         return Err(SiteCompileError::source(
             path,
@@ -189,6 +195,30 @@ fn validate_manifest(
             path,
             "clean_html_urls is not implemented in this release",
         ));
+    }
+    if matches!(source.templates.default_output, OutputSource::Json) {
+        return Err(SiteCompileError::source(
+            path,
+            "templates.default_output `json` is not supported; use an OXR structured JSON body",
+        ));
+    }
+    if let Some(status) = source.errors.keys().find(|status| **status != 404) {
+        return Err(SiteCompileError::source(
+            path,
+            format!(
+                "errors.{status} is not supported in Oxista v1 alpha; only a 404 template is implemented"
+            ),
+        ));
+    }
+    for (index, pattern) in source.visibility.deny.iter().enumerate() {
+        if !supported_deny_pattern(pattern) {
+            return Err(SiteCompileError::source(
+                path,
+                format!(
+                    "visibility.deny[{index}] uses unsupported glob `{pattern}`; use an exact relative path, `**/name`, or `**/*.ext`"
+                ),
+            ));
+        }
     }
     for (name, contract) in &source.inputs {
         match inputs.get(name) {
@@ -236,6 +266,20 @@ fn validate_manifest(
         validate_cache_policy(path, policy)?;
     }
     Ok(())
+}
+
+fn supported_deny_pattern(pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let has_glob = pattern.contains(['*', '?', '[', ']']);
+    if !has_glob {
+        return true;
+    }
+    pattern
+        .strip_prefix("**/*")
+        .or_else(|| pattern.strip_prefix("**/"))
+        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains(['*', '?', '[', ']']))
 }
 
 fn input_accepts(kind: &str, value: &Value) -> bool {
@@ -528,16 +572,22 @@ fn compile_oxr(
                 "redirect Location must be a local absolute path",
             ));
         }
+        let query = match redirect.query {
+            RedirectQuerySource::Drop => RedirectQuery::Drop,
+            RedirectQuerySource::Preserve => RedirectQuery::Preserve,
+            RedirectQuerySource::Replace => {
+                return Err(SiteCompileError::source(
+                    path,
+                    "response.redirect.query `replace` is not supported because Oxista v1 has no replacement query field; use `drop`, `preserve`, or include a fixed query in `location`",
+                ));
+            }
+        };
         (
             SiteResponseKind::Redirect {
                 status,
                 location: CompiledTemplate::compile(&redirect.location)
                     .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
-                query: match redirect.query {
-                    RedirectQuerySource::Drop => RedirectQuery::Drop,
-                    RedirectQuerySource::Preserve => RedirectQuery::Preserve,
-                    RedirectQuerySource::Replace => RedirectQuery::Replace,
-                },
+                query,
             },
             None,
         )
@@ -634,13 +684,11 @@ fn compile_oxr_body(
                     "@inline/{}",
                     oxr.strip_prefix(root).unwrap_or(oxr).to_string_lossy()
                 );
-                let template = CompiledOxt::inline(
+                let template = CompiledOxt::inline_with_output(
                     name.clone(),
                     inline_body,
-                    matches!(
-                        manifest.templates.default_autoescape,
-                        AutoescapeSource::Html
-                    ),
+                    manifest.templates.default_output,
+                    manifest.templates.default_autoescape,
                 )?;
                 templates.insert(name.clone(), template);
                 Ok((
@@ -1522,5 +1570,195 @@ response:
             assert!(message.contains(expected_path), "{message}");
             assert!(message.contains("response finalizer"), "{message}");
         }
+    }
+
+    #[test]
+    fn rejects_inert_or_unsupported_oxista_v1_fields() {
+        let manifest_cases = [
+            (
+                "oxista: site/v1\npaths:\n  trailing_slash: preserve\n",
+                "paths.trailing_slash",
+            ),
+            (
+                "oxista: site/v1\ntemplates:\n  default_output: json\n",
+                "templates.default_output",
+            ),
+            (
+                "oxista: site/v1\nerrors:\n  500:\n    template: error.oxt\n",
+                "errors.500",
+            ),
+            (
+                "oxista: site/v1\nvisibility:\n  deny:\n    - assets/*.pem\n",
+                "visibility.deny[0]",
+            ),
+        ];
+        for (manifest, expected) in manifest_cases {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir(&root).expect("site directory can be created");
+            fs::write(root.join("site.oxsite"), manifest).expect("manifest can be written");
+            fs::write(root.join("index.html"), "asset").expect("asset can be written");
+            let error = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("unsupported field value must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        fs::write(root.join("site.oxsite"), "oxista: site/v1\n").expect("manifest can be written");
+        fs::write(
+            root.join("redirect.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  redirect:
+    status: 308
+    location: /target
+    query: replace
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let error = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("query replacement without a value must fail");
+        assert!(error.to_string().contains("response.redirect.query"));
+        assert!(error.to_string().contains("drop"));
+    }
+
+    #[test]
+    fn template_output_controls_content_type_and_default_autoescape() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+templates:
+  roots: [_templates]
+  default_output: text
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/plain.oxt"),
+            r#"---
+oxista: template/v1
+output: text
+params:
+  value: string
+---
+{{ value }}
+"#,
+        )
+        .expect("text template can be written");
+        fs::write(
+            root.join("_templates/page.oxt"),
+            r#"---
+oxista: template/v1
+output: html
+params:
+  value: string
+---
+{{ value }}
+"#,
+        )
+        .expect("HTML template can be written");
+        for (name, template) in [("plain.txt", "plain.oxt"), ("page.html", "page.oxt")] {
+            fs::write(
+                root.join(format!("{name}.oxr")),
+                format!(
+                    r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/{template}
+      with:
+        value: "<value>"
+---
+"#
+                ),
+            )
+            .expect("OXR can be written");
+        }
+        fs::write(
+            root.join("inline.txt.oxr"),
+            r#"---
+oxista: response/v1
+page:
+  value: "<inline>"
+response:
+  body:
+    template: inline
+---
+{{ page.value }}
+"#,
+        )
+        .expect("inline OXR can be written");
+
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("site compiles");
+        for (path, content_type, expected) in [
+            ("/plain.txt", "text/plain; charset=utf-8", "<value>\n"),
+            ("/page.html", "text/html; charset=utf-8", "&lt;value&gt;\n"),
+            ("/inline.txt", "text/plain; charset=utf-8", "<inline>\n"),
+        ] {
+            let response = snapshot
+                .execute(&request(path))
+                .expect("site executes")
+                .expect("path is handled");
+            assert_eq!(response.headers["content-type"], content_type);
+            let PreparedSiteBody::Bytes(body) = response.body else {
+                panic!("template response is rendered bytes");
+            };
+            assert_eq!(String::from_utf8_lossy(&body), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_json_oxt_output_with_structured_json_migration() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/data.oxt"),
+            r#"---
+oxista: template/v1
+output: json
+---
+{"ok": true}
+"#,
+        )
+        .expect("template can be written");
+        let error = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("JSON OXT must be rejected");
+        assert!(error.to_string().contains("output: json"));
+        assert!(error.to_string().contains("structured JSON"));
     }
 }

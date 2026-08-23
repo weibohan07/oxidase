@@ -258,12 +258,11 @@ impl SiteSnapshot {
                 let body = template
                     .render(&self.templates, &context, &self.limits)
                     .map_err(SiteError::Template)?;
-                let fallback_type = if name.ends_with(".json.oxt") {
-                    "application/json"
-                } else {
-                    "text/html; charset=utf-8"
-                };
-                ensure_content_type(&mut headers, plan.content_type.as_deref(), fallback_type)?;
+                ensure_content_type(
+                    &mut headers,
+                    plan.content_type.as_deref(),
+                    template.content_type(),
+                )?;
                 headers.insert(
                     header::CONTENT_LENGTH,
                     header_value(body.len().to_string())?,
@@ -361,7 +360,6 @@ pub(crate) enum SiteResponseKind {
 pub(crate) enum RedirectQuery {
     Drop,
     Preserve,
-    Replace,
 }
 
 #[derive(Debug, Clone, Default)]
