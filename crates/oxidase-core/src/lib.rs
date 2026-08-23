@@ -1,6 +1,7 @@
 //! Protocol-independent language and execution-plan types for Oxidase.
 
 pub mod expression;
+pub mod http_policy;
 pub mod ids;
 pub mod outcome;
 pub mod pattern;
@@ -10,6 +11,7 @@ pub mod template;
 pub mod value;
 
 pub use expression::{EvalContext, Expression, ExpressionError, PathSegment};
+pub use http_policy::{is_forbidden_user_header, is_hop_by_hop_header};
 pub use ids::{ConfigVersion, ListenerId, ResourceId, RouteId, ServiceId, SourceSpan};
 pub use outcome::{ErrorClass, ResponseHead, ServiceError, ServiceOutcome};
 pub use pattern::{CompiledPattern, PatternContext, PatternError};

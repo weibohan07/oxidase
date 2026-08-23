@@ -19,9 +19,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::body::{GatewayBody, GatewayBodyPlan, full_body};
+use crate::body::{GatewayBody, GatewayBodyPlan};
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::Metrics;
+use crate::response::ResponseFinalizer;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -618,13 +619,13 @@ async fn handle_admin_request(
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
 ) -> Result<Response<GatewayBody>, Infallible> {
-    let head_only = request.method() == Method::HEAD;
+    let method = request.method().clone();
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return Ok(admin_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Method Not Allowed"),
-            head_only,
+            &method,
         ));
     }
     let response = match request.uri().path() {
@@ -632,7 +633,7 @@ async fn handle_admin_request(
             StatusCode::OK,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"live\n"),
-            head_only,
+            &method,
         ),
         "/health/ready" => {
             let ready = !store.pin().listeners.is_empty();
@@ -644,20 +645,20 @@ async fn handle_admin_request(
                 },
                 "text/plain; charset=utf-8",
                 Bytes::from_static(if ready { b"ready\n" } else { b"not ready\n" }),
-                head_only,
+                &method,
             )
         }
         "/metrics" => admin_response(
             StatusCode::OK,
             "text/plain; version=0.0.4; charset=utf-8",
             Bytes::from(metrics.render_prometheus()),
-            head_only,
+            &method,
         ),
         _ => admin_response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Not Found"),
-            head_only,
+            &method,
         ),
     };
     Ok(response)
@@ -667,27 +668,16 @@ fn admin_response(
     status: StatusCode,
     content_type: &'static str,
     body: Bytes,
-    head_only: bool,
+    method: &Method,
 ) -> Response<GatewayBody> {
-    let length = body.len();
-    let mut response = Response::new(if head_only {
-        GatewayBodyPlan::Empty.into_body(true)
-    } else {
-        full_body(body)
-    });
-    *response.status_mut() = status;
+    let mut response = oxidase_core::ResponseHead::new(status, GatewayBodyPlan::Bytes(body));
     response
-        .headers_mut()
+        .headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
-        .headers_mut()
+        .headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Ok(length) = HeaderValue::from_str(&length.to_string()) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_LENGTH, length);
-    }
-    response
+    ResponseFinalizer::new(method).finalize(response)
 }
 
 async fn run_listener(
@@ -820,12 +810,12 @@ async fn handle_request(
         return Ok(safe_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
-            false,
+            request.method(),
         ));
     };
 
     let (parts, body) = request.into_parts();
-    let is_head = parts.method == Method::HEAD;
+    let request_method = parts.method.clone();
     let authority = parts
         .headers
         .get(header::HOST)
@@ -853,12 +843,16 @@ async fn handle_request(
     let (outcome, status, response) = match report.outcome {
         ServiceOutcome::Handled(response) => {
             let status = response.status;
-            ("handled", status, response_from_head(response, is_head))
+            (
+                "handled",
+                status,
+                response_from_head(response, &request_method),
+            )
         }
         ServiceOutcome::Declined => (
             "declined",
             StatusCode::NOT_FOUND,
-            safe_response(StatusCode::NOT_FOUND, "Not Found", is_head),
+            safe_response(StatusCode::NOT_FOUND, "Not Found", &request_method),
         ),
         ServiceOutcome::Failed(error) => {
             tracing::error!(
@@ -875,7 +869,7 @@ async fn handle_request(
                 safe_response(
                     error.public_status,
                     safe_error_body(error.public_status),
-                    is_head,
+                    &request_method,
                 ),
             )
         }
@@ -894,22 +888,10 @@ async fn handle_request(
 }
 
 fn response_from_head(
-    mut response: oxidase_core::ResponseHead<GatewayBodyPlan>,
-    is_head: bool,
+    response: oxidase_core::ResponseHead<GatewayBodyPlan>,
+    method: &Method,
 ) -> Response<GatewayBody> {
-    if !response.headers.contains_key(header::CONTENT_LENGTH)
-        && let Some(length) = response.body.length()
-        && let Ok(value) = HeaderValue::from_str(&length.to_string())
-    {
-        response.headers.insert(header::CONTENT_LENGTH, value);
-    }
-    let body_forbidden = is_head
-        || response.status == StatusCode::NO_CONTENT
-        || response.status == StatusCode::NOT_MODIFIED;
-    let mut output = Response::new(response.body.into_body(body_forbidden));
-    *output.status_mut() = response.status;
-    *output.headers_mut() = response.headers;
-    output
+    ResponseFinalizer::new(method).finalize(response)
 }
 
 fn safe_error_body(status: StatusCode) -> &'static str {
@@ -925,25 +907,15 @@ fn safe_error_body(status: StatusCode) -> &'static str {
 fn safe_response(
     status: StatusCode,
     message: &'static str,
-    head_only: bool,
+    method: &Method,
 ) -> Response<GatewayBody> {
     let bytes = Bytes::from_static(message.as_bytes());
-    let mut response = Response::new(if head_only {
-        GatewayBodyPlan::Empty.into_body(true)
-    } else {
-        full_body(bytes.clone())
-    });
-    *response.status_mut() = status;
-    response.headers_mut().insert(
+    let mut response = oxidase_core::ResponseHead::new(status, GatewayBodyPlan::Bytes(bytes));
+    response.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    if let Ok(length) = HeaderValue::from_str(&bytes.len().to_string()) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_LENGTH, length);
-    }
-    response
+    ResponseFinalizer::new(method).finalize(response)
 }
 
 #[derive(Debug, Error)]
@@ -1023,6 +995,12 @@ mod tests {
             .await
             .expect("response can be read");
         String::from_utf8(response).expect("test response is UTF-8")
+    }
+
+    fn raw_response_parts(response: &str) -> (&str, &str) {
+        response
+            .split_once("\r\n\r\n")
+            .expect("wire response contains a header terminator")
     }
 
     async fn spawn_upstream() -> (
@@ -1195,6 +1173,90 @@ listeners:
     }
 
     #[tokio::test]
+    async fn finalizes_status_and_head_framing_on_the_wire() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: route
+    cases:
+      - when:
+          path: /informational
+        service:
+          type: respond
+          status: 101
+          body:
+            text: forbidden-101
+      - when:
+          path: /no-content
+        service:
+          type: respond
+          status: 204
+          body:
+            text: forbidden-204
+      - when:
+          path: /not-modified
+        service:
+          type: respond
+          status: 304
+          body:
+            text: forbidden-304
+    default:
+      type: respond
+      body:
+        text: hello
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        for (path, status) in [
+            ("/informational", "101 Switching Protocols"),
+            ("/no-content", "204 No Content"),
+            ("/not-modified", "304 Not Modified"),
+        ] {
+            let response = tokio::time::timeout(Duration::from_secs(1), request(address, path, ""))
+                .await
+                .expect("wire response completes");
+            let (headers, body) = raw_response_parts(&response);
+            assert!(headers.starts_with(&format!("HTTP/1.1 {status}")));
+            let headers = headers.to_ascii_lowercase();
+            assert!(!headers.contains("content-length:"));
+            assert!(!headers.contains("transfer-encoding:"));
+            assert!(body.is_empty());
+        }
+
+        let response = raw_request(
+            address,
+            "HEAD /head HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&response);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 5"));
+        assert!(body.is_empty());
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn streams_asset_and_honors_single_range() {
         let directory = tempdir().expect("temporary directory is available");
         let site = directory.path().join("site");
@@ -1242,6 +1304,15 @@ listeners:
                 .contains("content-range: bytes 2-5/10")
         );
         assert!(response.ends_with("cdef"));
+        let head = raw_request(
+            address,
+            "HEAD /large.bin HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&head);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 10"));
+        assert!(body.is_empty());
         running.shutdown().await.expect("server shuts down cleanly");
     }
 

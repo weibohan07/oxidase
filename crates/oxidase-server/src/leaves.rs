@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
@@ -22,6 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
+use crate::response::remove_hop_by_hop;
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
@@ -119,13 +120,26 @@ impl ProxyClient {
         };
         let (mut parts, body) = response.into_parts();
         remove_hop_by_hop(&mut parts.headers);
+        let representation_length = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let body = if request.method() == Method::HEAD {
+            GatewayBodyPlan::Head {
+                representation_length,
+            }
+        } else {
+            GatewayBodyPlan::Stream {
+                body: timeout_incoming_body(body, cluster_spec.response_timeout),
+                known_length: None,
+            }
+        };
         ServiceOutcome::Handled(ResponseHead {
             status: parts.status,
             headers: parts.headers,
-            body: GatewayBodyPlan::Stream(timeout_incoming_body(
-                body,
-                cluster_spec.response_timeout,
-            )),
+            body,
         })
     }
 }
@@ -249,32 +263,6 @@ fn escape_forwarded(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn remove_hop_by_hop(headers: &mut HeaderMap) {
-    let nominated = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|name| HeaderName::from_str(name.trim()).ok())
-        .collect::<Vec<_>>();
-    for name in nominated {
-        headers.remove(name);
-    }
-    for name in [
-        header::CONNECTION,
-        HeaderName::from_static("keep-alive"),
-        HeaderName::from_static("proxy-authenticate"),
-        HeaderName::from_static("proxy-authorization"),
-        header::TE,
-        header::TRAILER,
-        header::TRANSFER_ENCODING,
-        header::UPGRADE,
-        HeaderName::from_static("proxy-connection"),
-    ] {
-        headers.remove(name);
-    }
-}
-
 async fn prepare_site_body(
     mut response: PreparedSiteResponse,
     request: &RequestFrame,
@@ -378,7 +366,9 @@ async fn stream_asset(
         );
     }
     if head_only {
-        return Ok(GatewayBodyPlan::Empty);
+        return Ok(GatewayBodyPlan::Head {
+            representation_length: Some(response_length),
+        });
     }
 
     let mut file = tokio::fs::File::open(path).await.map_err(|error| {
@@ -401,9 +391,10 @@ async fn stream_asset(
     let stream = ReaderStream::new(reader)
         .map_ok(Frame::data)
         .map_err(|error| -> BoxError { Box::new(error) });
-    Ok(GatewayBodyPlan::Stream(
-        StreamBody::new(stream).boxed_unsync(),
-    ))
+    Ok(GatewayBodyPlan::Stream {
+        body: StreamBody::new(stream).boxed_unsync(),
+        known_length: Some(response_length),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

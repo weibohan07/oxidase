@@ -3,6 +3,7 @@
 mod body;
 mod leaves;
 mod metrics;
+mod response;
 mod server;
 
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};

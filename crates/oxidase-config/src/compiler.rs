@@ -13,6 +13,7 @@ use oxidase_core::{
     HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
     RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase, RouteId, ServiceGraph,
     ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
+    is_forbidden_user_header,
 };
 use serde::Serialize;
 use url::Url;
@@ -760,7 +761,7 @@ impl<'a> ProgramBuilder<'a> {
                 body,
             } => Ok(ServiceKind::Respond {
                 status: status_code(*status, file, field_path)?,
-                headers: compile_headers(headers, file, field_path)?,
+                headers: compile_headers(headers, file, &format!("{field_path}.headers"))?,
                 body: compile_body(body, file, field_path)?,
             }),
             InlineServiceSource::Redirect {
@@ -782,7 +783,7 @@ impl<'a> ProgramBuilder<'a> {
                     status,
                     location: redirect_template(location, file, field_path)?,
                     preserve_query: matches!(query, RedirectQuerySource::Preserve),
-                    headers: compile_headers(headers, file, field_path)?,
+                    headers: compile_headers(headers, file, &format!("{field_path}.headers"))?,
                 })
             }
             InlineServiceSource::Site { site } => {
@@ -971,7 +972,11 @@ fn compile_request_transform(
         scheme: optional_template(&source.scheme, file, field_path)?,
         authority: optional_template(&source.authority, file, field_path)?,
         path_and_query: optional_template(&source.path, file, field_path)?,
-        headers: compile_headers(&source.headers, file, field_path)?,
+        headers: compile_headers(
+            &source.headers,
+            file,
+            &format!("{field_path}.request.headers"),
+        )?,
     })
 }
 
@@ -981,7 +986,11 @@ fn compile_response_transform(
     field_path: &str,
 ) -> Result<ResponseTransform, CompileError> {
     Ok(ResponseTransform {
-        headers: compile_headers(&source.headers, file, field_path)?,
+        headers: compile_headers(
+            &source.headers,
+            file,
+            &format!("{field_path}.response.headers"),
+        )?,
     })
 }
 
@@ -991,21 +1000,16 @@ fn compile_headers(
     field_path: &str,
 ) -> Result<HeaderTransforms, CompileError> {
     Ok(HeaderTransforms {
-        set: compile_header_values(&source.set, file, field_path)?,
-        add: compile_header_values(&source.add, file, field_path)?,
+        set: compile_header_values(&source.set, file, &format!("{field_path}.set"))?,
+        add: compile_header_values(&source.add, file, &format!("{field_path}.add"))?,
         remove: source
             .remove
             .iter()
-            .map(|name| HeaderName::from_str(name))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                diagnostic_at(
-                    "service.header_name",
-                    format!("invalid header name: {error}"),
-                    file,
-                    field_path,
-                )
-            })?,
+            .enumerate()
+            .map(|(index, name)| {
+                compile_user_header_name(name, file, &format!("{field_path}.remove[{index}]"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -1017,7 +1021,9 @@ fn compile_header_values(
     source
         .iter()
         .map(|(name, value)| {
-            let value = template(value, file, field_path)?;
+            let header_path = format!("{field_path}.{name}");
+            let name = compile_user_header_name(name, file, &header_path)?;
+            let value = template(value, file, &header_path)?;
             if value.is_constant() {
                 let rendered = value
                     .render(&oxidase_core::EvalContext::default())
@@ -1029,23 +1035,37 @@ fn compile_header_values(
                         "service.header_value",
                         format!("header `{name}` has an invalid constant value"),
                         file,
-                        field_path,
+                        &header_path,
                     )
                 })?;
             }
-            Ok(HeaderTransform {
-                name: HeaderName::from_str(name).map_err(|error| {
-                    diagnostic_at(
-                        "service.header_name",
-                        format!("invalid header name `{name}`: {error}"),
-                        file,
-                        field_path,
-                    )
-                })?,
-                value,
-            })
+            Ok(HeaderTransform { name, value })
         })
         .collect()
+}
+
+fn compile_user_header_name(
+    source: &str,
+    file: &Path,
+    field_path: &str,
+) -> Result<HeaderName, CompileError> {
+    let name = HeaderName::from_str(source).map_err(|error| {
+        diagnostic_at(
+            "service.header_name",
+            format!("invalid header name `{source}`: {error}"),
+            file,
+            field_path,
+        )
+    })?;
+    if is_forbidden_user_header(&name) {
+        return Err(diagnostic_at(
+            "service.forbidden_header",
+            format!("header `{name}` is managed by the HTTP response finalizer"),
+            file,
+            field_path,
+        ));
+    }
+    Ok(name)
 }
 
 fn compile_predicate(
@@ -1654,5 +1674,67 @@ imports: [a.yaml, b.yaml]
         assert_eq!(error.diagnostics[0].code, "service.duplicate_internal_id");
         assert!(error.to_string().contains("first"));
         assert!(error.to_string().contains("second"));
+    }
+
+    #[test]
+    fn rejects_user_controlled_response_framing_headers() {
+        for name in ["Content-Length", "Connection", "Transfer-Encoding"] {
+            let (_directory, path) = write_config(&format!(
+                r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: respond
+    headers:
+      set:
+        {name}: value
+    body:
+      text: body
+listeners:
+  - name: test
+    bind: 127.0.0.1:7589
+    service:
+      ref: root
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("framing header must fail");
+            assert_eq!(error.diagnostics[0].code, "service.forbidden_header");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("services.root.headers.set"));
+        }
+    }
+
+    #[test]
+    fn rejects_response_transform_of_managed_header() {
+        let (_directory, path) = write_config(
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: transform
+    response:
+      headers:
+        add:
+          Trailer: X-Checksum
+    service:
+      type: respond
+      body:
+        text: body
+listeners:
+  - name: test
+    bind: 127.0.0.1:7589
+    service:
+      ref: root
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("managed transform header must fail");
+        assert_eq!(error.diagnostics[0].code, "service.forbidden_header");
+        assert!(
+            error
+                .to_string()
+                .contains("services.root.response.headers.add.Trailer")
+        );
     }
 }

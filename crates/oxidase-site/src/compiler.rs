@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
 
 use http::{HeaderName, HeaderValue, StatusCode};
-use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value};
+use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value, is_forbidden_user_header};
 use walkdir::WalkDir;
 
 use crate::error::SiteCompileError;
@@ -124,7 +124,11 @@ impl SiteCompiler {
             let logical_path = logical_path(relative);
             let plan = SiteResponsePlan {
                 status: StatusCode::OK,
-                headers: compile_response_policy(&source.defaults.response, &manifest)?,
+                headers: compile_response_policy(
+                    &source.defaults.response,
+                    &manifest,
+                    "defaults.response",
+                )?,
                 content_type: None,
                 page: BTreeMap::new(),
                 kind: SiteResponseKind::Asset(compile_asset(asset, &source)?),
@@ -471,19 +475,32 @@ fn compile_oxr(
     let extension = relative_without_oxr
         .extension()
         .map(|extension| format!(".{}", extension.to_string_lossy()));
-    let mut headers = compile_response_policy(&manifest.defaults.response, path)?;
+    let mut headers =
+        compile_response_policy(&manifest.defaults.response, path, "defaults.response")?;
     if let Some(extension) = extension.as_ref()
         && let Some(policy) = manifest.defaults.by_extension.get(extension)
     {
-        headers.merge(compile_response_policy(policy, path)?);
+        headers.merge(compile_response_policy(
+            policy,
+            path,
+            &format!("defaults.by_extension.{extension}"),
+        )?);
     }
     for profile in &source.apply {
         let policy = manifest.profiles.get(profile).ok_or_else(|| {
             SiteCompileError::source(path, format!("unknown response profile `{profile}`"))
         })?;
-        headers.merge(compile_response_policy(policy, path)?);
+        headers.merge(compile_response_policy(
+            policy,
+            path,
+            &format!("profiles.{profile}"),
+        )?);
     }
-    headers.merge(compile_headers(&source.response.headers, path)?);
+    headers.merge(compile_headers(
+        &source.response.headers,
+        path,
+        "response.headers",
+    )?);
     let page = source
         .page
         .iter()
@@ -753,8 +770,9 @@ fn compile_constant(source: &serde_yaml_ng::Value) -> Result<Value, SiteCompileE
 fn compile_response_policy(
     source: &ResponsePolicySource,
     path: &Path,
+    field_path: &str,
 ) -> Result<HeaderPlan, SiteCompileError> {
-    let mut headers = compile_headers(&source.headers, path)?;
+    let mut headers = compile_headers(&source.headers, path, &format!("{field_path}.headers"))?;
     if let Some(cache) = &source.cache {
         let mut directives = Vec::new();
         if let Some(visibility) = &cache.visibility {
@@ -781,28 +799,38 @@ fn compile_response_policy(
     Ok(headers)
 }
 
-fn compile_headers(source: &HeadersSource, path: &Path) -> Result<HeaderPlan, SiteCompileError> {
+fn compile_headers(
+    source: &HeadersSource,
+    path: &Path,
+    field_path: &str,
+) -> Result<HeaderPlan, SiteCompileError> {
     Ok(HeaderPlan {
-        set: compile_header_map(&source.set, path)?,
-        add: compile_header_map(&source.add, path)?,
+        set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
+        add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
         remove: source
             .remove
             .iter()
-            .map(|name| HeaderName::from_str(name))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
+            .enumerate()
+            .map(|(index, name)| {
+                compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
 fn compile_header_map(
     source: &BTreeMap<String, String>,
     path: &Path,
+    field_path: &str,
 ) -> Result<Vec<(HeaderName, CompiledTemplate)>, SiteCompileError> {
     source
         .iter()
         .map(|(name, value)| {
-            let template = CompiledTemplate::compile(value)
-                .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+            let header_path = format!("{field_path}.{name}");
+            let name = compile_user_header_name(name, path, &header_path)?;
+            let template = CompiledTemplate::compile(value).map_err(|error| {
+                SiteCompileError::source(path, format!("{header_path}: {error}"))
+            })?;
             if template.is_constant() {
                 let rendered = template
                     .render(&oxidase_core::EvalContext::default())
@@ -810,17 +838,33 @@ fn compile_header_map(
                 HeaderValue::from_str(&rendered).map_err(|_| {
                     SiteCompileError::source(
                         path,
-                        format!("header `{name}` has an invalid constant value"),
+                        format!("{header_path}: header `{name}` has an invalid constant value"),
                     )
                 })?;
             }
-            Ok((
-                HeaderName::from_str(name)
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
-                template,
-            ))
+            Ok((name, template))
         })
         .collect()
+}
+
+fn compile_user_header_name(
+    source: &str,
+    path: &Path,
+    field_path: &str,
+) -> Result<HeaderName, SiteCompileError> {
+    let name = HeaderName::from_str(source).map_err(|error| {
+        SiteCompileError::source(
+            path,
+            format!("{field_path}: invalid header name `{source}`: {error}"),
+        )
+    })?;
+    if is_forbidden_user_header(&name) {
+        return Err(SiteCompileError::source(
+            path,
+            format!("{field_path}: header `{name}` is managed by the HTTP response finalizer"),
+        ));
+    }
+    Ok(name)
 }
 
 fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, SiteCompileError> {
@@ -1385,5 +1429,81 @@ response:
             )]),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_managed_headers_in_oxista_policies_and_oxr() {
+        let cases = [
+            (
+                r#"oxista: site/v1
+defaults:
+  response:
+    headers:
+      set:
+        Connection: close
+"#,
+                None,
+                "defaults.response.headers.set.Connection",
+            ),
+            (
+                r#"oxista: site/v1
+profiles:
+  cached:
+    headers:
+      add:
+        Transfer-Encoding: chunked
+"#,
+                Some(
+                    r#"---
+oxista: response/v1
+apply: [cached]
+response:
+  body:
+    text: body
+---
+"#,
+                ),
+                "profiles.cached.headers.add.Transfer-Encoding",
+            ),
+            (
+                "oxista: site/v1\n",
+                Some(
+                    r#"---
+oxista: response/v1
+response:
+  headers:
+    remove:
+      - Content-Length
+  body:
+    text: body
+---
+"#,
+                ),
+                "response.headers.remove[0]",
+            ),
+        ];
+
+        for (manifest, oxr, expected_path) in cases {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir(&root).expect("site directory can be created");
+            fs::write(root.join("site.oxsite"), manifest).expect("manifest can be written");
+            if let Some(oxr) = oxr {
+                fs::write(root.join("index.html.oxr"), oxr).expect("OXR can be written");
+            } else {
+                fs::write(root.join("index.html"), "asset").expect("asset can be written");
+            }
+
+            let error = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("managed header must be rejected");
+            let message = error.to_string();
+            assert!(message.contains(expected_path), "{message}");
+            assert!(message.contains("response finalizer"), "{message}");
+        }
     }
 }

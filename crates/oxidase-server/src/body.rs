@@ -18,7 +18,13 @@ pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
 pub enum GatewayBodyPlan {
     Empty,
     Bytes(Bytes),
-    Stream(GatewayBody),
+    Stream {
+        body: GatewayBody,
+        known_length: Option<u64>,
+    },
+    Head {
+        representation_length: Option<u64>,
+    },
 }
 
 impl std::fmt::Debug for GatewayBodyPlan {
@@ -29,28 +35,41 @@ impl std::fmt::Debug for GatewayBodyPlan {
                 .debug_struct("Bytes")
                 .field("length", &bytes.len())
                 .finish(),
-            Self::Stream(_) => formatter.write_str("Stream(..)"),
+            Self::Stream { known_length, .. } => formatter
+                .debug_struct("Stream")
+                .field("known_length", known_length)
+                .finish(),
+            Self::Head {
+                representation_length,
+            } => formatter
+                .debug_struct("Head")
+                .field("representation_length", representation_length)
+                .finish(),
         }
     }
 }
 
 impl GatewayBodyPlan {
-    pub(crate) fn length(&self) -> Option<usize> {
+    pub(crate) fn representation_length(&self) -> Option<u64> {
         match self {
             Self::Empty => Some(0),
-            Self::Bytes(bytes) => Some(bytes.len()),
-            Self::Stream(_) => None,
+            Self::Bytes(bytes) => Some(bytes.len() as u64),
+            Self::Stream { known_length, .. } => *known_length,
+            Self::Head {
+                representation_length,
+            } => *representation_length,
         }
     }
 
-    pub(crate) fn into_body(self, head_only: bool) -> GatewayBody {
-        if head_only {
+    pub(crate) fn into_body(self, suppress: bool) -> GatewayBody {
+        if suppress {
             return empty_body();
         }
         match self {
             Self::Empty => empty_body(),
             Self::Bytes(bytes) => full_body(bytes),
-            Self::Stream(body) => body,
+            Self::Stream { body, .. } => body,
+            Self::Head { .. } => empty_body(),
         }
     }
 }
