@@ -64,6 +64,28 @@ impl FieldSpanIndex {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &FieldSpan)> {
         self.spans.iter().map(|(path, span)| (path.as_str(), span))
     }
+
+    #[must_use]
+    pub fn shifted(&self, byte_offset: usize, line_offset: usize) -> Self {
+        let spans = self
+            .spans
+            .iter()
+            .map(|(path, span)| {
+                let mut span = span.clone();
+                shift_range(&mut span.key, byte_offset, line_offset);
+                shift_range(&mut span.value, byte_offset, line_offset);
+                (path.clone(), span)
+            })
+            .collect();
+        Self { spans }
+    }
+}
+
+fn shift_range(range: &mut SourceRange, byte_offset: usize, line_offset: usize) {
+    range.start_byte += byte_offset;
+    range.end_byte += byte_offset;
+    range.start_line += line_offset;
+    range.end_line += line_offset;
 }
 
 #[derive(Debug, Clone)]

@@ -9,9 +9,11 @@ use std::time::{Duration, SystemTime};
 use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{
     CompiledTemplate, ContentDigest, ContentDigestBuilder, ContentHasher, Expression, ResourceId,
-    Value, is_forbidden_user_header,
+    SourceSpan, Value, is_forbidden_user_header,
 };
 use walkdir::WalkDir;
+
+use oxidase_source::FieldSpanIndex;
 
 use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
@@ -46,6 +48,7 @@ pub struct SiteSourceEntry {
     pub modified: Option<SystemTime>,
     pub digest: ContentDigest,
     text: Option<Arc<str>>,
+    spans: Option<Arc<FieldSpanIndex>>,
 }
 
 #[derive(Debug)]
@@ -111,6 +114,11 @@ impl SiteSourceIndex {
                 .ok()
                 .and_then(|canonical| self.entries.get(&canonical))
         })
+    }
+
+    fn spans(&self, path: &Path) -> Option<&FieldSpanIndex> {
+        self.indexed_entry(path)
+            .and_then(|entry| entry.spans.as_deref())
     }
 
     #[cfg(test)]
@@ -479,6 +487,24 @@ fn read_site_source_entry(
                 })
         })
         .transpose()?;
+    let spans = match (kind, text.as_deref()) {
+        (SiteSourceKind::Manifest, Some(text)) => Some(Arc::new(
+            oxidase_source::parse_document::<serde_yaml_ng::Value>(source_path, text)
+                .map_err(|error| SiteCompileError::source(source_path, error.to_string()))?
+                .spans,
+        )),
+        (SiteSourceKind::Response | SiteSourceKind::Template, Some(text)) => {
+            let (front_matter, _) = split_front_matter(source_path, text)?;
+            let byte_offset = text.split_inclusive('\n').next().map_or(0, str::len);
+            let spans =
+                oxidase_source::parse_document::<serde_yaml_ng::Value>(source_path, front_matter)
+                    .map_err(|error| SiteCompileError::source(source_path, error.to_string()))?
+                    .spans
+                    .shifted(byte_offset, 1);
+            Some(Arc::new(spans))
+        }
+        _ => None,
+    };
     Ok(SiteSourceEntry {
         source_path: source_path.to_path_buf(),
         canonical_path: canonical_path.to_path_buf(),
@@ -487,6 +513,7 @@ fn read_site_source_entry(
         modified: metadata.modified().ok(),
         digest: hasher.finish(),
         text,
+        spans,
     })
 }
 
@@ -1147,6 +1174,7 @@ fn compile_oxr(
         &source.response.headers,
         path,
         "response.headers",
+        index.spans(path),
     )?);
     let page = source
         .page
@@ -1426,7 +1454,12 @@ fn compile_response_policy(
     path: &Path,
     field_path: &str,
 ) -> Result<HeaderPlan, SiteCompileError> {
-    let mut headers = compile_headers(&source.headers, path, &format!("{field_path}.headers"))?;
+    let mut headers = compile_headers(
+        &source.headers,
+        path,
+        &format!("{field_path}.headers"),
+        None,
+    )?;
     if let Some(cache) = &source.cache {
         let mut directives = Vec::new();
         if let Some(visibility) = &cache.visibility {
@@ -1461,17 +1494,23 @@ fn compile_headers(
     source: &HeadersSource,
     path: &Path,
     field_path: &str,
+    spans: Option<&FieldSpanIndex>,
 ) -> Result<HeaderPlan, SiteCompileError> {
     Ok(HeaderPlan {
         layers: vec![HeaderPolicyLayer {
-            set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
-            add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
+            set: compile_header_map(&source.set, path, &format!("{field_path}.set"), spans)?,
+            add: compile_header_map(&source.add, path, &format!("{field_path}.add"), spans)?,
             remove: source
                 .remove
                 .iter()
                 .enumerate()
                 .map(|(index, name)| {
-                    compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
+                    compile_user_header_name(
+                        name,
+                        path,
+                        &format!("{field_path}.remove[{index}]"),
+                        spans,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         }],
@@ -1506,23 +1545,27 @@ fn compile_header_map(
     source: &BTreeMap<String, String>,
     path: &Path,
     field_path: &str,
+    spans: Option<&FieldSpanIndex>,
 ) -> Result<Vec<(HeaderName, CompiledTemplate)>, SiteCompileError> {
     source
         .iter()
         .map(|(name, value)| {
             let header_path = format!("{field_path}.{name}");
-            let name = compile_user_header_name(name, path, &header_path)?;
-            let template = CompiledTemplate::compile(value).map_err(|error| {
-                SiteCompileError::source(path, format!("{header_path}: {error}"))
-            })?;
+            let name = compile_user_header_name(name, path, &header_path, spans)?;
+            let template = CompiledTemplate::compile(value)
+                .map_err(|error| site_source_error(path, &header_path, spans, error.to_string()))?;
             if template.is_constant() {
                 let rendered = template
                     .render(&oxidase_core::EvalContext::default())
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+                    .map_err(|error| {
+                        site_source_error(path, &header_path, spans, error.to_string())
+                    })?;
                 HeaderValue::from_str(&rendered).map_err(|_| {
-                    SiteCompileError::source(
+                    site_source_error(
                         path,
-                        format!("{header_path}: header `{name}` has an invalid constant value"),
+                        &header_path,
+                        spans,
+                        format!("header `{name}` has an invalid constant value"),
                     )
                 })?;
             }
@@ -1535,20 +1578,70 @@ fn compile_user_header_name(
     source: &str,
     path: &Path,
     field_path: &str,
+    spans: Option<&FieldSpanIndex>,
 ) -> Result<HeaderName, SiteCompileError> {
     let name = HeaderName::from_str(source).map_err(|error| {
-        SiteCompileError::source(
+        site_source_key_error(
             path,
-            format!("{field_path}: invalid header name `{source}`: {error}"),
+            field_path,
+            spans,
+            format!("invalid header name `{source}`: {error}"),
         )
     })?;
     if is_forbidden_user_header(&name) {
-        return Err(SiteCompileError::source(
+        return Err(site_source_key_error(
             path,
-            format!("{field_path}: header `{name}` is managed by the HTTP response finalizer"),
+            field_path,
+            spans,
+            format!("header `{name}` is managed by the HTTP response finalizer"),
         ));
     }
     Ok(name)
+}
+
+fn site_source_error(
+    path: &Path,
+    field_path: &str,
+    spans: Option<&FieldSpanIndex>,
+    message: impl Into<String>,
+) -> SiteCompileError {
+    site_source_error_at(path, field_path, spans, false, message)
+}
+
+fn site_source_key_error(
+    path: &Path,
+    field_path: &str,
+    spans: Option<&FieldSpanIndex>,
+    message: impl Into<String>,
+) -> SiteCompileError {
+    site_source_error_at(path, field_path, spans, true, message)
+}
+
+fn site_source_error_at(
+    path: &Path,
+    field_path: &str,
+    spans: Option<&FieldSpanIndex>,
+    use_key: bool,
+    message: impl Into<String>,
+) -> SiteCompileError {
+    let message = message.into();
+    let Some(source) = spans.and_then(|spans| spans.nearest(field_path)) else {
+        return SiteCompileError::source(path, format!("{field_path}: {message}"));
+    };
+    let source = if use_key { &source.key } else { &source.value };
+    SiteCompileError::source_span(
+        SourceSpan {
+            file: path.to_path_buf(),
+            start_byte: source.start_byte,
+            end_byte: source.end_byte,
+            line: source.start_line,
+            column: source.start_column,
+            end_line: source.end_line,
+            end_column: source.end_column,
+            field_path: field_path.to_owned(),
+        },
+        format!("{field_path}: {message}"),
+    )
 }
 
 fn compile_asset(
@@ -2505,6 +2598,45 @@ defaults:
             assert!(message.contains(expected_path), "{message}");
             assert!(message.contains("response finalizer"), "{message}");
         }
+    }
+
+    #[test]
+    fn reports_oxr_header_errors_at_the_front_matter_field() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        fs::write(root.join("site.oxsite"), "oxista: site/v1\n").expect("manifest can be written");
+        fs::write(
+            root.join("index.html.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  headers:
+    set:
+      Connection: close
+  body:
+    text: body
+---
+"#,
+        )
+        .expect("OXR can be written");
+
+        let error = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("managed header must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(" at 6:7-6:17:"),
+            "unexpected source location: {message}"
+        );
+        assert!(
+            message.contains("response.headers.set.Connection"),
+            "{message}"
+        );
     }
 
     #[test]
