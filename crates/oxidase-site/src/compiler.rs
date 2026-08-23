@@ -739,6 +739,7 @@ fn validate_template_graph(
         let template = templates.get(name).ok_or_else(|| {
             SiteCompileError::source(name, format!("included template `{name}` does not exist"))
         })?;
+        template.validate_include_contracts(templates)?;
         visiting.push(name.to_owned());
         for dependency in template.dependencies() {
             visit(dependency, templates, visiting, visited)?;
@@ -2703,5 +2704,127 @@ response:
                 assert!(message.contains("expects int, received string"));
             }
         }
+    }
+
+    #[test]
+    fn typed_include_contracts_flow_through_site_compilation() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n  default_output: text\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/child.oxt"),
+            r#"---
+oxista: template/v1
+params:
+  item: string
+---
+C{{ item }}
+"#,
+        )
+        .expect("child template can be written");
+        let parent_path = root.join("_templates/parent.oxt");
+        fs::write(
+            &parent_path,
+            r#"---
+oxista: template/v1
+params:
+  value: string
+---
+P{% include "_templates/child.oxt" with item=value only %}Z{{ item ?? "clean" }}
+"#,
+        )
+        .expect("parent template can be written");
+        fs::write(
+            root.join("page.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/parent.oxt
+      with:
+        value: hello
+---
+"#,
+        )
+        .expect("response source can be written");
+
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("valid typed include site compiles");
+        let response = snapshot
+            .execute(&request("/page"))
+            .expect("site execution succeeds")
+            .expect("page is handled");
+        let PreparedSiteBody::Bytes(body) = response.body else {
+            panic!("template response is rendered bytes");
+        };
+        assert_eq!(String::from_utf8_lossy(&body).trim(), "PChello\nZclean");
+
+        fs::write(
+            &parent_path,
+            r#"---
+oxista: template/v1
+params:
+  value: string
+---
+{% include "_templates/child.oxt" %}
+"#,
+        )
+        .expect("invalid parent can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("missing include argument must fail preparation");
+        assert!(
+            failure
+                .to_string()
+                .contains("missing required parameter `item`"),
+            "{failure}"
+        );
+
+        fs::write(
+            &parent_path,
+            r#"---
+oxista: template/v1
+params:
+  value: string
+---
+{% include "_templates/child.oxt" with item=value %}
+"#,
+        )
+        .expect("valid parent can be restored");
+        for (name, body) in [
+            ("a.oxt", "{% include \"_templates/b.oxt\" %}"),
+            ("b.oxt", "{% include \"_templates/a.oxt\" %}"),
+        ] {
+            fs::write(
+                root.join("_templates").join(name),
+                format!("---\noxista: template/v1\n---\n{body}\n"),
+            )
+            .expect("cycle fixture can be written");
+        }
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("include cycle must fail preparation");
+        assert!(failure.to_string().contains("template dependency cycle"));
+        assert!(failure.to_string().contains("a.oxt"));
+        assert!(failure.to_string().contains("b.oxt"));
     }
 }

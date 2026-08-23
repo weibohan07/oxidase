@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use thiserror::Error;
@@ -14,22 +15,48 @@ pub enum PathSegment {
 
 #[derive(Debug, Clone, Default)]
 pub struct EvalContext {
-    roots: BTreeMap<String, Value>,
+    roots: Arc<BTreeMap<String, Value>>,
+    scopes: Vec<Arc<BTreeMap<String, Value>>>,
 }
 
 impl EvalContext {
     #[must_use]
     pub fn new(roots: BTreeMap<String, Value>) -> Self {
-        Self { roots }
+        Self {
+            roots: Arc::new(roots),
+            scopes: Vec::new(),
+        }
     }
 
     pub fn insert(&mut self, name: impl Into<String>, value: Value) -> Option<Value> {
-        self.roots.insert(name.into(), value)
+        Arc::make_mut(&mut self.roots).insert(name.into(), value)
+    }
+
+    /// Returns a child context with one additional lexical scope. The shared
+    /// root namespace and all existing scopes remain immutable.
+    #[must_use]
+    pub fn with_scope(&self, values: BTreeMap<String, Value>) -> Self {
+        let mut child = self.clone();
+        child.scopes.push(Arc::new(values));
+        child
+    }
+
+    /// Returns the shared root namespace without lexical child scopes.
+    #[must_use]
+    pub fn without_scopes(&self) -> Self {
+        Self {
+            roots: self.roots.clone(),
+            scopes: Vec::new(),
+        }
     }
 
     #[must_use]
     pub fn root(&self, name: &str) -> Option<&Value> {
-        self.roots.get(name)
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .or_else(|| self.roots.get(name))
     }
 }
 
@@ -55,6 +82,16 @@ impl Expression {
 
     pub fn evaluate(&self, context: &EvalContext) -> Result<Value, ExpressionError> {
         self.root.evaluate(context)
+    }
+
+    /// Returns the value when this expression is a literal with no runtime
+    /// lookup or computation.
+    #[must_use]
+    pub fn constant_value(&self) -> Option<&Value> {
+        match &self.root {
+            Expr::Literal(value) => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -710,6 +747,22 @@ mod tests {
         let mut roots = BTreeMap::new();
         roots.insert("bindings".to_owned(), Value::Map(bindings));
         EvalContext::new(roots)
+    }
+
+    #[test]
+    fn lexical_context_scopes_share_roots_and_do_not_mutate_parents() {
+        let parent = EvalContext::new(BTreeMap::from([
+            ("value".to_owned(), Value::from("root")),
+            ("public".to_owned(), Value::from("visible")),
+        ]));
+        let child = parent.with_scope(BTreeMap::from([("value".to_owned(), Value::from("child"))]));
+        assert_eq!(child.root("value"), Some(&Value::from("child")));
+        assert_eq!(child.root("public"), Some(&Value::from("visible")));
+        assert_eq!(parent.root("value"), Some(&Value::from("root")));
+        assert_eq!(
+            child.without_scopes().root("value"),
+            Some(&Value::from("root"))
+        );
     }
 
     #[test]

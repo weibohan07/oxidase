@@ -2004,7 +2004,7 @@ listeners:
         )
         .expect("manifest can be written");
         fs::write(
-            site.join("_templates/card.oxt"),
+            site.join("_templates/value.oxt"),
             r#"---
 oxista: template/v1
 params:
@@ -2013,7 +2013,16 @@ params:
 {{ count }}
 "#,
         )
-        .expect("template can be written");
+        .expect("typed child template can be written");
+        fs::write(
+            site.join("_templates/card.oxt"),
+            r#"---
+oxista: template/v1
+---
+{% include "_templates/value.oxt" with count=page.count only %}
+"#,
+        )
+        .expect("include caller template can be written");
         fs::write(
             site.join("index.oxr"),
             r#"---
@@ -2024,9 +2033,6 @@ response:
   body:
     template:
       source: _templates/card.oxt
-      with:
-        count:
-          $expr: page.count
 ---
 "#,
         )

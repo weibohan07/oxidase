@@ -99,6 +99,8 @@ pub enum TemplateRenderError {
         template: String,
         expression: String,
     },
+    #[error(transparent)]
+    Argument(#[from] TemplateArgumentError),
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +149,7 @@ impl SiteError {
     pub(crate) fn from_template_render(error: TemplateRenderError) -> Self {
         match error {
             TemplateRenderError::Limit { template, kind } => Self::TemplateLimit { template, kind },
+            TemplateRenderError::Argument(error) => Self::TemplateArgument(error),
             error => Self::TemplateRender(error),
         }
     }

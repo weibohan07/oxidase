@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use oxidase_core::expression::html_escape;
@@ -27,6 +28,42 @@ pub struct CompiledOxt {
     dependencies: BTreeSet<String>,
 }
 
+const PUBLIC_TEMPLATE_ROOTS: [&str; 5] = ["request", "bindings", "site", "resource", "page"];
+
+#[derive(Debug, Clone)]
+struct TemplateContext {
+    public_roots: Arc<EvalContext>,
+    current: EvalContext,
+}
+
+impl TemplateContext {
+    fn new(public_roots: EvalContext) -> Self {
+        let public_roots = Arc::new(public_roots.without_scopes());
+        Self {
+            current: public_roots.as_ref().clone(),
+            public_roots,
+        }
+    }
+
+    fn with_scope(&self, values: BTreeMap<String, Value>) -> Self {
+        Self {
+            public_roots: self.public_roots.clone(),
+            current: self.current.with_scope(values),
+        }
+    }
+
+    fn only(&self) -> Self {
+        Self {
+            public_roots: self.public_roots.clone(),
+            current: self.public_roots.as_ref().clone(),
+        }
+    }
+
+    const fn values(&self) -> &EvalContext {
+        &self.current
+    }
+}
+
 impl CompiledOxt {
     pub(crate) fn compile(
         name: impl Into<String>,
@@ -43,15 +80,14 @@ impl CompiledOxt {
                 "OXT `output: json` is not supported because text templates cannot guarantee valid JSON; use an OXR structured JSON body",
             ));
         }
-        let params = metadata
-            .params
-            .iter()
-            .map(|(name, kind)| {
-                ValueType::parse(kind)
-                    .map(|kind| (name.clone(), kind))
-                    .map_err(|message| SiteCompileError::source(name, message))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut params = BTreeMap::new();
+        for (parameter, kind) in &metadata.params {
+            validate_binding(parameter, &name)?;
+            validate_local_binding(parameter, &name)?;
+            let kind = ValueType::parse(kind)
+                .map_err(|message| SiteCompileError::source(&name, message))?;
+            params.insert(parameter.clone(), kind);
+        }
         Self::compile_parts(
             name,
             params,
@@ -145,6 +181,13 @@ impl CompiledOxt {
         &self.dependencies
     }
 
+    pub(crate) fn validate_include_contracts(
+        &self,
+        templates: &BTreeMap<String, Self>,
+    ) -> Result<(), SiteCompileError> {
+        validate_include_nodes(&self.name, &self.nodes, templates)
+    }
+
     pub(crate) const fn content_type(&self) -> &'static str {
         match self.output {
             TemplateOutput::Html => "text/html; charset=utf-8",
@@ -200,6 +243,7 @@ impl CompiledOxt {
         for (name, kind) in &self.params {
             let Some(argument) = arguments.get(name) else {
                 if kind.optional() {
+                    values.insert(name.clone(), Value::Null);
                     continue;
                 }
                 return Err(TemplateArgumentError::Missing {
@@ -242,14 +286,20 @@ impl CompiledOxt {
         context: &EvalContext,
         limits: &TemplateLimits,
     ) -> Result<String, TemplateRenderError> {
-        let mut state = RenderState {
-            started: Instant::now(),
-            output: String::new(),
-            iterations: 0,
-            expression_steps: 0,
-        };
-        render_template(self, templates, context, limits, 0, &mut state)?;
-        Ok(state.output)
+        self.render_with_arguments(templates, context, &BTreeMap::new(), limits)
+    }
+
+    pub(crate) fn render_with_arguments(
+        &self,
+        templates: &BTreeMap<String, Self>,
+        public_context: &EvalContext,
+        arguments: &BTreeMap<String, Value>,
+        limits: &TemplateLimits,
+    ) -> Result<String, TemplateRenderError> {
+        let context = TemplateContext::new(public_context.clone()).with_scope(arguments.clone());
+        let mut budget = RenderBudget::new();
+        render_template(self, templates, &context, limits, 0, &mut budget)?;
+        Ok(budget.output)
     }
 }
 
@@ -272,7 +322,14 @@ enum TemplateNode {
         value: Expression,
         body: Vec<Self>,
     },
-    Include(String),
+    Include(IncludeCall),
+}
+
+#[derive(Debug, Clone)]
+struct IncludeCall {
+    name: String,
+    arguments: BTreeMap<String, Expression>,
+    only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,6 +592,7 @@ impl TemplateParser<'_> {
             SiteCompileError::source(self.name, "`for` syntax is `for name in expression`")
         })?;
         validate_binding(binding, self.name)?;
+        validate_local_binding(binding, self.name)?;
         let values = Expression::compile(values)
             .map_err(|error| SiteCompileError::source(self.name, error.to_string()))?;
         let (body, stop) = self.parse_nodes(&["else", "endfor"])?;
@@ -564,6 +622,7 @@ impl TemplateParser<'_> {
         })?;
         let binding = binding.trim();
         validate_binding(binding, self.name)?;
+        validate_local_binding(binding, self.name)?;
         let value = Expression::compile(value.trim())
             .map_err(|error| SiteCompileError::source(self.name, error.to_string()))?;
         let (body, stop) = self.parse_nodes(&["endwith"])?;
@@ -579,29 +638,352 @@ impl TemplateParser<'_> {
 
     fn parse_include(&mut self, tag: &str) -> Result<TemplateNode, SiteCompileError> {
         let source = tag_argument(tag, "include")?;
-        let name = quoted_static_path(source).ok_or_else(|| {
-            SiteCompileError::source(self.name, "include path must be a static quoted string")
-        })?;
-        let name = normalize_template_name(name)?;
-        self.dependencies.insert(name.clone());
-        Ok(TemplateNode::Include(name))
+        let include = parse_include_call(source, self.name)?;
+        self.dependencies.insert(include.name.clone());
+        Ok(TemplateNode::Include(include))
     }
+}
+
+fn parse_include_call(source: &str, template: &str) -> Result<IncludeCall, SiteCompileError> {
+    let (path, rest) = take_quoted_path(source).ok_or_else(|| {
+        SiteCompileError::source(template, "include path must be a static quoted string")
+    })?;
+    let name = normalize_template_name(path)?;
+    let mut rest = rest.trim_start();
+    let mut arguments = BTreeMap::new();
+    let mut only = false;
+
+    if rest.is_empty() {
+        return Ok(IncludeCall {
+            name,
+            arguments,
+            only,
+        });
+    }
+    if let Some(after_only) = strip_tag_keyword(rest, "only") {
+        if !after_only.trim().is_empty() {
+            return Err(SiteCompileError::source(
+                template,
+                "`only` must appear once at the end of an include tag",
+            ));
+        }
+        return Ok(IncludeCall {
+            name,
+            arguments,
+            only: true,
+        });
+    }
+    rest = strip_tag_keyword(rest, "with").ok_or_else(|| {
+        SiteCompileError::source(
+            template,
+            "include syntax is `include \"path.oxt\" [with name=expression ...] [only]`",
+        )
+    })?;
+
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            if arguments.is_empty() {
+                return Err(SiteCompileError::source(
+                    template,
+                    "include `with` requires at least one named argument",
+                ));
+            }
+            break;
+        }
+        if let Some(after_only) = strip_tag_keyword(rest, "only") {
+            if arguments.is_empty() {
+                return Err(SiteCompileError::source(
+                    template,
+                    "include `with` requires at least one named argument",
+                ));
+            }
+            if !after_only.trim().is_empty() {
+                return Err(SiteCompileError::source(
+                    template,
+                    "`only` must appear once at the end of an include tag",
+                ));
+            }
+            only = true;
+            break;
+        }
+
+        let (parameter, after_parameter) = take_binding(rest).ok_or_else(|| {
+            SiteCompileError::source(template, "include argument requires a binding name")
+        })?;
+        validate_binding(parameter, template)?;
+        validate_local_binding(parameter, template)?;
+        let after_parameter = after_parameter.trim_start();
+        let Some(expression_source) = after_parameter.strip_prefix('=') else {
+            return Err(SiteCompileError::source(
+                template,
+                format!("include argument `{parameter}` requires `=`"),
+            ));
+        };
+        if expression_source.starts_with('=') {
+            return Err(SiteCompileError::source(
+                template,
+                format!("include argument `{parameter}` has no value"),
+            ));
+        }
+        let expression_source = expression_source.trim_start();
+        let boundary = include_expression_boundary(expression_source);
+        let expression = expression_source[..boundary].trim_end();
+        if expression.is_empty() {
+            return Err(SiteCompileError::source(
+                template,
+                format!("include argument `{parameter}` has no value"),
+            ));
+        }
+        let expression = Expression::compile(expression)
+            .map_err(|error| SiteCompileError::source(template, error.to_string()))?;
+        if arguments.insert(parameter.to_owned(), expression).is_some() {
+            return Err(SiteCompileError::source(
+                template,
+                format!("duplicate include argument `{parameter}`"),
+            ));
+        }
+        rest = &expression_source[boundary..];
+    }
+
+    Ok(IncludeCall {
+        name,
+        arguments,
+        only,
+    })
+}
+
+fn take_quoted_path(source: &str) -> Option<(&str, &str)> {
+    let quote = source.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, character) in source[quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == quote {
+            let end = quote.len_utf8() + offset;
+            return Some((
+                &source[quote.len_utf8()..end],
+                &source[end + quote.len_utf8()..],
+            ));
+        }
+    }
+    None
+}
+
+fn strip_tag_keyword<'a>(source: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = source.strip_prefix(keyword)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn take_binding(source: &str) -> Option<(&str, &str)> {
+    let mut end = 0;
+    for (offset, character) in source.char_indices() {
+        if offset == 0 {
+            if !matches!(character, '_' | 'a'..='z' | 'A'..='Z') {
+                return None;
+            }
+        } else if character != '_' && !character.is_ascii_alphanumeric() {
+            break;
+        }
+        end = offset + character.len_utf8();
+    }
+    (end > 0).then(|| (&source[..end], &source[end..]))
+}
+
+fn include_expression_boundary(source: &str) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (offset, character) in source.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            character if character.is_whitespace() && depth == 0 => {
+                let candidate = source[offset..].trim_start();
+                if strip_tag_keyword(candidate, "only").is_some()
+                    || looks_like_include_assignment(candidate)
+                {
+                    return offset;
+                }
+            }
+            _ => {}
+        }
+    }
+    source.len()
+}
+
+fn looks_like_include_assignment(source: &str) -> bool {
+    let Some((_, rest)) = take_binding(source) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with('=') && !rest.starts_with("==")
+}
+
+fn validate_include_nodes(
+    owner: &str,
+    nodes: &[TemplateNode],
+    templates: &BTreeMap<String, CompiledOxt>,
+) -> Result<(), SiteCompileError> {
+    for node in nodes {
+        match node {
+            TemplateNode::Include(include) => {
+                let target = templates.get(&include.name).ok_or_else(|| {
+                    SiteCompileError::source(
+                        owner,
+                        format!("included template `{}` does not exist", include.name),
+                    )
+                })?;
+                for parameter in include.arguments.keys() {
+                    if !target.params.contains_key(parameter) {
+                        return Err(SiteCompileError::source(
+                            owner,
+                            format!(
+                                "include `{}` has unknown parameter `{parameter}`",
+                                include.name
+                            ),
+                        ));
+                    }
+                }
+                for (parameter, kind) in &target.params {
+                    let Some(argument) = include.arguments.get(parameter) else {
+                        if kind.optional() {
+                            continue;
+                        }
+                        return Err(SiteCompileError::source(
+                            owner,
+                            format!(
+                                "include `{}` is missing required parameter `{parameter}` ({})",
+                                include.name,
+                                kind.describe()
+                            ),
+                        ));
+                    };
+                    if let Some(value) = argument.constant_value()
+                        && !kind.accepts(value)
+                    {
+                        return Err(SiteCompileError::source(
+                            owner,
+                            format!(
+                                "include `{}` parameter `{parameter}` expects {}, received {}",
+                                include.name,
+                                kind.describe(),
+                                value.type_name()
+                            ),
+                        ));
+                    }
+                }
+            }
+            TemplateNode::If {
+                branches,
+                otherwise,
+            } => {
+                for (_, body) in branches {
+                    validate_include_nodes(owner, body, templates)?;
+                }
+                validate_include_nodes(owner, otherwise, templates)?;
+            }
+            TemplateNode::For {
+                body, otherwise, ..
+            } => {
+                validate_include_nodes(owner, body, templates)?;
+                validate_include_nodes(owner, otherwise, templates)?;
+            }
+            TemplateNode::With { body, .. } => {
+                validate_include_nodes(owner, body, templates)?;
+            }
+            TemplateNode::Text(_) | TemplateNode::Interpolation(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_include_arguments(
+    template: &CompiledOxt,
+    include: &IncludeCall,
+    context: &TemplateContext,
+    caller: &str,
+    limits: &TemplateLimits,
+    budget: &mut RenderBudget,
+) -> Result<BTreeMap<String, Value>, TemplateRenderError> {
+    let mut values = BTreeMap::new();
+    for (parameter, kind) in &template.params {
+        let Some(argument) = include.arguments.get(parameter) else {
+            if kind.optional() {
+                values.insert(parameter.clone(), Value::Null);
+                continue;
+            }
+            return Err(TemplateArgumentError::Missing {
+                template: template.name.clone(),
+                parameter: parameter.clone(),
+                expected: kind.describe().to_owned(),
+            }
+            .into());
+        };
+        budget.charge_expression(caller, limits)?;
+        let value = argument.evaluate(context.values()).map_err(|error| {
+            TemplateArgumentError::Evaluation {
+                template: template.name.clone(),
+                parameter: parameter.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if !kind.accepts(&value) {
+            return Err(TemplateArgumentError::Type {
+                template: template.name.clone(),
+                parameter: parameter.clone(),
+                expected: kind.describe().to_owned(),
+                actual: kind.actual_description(&value),
+            }
+            .into());
+        }
+        values.insert(parameter.clone(), value);
+    }
+    for parameter in include.arguments.keys() {
+        if !template.params.contains_key(parameter) {
+            return Err(TemplateArgumentError::Unknown {
+                template: template.name.clone(),
+                parameter: parameter.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(values)
 }
 
 fn render_template(
     template: &CompiledOxt,
     templates: &BTreeMap<String, CompiledOxt>,
-    context: &EvalContext,
+    context: &TemplateContext,
     limits: &TemplateLimits,
     depth: usize,
-    state: &mut RenderState,
+    budget: &mut RenderBudget,
 ) -> Result<(), TemplateRenderError> {
-    if depth > limits.include_depth {
-        return Err(TemplateRenderError::Limit {
-            template: template.name.clone(),
-            kind: TemplateLimitKind::IncludeDepth,
-        });
-    }
+    budget.enter_include(&template.name, depth, limits)?;
     render_nodes(
         &template.nodes,
         ActiveTemplate {
@@ -612,7 +994,7 @@ fn render_template(
         context,
         limits,
         depth,
-        state,
+        budget,
     )
 }
 
@@ -626,18 +1008,18 @@ fn render_nodes(
     nodes: &[TemplateNode],
     active: ActiveTemplate<'_>,
     templates: &BTreeMap<String, CompiledOxt>,
-    context: &EvalContext,
+    context: &TemplateContext,
     limits: &TemplateLimits,
     depth: usize,
-    state: &mut RenderState,
+    budget: &mut RenderBudget,
 ) -> Result<(), TemplateRenderError> {
     for node in nodes {
-        check_limits(active.name, limits, state)?;
+        budget.checkpoint_time(active.name, limits)?;
         match node {
-            TemplateNode::Text(value) => push_output(active.name, value, limits, state)?,
+            TemplateNode::Text(value) => budget.write_output(active.name, value, limits)?,
             TemplateNode::Interpolation(expression) => {
-                state.expression_steps += 1;
-                let value = expression.evaluate(context).map_err(|error| {
+                budget.charge_expression(active.name, limits)?;
+                let value = expression.evaluate(context.values()).map_err(|error| {
                     TemplateRenderError::Evaluation {
                         template: active.name.to_owned(),
                         expression: expression.source().to_owned(),
@@ -658,9 +1040,9 @@ fn render_nodes(
                         message: message.to_owned(),
                     })?;
                 if active.autoescape_html {
-                    push_output(active.name, &html_escape(&value), limits, state)?;
+                    budget.write_output(active.name, &html_escape(&value), limits)?;
                 } else {
-                    push_output(active.name, &value, limits, state)?;
+                    budget.write_output(active.name, &value, limits)?;
                 }
             }
             TemplateNode::If {
@@ -669,8 +1051,8 @@ fn render_nodes(
             } => {
                 let mut rendered = false;
                 for (condition, body) in branches {
-                    state.expression_steps += 1;
-                    let value = condition.evaluate(context).map_err(|error| {
+                    budget.charge_expression(active.name, limits)?;
+                    let value = condition.evaluate(context.values()).map_err(|error| {
                         TemplateRenderError::Evaluation {
                             template: active.name.to_owned(),
                             expression: condition.source().to_owned(),
@@ -685,13 +1067,13 @@ fn render_nodes(
                         });
                     };
                     if value {
-                        render_nodes(body, active, templates, context, limits, depth, state)?;
+                        render_nodes(body, active, templates, context, limits, depth, budget)?;
                         rendered = true;
                         break;
                     }
                 }
                 if !rendered {
-                    render_nodes(otherwise, active, templates, context, limits, depth, state)?;
+                    render_nodes(otherwise, active, templates, context, limits, depth, budget)?;
                 }
             }
             TemplateNode::For {
@@ -700,16 +1082,15 @@ fn render_nodes(
                 body,
                 otherwise,
             } => {
-                state.expression_steps += 1;
+                budget.charge_expression(active.name, limits)?;
                 let expression_source = values.source().to_owned();
-                let values =
-                    values
-                        .evaluate(context)
-                        .map_err(|error| TemplateRenderError::Evaluation {
-                            template: active.name.to_owned(),
-                            expression: expression_source.clone(),
-                            message: error.to_string(),
-                        })?;
+                let values = values.evaluate(context.values()).map_err(|error| {
+                    TemplateRenderError::Evaluation {
+                        template: active.name.to_owned(),
+                        expression: expression_source.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
                 let Value::List(values) = values else {
                     return Err(TemplateRenderError::Evaluation {
                         template: active.name.to_owned(),
@@ -718,14 +1099,12 @@ fn render_nodes(
                     });
                 };
                 if values.is_empty() {
-                    render_nodes(otherwise, active, templates, context, limits, depth, state)?;
+                    render_nodes(otherwise, active, templates, context, limits, depth, budget)?;
                 } else {
                     for value in values {
-                        state.iterations += 1;
-                        check_limits(active.name, limits, state)?;
-                        let mut child = context.clone();
-                        child.insert(binding, value);
-                        render_nodes(body, active, templates, &child, limits, depth, state)?;
+                        budget.charge_loop_iteration(active.name, limits)?;
+                        let child = context.with_scope(BTreeMap::from([(binding.clone(), value)]));
+                        render_nodes(body, active, templates, &child, limits, depth, budget)?;
                     }
                 }
             }
@@ -734,79 +1113,144 @@ fn render_nodes(
                 value,
                 body,
             } => {
-                state.expression_steps += 1;
-                let value =
-                    value
-                        .evaluate(context)
-                        .map_err(|error| TemplateRenderError::Evaluation {
-                            template: active.name.to_owned(),
-                            expression: value.source().to_owned(),
-                            message: error.to_string(),
-                        })?;
-                let mut child = context.clone();
-                child.insert(binding, value);
-                render_nodes(body, active, templates, &child, limits, depth, state)?;
+                budget.charge_expression(active.name, limits)?;
+                let value = value.evaluate(context.values()).map_err(|error| {
+                    TemplateRenderError::Evaluation {
+                        template: active.name.to_owned(),
+                        expression: value.source().to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let child = context.with_scope(BTreeMap::from([(binding.clone(), value)]));
+                render_nodes(body, active, templates, &child, limits, depth, budget)?;
             }
-            TemplateNode::Include(name) => {
-                let template =
-                    templates
-                        .get(name)
-                        .ok_or_else(|| TemplateRenderError::MissingValue {
-                            template: active.name.to_owned(),
-                            expression: format!("include {name}"),
-                        })?;
-                render_template(template, templates, context, limits, depth + 1, state)?;
+            TemplateNode::Include(include) => {
+                let template = templates.get(&include.name).ok_or_else(|| {
+                    TemplateRenderError::MissingValue {
+                        template: active.name.to_owned(),
+                        expression: format!("include {}", include.name),
+                    }
+                })?;
+                let arguments = evaluate_include_arguments(
+                    template,
+                    include,
+                    context,
+                    active.name,
+                    limits,
+                    budget,
+                )?;
+                let child = if include.only {
+                    context.only()
+                } else {
+                    context.clone()
+                }
+                .with_scope(arguments);
+                render_template(template, templates, &child, limits, depth + 1, budget)?;
             }
         }
     }
     Ok(())
 }
 
-struct RenderState {
+struct RenderBudget {
     started: Instant,
     output: String,
-    iterations: usize,
+    output_bytes: usize,
+    loop_iterations: usize,
+    include_depth: usize,
     expression_steps: usize,
 }
 
-fn push_output(
-    template_name: &str,
-    value: &str,
-    limits: &TemplateLimits,
-    state: &mut RenderState,
-) -> Result<(), TemplateRenderError> {
-    if state.output.len().saturating_add(value.len()) > limits.output_size {
-        return Err(TemplateRenderError::Limit {
-            template: template_name.to_owned(),
-            kind: TemplateLimitKind::OutputSize,
-        });
+impl RenderBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            output: String::new(),
+            output_bytes: 0,
+            loop_iterations: 0,
+            include_depth: 0,
+            expression_steps: 0,
+        }
     }
-    state.output.push_str(value);
-    Ok(())
+
+    fn checkpoint_time(
+        &self,
+        template_name: &str,
+        limits: &TemplateLimits,
+    ) -> Result<(), TemplateRenderError> {
+        if self.started.elapsed() > limits.render_time {
+            return Err(limit_error(template_name, TemplateLimitKind::RenderTime));
+        }
+        Ok(())
+    }
+
+    fn charge_expression(
+        &mut self,
+        template_name: &str,
+        limits: &TemplateLimits,
+    ) -> Result<(), TemplateRenderError> {
+        self.checkpoint_time(template_name, limits)?;
+        if self.expression_steps >= limits.expression_steps {
+            return Err(limit_error(
+                template_name,
+                TemplateLimitKind::ExpressionSteps,
+            ));
+        }
+        self.expression_steps += 1;
+        Ok(())
+    }
+
+    fn charge_loop_iteration(
+        &mut self,
+        template_name: &str,
+        limits: &TemplateLimits,
+    ) -> Result<(), TemplateRenderError> {
+        self.checkpoint_time(template_name, limits)?;
+        if self.loop_iterations >= limits.loop_iterations {
+            return Err(limit_error(
+                template_name,
+                TemplateLimitKind::LoopIterations,
+            ));
+        }
+        self.loop_iterations += 1;
+        Ok(())
+    }
+
+    fn enter_include(
+        &mut self,
+        template_name: &str,
+        depth: usize,
+        limits: &TemplateLimits,
+    ) -> Result<(), TemplateRenderError> {
+        self.checkpoint_time(template_name, limits)?;
+        if depth > limits.include_depth {
+            return Err(limit_error(template_name, TemplateLimitKind::IncludeDepth));
+        }
+        self.include_depth = self.include_depth.max(depth);
+        Ok(())
+    }
+
+    fn write_output(
+        &mut self,
+        template_name: &str,
+        value: &str,
+        limits: &TemplateLimits,
+    ) -> Result<(), TemplateRenderError> {
+        self.checkpoint_time(template_name, limits)?;
+        let output_bytes = self.output_bytes.saturating_add(value.len());
+        if output_bytes > limits.output_size {
+            return Err(limit_error(template_name, TemplateLimitKind::OutputSize));
+        }
+        self.output.push_str(value);
+        self.output_bytes = output_bytes;
+        Ok(())
+    }
 }
 
-fn check_limits(
-    template_name: &str,
-    limits: &TemplateLimits,
-    state: &RenderState,
-) -> Result<(), TemplateRenderError> {
-    if state.started.elapsed() > limits.render_time {
-        Err(TemplateRenderError::Limit {
-            template: template_name.to_owned(),
-            kind: TemplateLimitKind::RenderTime,
-        })
-    } else if state.iterations > limits.loop_iterations {
-        Err(TemplateRenderError::Limit {
-            template: template_name.to_owned(),
-            kind: TemplateLimitKind::LoopIterations,
-        })
-    } else if state.expression_steps > limits.expression_steps {
-        Err(TemplateRenderError::Limit {
-            template: template_name.to_owned(),
-            kind: TemplateLimitKind::ExpressionSteps,
-        })
-    } else {
-        Ok(())
+fn limit_error(template: &str, kind: TemplateLimitKind) -> TemplateRenderError {
+    TemplateRenderError::Limit {
+        template: template.to_owned(),
+        kind,
     }
 }
 
@@ -897,15 +1341,14 @@ fn validate_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
     Ok(())
 }
 
-fn quoted_static_path(source: &str) -> Option<&str> {
-    source
-        .strip_prefix('"')
-        .and_then(|source| source.strip_suffix('"'))
-        .or_else(|| {
-            source
-                .strip_prefix('\'')
-                .and_then(|source| source.strip_suffix('\''))
-        })
+fn validate_local_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
+    if PUBLIC_TEMPLATE_ROOTS.contains(&binding) {
+        return Err(SiteCompileError::source(
+            name,
+            format!("template binding `{binding}` cannot shadow a public context root"),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_template_name(source: &str) -> Result<String, SiteCompileError> {
@@ -932,11 +1375,13 @@ pub(crate) fn normalize_template_name(source: &str) -> Result<String, SiteCompil
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use oxidase_core::{EvalContext, Value};
 
-    use super::{CompiledOxt, TemplateLimits};
+    use super::{
+        CompiledOxt, RenderBudget, TemplateLimits, TemplateOutput, ValueType, parse_include_call,
+    };
     use crate::{TemplateLimitKind, TemplateRenderError};
 
     fn limits() -> TemplateLimits {
@@ -948,6 +1393,51 @@ mod tests {
             expression_steps: 100,
             strict_undefined: true,
         }
+    }
+
+    fn typed_template(
+        name: &str,
+        source: &str,
+        params: &[(&str, &str)],
+        output: TemplateOutput,
+        autoescape_html: bool,
+    ) -> CompiledOxt {
+        let params = params
+            .iter()
+            .map(|(name, kind)| {
+                (
+                    (*name).to_owned(),
+                    ValueType::parse(kind).expect("fixture parameter type is valid"),
+                )
+            })
+            .collect();
+        CompiledOxt::compile_parts(name.to_owned(), params, autoescape_html, output, source)
+            .expect("fixture template compiles")
+    }
+
+    fn public_context() -> EvalContext {
+        EvalContext::new(BTreeMap::from([
+            (
+                "request".to_owned(),
+                Value::Map(BTreeMap::from([("path".to_owned(), Value::from("/cards"))])),
+            ),
+            (
+                "site".to_owned(),
+                Value::Map(BTreeMap::from([("name".to_owned(), Value::from("docs"))])),
+            ),
+            (
+                "resource".to_owned(),
+                Value::Map(BTreeMap::from([("path".to_owned(), Value::from("/cards"))])),
+            ),
+            (
+                "page".to_owned(),
+                Value::Map(BTreeMap::from([
+                    ("title".to_owned(), Value::from("Cards")),
+                    ("value".to_owned(), Value::from("dynamic")),
+                ])),
+            ),
+            ("bindings".to_owned(), Value::Map(BTreeMap::new())),
+        ]))
     }
 
     #[test]
@@ -1000,6 +1490,209 @@ mod tests {
     }
 
     #[test]
+    fn parses_typed_include_grammar_without_whitespace_splitting() {
+        let include = parse_include_call(
+            "\"_templates/card.oxt\" with title=page.title label=default(page.label, \"Hello world\") only",
+            "parent.oxt",
+        )
+        .expect("typed include parses");
+        assert_eq!(include.name, "_templates/card.oxt");
+        assert!(include.only);
+        assert_eq!(include.arguments["title"].source(), "page.title");
+        assert_eq!(
+            include.arguments["label"].source(),
+            "default(page.label, \"Hello world\")"
+        );
+
+        let duplicate = parse_include_call("\"child.oxt\" with value=1 value=2", "parent.oxt")
+            .expect_err("duplicate argument must fail");
+        assert!(duplicate.to_string().contains("duplicate include argument"));
+        assert!(parse_include_call("page.template with value=1", "parent.oxt").is_err());
+        assert!(parse_include_call("\"child.oxt\" with", "parent.oxt").is_err());
+        assert!(parse_include_call("\"child.oxt\" with only", "parent.oxt").is_err());
+        assert!(parse_include_call("\"child.oxt\" only only", "parent.oxt").is_err());
+    }
+
+    #[test]
+    fn validates_include_parameter_contracts_at_compile_time() {
+        let child = typed_template(
+            "child.oxt",
+            "{{ count }}",
+            &[("count", "int")],
+            TemplateOutput::Text,
+            false,
+        );
+        for (source, expected) in [
+            ("{% include \"child.oxt\" %}", "missing required parameter"),
+            (
+                "{% include \"child.oxt\" with extra=1 %}",
+                "unknown parameter",
+            ),
+            (
+                "{% include \"child.oxt\" with count=\"wrong\" %}",
+                "expects int",
+            ),
+        ] {
+            let parent =
+                CompiledOxt::inline("parent.oxt", source, false).expect("include syntax compiles");
+            let templates = BTreeMap::from([
+                ("parent.oxt".to_owned(), parent.clone()),
+                ("child.oxt".to_owned(), child.clone()),
+            ]);
+            let error = parent
+                .validate_include_contracts(&templates)
+                .expect_err("invalid include contract must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "{% include \"child.oxt\" with count=page.count %}",
+            false,
+        )
+        .expect("dynamic include compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("child.oxt".to_owned(), child),
+        ]);
+        parent
+            .validate_include_contracts(&templates)
+            .expect("dynamic argument is checked at runtime");
+    }
+
+    #[test]
+    fn include_arguments_are_typed_and_scoped_lexically() {
+        let child = typed_template(
+            "child.oxt",
+            "{{ item }}",
+            &[("item", "string")],
+            TemplateOutput::Text,
+            false,
+        );
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "{% include \"child.oxt\" with item=page.value %}|{{ item ?? \"parent-clean\" }}",
+            false,
+        )
+        .expect("parent compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("child.oxt".to_owned(), child),
+        ]);
+        parent
+            .validate_include_contracts(&templates)
+            .expect("include contract is valid");
+        assert_eq!(
+            parent
+                .render(&templates, &public_context(), &limits())
+                .expect("include renders"),
+            "dynamic|parent-clean"
+        );
+
+        let mut wrong_context = public_context();
+        wrong_context.insert(
+            "page",
+            Value::Map(BTreeMap::from([("value".to_owned(), Value::Integer(7))])),
+        );
+        assert!(matches!(
+            parent
+                .render(&templates, &wrong_context, &limits())
+                .expect_err("dynamic type mismatch must fail"),
+            TemplateRenderError::Argument(crate::TemplateArgumentError::Type { .. })
+        ));
+    }
+
+    #[test]
+    fn include_only_controls_inherited_locals_but_preserves_public_roots() {
+        let inherited = CompiledOxt::inline("inherited.oxt", "{{ item ?? \"none\" }}", false)
+            .expect("child compiles");
+        let public = CompiledOxt::inline(
+            "public.oxt",
+            "{{ request.path }}|{{ site.name }}|{{ page.title }}|{{ resource.path }}",
+            false,
+        )
+        .expect("public child compiles");
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "{% for item in page.items %}{% include \"inherited.oxt\" %}/{% include \"inherited.oxt\" only %}/{% include \"public.oxt\" only %}{% endfor %}",
+            false,
+        )
+        .expect("parent compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("inherited.oxt".to_owned(), inherited),
+            ("public.oxt".to_owned(), public),
+        ]);
+        parent
+            .validate_include_contracts(&templates)
+            .expect("include contracts are valid");
+        let mut context = public_context();
+        context.insert(
+            "page",
+            Value::Map(BTreeMap::from([
+                ("title".to_owned(), Value::from("Cards")),
+                ("items".to_owned(), Value::List(vec![Value::from("one")])),
+            ])),
+        );
+        assert_eq!(
+            parent
+                .render(&templates, &context, &limits())
+                .expect("scoped includes render"),
+            "one/none//cards|docs|Cards|/cards"
+        );
+    }
+
+    #[test]
+    fn nested_includes_share_context_but_use_child_autoescape_and_output() {
+        let leaf = typed_template(
+            "leaf.oxt",
+            "{{ value }}",
+            &[("value", "string")],
+            TemplateOutput::Html,
+            true,
+        );
+        let middle = typed_template(
+            "middle.oxt",
+            "M{% include \"leaf.oxt\" with value=value %}",
+            &[("value", "string")],
+            TemplateOutput::Text,
+            false,
+        );
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "P{% include \"middle.oxt\" with value=page.markup %}Z",
+            false,
+        )
+        .expect("parent compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("middle.oxt".to_owned(), middle.clone()),
+            ("leaf.oxt".to_owned(), leaf.clone()),
+        ]);
+        for template in templates.values() {
+            template
+                .validate_include_contracts(&templates)
+                .expect("nested contract is valid");
+        }
+        let mut context = public_context();
+        context.insert(
+            "page",
+            Value::Map(BTreeMap::from([(
+                "markup".to_owned(),
+                Value::from("<b>safe?</b>"),
+            )])),
+        );
+        assert_eq!(
+            parent
+                .render(&templates, &context, &limits())
+                .expect("nested includes render"),
+            "PM&lt;b&gt;safe?&lt;/b&gt;Z"
+        );
+        assert_eq!(middle.content_type(), "text/plain; charset=utf-8");
+        assert_eq!(leaf.content_type(), "text/html; charset=utf-8");
+    }
+
+    #[test]
     fn enforces_output_and_loop_limits() {
         let template = CompiledOxt::inline(
             "bounded.oxt",
@@ -1035,6 +1728,171 @@ mod tests {
                 kind: TemplateLimitKind::LoopIterations,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn render_budget_charges_before_every_operation_with_exact_boundaries() {
+        let interpolation = CompiledOxt::inline(
+            "expressions.oxt",
+            "{{ page.first }}{{ page.second }}",
+            false,
+        )
+        .expect("template compiles");
+        let context = EvalContext::new(BTreeMap::from([(
+            "page".to_owned(),
+            Value::Map(BTreeMap::from([
+                ("first".to_owned(), Value::from("a")),
+                ("second".to_owned(), Value::from("b")),
+            ])),
+        )]));
+        let mut exact = limits();
+        exact.expression_steps = 2;
+        assert_eq!(
+            interpolation
+                .render(&BTreeMap::new(), &context, &exact)
+                .expect("exact expression limit is allowed"),
+            "ab"
+        );
+        exact.expression_steps = 1;
+        assert!(matches!(
+            interpolation
+                .render(&BTreeMap::new(), &context, &exact)
+                .expect_err("second expression must fail before evaluation"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::ExpressionSteps,
+                ..
+            }
+        ));
+
+        let branches = CompiledOxt::inline(
+            "branches.oxt",
+            "{% if false %}a{% elif false %}b{% elif true %}c{% endif %}",
+            false,
+        )
+        .expect("branches compile");
+        exact.expression_steps = 2;
+        assert!(matches!(
+            branches
+                .render(&BTreeMap::new(), &EvalContext::default(), &exact)
+                .expect_err("third branch condition exceeds the budget"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::ExpressionSteps,
+                ..
+            }
+        ));
+
+        let output = CompiledOxt::inline("output.oxt", "ab", false).expect("text compiles");
+        exact.expression_steps = 100;
+        exact.output_size = 2;
+        assert_eq!(
+            output
+                .render(&BTreeMap::new(), &EvalContext::default(), &exact)
+                .expect("exact byte limit is allowed"),
+            "ab"
+        );
+        exact.output_size = 1;
+        assert!(matches!(
+            output
+                .render(&BTreeMap::new(), &EvalContext::default(), &exact)
+                .expect_err("one byte beyond output limit fails"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::OutputSize,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn loop_include_and_time_budgets_are_shared_and_exact() {
+        let loop_template = CompiledOxt::inline(
+            "loop.oxt",
+            "{% for item in page.items %}x{% endfor %}",
+            false,
+        )
+        .expect("loop compiles");
+        let context = EvalContext::new(BTreeMap::from([(
+            "page".to_owned(),
+            Value::Map(BTreeMap::from([(
+                "items".to_owned(),
+                Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+            )])),
+        )]));
+        let mut exact = limits();
+        exact.loop_iterations = 2;
+        assert_eq!(
+            loop_template
+                .render(&BTreeMap::new(), &context, &exact)
+                .expect("exact loop limit is allowed"),
+            "xx"
+        );
+        exact.loop_iterations = 1;
+        assert!(matches!(
+            loop_template
+                .render(&BTreeMap::new(), &context, &exact)
+                .expect_err("second iteration exceeds the budget"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::LoopIterations,
+                ..
+            }
+        ));
+
+        let child =
+            CompiledOxt::inline("child.oxt", "{{ page.value }}", false).expect("child compiles");
+        let parent = CompiledOxt::inline(
+            "parent.oxt",
+            "{{ page.value }}{% include \"child.oxt\" %}",
+            false,
+        )
+        .expect("parent compiles");
+        let templates = BTreeMap::from([
+            ("parent.oxt".to_owned(), parent.clone()),
+            ("child.oxt".to_owned(), child),
+        ]);
+        exact.loop_iterations = 20;
+        exact.expression_steps = 1;
+        assert!(matches!(
+            parent
+                .render(&templates, &public_context(), &exact)
+                .expect_err("include cannot reset expression budget"),
+            TemplateRenderError::Limit {
+                template,
+                kind: TemplateLimitKind::ExpressionSteps,
+            } if template == "child.oxt"
+        ));
+        exact.expression_steps = 100;
+        exact.include_depth = 0;
+        assert!(matches!(
+            parent
+                .render(&templates, &public_context(), &exact)
+                .expect_err("depth zero rejects the first include"),
+            TemplateRenderError::Limit {
+                kind: TemplateLimitKind::IncludeDepth,
+                ..
+            }
+        ));
+        exact.include_depth = 1;
+        assert_eq!(
+            parent
+                .render(&templates, &public_context(), &exact)
+                .expect("depth one permits one include"),
+            "dynamicdynamic"
+        );
+
+        let mut budget = RenderBudget::new();
+        budget.started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant can move backwards");
+        let mut timed = limits();
+        timed.render_time = Duration::from_millis(1);
+        assert!(matches!(
+            budget
+                .checkpoint_time("slow.oxt", &timed)
+                .expect_err("cooperative time checkpoint must fail"),
+            TemplateRenderError::Limit {
+                template,
+                kind: TemplateLimitKind::RenderTime,
+            } if template == "slow.oxt"
         ));
     }
 }
