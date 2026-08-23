@@ -40,7 +40,23 @@ pub fn parse<T: DeserializeOwned>(path: &Path, source: &str) -> Result<T, Strict
 
 fn validate_subset(path: &Path, source: &str) -> Result<(), StrictYamlError> {
     let mut mappings = Vec::<MappingFrame>::new();
+    let mut block_scalar = None::<BlockScalarState>;
     for (line_index, raw_line) in source.lines().enumerate() {
+        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+        if let Some(state) = block_scalar.as_mut() {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            if indent > state.base_indent {
+                let required_indent = state
+                    .explicit_indent
+                    .map(|explicit| state.base_indent + explicit)
+                    .unwrap_or(indent);
+                state.content_indent.get_or_insert(required_indent);
+                continue;
+            }
+            block_scalar = None;
+        }
         if let Some(column) = indentation_tab(raw_line) {
             return Err(error(
                 path,
@@ -108,7 +124,6 @@ fn validate_subset(path: &Path, source: &str) -> Result<(), StrictYamlError> {
             }
         }
 
-        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
         let (mapping_indent, content, starts_sequence_item) =
             if let Some(rest) = trimmed.strip_prefix("- ") {
                 (indent + 2, rest, true)
@@ -134,7 +149,15 @@ fn validate_subset(path: &Path, source: &str) -> Result<(), StrictYamlError> {
             }
         }
 
+        let scalar_indicator = block_scalar_indicator(content, starts_sequence_item);
         let Some((key, key_column)) = mapping_key(content) else {
+            if let Some(explicit_indent) = scalar_indicator {
+                block_scalar = Some(BlockScalarState {
+                    base_indent: indent,
+                    explicit_indent,
+                    content_indent: None,
+                });
+            }
             continue;
         };
         if key == "<<" {
@@ -167,8 +190,21 @@ fn validate_subset(path: &Path, source: &str) -> Result<(), StrictYamlError> {
                 None,
             ));
         }
+        if let Some(explicit_indent) = scalar_indicator {
+            block_scalar = Some(BlockScalarState {
+                base_indent: mapping_indent,
+                explicit_indent,
+                content_indent: None,
+            });
+        }
     }
     Ok(())
+}
+
+struct BlockScalarState {
+    base_indent: usize,
+    explicit_indent: Option<usize>,
+    content_indent: Option<usize>,
 }
 
 struct MappingFrame {
@@ -278,6 +314,10 @@ fn find_indicator_token(value: &str, indicator: char) -> Option<usize> {
 }
 
 fn mapping_key(content: &str) -> Option<(String, usize)> {
+    mapping_entry(content).map(|(key, column, _)| (key, column))
+}
+
+fn mapping_entry(content: &str) -> Option<(String, usize, &str)> {
     let mut quote = None;
     let mut escaped = false;
     let mut bracket_depth = 0usize;
@@ -312,13 +352,39 @@ fn mapping_key(content: &str) -> Option<(String, usize)> {
                         })
                         .unwrap_or(raw_key)
                         .to_owned();
-                    return Some((key, column));
+                    return Some((key, column, content[index + 1..].trim()));
                 }
                 _ => {}
             }
         }
     }
     None
+}
+
+fn block_scalar_indicator(content: &str, starts_sequence_item: bool) -> Option<Option<usize>> {
+    let value = mapping_entry(content)
+        .map(|(_, _, value)| value)
+        .or_else(|| starts_sequence_item.then_some(content.trim()))?;
+    parse_block_scalar_indicator(value)
+}
+
+fn parse_block_scalar_indicator(value: &str) -> Option<Option<usize>> {
+    let mut characters = value.chars();
+    if !matches!(characters.next(), Some('|' | '>')) {
+        return None;
+    }
+    let mut chomping = false;
+    let mut indentation = None;
+    for character in characters {
+        match character {
+            '+' | '-' if !chomping => chomping = true,
+            '1'..='9' if indentation.is_none() => {
+                indentation = character.to_digit(10).map(|value| value as usize);
+            }
+            _ => return None,
+        }
+    }
+    Some(indentation)
 }
 
 #[cfg(test)]
@@ -395,6 +461,66 @@ mod tests {
         let error = parse::<Fixture>(Path::new("fixture.yaml"), "value: ok\nextra: true\n")
             .expect_err("unknown field must fail");
         assert_eq!(error.code, "source.parse");
+        assert_eq!(error.line, 2);
+    }
+
+    #[test]
+    fn block_scalar_contents_are_opaque_to_the_strict_prescan() {
+        let source = concat!(
+            "value: |-\r\n",
+            "  key: first\r\n",
+            "  key: second\r\n",
+            "  literal # &anchor *alias !tag { mapping } {{ template }}\r\n",
+            "items:\r\n",
+            "  - name: folded\r\n",
+            "    value: >+\r\n",
+            "      colon: remains text\r\n",
+            "\r\n",
+            "      hash # remains text\r\n",
+            "names:\r\n",
+            "  - |-\r\n",
+            "    direct: sequence scalar\r\n",
+            "    direct: duplicate-looking text\r\n",
+        );
+        let fixture = parse::<Fixture>(Path::new("fixture.yaml"), source)
+            .expect("block scalar content is not YAML structure");
+        assert!(fixture.value.contains("key: first"));
+        assert!(fixture.value.contains("# &anchor *alias !tag { mapping }"));
+        assert!(fixture.items[0].value.contains("colon:"));
+        assert!(fixture.items[0].value.contains("hash # remains text"));
+        assert!(fixture.names[0].contains("direct: duplicate-looking text"));
+    }
+
+    #[test]
+    fn accepts_block_scalar_chomping_and_indentation_indicators() {
+        for indicator in [
+            "|", "|-", "|+", ">", ">-", ">+", "|2", "|2-", "|-2", ">2+", ">+2",
+        ] {
+            let source = format!("value: {indicator}\n  scalar: text\n");
+            let fixture = parse::<Fixture>(Path::new("fixture.yaml"), &source)
+                .unwrap_or_else(|error| panic!("{indicator} should parse: {error}"));
+            assert!(fixture.value.contains("scalar: text"), "{indicator}");
+        }
+    }
+
+    #[test]
+    fn resumes_structural_checks_after_block_scalars() {
+        let duplicate = "value: |\n  key: first\n  key: second\nvalue: real duplicate\n";
+        let error = parse::<Fixture>(Path::new("fixture.yaml"), duplicate)
+            .expect_err("real duplicate after scalar must fail");
+        assert_eq!(error.code, "source.duplicate_key");
+        assert_eq!(error.line, 4);
+
+        let anchor = "value: >\n  & text inside scalar\nitems: &outside\n";
+        let error = parse::<Fixture>(Path::new("fixture.yaml"), anchor)
+            .expect_err("anchor after scalar must fail");
+        assert_eq!(error.code, "source.anchor");
+        assert_eq!(error.line, 3);
+
+        let quoted_indicator = "value: \"|\"\nvalue: duplicate\n";
+        let error = parse::<Fixture>(Path::new("fixture.yaml"), quoted_indicator)
+            .expect_err("quoted pipe must not enter block scalar mode");
+        assert_eq!(error.code, "source.duplicate_key");
         assert_eq!(error.line, 2);
     }
 }
