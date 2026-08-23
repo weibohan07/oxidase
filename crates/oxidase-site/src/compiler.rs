@@ -9,7 +9,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value, is_forbidden_user_header};
 use walkdir::WalkDir;
 
-use crate::error::SiteCompileError;
+use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
     AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, RedirectQuery,
     SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
@@ -31,15 +31,37 @@ impl SiteCompiler {
         root: impl AsRef<Path>,
         manifest: impl AsRef<Path>,
         inputs: BTreeMap<String, Value>,
+    ) -> Result<SiteSnapshot, SiteCompileFailure> {
+        let root = root.as_ref().to_path_buf();
+        let manifest = manifest.as_ref().to_path_buf();
+        let mut dependencies = Vec::new();
+        track_candidate(&mut dependencies, &root);
+        track_candidate(&mut dependencies, &manifest);
+        Self::compile_inner(id, &root, &manifest, inputs, &mut dependencies).map_err(|error| {
+            dependencies.sort();
+            dependencies.dedup();
+            SiteCompileFailure {
+                error,
+                discovered_dependencies: dependencies,
+            }
+        })
+    }
+
+    fn compile_inner(
+        id: ResourceId,
+        root: &Path,
+        manifest: &Path,
+        inputs: BTreeMap<String, Value>,
+        dependencies: &mut Vec<PathBuf>,
     ) -> Result<SiteSnapshot, SiteCompileError> {
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|error| SiteCompileError::io(root.as_ref(), error))?;
+            .map_err(|error| SiteCompileError::io(root, error))?;
+        track_site_dependency(dependencies, &root, &root);
         let manifest = manifest
-            .as_ref()
             .canonicalize()
-            .map_err(|error| SiteCompileError::io(manifest.as_ref(), error))?;
+            .map_err(|error| SiteCompileError::io(manifest, error))?;
+        track_site_dependency(dependencies, &manifest, &root);
         if !path_is_within(&manifest, &root) {
             return Err(SiteCompileError::UnsafePath {
                 path: manifest,
@@ -76,8 +98,15 @@ impl SiteCompiler {
         let mut files = collect_files(&root, &source)?;
         files.sort();
         let template_roots = template_roots(&root, &source)?;
-        let mut dependencies = vec![manifest.clone()];
-        let mut templates = compile_templates(&root, &files, &template_roots, &mut dependencies)?;
+        for path in &files {
+            track_site_dependency(dependencies, path, &root);
+        }
+        for path in &template_roots {
+            track_site_dependency(dependencies, path, &root);
+        }
+        track_precompressed_candidates(&files, &source, &root, dependencies);
+        let mut templates = compile_templates(&root, &files, &template_roots, dependencies)?;
+        track_template_dependencies(&root, &templates, dependencies);
         validate_template_graph(&templates)?;
 
         let oxr_files = files
@@ -99,7 +128,7 @@ impl SiteCompiler {
             }
             dependencies.push(oxr.clone());
             let (logical_path, plan, backing) =
-                compile_oxr(&root, oxr, &source, &mut templates, &mut dependencies)?;
+                compile_oxr(&root, oxr, &source, &mut templates, dependencies)?;
             if let Some(backing) = backing {
                 backing_assets.insert(backing);
             }
@@ -135,7 +164,7 @@ impl SiteCompiler {
                 source: asset.clone(),
             };
             insert_with_index_aliases(&mut entries, logical_path, plan, &source)?;
-            dependencies.push(asset.clone());
+            track_site_dependency(dependencies, asset, &root);
         }
         validate_template_graph(&templates)?;
 
@@ -159,7 +188,7 @@ impl SiteCompiler {
             id,
             root,
             manifest,
-            dependencies,
+            dependencies: dependencies.clone(),
             missing: match source.paths.missing {
                 MissingSource::Decline => SiteMissing::Decline,
                 MissingSource::Respond => SiteMissing::Respond,
@@ -170,6 +199,64 @@ impl SiteCompiler {
             entries,
             error_404_template,
         })
+    }
+}
+
+fn track_candidate(dependencies: &mut Vec<PathBuf>, path: &Path) {
+    dependencies.push(path.to_path_buf());
+    if let Some(parent) = path.parent() {
+        dependencies.push(parent.to_path_buf());
+    }
+}
+
+fn track_site_dependency(dependencies: &mut Vec<PathBuf>, path: &Path, root: &Path) {
+    dependencies.push(path.to_path_buf());
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if !directory.starts_with(root) {
+            break;
+        }
+        dependencies.push(directory.to_path_buf());
+        if directory == root {
+            break;
+        }
+        parent = directory.parent();
+    }
+}
+
+fn track_template_dependencies(
+    root: &Path,
+    templates: &BTreeMap<String, CompiledOxt>,
+    dependencies: &mut Vec<PathBuf>,
+) {
+    for template in templates.values() {
+        for dependency in template.dependencies() {
+            track_site_dependency(dependencies, &root.join(dependency), root);
+        }
+    }
+}
+
+fn track_precompressed_candidates(
+    files: &[PathBuf],
+    source: &ManifestSource,
+    root: &Path,
+    dependencies: &mut Vec<PathBuf>,
+) {
+    let existing_precompressed = precompressed_paths(files, source);
+    for path in files
+        .iter()
+        .filter(|path| !has_source_extension(path) && !existing_precompressed.contains(*path))
+    {
+        for suffix in [
+            source.assets.precompressed.brotli.as_deref(),
+            source.assets.precompressed.gzip.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
+            track_site_dependency(dependencies, &candidate, root);
+        }
     }
 }
 
@@ -679,6 +766,7 @@ fn compile_oxr_body(
             }
             oxr.parent().unwrap_or(root).join(relative)
         };
+        track_site_dependency(dependencies, &asset, root);
         let asset = asset
             .canonicalize()
             .map_err(|error| SiteCompileError::io(&asset, error))?;
@@ -728,6 +816,7 @@ fn compile_oxr_body(
             )),
             TemplateReferenceSource::External(external) => {
                 let name = normalize_template_name(&external.source)?;
+                track_site_dependency(dependencies, &root.join(&name), root);
                 let template = templates.get(&name).ok_or_else(|| {
                     SiteCompileError::source(oxr, format!("template `{name}` does not exist"))
                 })?;
@@ -1456,6 +1545,76 @@ response:
         };
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["path"], "/feed.json");
+    }
+
+    #[test]
+    fn failed_compilation_retains_scanned_and_missing_dependencies() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        let templates = root.join("_templates");
+        fs::create_dir_all(&templates).expect("template directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        let invalid_template = templates.join("invalid.oxt");
+        fs::write(&invalid_template, "not front matter").expect("invalid OXT can be written");
+        let canonical_root = root.canonicalize().expect("site root canonicalizes");
+        let canonical_templates = canonical_root.join("_templates");
+
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("invalid OXT rejects the candidate");
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&invalid_template.canonicalize().expect("OXT canonicalizes"))
+        );
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&canonical_templates)
+        );
+
+        fs::remove_file(&invalid_template).expect("invalid OXT can be removed");
+        let oxr = root.join("index.html.oxr");
+        fs::write(
+            &oxr,
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/missing.oxt
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let missing = canonical_templates.join("missing.oxt");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("missing external template rejects the candidate");
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&oxr.canonicalize().expect("OXR canonicalizes"))
+        );
+        assert!(failure.discovered_dependencies.contains(&missing));
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&canonical_templates)
+        );
     }
 
     #[cfg(unix)]

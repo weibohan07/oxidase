@@ -377,7 +377,13 @@ impl ReloadHandle {
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
             match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
                 Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies)),
-                Err(error) => Err((ServerError::Reload(error.to_string()), attempt_dependencies)),
+                Err(error) => {
+                    let mut dependencies = attempt_dependencies;
+                    dependencies.extend(error.candidate_dependencies.iter().cloned());
+                    dependencies.sort();
+                    dependencies.dedup();
+                    Err((ServerError::Reload(error.to_string()), dependencies))
+                }
             }
         })
         .await

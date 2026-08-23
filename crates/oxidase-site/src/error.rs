@@ -2,6 +2,24 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+#[derive(Debug)]
+pub struct SiteCompileFailure {
+    pub error: SiteCompileError,
+    pub discovered_dependencies: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for SiteCompileFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SiteCompileFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SiteCompileError {
     #[error("cannot access `{path}`: {source}")]
