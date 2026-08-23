@@ -31,13 +31,20 @@ cannot leak captures or rewrites into its siblings.
 
 The runnable HTTP/1.1 slice supports every current Service node, including streaming
 Proxy over pooled HTTP/1.1, HTTPS, and upstream HTTP/2 connections. Assets are
-streamed from async files and support single byte ranges, ETag/Last-Modified
-conditionals, and precompressed representation selection.
+streamed from async files and support quality-weighted identity/Brotli/gzip
+selection, representation-specific ETags, correct validator precedence, If-Range,
+and single byte ranges. Range requests deliberately use identity.
+
+Listener programs share one immutable `ServiceGraph`; normal requests do not clone
+the graph or collect explain traces. Every handled response passes through one
+framing finalizer, and Gateway/Oxista source cannot set hop-by-hop or framing
+headers. HEAD, informational, 204, and 304 body rules are covered by wire tests.
 
 Inbound TLS/HTTP/2 and OXT `extends`/`block` are not yet implemented. Atomic
 last-known-good reload is available with `serve --watch`; health and bounded metrics
 are available on an explicit separate `--admin-bind`. See
 [`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
+This release remains `0.2.0-alpha` and is not described as production-ready.
 
 ## Try the vertical slice
 
@@ -96,8 +103,10 @@ listeners:
       ref: public
 ```
 
-The v1alpha1 YAML boundary is strict: unknown and duplicate keys fail, aliases and
-merge keys are unsupported, and imports/references are cycle checked. `check` and
+The v1alpha1 YAML boundary is shared by Gateway and every Oxista format. Unknown or
+duplicate keys, anchors, aliases, merge keys, custom tags, tab indentation, and flow
+mappings fail; flow sequences are allowed. Imports/references are cycle checked,
+and parsed-but-inert field values are rejected with migration guidance. `check` and
 `serve` use the same compiler and Site preparation path.
 
 ## CLI
@@ -115,16 +124,23 @@ binary runtime snapshot.
 
 `serve --watch` watches imported configuration and compiled Site dependencies.
 Reload compiles and prepares the complete candidate, prebinds new listeners, reuses
-unchanged resources, and atomically commits only on success. Existing requests drain
-on their pinned snapshot.
+unchanged resources, and atomically commits only on success. Blocking preparation
+runs off Tokio workers. Failed-candidate imports remain watched, and retired HTTP/1
+connections receive graceful shutdown: idle keep-alive closes promptly while active
+requests drain on their pinned snapshot.
 
 ## Development
 
 ```bash
+cargo +1.88.0 check --workspace --all-targets --all-features
+cargo +1.88.0 test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
+cargo check --manifest-path fuzz/Cargo.toml --bins
+cargo build --workspace --release
 ```
 
 The HTTP end-to-end tests bind ephemeral loopback ports. Sandboxed environments may

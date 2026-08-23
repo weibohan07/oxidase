@@ -10,6 +10,7 @@ The workspace is intentionally layered:
 
 - `oxidase-core`: values, IDs, source locations, patterns, expressions, Service IR,
   and protocol-independent outcomes.
+- `oxidase-source`: the shared strict YAML subset and position-aware parse errors.
 - `oxidase-config`: strict source models, import/reference resolution, diagnostics,
   and lowering.
 - `oxidase-site`: the Oxista compiler and immutable site resources.
@@ -22,4 +23,3 @@ The workspace is intentionally layered:
 
 Detailed constraints live in `docs/architecture/` and accepted decisions in
 `docs/adr/`.
-

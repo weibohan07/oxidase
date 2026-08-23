@@ -12,14 +12,25 @@ are `Transform`, `Observe`, `Timeout`, and `Recover`. Composition Services are
 `Route`, `Fallback`, and the explicitly budgeted `Reenter` operation. Router is a
 source-level convenience lowered into these nodes, never a privileged executor.
 
+The compiled node table is one immutable `ServiceGraph` shared by every listener
+program view through `Arc`. A request copies only its entry ID and shared graph
+handle; graph cost is not proportional to the total node count. Inline Service and
+Route identities are derived from a compiler-owned canonical source-file identity
+plus semantic field path, so equal paths in separate imports cannot collide.
+Duplicate generated IDs are compiler errors rather than map overwrites.
+
 `Fallback` tries the next candidate only after `Declined`. `Recover` is the only
 generic mechanism that turns selected failures into another Service execution.
 `Route` evaluates predicates into local captures, commits the complete match into a
 child lexical scope, and discards that scope on exit.
 
 Each execution frame combines immutable original request metadata, a scoped request
-overlay, lexical bindings, and explicit body state. Consequently these programs are
-different:
+overlay, lexical bindings, and explicit body state. Scheme, authority, and
+path-and-query replacements are parsed into `http` typed values. Only `http` and
+`https` schemes are accepted; authorities reject userinfo and invalid ports; paths
+must remain origin-form. Constant rewrites fail during compilation and dynamic
+rewrites fail as `InvalidState` before a child runs. Consequently these programs
+are different:
 
 ```text
 Fallback(Transform(A, Site), Proxy)
@@ -30,7 +41,15 @@ In the first form a declined Site cannot leak `A` into Proxy. In the second, `A`
 intentionally applies to both candidates. Response transformations run after child
 execution and therefore wrap every handled descendant.
 
+Normal execution uses a no-op trace sink and does not allocate explain event/detail
+strings per Service node. Explain and declarative tests explicitly select the
+structured collector while executing the same graph and leaf boundary.
+
+After the root returns `Handled`, a single protocol finalizer removes hop-by-hop and
+untrusted framing metadata, derives safe lengths, and enforces body rules for HEAD,
+1xx, 204, and 304. A response status such as 404 remains handled; finalization does
+not change the `Handled`/`Declined`/`Failed` algebra.
+
 Predicates in v0.2 inspect only the request head. A body-consuming Service marks the
 body irreversible; fallback after such a candidate requires a future explicit
 replay plan and is rejected in the meantime.
-

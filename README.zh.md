@@ -30,12 +30,19 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 
 当前可运行的 HTTP/1.1 垂直切片支持所有现有 Service 节点，包括通过共享连接池
 执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2 的 Proxy。Asset 使用异步文件流，支持
-单 Range、ETag/Last-Modified 条件请求与预压缩表示选择。
+按质量值选择 identity/Brotli/gzip、各表示独立 ETag、正确的 validator 优先级、
+If-Range 与单 Range；Range 请求明确使用 identity。
+
+所有 Listener program 共享一张不可变 `ServiceGraph`；普通请求既不复制整图，也
+不收集 explain trace。所有已处理响应统一经过 framing finalizer，Gateway/Oxista
+源码不能控制 hop-by-hop 或 framing Header。HEAD、1xx、204、304 的 body 规则均有
+wire-level 测试。
 
 入站 TLS/HTTP/2 及 OXT `extends/block` 尚未实现。使用 `serve --watch` 可以启用
 保留 last-known-good 的原子 reload；通过独立、显式的 `--admin-bind` 可启用健康检查
 与有界指标。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
+本版本仍是 `0.2.0-alpha`，不宣称 production-ready。
 
 ## 运行垂直切片
 
@@ -93,9 +100,10 @@ listeners:
       ref: public
 ```
 
-v1alpha1 YAML 边界默认严格：未知键、重复键、import cycle 和普通 Service cycle
-都会报错，不支持 YAML alias/merge key。`check` 与 `serve` 使用同一条编译和 Site
-准备管线。
+Gateway 与所有 Oxista 格式共享同一套严格 v1alpha1 YAML 边界：未知键、重复键、
+anchor、alias、merge key、自定义 tag、tab 缩进和 flow mapping 都会报错；允许 flow
+sequence。Import/reference cycle 会被检查，已解析但当前没有语义的字段值会带迁移
+建议直接拒绝。`check` 与 `serve` 使用同一条编译和 Site 准备管线。
 
 ## CLI
 
@@ -111,15 +119,22 @@ oxidase test <config>
 
 `serve --watch` 会监控 imported config 和已编译 Site 的依赖。Reload 会先完成候选
 版本的完整编译与资源准备，预绑定新增 Listener，复用未变化资源，全部成功后才
-原子提交；已有请求继续在其固定快照上 drain。
+原子提交。阻塞式 preparation 不占用 Tokio worker；失败候选中新发现的 import
+仍会被观察。Retired HTTP/1 connection 会收到 graceful shutdown：空闲 keep-alive
+及时关闭，活跃请求继续在其固定旧快照上 drain。
 
 ## 开发
 
 ```bash
+cargo +1.88.0 check --workspace --all-targets --all-features
+cargo +1.88.0 test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
+cargo check --manifest-path fuzz/Cargo.toml --bins
+cargo build --workspace --release
 ```
 
 HTTP 端到端测试会绑定临时 loopback 端口；沙箱环境可能需要相应权限。
