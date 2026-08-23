@@ -617,7 +617,7 @@ fn headers_contains_wildcard(headers: &HeaderMap) -> bool {
 }
 
 fn parse_quality(source: &str) -> Option<u16> {
-    let (integer, fraction) = source.split_once('.').map_or((source, ""), |parts| parts);
+    let (integer, fraction) = source.split_once('.').unwrap_or((source, ""));
     if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
