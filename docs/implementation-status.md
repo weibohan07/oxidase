@@ -4,8 +4,8 @@ Last updated: 2026-08-23
 
 ## Baseline
 
-- hardening branch: `hardening/v0.2-alpha-correctness`
-- public starting point: `f202a3644badffedf93eeb7b2b421a6726c05595`
+- hardening branch: `hardening/v0.2-alpha-semantic-closure`
+- public starting point: `8a164a8772263de782ed859d541d6ba191dbbbfb`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -30,8 +30,9 @@ Last updated: 2026-08-23
 - Phase 2 strict `oxidase.dev/v1alpha1` source AST and compiler with one YAML subset
   shared by Gateway, `.oxsite`, `.oxr`, `.oxt`, and request documents. It rejects
   duplicate/unknown keys, anchors, aliases, merge keys, tags, tab indentation, and
-  flow mappings while allowing flow sequences. Relative imports, import-cycle
-  checks, named/inline Services, resource references, and Router lowering remain.
+  flow mappings while allowing flow sequences and correctly treating literal/folded
+  block scalar contents as opaque text. Relative imports, import-cycle checks,
+  named/inline Services, resource references, and Router lowering remain.
 - `oxidase check`, symbolic `explain`, deterministic `compile` manifest, and
   declarative `test` commands all use the same compiler and normalized plans.
 - Phase 3 Oxista compiler for strict `.oxsite`, `.oxr`, and `.oxt` sources. Site
@@ -45,6 +46,18 @@ Last updated: 2026-08-23
   template arguments are checked immediately before render; URL means absolute URL,
   and `safe_html` is rejected until Value can carry trusted provenance. Unsupported
   or inert v1 field values fail with field-specific migration guidance.
+- External OXT metadata preserves omission and inherits Site output/autoescape
+  defaults before output-derived fallback. Custom 404 templates must be callable
+  without required parameters, use their effective Content-Type/autoescape and
+  receive `defaults.response` headers; HEAD preserves their full representation
+  length without a body.
+- Oxista header policies retain global, logical-extension, profile, and local OXR
+  layers, with remove/set/add executed inside each layer. Ordinary assets now share
+  `defaults.by_extension` with OXR-backed assets, including br/gzip responses.
+- `visibility.deny` compiles exact relative paths, exact component-name rules, and
+  exact final-extension rules with case-sensitive semantics. Invalid or ambiguous
+  patterns fail at compilation; denied directories are pruned without skipping
+  symlink escape validation.
 - Required `basic-gateway` and `oxista-site` examples compile and their three
   declarative gateway tests pass. `check` now prepares every Site through the same
   path that reload will use.
@@ -54,10 +67,12 @@ Last updated: 2026-08-23
 - Site bytes and assets are adapted to HTTP without default collection. Identity,
   Brotli, and gzip representations own independent length/ETag/mtime metadata.
   Quality negotiation, validator precedence, representation-aware 304, If-Range,
-  suffix/open-ended/single ranges, HEAD, 406, and 416 are covered on the wire.
+  suffix/open-ended/single ranges, HEAD, 406, and 416 are covered on the wire. Range
+  applies only to GET; unknown units, malformed or multiple ranges, and ranges with
+  identity excluded are ignored in favor of a full negotiated representation.
 - One root `ResponseFinalizer` owns HTTP framing for Respond, Redirect, Site, Proxy,
   and Transform output. It strips hop-by-hop/untrusted framing metadata and enforces
-  HEAD, 1xx, 204, and 304 body semantics. Source header policy rejects direct
+  HEAD, 1xx, 204, 205, and 304 body semantics. Source header policy rejects direct
   control of dangerous framing and hop-by-hop headers.
 - `oxidase serve` now runs the prepared gateway. Real loopback tests cover
   Respond/Redirect/Route/fallback, streaming asset range responses, and shutdown.
@@ -78,6 +93,11 @@ Last updated: 2026-08-23
   worker. `serve --watch` polls published plus last-attempt dependencies with
   debounce and latest-dirty coalescing. Failed imports and missing declared paths
   remain observed while the last-known-good snapshot stays active.
+- Failed Site preparation carries its structured error plus partial dependencies
+  through runtime preparation into reload state. Existing invalid OXT/OXR files,
+  missing templates, scanned assets, template roots, backing/precompressed
+  candidates, and their parent directories remain watched and can recover without
+  another Gateway edit.
 - Retired HTTP/1 connections receive Hyper graceful shutdown. Idle keep-alive closes
   promptly, active requests finish on their pinned snapshot, and the drain timeout
   is the only point at which remaining tasks are aborted.
@@ -90,15 +110,20 @@ Last updated: 2026-08-23
 - Redirect and constant header validation fail closed; property-style generated
   Pattern/path tests, template-limit tests, and seven cargo-fuzz harnesses cover the
   highest-risk parsers and resolvers.
+- Template rendering and argument validation use structured errors. Only
+  output/loop/include-depth/expression-step/time budgets map to `TemplateLimit` for
+  Recover; other render/argument/response failures map to `InvalidState`, and asset
+  I/O remains `SiteIo`.
 - CI has distinct Rust 1.88 MSRV, stable workspace, cargo-deny, and fuzz compile
-  jobs. Dependency-policy, security, contributing, operations, migration, and
+  jobs. The stable job includes a release build and the workflow supports manual
+  dispatch. Dependency-policy, security, contributing, operations, migration, and
   benchmark entrypoints are present. The superseded v0.1 implementation remains in
   Git history.
 
 ## Currently runnable
 
 - A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, reloaded, observed, and tested. Eighty-seven
+  executed in memory, explained, reloaded, observed, and tested. One hundred
   workspace tests pass, including real listener/upstream/watcher tests that require
   permission to bind loopback ports.
 
@@ -118,13 +143,17 @@ Last updated: 2026-08-23
   snapshot containing site assets or connection state.
 - Semantic diagnostics retain file and field path but do not yet recover exact
   scalar lines for every lowering error.
+- Generated inline Service/Route IDs are deterministic within one source program
+  but can change when the import set changes. They are alpha inspection identities,
+  not durable API keys, metrics labels, control-plane IDs, or configuration refs.
 - OXT `extends`/`block` is explicitly rejected; inheritance is not claimed.
 - OXT JSON output is rejected in favor of structured OXR JSON. `safe_html` is also
   rejected until the Value model can represent audited provenance.
 - Symlinked files are checked against the canonical root, but their alias path is not
   indexed in this release; directory symlinks are rejected rather than traversed.
-- Asset negotiation is HTTP/1.1 only. Range forces identity, multipart ranges are
-  deliberately rejected, and this is not a general content-negotiation framework.
+- Asset negotiation is HTTP/1.1 only and is not a general content-negotiation
+  framework. Range is implemented only for GET and only for one bytes range;
+  unknown units, malformed syntax, and multipart ranges are deliberately ignored.
 - Listener serving supports HTTP/1.1 only. TLS, HTTP/2, upgrades, trailers, gRPC,
   and `100-continue` policy remain unimplemented.
 - Cluster health checks, retry policy, stable per-cluster health state, and
@@ -149,9 +178,9 @@ Last updated: 2026-08-23
 ## Validation boundary
 
 - Rust 1.88 was installed locally; MSRV workspace all-target/all-feature check and
-  all 87 workspace tests passed.
+  all 100 workspace tests passed.
 - Stable formatting, workspace/all-target/all-feature Clippy with warnings denied,
-  all 87 workspace tests, docs with warnings denied, and the release workspace build
+  all 100 workspace tests, docs with warnings denied, and the release workspace build
   passed. Loopback tests ran with the required local permission.
 - `cargo deny check` passed advisories, bans, licenses, and sources; one allowed
   indirect `syn` duplicate-version warning remains.
@@ -161,8 +190,11 @@ Last updated: 2026-08-23
 - The release-mode shared-graph smoke benchmark executed 100,000 short paths through
   a 4,097-node graph in about 171ms on this machine. This is a local regression
   smoke result, not a performance guarantee.
-- Hosted CI is configured but has not run in this work session. Branch-protection
-  settings were not changed or independently verified.
+- Hosted CI run `32653982248` passed all four jobs on the semantic-closure branch,
+  including Ubuntu loopback tests and the stable release build. `main` branch
+  protection was enabled and read back with strict/up-to-date required checks for
+  `MSRV 1.88`, `Stable workspace`, `Dependency policy`, and
+  `Fuzz harness compile smoke`; signed commits and admin enforcement remain off.
 
 ## Next concrete work
 

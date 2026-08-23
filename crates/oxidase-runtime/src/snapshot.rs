@@ -9,7 +9,7 @@ use oxidase_config::{
     ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
 };
 use oxidase_core::{ConfigVersion, ResourceId, ServiceGraph, ServiceProgram};
-use oxidase_site::{SiteCompiler, SiteSnapshot};
+use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
@@ -45,10 +45,19 @@ impl RuntimeSnapshot {
         let mut reuse = ResourceReuse::default();
         let mut dependencies = gateway.dependencies.clone();
         for (id, source) in &gateway.resources.sites {
-            let fingerprint = site_fingerprint(source).map_err(|message| PreparationError {
-                resource: id.clone(),
-                message,
-            })?;
+            let fingerprint = match site_fingerprint(source) {
+                Ok(fingerprint) => fingerprint,
+                Err(message) => {
+                    let mut candidate_dependencies = dependencies.clone();
+                    candidate_dependencies.extend(discover_site_dependencies(source));
+                    normalize_dependencies(&mut candidate_dependencies);
+                    return Err(PreparationError {
+                        resource: id.clone(),
+                        kind: PreparationErrorKind::Fingerprint(message),
+                        candidate_dependencies,
+                    });
+                }
+            };
             let snapshot = previous
                 .filter(|previous| previous.site_fingerprints.get(id) == Some(&fingerprint))
                 .and_then(|previous| previous.resources.sites.get(id).cloned());
@@ -56,18 +65,14 @@ impl RuntimeSnapshot {
                 reuse.sites += 1;
                 snapshot
             } else {
-                Arc::new(
-                    SiteCompiler::compile(
-                        id.clone(),
-                        &source.root,
-                        &source.manifest,
-                        source.inputs.clone(),
-                    )
-                    .map_err(|error| PreparationError {
-                        resource: id.clone(),
-                        message: error.to_string(),
-                    })?,
+                let compiled = SiteCompiler::compile(
+                    id.clone(),
+                    &source.root,
+                    &source.manifest,
+                    source.inputs.clone(),
                 )
+                .map_err(|failure| preparation_error_from_site(id, &dependencies, failure))?;
+                Arc::new(compiled)
             };
             dependencies.extend(snapshot.dependencies.iter().cloned());
             dependencies.extend(site_directories(&snapshot));
@@ -90,8 +95,7 @@ impl RuntimeSnapshot {
             cluster_fingerprints.insert(id.clone(), fingerprint);
             clusters.insert(id, cluster);
         }
-        dependencies.sort();
-        dependencies.dedup();
+        normalize_dependencies(&mut dependencies);
         let mut version_hash = Fnv::new();
         version_hash.update(gateway.config_version.as_str().as_bytes());
         for (id, fingerprint) in &site_fingerprints {
@@ -144,10 +148,55 @@ pub struct ResourceReuse {
     pub clusters: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparationError {
     pub resource: ResourceId,
-    pub message: String,
+    pub kind: PreparationErrorKind,
+    pub candidate_dependencies: Vec<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum PreparationErrorKind {
+    Fingerprint(String),
+    Site(SiteCompileError),
+}
+
+fn preparation_error_from_site(
+    resource: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+    failure: SiteCompileFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    candidate_dependencies.extend(failure.discovered_dependencies);
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::Site(failure.error),
+        candidate_dependencies,
+    }
+}
+
+fn normalize_dependencies(dependencies: &mut Vec<std::path::PathBuf>) {
+    dependencies.sort();
+    dependencies.dedup();
+}
+
+fn discover_site_dependencies(source: &oxidase_config::SiteSpec) -> Vec<std::path::PathBuf> {
+    let mut dependencies = vec![source.root.clone(), source.manifest.clone()];
+    for path in [&source.root, &source.manifest] {
+        if let Some(parent) = path.parent() {
+            dependencies.push(parent.to_path_buf());
+        }
+    }
+    for entry in walkdir::WalkDir::new(&source.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        dependencies.push(entry.path().to_path_buf());
+    }
+    normalize_dependencies(&mut dependencies);
+    dependencies
 }
 
 fn site_fingerprint(source: &oxidase_config::SiteSpec) -> Result<u64, String> {
@@ -243,12 +292,21 @@ impl fmt::Display for PreparationError {
         write!(
             formatter,
             "failed to prepare resource `{}`: {}",
-            self.resource, self.message
+            self.resource, self.kind
         )
     }
 }
 
 impl std::error::Error for PreparationError {}
+
+impl fmt::Display for PreparationErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fingerprint(message) => formatter.write_str(message),
+            Self::Site(error) => error.fmt(formatter),
+        }
+    }
+}
 
 pub struct SnapshotStore {
     current: ArcSwap<RuntimeSnapshot>,

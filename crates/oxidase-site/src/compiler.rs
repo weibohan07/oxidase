@@ -9,10 +9,10 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value, is_forbidden_user_header};
 use walkdir::WalkDir;
 
-use crate::error::SiteCompileError;
+use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
-    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, RedirectQuery,
-    SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
+    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, HeaderPolicyLayer,
+    RedirectQuery, SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
 };
 use crate::source::{
     EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource, MissingSource, OutputSource,
@@ -31,15 +31,37 @@ impl SiteCompiler {
         root: impl AsRef<Path>,
         manifest: impl AsRef<Path>,
         inputs: BTreeMap<String, Value>,
+    ) -> Result<SiteSnapshot, SiteCompileFailure> {
+        let root = root.as_ref().to_path_buf();
+        let manifest = manifest.as_ref().to_path_buf();
+        let mut dependencies = Vec::new();
+        track_candidate(&mut dependencies, &root);
+        track_candidate(&mut dependencies, &manifest);
+        Self::compile_inner(id, &root, &manifest, inputs, &mut dependencies).map_err(|error| {
+            dependencies.sort();
+            dependencies.dedup();
+            SiteCompileFailure {
+                error,
+                discovered_dependencies: dependencies,
+            }
+        })
+    }
+
+    fn compile_inner(
+        id: ResourceId,
+        root: &Path,
+        manifest: &Path,
+        inputs: BTreeMap<String, Value>,
+        dependencies: &mut Vec<PathBuf>,
     ) -> Result<SiteSnapshot, SiteCompileError> {
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|error| SiteCompileError::io(root.as_ref(), error))?;
+            .map_err(|error| SiteCompileError::io(root, error))?;
+        track_site_dependency(dependencies, &root, &root);
         let manifest = manifest
-            .as_ref()
             .canonicalize()
-            .map_err(|error| SiteCompileError::io(manifest.as_ref(), error))?;
+            .map_err(|error| SiteCompileError::io(manifest, error))?;
+        track_site_dependency(dependencies, &manifest, &root);
         if !path_is_within(&manifest, &root) {
             return Err(SiteCompileError::UnsafePath {
                 path: manifest,
@@ -58,6 +80,7 @@ impl SiteCompiler {
             ));
         }
         validate_manifest(&manifest, &source, &inputs)?;
+        let deny_patterns = compile_deny_patterns(&manifest, &source.visibility.deny)?;
         let limits = compile_limits(&manifest, &source)?;
         let mut data = source
             .data
@@ -73,11 +96,25 @@ impl SiteCompiler {
             }
         }
 
-        let mut files = collect_files(&root, &source)?;
-        files.sort();
         let template_roots = template_roots(&root, &source)?;
-        let mut dependencies = vec![manifest.clone()];
-        let mut templates = compile_templates(&root, &files, &template_roots, &mut dependencies)?;
+        let mut files = collect_files(&root, &source, &template_roots, &deny_patterns)?;
+        files.sort();
+        for path in &files {
+            track_site_dependency(dependencies, path, &root);
+        }
+        for path in &template_roots {
+            track_site_dependency(dependencies, path, &root);
+        }
+        track_precompressed_candidates(&files, &source, &root, dependencies);
+        let mut templates = compile_templates(
+            &root,
+            &files,
+            &template_roots,
+            source.templates.default_output,
+            source.templates.default_autoescape,
+            dependencies,
+        )?;
+        track_template_dependencies(&root, &templates, dependencies);
         validate_template_graph(&templates)?;
 
         let oxr_files = files
@@ -94,12 +131,12 @@ impl SiteCompiler {
                     path: oxr.clone(),
                     message: "OXR escapes the site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root) {
+            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
                 continue;
             }
             dependencies.push(oxr.clone());
             let (logical_path, plan, backing) =
-                compile_oxr(&root, oxr, &source, &mut templates, &mut dependencies)?;
+                compile_oxr(&root, oxr, &source, &mut templates, dependencies)?;
             if let Some(backing) = backing {
                 backing_assets.insert(backing);
             }
@@ -118,40 +155,47 @@ impl SiteCompiler {
                     path: asset.clone(),
                     message: "asset is outside the canonical site root".to_owned(),
                 })?;
-            if is_private(relative, &source, &template_roots, &root) {
+            if is_private(relative, &source, &template_roots, &root, &deny_patterns) {
                 continue;
             }
+            let headers = compile_resource_base_policy(relative, &source, asset)?;
             let logical_path = logical_path(relative);
             let plan = SiteResponsePlan {
                 status: StatusCode::OK,
-                headers: compile_response_policy(
-                    &source.defaults.response,
-                    &manifest,
-                    "defaults.response",
-                )?,
+                headers,
                 content_type: None,
                 page: BTreeMap::new(),
                 kind: SiteResponseKind::Asset(Box::new(compile_asset(asset, &source)?)),
                 source: asset.clone(),
             };
             insert_with_index_aliases(&mut entries, logical_path, plan, &source)?;
-            dependencies.push(asset.clone());
+            track_site_dependency(dependencies, asset, &root);
         }
         validate_template_graph(&templates)?;
 
-        let error_404_template = source
+        let error_404 = source
             .errors
             .get(&404)
-            .map(|error| normalize_template_name(&error.template))
+            .map(|error| {
+                let name = normalize_template_name(&error.template)?;
+                track_site_dependency(dependencies, &root.join(&name), &root);
+                let template = templates.get(&name).ok_or_else(|| {
+                    SiteCompileError::source(
+                        &manifest,
+                        format!("404 error template `{name}` does not exist"),
+                    )
+                })?;
+                template.validate_arguments(&BTreeMap::new())?;
+                Ok(crate::runtime::ErrorPagePlan {
+                    template: name,
+                    headers: compile_response_policy(
+                        &source.defaults.response,
+                        &manifest,
+                        "defaults.response",
+                    )?,
+                })
+            })
             .transpose()?;
-        if let Some(name) = &error_404_template
-            && !templates.contains_key(name)
-        {
-            return Err(SiteCompileError::source(
-                &manifest,
-                format!("404 error template `{name}` does not exist"),
-            ));
-        }
 
         dependencies.sort();
         dependencies.dedup();
@@ -159,7 +203,7 @@ impl SiteCompiler {
             id,
             root,
             manifest,
-            dependencies,
+            dependencies: dependencies.clone(),
             missing: match source.paths.missing {
                 MissingSource::Decline => SiteMissing::Decline,
                 MissingSource::Respond => SiteMissing::Respond,
@@ -168,8 +212,66 @@ impl SiteCompiler {
             limits,
             templates,
             entries,
-            error_404_template,
+            error_404,
         })
+    }
+}
+
+fn track_candidate(dependencies: &mut Vec<PathBuf>, path: &Path) {
+    dependencies.push(path.to_path_buf());
+    if let Some(parent) = path.parent() {
+        dependencies.push(parent.to_path_buf());
+    }
+}
+
+fn track_site_dependency(dependencies: &mut Vec<PathBuf>, path: &Path, root: &Path) {
+    dependencies.push(path.to_path_buf());
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if !directory.starts_with(root) {
+            break;
+        }
+        dependencies.push(directory.to_path_buf());
+        if directory == root {
+            break;
+        }
+        parent = directory.parent();
+    }
+}
+
+fn track_template_dependencies(
+    root: &Path,
+    templates: &BTreeMap<String, CompiledOxt>,
+    dependencies: &mut Vec<PathBuf>,
+) {
+    for template in templates.values() {
+        for dependency in template.dependencies() {
+            track_site_dependency(dependencies, &root.join(dependency), root);
+        }
+    }
+}
+
+fn track_precompressed_candidates(
+    files: &[PathBuf],
+    source: &ManifestSource,
+    root: &Path,
+    dependencies: &mut Vec<PathBuf>,
+) {
+    let existing_precompressed = precompressed_paths(files, source);
+    for path in files
+        .iter()
+        .filter(|path| !has_source_extension(path) && !existing_precompressed.contains(*path))
+    {
+        for suffix in [
+            source.assets.precompressed.brotli.as_deref(),
+            source.assets.precompressed.gzip.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
+            track_site_dependency(dependencies, &candidate, root);
+        }
     }
 }
 
@@ -209,16 +311,6 @@ fn validate_manifest(
                 "errors.{status} is not supported in Oxista v1 alpha; only a 404 template is implemented"
             ),
         ));
-    }
-    for (index, pattern) in source.visibility.deny.iter().enumerate() {
-        if !supported_deny_pattern(pattern) {
-            return Err(SiteCompileError::source(
-                path,
-                format!(
-                    "visibility.deny[{index}] uses unsupported glob `{pattern}`; use an exact relative path, `**/name`, or `**/*.ext`"
-                ),
-            ));
-        }
     }
     for (name, contract) in &source.inputs {
         validate_input_kind(path, name, &contract.kind)?;
@@ -266,21 +358,120 @@ fn validate_manifest(
     {
         validate_cache_policy(path, policy)?;
     }
+    compile_response_policy(&source.defaults.response, path, "defaults.response")?;
+    for (extension, policy) in &source.defaults.by_extension {
+        compile_response_policy(
+            policy,
+            path,
+            &format!("defaults.by_extension[\"{extension}\"]"),
+        )?;
+    }
+    for (name, policy) in &source.profiles {
+        compile_response_policy(policy, path, &format!("profiles.{name}"))?;
+    }
     Ok(())
 }
 
-fn supported_deny_pattern(pattern: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DenyPattern {
+    ExactPath(Vec<String>),
+    ComponentName(String),
+    FileExtension(String),
+}
+
+impl DenyPattern {
+    fn matches(&self, relative: &Path) -> bool {
+        let components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match self {
+            Self::ExactPath(expected) => {
+                components.len() >= expected.len()
+                    && components
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual == expected)
+            }
+            Self::ComponentName(expected) => {
+                components.iter().any(|component| component == expected)
+            }
+            Self::FileExtension(extension) => components
+                .last()
+                .is_some_and(|name| name.ends_with(extension)),
+        }
+    }
+}
+
+fn compile_deny_patterns(
+    path: &Path,
+    patterns: &[String],
+) -> Result<Vec<DenyPattern>, SiteCompileError> {
+    patterns
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            compile_deny_pattern(pattern).map_err(|message| {
+                SiteCompileError::source(
+                    path,
+                    format!(
+                        "visibility.deny[{index}] `{pattern}` is invalid: {message}; use an exact relative path, `**/name`, or `**/*.ext`"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn compile_deny_pattern(pattern: &str) -> Result<DenyPattern, &'static str> {
     if pattern.is_empty() {
-        return false;
+        return Err("pattern cannot be empty");
     }
-    let has_glob = pattern.contains(['*', '?', '[', ']']);
-    if !has_glob {
-        return true;
+    if pattern.contains('\\') {
+        return Err("backslashes are not allowed");
     }
-    pattern
-        .strip_prefix("**/*")
-        .or_else(|| pattern.strip_prefix("**/"))
-        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains(['*', '?', '[', ']']))
+    if pattern.starts_with('/') || looks_like_windows_absolute(pattern) {
+        return Err("absolute paths are not allowed");
+    }
+    if let Some(extension) = pattern.strip_prefix("**/*.") {
+        if !valid_pattern_component(extension) || extension.contains('/') {
+            return Err("extension pattern must contain one non-empty extension");
+        }
+        return Ok(DenyPattern::FileExtension(format!(".{extension}")));
+    }
+    if let Some(name) = pattern.strip_prefix("**/") {
+        if !valid_pattern_component(name) || name.contains('/') {
+            return Err("component pattern must contain one exact path component");
+        }
+        return Ok(DenyPattern::ComponentName(name.to_owned()));
+    }
+    if pattern.contains(['*', '?', '[', ']']) {
+        return Err("unsupported wildcard syntax");
+    }
+    let components = pattern.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| !valid_pattern_component(component))
+    {
+        return Err("exact paths cannot contain empty, `.` or `..` components");
+    }
+    Ok(DenyPattern::ExactPath(
+        components.into_iter().map(str::to_owned).collect(),
+    ))
+}
+
+fn valid_pattern_component(component: &str) -> bool {
+    !component.is_empty()
+        && !matches!(component, "." | "..")
+        && !component.contains(['*', '?', '[', ']'])
+}
+
+fn looks_like_windows_absolute(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn validate_input_kind(path: &Path, name: &str, kind: &str) -> Result<(), SiteCompileError> {
@@ -360,9 +551,15 @@ fn compile_limits(
     })
 }
 
-fn collect_files(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, SiteCompileError> {
+fn collect_files(
+    root: &Path,
+    source: &ManifestSource,
+    template_roots: &[PathBuf],
+    deny_patterns: &[DenyPattern],
+) -> Result<Vec<PathBuf>, SiteCompileError> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    let mut entries = WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -372,31 +569,78 @@ fn collect_files(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, S
         if entry.path() == root {
             continue;
         }
-        if entry.file_type().is_symlink() {
-            let canonical = entry
+        let relative =
+            entry
                 .path()
-                .canonicalize()
-                .map_err(|error| SiteCompileError::io(entry.path(), error))?;
-            if source.visibility.symlinks == SymlinkModeSource::Deny
-                || !path_is_within(&canonical, root)
-            {
-                return Err(SiteCompileError::UnsafePath {
+                .strip_prefix(root)
+                .map_err(|_| SiteCompileError::UnsafePath {
                     path: entry.path().to_path_buf(),
-                    message: "symlink is denied or escapes the site root".to_owned(),
-                });
-            }
-            if canonical.is_dir() {
-                return Err(SiteCompileError::UnsafePath {
-                    path: entry.path().to_path_buf(),
-                    message: "directory symlinks are not traversed in Oxista v1".to_owned(),
-                });
-            }
+                    message: "site scan escaped the canonical root".to_owned(),
+                })?;
+        if entry.file_type().is_dir()
+            && !is_template_scan_path(entry.path(), template_roots)
+            && denied_by_visibility(relative, source, deny_patterns, true)
+        {
+            validate_pruned_subtree_symlinks(entry.path(), source, root)?;
+            entries.skip_current_dir();
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            let canonical = validate_symlink(entry.path(), source, root)?;
             files.push(canonical);
         } else if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
         }
     }
     Ok(files)
+}
+
+fn is_template_scan_path(path: &Path, template_roots: &[PathBuf]) -> bool {
+    template_roots
+        .iter()
+        .any(|root| path.starts_with(root) || root.starts_with(path))
+}
+
+fn validate_pruned_subtree_symlinks(
+    directory: &Path,
+    source: &ManifestSource,
+    root: &Path,
+) -> Result<(), SiteCompileError> {
+    for entry in WalkDir::new(directory).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| {
+            let path = error
+                .path()
+                .map_or_else(|| directory.to_path_buf(), Path::to_path_buf);
+            SiteCompileError::source(path, error.to_string())
+        })?;
+        if entry.file_type().is_symlink() {
+            validate_symlink(entry.path(), source, root)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_symlink(
+    path: &Path,
+    source: &ManifestSource,
+    root: &Path,
+) -> Result<PathBuf, SiteCompileError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| SiteCompileError::io(path, error))?;
+    if source.visibility.symlinks == SymlinkModeSource::Deny || !path_is_within(&canonical, root) {
+        return Err(SiteCompileError::UnsafePath {
+            path: path.to_path_buf(),
+            message: "symlink is denied or escapes the site root".to_owned(),
+        });
+    }
+    if canonical.is_dir() {
+        return Err(SiteCompileError::UnsafePath {
+            path: path.to_path_buf(),
+            message: "directory symlinks are not traversed in Oxista v1".to_owned(),
+        });
+    }
+    Ok(canonical)
 }
 
 fn template_roots(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, SiteCompileError> {
@@ -425,6 +669,8 @@ fn compile_templates(
     root: &Path,
     files: &[PathBuf],
     template_roots: &[PathBuf],
+    default_output: OutputSource,
+    default_autoescape: Option<crate::source::AutoescapeSource>,
     dependencies: &mut Vec<PathBuf>,
 ) -> Result<BTreeMap<String, CompiledOxt>, SiteCompileError> {
     let mut templates = BTreeMap::new();
@@ -455,7 +701,13 @@ fn compile_templates(
                 format!("expected `oxista: {TEMPLATE_API_VERSION}`"),
             ));
         }
-        let template = CompiledOxt::compile(name.clone(), &metadata, body)?;
+        let template = CompiledOxt::compile(
+            name.clone(),
+            &metadata,
+            body,
+            default_output,
+            default_autoescape,
+        )?;
         if templates.insert(name.clone(), template).is_some() {
             return Err(SiteCompileError::source(
                 path,
@@ -539,20 +791,7 @@ fn compile_oxr(
             .ok_or_else(|| SiteCompileError::source(path, "OXR must end with `.oxr`"))?,
     );
     let logical_path = logical_path(&relative_without_oxr);
-    let extension = relative_without_oxr
-        .extension()
-        .map(|extension| format!(".{}", extension.to_string_lossy()));
-    let mut headers =
-        compile_response_policy(&manifest.defaults.response, path, "defaults.response")?;
-    if let Some(extension) = extension.as_ref()
-        && let Some(policy) = manifest.defaults.by_extension.get(extension)
-    {
-        headers.merge(compile_response_policy(
-            policy,
-            path,
-            &format!("defaults.by_extension.{extension}"),
-        )?);
-    }
+    let mut headers = compile_resource_base_policy(&relative_without_oxr, manifest, path)?;
     for profile in &source.apply {
         let policy = manifest.profiles.get(profile).ok_or_else(|| {
             SiteCompileError::source(path, format!("unknown response profile `{profile}`"))
@@ -679,6 +918,7 @@ fn compile_oxr_body(
             }
             oxr.parent().unwrap_or(root).join(relative)
         };
+        track_site_dependency(dependencies, &asset, root);
         let asset = asset
             .canonicalize()
             .map_err(|error| SiteCompileError::io(&asset, error))?;
@@ -728,6 +968,7 @@ fn compile_oxr_body(
             )),
             TemplateReferenceSource::External(external) => {
                 let name = normalize_template_name(&external.source)?;
+                track_site_dependency(dependencies, &root.join(&name), root);
                 let template = templates.get(&name).ok_or_else(|| {
                     SiteCompileError::source(oxr, format!("template `{name}` does not exist"))
                 })?;
@@ -860,7 +1101,11 @@ fn compile_response_policy(
             directives.push("immutable".to_owned());
         }
         if !directives.is_empty() {
-            headers.set.push((
+            let layer = headers
+                .layers
+                .last_mut()
+                .expect("compiled header policy always has one layer");
+            layer.set.push((
                 HeaderName::from_static("cache-control"),
                 CompiledTemplate::compile(directives.join(", "))
                     .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
@@ -876,17 +1121,43 @@ fn compile_headers(
     field_path: &str,
 ) -> Result<HeaderPlan, SiteCompileError> {
     Ok(HeaderPlan {
-        set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
-        add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
-        remove: source
-            .remove
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        layers: vec![HeaderPolicyLayer {
+            set: compile_header_map(&source.set, path, &format!("{field_path}.set"))?,
+            add: compile_header_map(&source.add, path, &format!("{field_path}.add"))?,
+            remove: source
+                .remove
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    compile_user_header_name(name, path, &format!("{field_path}.remove[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }],
     })
+}
+
+fn compile_resource_base_policy(
+    logical_relative_path: &Path,
+    manifest: &ManifestSource,
+    source_path: &Path,
+) -> Result<HeaderPlan, SiteCompileError> {
+    let mut headers = compile_response_policy(
+        &manifest.defaults.response,
+        source_path,
+        "defaults.response",
+    )?;
+    if let Some(extension) = logical_relative_path
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        && let Some(policy) = manifest.defaults.by_extension.get(&extension)
+    {
+        headers.merge(compile_response_policy(
+            policy,
+            source_path,
+            &format!("defaults.by_extension[\"{extension}\"]"),
+        )?);
+    }
+    Ok(headers)
 }
 
 fn compile_header_map(
@@ -1136,6 +1407,7 @@ fn is_private(
     source: &ManifestSource,
     template_roots: &[PathBuf],
     site_root: &Path,
+    deny_patterns: &[DenyPattern],
 ) -> bool {
     if template_roots
         .iter()
@@ -1144,6 +1416,15 @@ fn is_private(
     {
         return true;
     }
+    denied_by_visibility(relative, source, deny_patterns, false)
+}
+
+fn denied_by_visibility(
+    relative: &Path,
+    source: &ManifestSource,
+    deny_patterns: &[DenyPattern],
+    is_directory: bool,
+) -> bool {
     let components = relative
         .components()
         .filter_map(|component| match component {
@@ -1161,21 +1442,18 @@ fn is_private(
     if source.visibility.underscore_directories != VisibilityModeSource::Allow
         && components
             .iter()
-            .take(components.len().saturating_sub(1))
+            .take(if is_directory {
+                components.len()
+            } else {
+                components.len().saturating_sub(1)
+            })
             .any(|component| component.starts_with('_'))
     {
         return true;
     }
-    let value = relative.to_string_lossy().replace('\\', "/");
-    source.visibility.deny.iter().any(|pattern| {
-        pattern
-            .strip_prefix("**/*")
-            .is_some_and(|suffix| value.ends_with(suffix))
-            || pattern
-                .strip_prefix("**/")
-                .is_some_and(|suffix| value.ends_with(suffix))
-            || value == *pattern
-    })
+    deny_patterns
+        .iter()
+        .any(|pattern| pattern.matches(relative))
 }
 
 fn logical_path(relative: &Path) -> String {
@@ -1293,8 +1571,8 @@ mod tests {
     use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, Value};
     use tempfile::tempdir;
 
-    use super::SiteCompiler;
-    use crate::{PreparedSiteBody, SiteError};
+    use super::{SiteCompiler, compile_deny_pattern};
+    use crate::{PreparedSiteBody, SiteError, TemplateArgumentError};
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary site directory is available");
@@ -1458,6 +1736,352 @@ response:
         assert_eq!(json["path"], "/feed.json");
     }
 
+    #[test]
+    fn failed_compilation_retains_scanned_and_missing_dependencies() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        let templates = root.join("_templates");
+        fs::create_dir_all(&templates).expect("template directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        let invalid_template = templates.join("invalid.oxt");
+        fs::write(&invalid_template, "not front matter").expect("invalid OXT can be written");
+        let canonical_root = root.canonicalize().expect("site root canonicalizes");
+        let canonical_templates = canonical_root.join("_templates");
+
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("invalid OXT rejects the candidate");
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&invalid_template.canonicalize().expect("OXT canonicalizes"))
+        );
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&canonical_templates)
+        );
+
+        fs::remove_file(&invalid_template).expect("invalid OXT can be removed");
+        let oxr = root.join("index.html.oxr");
+        fs::write(
+            &oxr,
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/missing.oxt
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let missing = canonical_templates.join("missing.oxt");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("missing external template rejects the candidate");
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&oxr.canonicalize().expect("OXR canonicalizes"))
+        );
+        assert!(failure.discovered_dependencies.contains(&missing));
+        assert!(
+            failure
+                .discovered_dependencies
+                .contains(&canonical_templates)
+        );
+    }
+
+    #[test]
+    fn preserves_header_layers_and_applies_logical_extension_defaults() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+assets:
+  precompressed:
+    brotli: .br
+    gzip: .gz
+defaults:
+  response:
+    headers:
+      set:
+        X-Policy: global
+        X-Override: global
+  by_extension:
+    ".css":
+      cache:
+        visibility: public
+        max_age: 1h
+      headers:
+        set:
+          X-Asset: css
+          X-Override: extension
+    ".html":
+      headers:
+        set:
+          X-Html: applied
+    ".txt":
+      headers:
+        set:
+          X-Extension: present
+          X-Override: extension
+profiles:
+  remove_policy:
+    headers:
+      remove: [X-Policy]
+      add:
+        Set-Cookie: profile=one
+  first:
+    headers:
+      set:
+        X-Profile: first
+  second:
+    headers:
+      set:
+        X-Profile: second
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(root.join("style.css"), "identity").expect("CSS can be written");
+        fs::write(root.join("style.css.br"), "brotli").expect("Brotli can be written");
+        fs::write(root.join("style.css.gz"), "gzip").expect("gzip can be written");
+        fs::write(root.join("page.html"), "html").expect("HTML can be written");
+        fs::write(root.join("plain.bin"), "bin").expect("binary can be written");
+        fs::write(root.join("theme.css"), "theme").expect("sibling CSS can be written");
+        fs::write(
+            root.join("theme.css.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  headers:
+    set:
+      X-Asset: local
+  body:
+    asset: sibling
+---
+"#,
+        )
+        .expect("CSS OXR can be written");
+        fs::write(
+            root.join("policy.txt.oxr"),
+            r#"---
+oxista: response/v1
+apply: [remove_policy, first, second]
+response:
+  headers:
+    remove: [X-Extension]
+    set:
+      X-Combined: base
+    add:
+      X-Combined: extra
+      Set-Cookie: local=two
+  body:
+    text: policy
+---
+"#,
+        )
+        .expect("policy OXR can be written");
+
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("site compiles");
+
+        let css = snapshot
+            .execute(&request("/style.css"))
+            .expect("CSS executes")
+            .expect("CSS is handled");
+        assert_eq!(css.headers["cache-control"], "public, max-age=3600");
+        assert_eq!(css.headers["x-asset"], "css");
+        assert_eq!(css.headers["x-override"], "extension");
+        let PreparedSiteBody::Asset(asset) = css.body else {
+            panic!("CSS uses the asset fast path");
+        };
+        assert!(asset.brotli.is_some());
+        assert!(asset.gzip.is_some());
+
+        let html = snapshot
+            .execute(&request("/page.html"))
+            .expect("HTML executes")
+            .expect("HTML is handled");
+        assert_eq!(html.headers["x-html"], "applied");
+        let plain = snapshot
+            .execute(&request("/plain.bin"))
+            .expect("binary executes")
+            .expect("binary is handled");
+        assert!(!plain.headers.contains_key("cache-control"));
+        assert!(!plain.headers.contains_key("x-asset"));
+
+        let theme = snapshot
+            .execute(&request("/theme.css"))
+            .expect("OXR CSS executes")
+            .expect("OXR CSS is handled");
+        assert_eq!(theme.headers["cache-control"], "public, max-age=3600");
+        assert_eq!(theme.headers["x-asset"], "local");
+
+        let policy = snapshot
+            .execute(&request("/policy.txt"))
+            .expect("policy executes")
+            .expect("policy is handled");
+        assert!(!policy.headers.contains_key("x-policy"));
+        assert!(!policy.headers.contains_key("x-extension"));
+        assert_eq!(policy.headers["x-override"], "extension");
+        assert_eq!(policy.headers["x-profile"], "second");
+        assert_eq!(
+            policy
+                .headers
+                .get_all("x-combined")
+                .iter()
+                .map(|value| value.to_str().expect("header is text"))
+                .collect::<Vec<_>>(),
+            ["base", "extra"]
+        );
+        assert_eq!(
+            policy
+                .headers
+                .get_all("set-cookie")
+                .iter()
+                .map(|value| value.to_str().expect("cookie is text"))
+                .collect::<Vec<_>>(),
+            ["profile=one", "local=two"]
+        );
+    }
+
+    #[test]
+    fn visibility_deny_matches_exact_components_extensions_and_subtrees() {
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        for directory in ["foo/secret", "a/b", "private-dir"] {
+            fs::create_dir_all(root.join(directory)).expect("fixture directory can be created");
+        }
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+visibility:
+  deny:
+    - "**/secret"
+    - "**/*.pem"
+    - exact-file.txt
+    - private-dir
+"#,
+        )
+        .expect("manifest can be written");
+        for path in [
+            "foo/mysecret",
+            "foo/secret/key.txt",
+            "secret",
+            "foo/secret.txt",
+            "key.pem",
+            "a/b/key.pem",
+            "key.pem.bak",
+            "notpem",
+            "exact-file.txt",
+            "private-dir/child.txt",
+        ] {
+            fs::write(root.join(path), path).expect("fixture file can be written");
+        }
+        let snapshot = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect("site compiles");
+        let paths = snapshot.public_paths().collect::<Vec<_>>();
+        for allowed in [
+            "/foo/mysecret",
+            "/foo/secret.txt",
+            "/key.pem.bak",
+            "/notpem",
+        ] {
+            assert!(paths.contains(&allowed), "{allowed} should remain public");
+        }
+        for denied in [
+            "/foo/secret/key.txt",
+            "/secret",
+            "/key.pem",
+            "/a/b/key.pem",
+            "/exact-file.txt",
+            "/private-dir/child.txt",
+        ] {
+            assert!(!paths.contains(&denied), "{denied} should be denied");
+        }
+        let component = compile_deny_pattern("**/secret").expect("pattern compiles");
+        assert!(component.matches(std::path::Path::new("foo/secret/key")));
+        assert!(!component.matches(std::path::Path::new("foo/Secret/key")));
+
+        for pattern in [
+            "/absolute",
+            "../escape",
+            "empty//component",
+            "back\\slash",
+            "**/nested/name",
+            "assets/*.pem",
+        ] {
+            fs::write(
+                root.join("site.oxsite"),
+                format!("oxista: site/v1\nvisibility:\n  deny:\n    - '{pattern}'\n"),
+            )
+            .expect("invalid manifest can be written");
+            let failure = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect_err("invalid deny pattern must fail");
+            assert!(
+                failure.to_string().contains("visibility.deny[0]"),
+                "{failure}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruned_private_directories_still_validate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("private")).expect("private directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            "oxista: site/v1\nvisibility:\n  deny: [private]\n",
+        )
+        .expect("manifest can be written");
+        symlink("/etc/passwd", root.join("private/escape"))
+            .expect("escaping symlink can be created");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("private subtree symlink escape must still fail");
+        assert!(failure.to_string().contains("symlink"), "{failure}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
@@ -1526,6 +2150,18 @@ response:
 "#,
                 ),
                 "response.headers.remove[0]",
+            ),
+            (
+                r#"oxista: site/v1
+defaults:
+  by_extension:
+    ".css":
+      headers:
+        set:
+          Upgrade: websocket
+"#,
+                None,
+                "defaults.by_extension[\".css\"].headers.set.Upgrade",
             ),
         ];
 
@@ -1628,6 +2264,7 @@ response:
 templates:
   roots: [_templates]
   default_output: text
+  default_autoescape: none
 "#,
         )
         .expect("manifest can be written");
@@ -1635,7 +2272,6 @@ templates:
             root.join("_templates/plain.oxt"),
             r#"---
 oxista: template/v1
-output: text
 params:
   value: string
 ---
@@ -1648,6 +2284,7 @@ params:
             r#"---
 oxista: template/v1
 output: html
+autoescape: html
 params:
   value: string
 ---
@@ -1710,6 +2347,115 @@ response:
             };
             assert_eq!(String::from_utf8_lossy(&body), expected);
         }
+    }
+
+    #[test]
+    fn custom_404_uses_effective_template_settings_and_default_headers() {
+        for (output, autoescape, expected_content_type, expected_body) in [
+            (
+                "text",
+                "none",
+                "text/plain; charset=utf-8",
+                "missing <value>\n",
+            ),
+            (
+                "html",
+                "html",
+                "text/html; charset=utf-8",
+                "missing &lt;value&gt;\n",
+            ),
+        ] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+            fs::write(
+                root.join("site.oxsite"),
+                format!(
+                    r#"oxista: site/v1
+paths:
+  missing: respond
+templates:
+  roots: [_templates]
+  default_output: {output}
+  default_autoescape: {autoescape}
+data:
+  marker: "<value>"
+defaults:
+  response:
+    headers:
+      set:
+        X-Error-Policy: applied
+errors:
+  404:
+    template: _templates/404.oxt
+"#
+                ),
+            )
+            .expect("manifest can be written");
+            fs::write(
+                root.join("_templates/404.oxt"),
+                r#"---
+oxista: template/v1
+---
+missing {{ site.marker }}
+"#,
+            )
+            .expect("404 template can be written");
+            let snapshot = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                root.join("site.oxsite"),
+                BTreeMap::new(),
+            )
+            .expect("site compiles");
+            let response = snapshot
+                .execute(&request("/missing"))
+                .expect("404 executes")
+                .expect("404 is handled");
+            assert_eq!(response.status, StatusCode::NOT_FOUND);
+            assert_eq!(response.headers["content-type"], expected_content_type);
+            assert_eq!(response.headers["x-error-policy"], "applied");
+            let PreparedSiteBody::Bytes(body) = response.body else {
+                panic!("404 template renders bytes");
+            };
+            assert_eq!(String::from_utf8_lossy(&body), expected_body);
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+        fs::write(
+            root.join("site.oxsite"),
+            r#"oxista: site/v1
+paths:
+  missing: respond
+errors:
+  404:
+    template: _templates/404.oxt
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            root.join("_templates/404.oxt"),
+            r#"---
+oxista: template/v1
+params:
+  reason: string
+---
+{{ reason }}
+"#,
+        )
+        .expect("parameterized 404 template can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            root.join("site.oxsite"),
+            BTreeMap::new(),
+        )
+        .expect_err("404 with a required parameter is not callable");
+        let message = failure.to_string();
+        assert!(message.contains("_templates/404.oxt"), "{message}");
+        assert!(message.contains("reason"), "{message}");
     }
 
     #[test]
@@ -1859,22 +2605,35 @@ response:
         let error = snapshot
             .execute(&request("/bad-count"))
             .expect_err("wrong dynamic integer must fail at runtime");
-        let SiteError::TemplateArgument(message) = error else {
+        let SiteError::TemplateArgument(TemplateArgumentError::Type {
+            template,
+            parameter,
+            expected,
+            actual,
+        }) = error
+        else {
             panic!("wrong type must be a template argument error");
         };
-        assert!(message.contains("_templates/card.oxt"));
-        assert!(message.contains("parameter `count`"));
-        assert!(message.contains("expects int, received string"));
+        assert_eq!(template, "_templates/card.oxt");
+        assert_eq!(parameter, "count");
+        assert_eq!(expected, "int");
+        assert_eq!(actual, "string");
 
         let error = snapshot
             .execute(&request("/bad-url"))
             .expect_err("relative URL must fail at runtime");
-        let SiteError::TemplateArgument(message) = error else {
+        let SiteError::TemplateArgument(TemplateArgumentError::Type {
+            parameter,
+            expected,
+            actual,
+            ..
+        }) = error
+        else {
             panic!("wrong URL must be a template argument error");
         };
-        assert!(message.contains("parameter `target`"));
-        assert!(message.contains("expects url"));
-        assert!(message.contains("not an absolute URL"));
+        assert_eq!(parameter, "target");
+        assert_eq!(expected, "url");
+        assert_eq!(actual, "string (not an absolute URL)");
 
         let response = snapshot
             .execute(&request("/good"))

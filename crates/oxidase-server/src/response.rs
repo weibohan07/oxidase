@@ -28,6 +28,7 @@ impl<'a> ResponseFinalizer<'a> {
         let representation_length = response.body.representation_length();
         let status_forbids_body = response.status.is_informational()
             || response.status == StatusCode::NO_CONTENT
+            || response.status == StatusCode::RESET_CONTENT
             || response.status == StatusCode::NOT_MODIFIED;
         let head_only = self.method == Method::HEAD;
         if !status_forbids_body
@@ -80,6 +81,7 @@ mod tests {
         for status in [
             StatusCode::SWITCHING_PROTOCOLS,
             StatusCode::NO_CONTENT,
+            StatusCode::RESET_CONTENT,
             StatusCode::NOT_MODIFIED,
         ] {
             let mut response = ResponseHead::new(

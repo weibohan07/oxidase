@@ -199,10 +199,17 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                     ServiceOutcome::Handled(output)
                 }
                 Ok(None) => ServiceOutcome::Declined,
-                Err(error) => ServiceOutcome::Failed(oxidase_core::ServiceError::new(
-                    oxidase_core::ErrorClass::SiteIo,
-                    error.to_string(),
-                )),
+                Err(error) => {
+                    let class = if matches!(error, oxidase_site::SiteError::TemplateLimit { .. }) {
+                        oxidase_core::ErrorClass::TemplateLimit
+                    } else {
+                        oxidase_core::ErrorClass::InvalidState
+                    };
+                    ServiceOutcome::Failed(oxidase_core::ServiceError::new(
+                        class,
+                        error.to_string(),
+                    ))
+                }
             }
         })
     }
@@ -552,12 +559,15 @@ fn update_stamp(hash: &mut u64, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::SocketAddr;
+    use std::path::Path;
     use std::time::Duration;
 
     use oxidase_config::Compiler;
     use oxidase_core::{RespondBody, ServiceKind};
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::watch_dependencies_with_timing;
 
@@ -572,6 +582,112 @@ mod tests {
         })
         .await
         .expect("condition becomes true before timeout");
+    }
+
+    async fn get(address: SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("test server accepts connections");
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("request can be written");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("response can be read");
+        String::from_utf8(response).expect("test response is UTF-8")
+    }
+
+    fn write_initial_gateway(config: &Path) {
+        fs::write(
+            config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: respond
+    body:
+      text: old-version
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("initial config can be written");
+    }
+
+    fn write_site_gateway(config: &Path) {
+        fs::write(
+            config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("site candidate config can be written");
+    }
+
+    async fn start_watched_gateway(
+        config: &Path,
+    ) -> (
+        oxidase_server::RunningServer,
+        oxidase_server::ReloadHandle,
+        SocketAddr,
+        String,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        write_initial_gateway(config);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let reload = running.reload_handle();
+        let initial_version = reload.current_snapshot().config_version.to_string();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn(watch_dependencies_with_timing(
+            config.to_path_buf(),
+            reload.clone(),
+            receiver,
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        (running, reload, address, initial_version, stop, watcher)
+    }
+
+    async fn stop_watched_gateway(
+        running: oxidase_server::RunningServer,
+        stop: tokio::sync::watch::Sender<bool>,
+        watcher: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = stop.send(true);
+        watcher.await.expect("watcher task stops");
+        running.shutdown().await.expect("gateway shuts down");
     }
 
     #[tokio::test]
@@ -676,5 +792,152 @@ services:
         let _ = stop.send(true);
         watcher.await.expect("watcher task stops");
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn watcher_recovers_when_existing_invalid_oxt_is_fixed_in_place() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        let site = directory.path().join("site");
+        let templates = site.join("_templates");
+        fs::create_dir_all(&templates).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("index.html.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/page.oxt
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let template = templates.join("page.oxt");
+        fs::write(&template, "invalid OXT").expect("invalid OXT can be written");
+        let (running, reload, address, initial_version, stop, watcher) =
+            start_watched_gateway(&config).await;
+
+        write_site_gateway(&config);
+        let watched_template = template.canonicalize().expect("template canonicalizes");
+        wait_until(|| reload.watched_dependencies().contains(&watched_template)).await;
+        assert_eq!(
+            reload.current_snapshot().config_version.as_str(),
+            initial_version
+        );
+        assert!(get(address, "/").await.ends_with("old-version"));
+
+        fs::write(
+            &template,
+            r#"---
+oxista: template/v1
+output: text
+---
+recovered-oxt
+"#,
+        )
+        .expect("OXT can be fixed");
+        wait_until(|| reload.current_snapshot().config_version.as_str() != initial_version).await;
+        assert!(get(address, "/").await.ends_with("recovered-oxt\n"));
+
+        stop_watched_gateway(running, stop, watcher).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_recovers_when_existing_invalid_oxr_is_fixed_in_place() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        fs::write(site.join("site.oxsite"), "oxista: site/v1\n").expect("manifest can be written");
+        let oxr = site.join("index.html.oxr");
+        fs::write(&oxr, "invalid OXR").expect("invalid OXR can be written");
+        let (running, reload, address, initial_version, stop, watcher) =
+            start_watched_gateway(&config).await;
+
+        write_site_gateway(&config);
+        let watched_oxr = oxr.canonicalize().expect("OXR canonicalizes");
+        wait_until(|| reload.watched_dependencies().contains(&watched_oxr)).await;
+        assert_eq!(
+            reload.current_snapshot().config_version.as_str(),
+            initial_version
+        );
+        assert!(get(address, "/").await.ends_with("old-version"));
+
+        fs::write(
+            &oxr,
+            r#"---
+oxista: response/v1
+response:
+  body:
+    text: recovered-oxr
+---
+"#,
+        )
+        .expect("OXR can be fixed");
+        wait_until(|| reload.current_snapshot().config_version.as_str() != initial_version).await;
+        assert!(get(address, "/").await.ends_with("recovered-oxr"));
+
+        stop_watched_gateway(running, stop, watcher).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_recovers_when_missing_template_is_created() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        let site = directory.path().join("site");
+        let templates = site.join("_templates");
+        fs::create_dir_all(&templates).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("index.html.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/page.oxt
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let missing = site
+            .canonicalize()
+            .expect("site root canonicalizes")
+            .join("_templates/page.oxt");
+        let (running, reload, address, initial_version, stop, watcher) =
+            start_watched_gateway(&config).await;
+
+        write_site_gateway(&config);
+        wait_until(|| reload.watched_dependencies().contains(&missing)).await;
+        assert_eq!(
+            reload.current_snapshot().config_version.as_str(),
+            initial_version
+        );
+        assert!(get(address, "/").await.ends_with("old-version"));
+
+        fs::write(
+            templates.join("page.oxt"),
+            r#"---
+oxista: template/v1
+output: text
+---
+created-template
+"#,
+        )
+        .expect("missing OXT can be created");
+        wait_until(|| reload.current_snapshot().config_version.as_str() != initial_version).await;
+        assert!(get(address, "/").await.ends_with("created-template\n"));
+
+        stop_watched_gateway(running, stop, watcher).await;
     }
 }

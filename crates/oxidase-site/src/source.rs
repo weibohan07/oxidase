@@ -336,8 +336,7 @@ pub(crate) struct ExternalTemplateSource {
 #[serde(deny_unknown_fields)]
 pub(crate) struct OxtMetadataSource {
     pub oxista: String,
-    #[serde(default)]
-    pub output: OutputSource,
+    pub output: Option<OutputSource>,
     pub autoescape: Option<AutoescapeSource>,
     #[serde(default)]
     pub params: BTreeMap<String, String>,

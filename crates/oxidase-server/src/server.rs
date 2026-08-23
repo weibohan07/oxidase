@@ -377,7 +377,13 @@ impl ReloadHandle {
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
             match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
                 Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies)),
-                Err(error) => Err((ServerError::Reload(error.to_string()), attempt_dependencies)),
+                Err(error) => {
+                    let mut dependencies = attempt_dependencies;
+                    dependencies.extend(error.candidate_dependencies.iter().cloned());
+                    dependencies.sort();
+                    dependencies.dedup();
+                    Err((ServerError::Reload(error.to_string()), dependencies))
+                }
             }
         })
         .await
@@ -1474,6 +1480,13 @@ services:
           status: 304
           body:
             text: forbidden-304
+      - when:
+          path: /reset-content
+        service:
+          type: respond
+          status: 205
+          body:
+            text: forbidden-205
     default:
       type: respond
       body:
@@ -1512,6 +1525,17 @@ listeners:
             assert!(body.is_empty());
         }
 
+        let reset = request(address, "/reset-content", "").await;
+        let (headers, body) = raw_response_parts(&reset);
+        assert!(headers.starts_with("HTTP/1.1 205 Reset Content"));
+        assert!(
+            raw_header_values(&reset, "content-length")
+                .iter()
+                .all(|value| value == "0")
+        );
+        assert!(!headers.to_ascii_lowercase().contains("transfer-encoding:"));
+        assert!(body.is_empty());
+
         let response = raw_request(
             address,
             "HEAD /head HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
@@ -1520,6 +1544,93 @@ listeners:
         let (headers, body) = raw_response_parts(&response);
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
         assert!(headers.to_ascii_lowercase().contains("content-length: 5"));
+        assert!(body.is_empty());
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn custom_site_404_preserves_template_metadata_for_head() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+paths:
+  missing: respond
+templates:
+  roots: [_templates]
+  default_output: text
+defaults:
+  response:
+    headers:
+      set:
+        X-Error-Policy: applied
+errors:
+  404:
+    template: _templates/404.oxt
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("_templates/404.oxt"),
+            "---\noxista: template/v1\n---\nnot-found\n",
+        )
+        .expect("404 template can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let get = request(address, "/missing", "").await;
+        assert!(get.starts_with("HTTP/1.1 404 Not Found"));
+        assert_eq!(
+            raw_header(&get, "content-type"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(raw_header(&get, "x-error-policy"), "applied");
+        assert!(get.ends_with("not-found\n"));
+
+        let head = raw_request(
+            address,
+            "HEAD /missing HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&head);
+        assert!(headers.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 10"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-error-policy: applied")
+        );
         assert!(body.is_empty());
 
         running.shutdown().await.expect("gateway shuts down");
@@ -1603,12 +1714,20 @@ defaults:
       set:
         Vary: Origin
         Cache-Control: "public, max-age=60"
+  by_extension:
+    ".css":
+      headers:
+        set:
+          X-Logical-Extension: css
 "#,
         )
         .expect("manifest can be written");
         fs::write(site.join("asset.txt"), "identity-v1").expect("identity can be written");
         fs::write(site.join("asset.txt.br"), "brotli-v1").expect("Brotli can be written");
         fs::write(site.join("asset.txt.gz"), "gzip-v1").expect("gzip can be written");
+        fs::write(site.join("style.css"), "style-identity").expect("CSS can be written");
+        fs::write(site.join("style.css.br"), "style-brotli")
+            .expect("compressed CSS can be written");
         fs::write(
             site.join("asset.txt.oxr"),
             r#"---
@@ -1651,6 +1770,12 @@ listeners:
             .expect("gateway binds")
             .spawn();
         let address = running.local_addresses()[0].1;
+
+        let compressed_css = request(address, "/style.css", "Accept-Encoding: br\r\n").await;
+        assert!(compressed_css.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(raw_header(&compressed_css, "content-encoding"), "br");
+        assert_eq!(raw_header(&compressed_css, "x-logical-extension"), "css");
+        assert!(compressed_css.ends_with("style-brotli"));
 
         let identity = request(address, "/asset.txt", "").await;
         assert!(identity.starts_with("HTTP/1.1 200 OK"));
@@ -1790,15 +1915,56 @@ listeners:
         )
         .await;
         let (headers, body) = raw_response_parts(&head_range);
-        assert!(headers.starts_with("HTTP/1.1 206 Partial Content"));
-        assert!(headers.to_ascii_lowercase().contains("content-length: 4"));
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 11"));
+        assert!(!headers.to_ascii_lowercase().contains("content-range:"));
         assert!(body.is_empty());
 
-        for value in ["bytes=99-100", "bytes=0-1,4-5"] {
-            let invalid = request(address, "/asset.txt", &format!("Range: {value}\r\n")).await;
-            assert!(invalid.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
-            assert_eq!(raw_header(&invalid, "content-range"), "bytes */11");
+        let compressed_head_range = raw_request(
+            address,
+            &format!(
+                "HEAD /asset.txt HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\nAccept-Encoding: br\r\nRange: bytes=2-5\r\nIf-Range: {identity_etag}\r\n\r\n"
+            ),
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&compressed_head_range);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-encoding: br")
+        );
+        assert!(headers.to_ascii_lowercase().contains("content-length: 9"));
+        assert!(!headers.to_ascii_lowercase().contains("content-range:"));
+        assert!(body.is_empty());
+
+        for value in ["items=0-10", "bytes=abc", "bytes=-", "bytes=0-1,4-5"] {
+            let ignored = request(
+                address,
+                "/asset.txt",
+                &format!("Accept-Encoding: br\r\nRange: {value}\r\n"),
+            )
+            .await;
+            assert!(ignored.starts_with("HTTP/1.1 200 OK"), "{value}: {ignored}");
+            assert_eq!(raw_header(&ignored, "content-encoding"), "br");
+            assert!(raw_header_values(&ignored, "content-range").is_empty());
+            assert!(ignored.ends_with("brotli-v1"));
         }
+
+        let unsatisfiable = request(address, "/asset.txt", "Range: bytes=99-100\r\n").await;
+        assert!(unsatisfiable.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
+        assert_eq!(raw_header(&unsatisfiable, "content-range"), "bytes */11");
+
+        let compressed_range = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br, identity;q=0\r\nRange: bytes=0-2\r\n",
+        )
+        .await;
+        assert!(compressed_range.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(raw_header(&compressed_range, "content-encoding"), "br");
+        assert!(raw_header_values(&compressed_range, "content-range").is_empty());
+        assert!(compressed_range.ends_with("brotli-v1"));
 
         fs::write(site.join("asset.txt.br"), "brotli-v2-changed")
             .expect("Brotli representation can change");
@@ -1862,8 +2028,16 @@ resources:
       root: site
 services:
   root:
-    type: site
-    site: web
+    type: recover
+    service:
+      type: site
+      site: web
+    handlers:
+      - classes: [template_limit]
+        service:
+          type: respond
+          body:
+            text: unexpected-limit-recovery
 listeners:
   - name: test
     bind: 127.0.0.1:0
@@ -1885,8 +2059,119 @@ listeners:
         let response = request(address, "/index", "").await;
         assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
         assert!(response.ends_with("Internal Server Error"));
+        assert!(!response.contains("unexpected-limit-recovery"));
         assert!(!response.contains("parameter `count`"));
         assert!(!response.contains("expects int"));
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn recover_catches_only_structured_template_limits() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(site.join("_templates")).expect("template directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+templates:
+  roots: [_templates]
+  limits:
+    output_size: 16B
+    loop_iterations: 1
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(
+            site.join("_templates/output.oxt"),
+            "---\noxista: template/v1\noutput: text\n---\nthis-output-is-longer-than-sixteen-bytes\n",
+        )
+        .expect("output template can be written");
+        fs::write(
+            site.join("_templates/loop.oxt"),
+            r#"---
+oxista: template/v1
+output: text
+---
+{% for item in page.items %}x{% endfor %}
+"#,
+        )
+        .expect("loop template can be written");
+        fs::write(
+            site.join("output.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  body:
+    template:
+      source: _templates/output.oxt
+---
+"#,
+        )
+        .expect("output OXR can be written");
+        fs::write(
+            site.join("loop.oxr"),
+            r#"---
+oxista: response/v1
+page:
+  items: [one, two]
+response:
+  body:
+    template:
+      source: _templates/loop.oxt
+---
+"#,
+        )
+        .expect("loop OXR can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: recover
+    service:
+      type: site
+      site: web
+    handlers:
+      - classes: [template_limit]
+        service:
+          type: respond
+          status: 503
+          body:
+            text: recovered-template-limit
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        for path in ["/output", "/loop"] {
+            let response = request(address, path, "").await;
+            assert!(
+                response.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "{path}: {response}"
+            );
+            assert!(response.ends_with("recovered-template-limit"));
+            assert!(!response.contains("_templates/"));
+        }
 
         running.shutdown().await.expect("gateway shuts down");
     }

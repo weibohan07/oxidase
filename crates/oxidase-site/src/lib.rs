@@ -7,7 +7,10 @@ mod source;
 mod template;
 
 pub use compiler::SiteCompiler;
-pub use error::{SiteCompileError, SiteError};
+pub use error::{
+    SiteCompileError, SiteCompileFailure, SiteError, TemplateArgumentError, TemplateLimitKind,
+    TemplateRenderError,
+};
 pub use runtime::{
     AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, PreparedSiteBody,
     PreparedSiteResponse, SiteMissing, SiteSnapshot,
