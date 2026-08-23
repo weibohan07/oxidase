@@ -29,14 +29,13 @@ cannot leak captures or rewrites into its siblings.
 
 ## Current v0.2 alpha
 
-The runnable HTTP/1.1 slice supports Respond, Redirect, Route, Fallback, Transform,
-Observe, Timeout, Recover, and compiled Site execution. Assets are streamed from
-async files and support single byte ranges, ETag/Last-Modified conditionals, and
-precompressed representation selection.
+The runnable HTTP/1.1 slice supports every current Service node, including streaming
+Proxy over pooled HTTP/1.1, HTTPS, and upstream HTTP/2 connections. Assets are
+streamed from async files and support single byte ranges, ETag/Last-Modified
+conditionals, and precompressed representation selection.
 
-Proxy is represented and validated in the Service plan but its production upstream
-adapter is the next implementation phase. TLS, HTTP/2, listener-aware reload,
-management endpoints, and OXT `extends`/`block` are not yet implemented. See
+Inbound TLS/HTTP/2, listener-aware reload, management endpoints, and OXT
+`extends`/`block` are not yet implemented. See
 [`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
 
 ## Try the vertical slice
@@ -59,9 +58,9 @@ The example demonstrates:
 - a missing resource declining from Site into an explicit Respond 404;
 - an outer response Transform applied to every handled branch.
 
-The `/api/*` route requires an upstream on `127.0.0.1:3000`; until the Proxy phase it
-returns a safe 502 while `explain` can still show the compiled rewrite and Cluster
-selection.
+The `/api/*` route proxies to an upstream on `127.0.0.1:3000`. Without that fixture
+upstream it returns a safe 502; `explain` can inspect the rewrite and Cluster
+selection without making the network request.
 
 ## Configuration sketch
 

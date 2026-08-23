@@ -46,16 +46,25 @@ Last updated: 2026-08-23
   and Brotli/gzip representation selection.
 - `oxidase serve` now runs the prepared gateway. Real loopback tests cover
   Respond/Redirect/Route/fallback, streaming asset range responses, and shutdown.
+- Phase 5 Proxy uses one long-lived Hyper client and connection pool for all
+  requests, streams downstream request and upstream response bodies, supports
+  HTTP/HTTPS plus upstream HTTP/2 ALPN, and never collects the normal proxy path.
+- Proxy removes Connection-nominated and standard hop-by-hop headers, applies a
+  target-Host and sanitized connection-derived Forwarded/X-Forwarded policy,
+  preserves raw path/query representation, enforces response-header and body-idle
+  timeouts, and returns classified Failed outcomes.
+- A real fixture-upstream test covers POST streaming, query preservation, forwarding
+  headers, response header sanitization, connection-pool reuse, and timeout mapping.
 
 ## Currently runnable
 
 - A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, and tested. Forty-four workspace tests pass,
+  executed in memory, explained, and tested. Forty-five workspace tests pass,
   including two real listener tests that require permission to bind loopback ports.
 
 ## Not implemented
 
-- Production Proxy, TLS/HTTP2, and listener-aware atomic reload.
+- Inbound TLS/HTTP2 and listener-aware atomic reload.
 
 ## Known limitations
 
@@ -73,13 +82,18 @@ Last updated: 2026-08-23
   indexed in this release; directory symlinks are rejected rather than traversed.
 - Asset range and precompressed metadata is compiled, but actual range/content
   negotiation is HTTP/1.1 only; multipart ranges are deliberately rejected.
-- Proxy currently returns a safe 502 from the production listener; no upstream I/O
-  is performed yet.
 - Listener serving supports HTTP/1.1 only. TLS, HTTP/2, upgrades, trailers, gRPC,
   and `100-continue` policy remain unimplemented.
+- Cluster health checks, retry policy, stable per-cluster health state, and
+  configurable Forwarded trust policy are not implemented. The current secure
+  default always replaces incoming forwarding metadata.
+- The response-header timeout currently bounds connect plus upload/header latency as
+  one deadline; per-phase connect/write timing is not separately observable yet.
+- Explicit slow-client, client-disconnect, and upstream-mid-body disconnect tests
+  remain for hardening, though dropped Hyper bodies propagate cancellation.
 
 ## Next concrete work
 
-Implement reusable Cluster clients, streaming Proxy request/response bodies,
-hop-by-hop header policy, forwarding metadata, timeouts, and upstream integration
+Implement dependency-aware reload with prepare/commit, last-known-good publication,
+resource reuse, listener add/remove rollback and drain, and cross-version request
 tests.

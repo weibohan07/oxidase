@@ -28,13 +28,13 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 
 ## 当前 v0.2 alpha
 
-当前可运行的 HTTP/1.1 垂直切片支持 Respond、Redirect、Route、Fallback、
-Transform、Observe、Timeout、Recover 与已编译 Site。Asset 使用异步文件流，
-支持单 Range、ETag/Last-Modified 条件请求与预压缩表示选择。
+当前可运行的 HTTP/1.1 垂直切片支持所有现有 Service 节点，包括通过共享连接池
+执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2 的 Proxy。Asset 使用异步文件流，支持
+单 Range、ETag/Last-Modified 条件请求与预压缩表示选择。
 
-Proxy 已进入规范 Service 计划并参与完整校验，但生产上游适配器仍是下一阶段。
-TLS、HTTP/2、Listener 生命周期感知的 reload、管理接口及 OXT `extends/block` 尚未
-实现。准确边界见 [`docs/implementation-status.md`](docs/implementation-status.md)。
+入站 TLS/HTTP/2、Listener 生命周期感知的 reload、管理接口及 OXT
+`extends/block` 尚未实现。准确边界见
+[`docs/implementation-status.md`](docs/implementation-status.md)。
 
 ## 运行垂直切片
 
@@ -56,8 +56,8 @@ cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
 - Site 缺失时 Decline，再由显式 Respond 生成 404；
 - 外层 response Transform 统一作用于所有已处理分支。
 
-`/api/*` 需要 `127.0.0.1:3000` 上游；Proxy 阶段完成前，真实请求会得到安全 502，
-但 `explain` 已能展示编译后的改写与 Cluster 选择。
+`/api/*` 会代理到 `127.0.0.1:3000` 上游；没有该 fixture upstream 时会得到安全
+502。`explain` 无需执行网络请求即可展示编译后的改写与 Cluster 选择。
 
 ## 配置片段
 

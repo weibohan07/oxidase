@@ -1,9 +1,16 @@
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use tokio::time::{Instant, Sleep};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -60,4 +67,59 @@ pub(crate) fn full_body(bytes: Bytes) -> GatewayBody {
 
 fn infallible_to_box(error: Infallible) -> BoxError {
     match error {}
+}
+
+pub(crate) fn timeout_incoming_body(body: Incoming, timeout: Duration) -> GatewayBody {
+    TimeoutBody::new(body, timeout).boxed_unsync()
+}
+
+struct TimeoutBody {
+    inner: Pin<Box<Incoming>>,
+    deadline: Pin<Box<Sleep>>,
+    timeout: Duration,
+}
+
+impl TimeoutBody {
+    fn new(inner: Incoming, timeout: Duration) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            timeout,
+        }
+    }
+}
+
+impl Body for TimeoutBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.inner.as_mut().poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let timeout = self.timeout;
+                self.deadline.as_mut().reset(Instant::now() + timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(Box::new(error)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => match self.deadline.as_mut().poll(context) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream response body idle timeout",
+                ))))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }

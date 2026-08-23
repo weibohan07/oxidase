@@ -19,12 +19,13 @@ use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::body::{GatewayBody, GatewayBodyPlan, full_body};
-use crate::leaves::HyperLeaves;
+use crate::leaves::{HyperLeaves, ProxyClient};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayServer {
     store: Arc<SnapshotStore>,
+    proxy: Arc<ProxyClient>,
     listeners: Vec<BoundListener>,
     drain_timeout: Duration,
 }
@@ -62,6 +63,7 @@ impl GatewayServer {
         }
         Ok(Self {
             store: Arc::new(SnapshotStore::new(snapshot)),
+            proxy: Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?),
             listeners,
             drain_timeout: Duration::from_secs(10),
         })
@@ -106,6 +108,7 @@ impl GatewayServer {
             tasks.spawn(run_listener(
                 listener,
                 self.store.clone(),
+                self.proxy.clone(),
                 receiver.clone(),
                 self.drain_timeout,
             ));
@@ -145,6 +148,7 @@ impl RunningServer {
 async fn run_listener(
     listener: BoundListener,
     store: Arc<SnapshotStore>,
+    proxy: Arc<ProxyClient>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
 ) -> Result<(), ServerError> {
@@ -164,8 +168,9 @@ async fn run_listener(
                 })?;
                 let listener_name = listener.name.clone();
                 let store = store.clone();
+                let proxy = proxy.clone();
                 connections.spawn(async move {
-                    serve_connection(stream, peer_address, listener_name, store).await;
+                    serve_connection(stream, peer_address, listener_name, store, proxy).await;
                 });
             }
             result = connections.join_next(), if !connections.is_empty() => {
@@ -196,9 +201,16 @@ async fn serve_connection(
     peer_address: SocketAddr,
     listener_name: String,
     store: Arc<SnapshotStore>,
+    proxy: Arc<ProxyClient>,
 ) {
     let service = service_fn(move |request| {
-        handle_request(request, peer_address, listener_name.clone(), store.clone())
+        handle_request(
+            request,
+            peer_address,
+            listener_name.clone(),
+            store.clone(),
+            proxy.clone(),
+        )
     });
     if let Err(error) = http1::Builder::new()
         .keep_alive(true)
@@ -214,6 +226,7 @@ async fn handle_request(
     peer_address: SocketAddr,
     listener_name: String,
     store: Arc<SnapshotStore>,
+    proxy: Arc<ProxyClient>,
 ) -> Result<Response<GatewayBody>, Infallible> {
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let snapshot = store.pin();
@@ -254,7 +267,7 @@ async fn handle_request(
         parts.headers,
     );
     metadata.peer_address = Some(peer_address.to_string());
-    let leaves = HyperLeaves::new(snapshot.clone());
+    let leaves = HyperLeaves::new(snapshot.clone(), proxy);
     let started = std::time::Instant::now();
     let report = Executor::new(&program, &leaves)
         .execute(RequestFrame::new(metadata), Some(body))
@@ -378,26 +391,46 @@ pub enum ServerError {
     },
     #[error("server task failed: {0}")]
     Task(String),
+    #[error("cannot initialize HTTP data plane: {0}")]
+    DataPlane(String),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use bytes::Bytes;
+    use http::{HeaderName, HeaderValue, Response, header};
+    use http_body_util::{BodyExt, Full};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
     use oxidase_config::Compiler;
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::watch;
 
     use super::GatewayServer;
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
+        raw_request(
+            address,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n{extra}\r\n"
+            ),
+        )
+        .await
+    }
+
+    async fn raw_request(address: std::net::SocketAddr, request: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("test server accepts connections");
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n{extra}\r\n"
-        );
         stream
             .write_all(request.as_bytes())
             .await
@@ -408,6 +441,95 @@ mod tests {
             .await
             .expect("response can be read");
         String::from_utf8(response).expect("test response is UTF-8")
+    }
+
+    async fn spawn_upstream() -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let address = listener.local_addr().expect("upstream address is known");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = accepts.clone();
+        let (shutdown, mut receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() || *receiver.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            break;
+                        };
+                        accepts_for_task.fetch_add(1, Ordering::Relaxed);
+                        connections.spawn(async move {
+                            let service = service_fn(|request: http::Request<hyper::body::Incoming>| async move {
+                                let path = request
+                                    .uri()
+                                    .path_and_query()
+                                    .map_or("/", http::uri::PathAndQuery::as_str)
+                                    .to_owned();
+                                let host = request
+                                    .headers()
+                                    .get(header::HOST)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let forwarded = request
+                                    .headers()
+                                    .get("x-forwarded-for")
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let has_hop_header = request.headers().contains_key("x-hop");
+                                if path.starts_with("/slow") {
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                }
+                                let body = request
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .expect("fixture request body is readable")
+                                    .to_bytes();
+                                let message = format!(
+                                    "{path}|{}|{host}|{forwarded}|{has_hop_header}",
+                                    String::from_utf8_lossy(&body)
+                                );
+                                let mut response = Response::new(Full::new(Bytes::from(message)));
+                                response.headers_mut().insert(
+                                    header::CONNECTION,
+                                    HeaderValue::from_static("x-remove"),
+                                );
+                                response.headers_mut().insert(
+                                    HeaderName::from_static("x-remove"),
+                                    HeaderValue::from_static("secret"),
+                                );
+                                response.headers_mut().insert(
+                                    HeaderName::from_static("x-keep"),
+                                    HeaderValue::from_static("kept"),
+                                );
+                                Ok::<_, Infallible>(response)
+                            });
+                            let _ = http1::Builder::new()
+                                .keep_alive(true)
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        (address, accepts, shutdown, task)
     }
 
     #[tokio::test]
@@ -514,5 +636,71 @@ listeners:
         );
         assert!(response.ends_with("cdef"));
         running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn proxies_streaming_bodies_with_pooling_headers_and_timeout() {
+        let (upstream, accepts, upstream_shutdown, upstream_task) = spawn_upstream().await;
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 25ms
+      response_timeout: 25ms
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("proxy config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("proxy config compiles"),
+        )
+        .expect("proxy snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let first = raw_request(
+            address,
+            "POST /upload?b=2&a=1 HTTP/1.1\r\nHost: incoming.test\r\nConnection: close, x-hop\r\nX-Hop: remove-me\r\nContent-Length: 6\r\n\r\nstream",
+        )
+        .await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"));
+        assert!(first.ends_with(&format!(
+            "/upload?b=2&a=1|stream|{upstream}|127.0.0.1|false"
+        )));
+        let first_lower = first.to_ascii_lowercase();
+        assert!(first_lower.contains("x-keep: kept"));
+        assert!(!first_lower.contains("x-remove: secret"));
+
+        let second = request(address, "/second", "").await;
+        assert!(second.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+
+        let timeout = request(address, "/slow", "").await;
+        assert!(timeout.starts_with("HTTP/1.1 504 Gateway Timeout"));
+        assert!(timeout.ends_with("Gateway Timeout"));
+
+        running.shutdown().await.expect("gateway shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("upstream task shuts down");
     }
 }

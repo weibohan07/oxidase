@@ -1,11 +1,18 @@
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http::{HeaderMap, HeaderValue, StatusCode, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use oxidase_core::{
     ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
@@ -14,15 +21,112 @@ use oxidase_site::{AssetPlan, PreparedSiteBody, PreparedSiteResponse, SiteError}
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::body::{BoxError, GatewayBodyPlan};
+use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
+    proxy: Arc<ProxyClient>,
 }
 
 impl HyperLeaves {
-    pub(crate) fn new(snapshot: Arc<RuntimeSnapshot>) -> Self {
-        Self { snapshot }
+    pub(crate) fn new(snapshot: Arc<RuntimeSnapshot>, proxy: Arc<ProxyClient>) -> Self {
+        Self { snapshot, proxy }
+    }
+}
+
+pub(crate) struct ProxyClient {
+    client: Client<HttpsConnector<HttpConnector>, Incoming>,
+    endpoint_sequence: AtomicU64,
+}
+
+impl ProxyClient {
+    pub(crate) fn new() -> Result<Self, String> {
+        let connector = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|error| format!("cannot load native TLS roots: {error}"))?
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client = Client::builder(TokioExecutor::new())
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
+            .build(connector);
+        Ok(Self {
+            client,
+            endpoint_sequence: AtomicU64::new(0),
+        })
+    }
+
+    async fn execute(
+        &self,
+        cluster: &ResourceId,
+        request: &RequestFrame,
+        body: &mut Option<Incoming>,
+        snapshot: &RuntimeSnapshot,
+    ) -> ServiceOutcome<GatewayBodyPlan> {
+        let Some(cluster_spec) = snapshot.resources.clusters.get(cluster) else {
+            return ServiceOutcome::Failed(ServiceError::new(
+                ErrorClass::InvalidState,
+                format!("prepared cluster `{cluster}` is missing"),
+            ));
+        };
+        let sequence = self.endpoint_sequence.fetch_add(1, Ordering::Relaxed);
+        let endpoint = &cluster_spec.endpoints[sequence as usize % cluster_spec.endpoints.len()];
+        let uri = match upstream_uri(endpoint, request.path_and_query()) {
+            Ok(uri) => uri,
+            Err(error) => return ServiceOutcome::Failed(error),
+        };
+        let Some(body) = body.take() else {
+            return ServiceOutcome::Failed(ServiceError::new(
+                ErrorClass::BodyUnavailable,
+                "Proxy request body is unavailable",
+            ));
+        };
+        let mut upstream = Request::new(body);
+        *upstream.method_mut() = request.method().clone();
+        *upstream.uri_mut() = uri;
+        *upstream.headers_mut() = request.headers();
+        remove_hop_by_hop(upstream.headers_mut());
+        apply_forwarding_headers(upstream.headers_mut(), request, endpoint);
+
+        let timeout = cluster_spec
+            .connect_timeout
+            .checked_add(cluster_spec.response_timeout)
+            .unwrap_or(cluster_spec.response_timeout);
+        let response = match tokio::time::timeout(timeout, self.client.request(upstream)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let class = if error.is_connect() {
+                    ErrorClass::UpstreamConnect
+                } else {
+                    ErrorClass::UpstreamProtocol
+                };
+                return ServiceOutcome::Failed(ServiceError::new(
+                    class,
+                    format!("upstream request to `{endpoint}` failed: {error}"),
+                ));
+            }
+            Err(_) => {
+                return ServiceOutcome::Failed(ServiceError::new(
+                    ErrorClass::Timeout,
+                    format!(
+                        "upstream `{endpoint}` did not produce response headers in {timeout:?}"
+                    ),
+                ));
+            }
+        };
+        let (mut parts, body) = response.into_parts();
+        remove_hop_by_hop(&mut parts.headers);
+        ServiceOutcome::Handled(ResponseHead {
+            status: parts.status,
+            headers: parts.headers,
+            body: GatewayBodyPlan::Stream(timeout_incoming_body(
+                body,
+                cluster_spec.response_timeout,
+            )),
+        })
     }
 }
 
@@ -67,15 +171,107 @@ impl LeafExecutor<Incoming, GatewayBodyPlan> for HyperLeaves {
     fn execute_proxy<'a>(
         &'a self,
         cluster: &'a ResourceId,
-        _request: &'a RequestFrame,
-        _body: &'a mut Option<Incoming>,
+        request: &'a RequestFrame,
+        body: &'a mut Option<Incoming>,
     ) -> BoxLeafFuture<'a, GatewayBodyPlan> {
-        Box::pin(async move {
-            ServiceOutcome::Failed(ServiceError::new(
-                ErrorClass::UpstreamConnect,
-                format!("Proxy cluster `{cluster}` is not enabled in the listener phase"),
-            ))
-        })
+        Box::pin(self.proxy.execute(cluster, request, body, &self.snapshot))
+    }
+}
+
+fn upstream_uri(endpoint: &url::Url, request_path: &str) -> Result<Uri, ServiceError> {
+    let host = endpoint.host_str().ok_or_else(|| {
+        ServiceError::new(ErrorClass::InvalidState, "cluster endpoint has no host")
+    })?;
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let authority = endpoint.port().map_or(authority_host.clone(), |port| {
+        format!("{authority_host}:{port}")
+    });
+    let base_path = endpoint.path().trim_end_matches('/');
+    let request_path = request_path.strip_prefix('/').unwrap_or(request_path);
+    let path = if base_path.is_empty() {
+        format!("/{request_path}")
+    } else {
+        format!("{base_path}/{request_path}")
+    };
+    Uri::from_str(&format!("{}://{authority}{path}", endpoint.scheme())).map_err(|error| {
+        ServiceError::new(
+            ErrorClass::InvalidState,
+            format!("cannot construct upstream URI: {error}"),
+        )
+    })
+}
+
+fn apply_forwarding_headers(headers: &mut HeaderMap, request: &RequestFrame, endpoint: &url::Url) {
+    let host = endpoint.host_str().unwrap_or_default();
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let target_authority = endpoint
+        .port()
+        .map_or(host.clone(), |port| format!("{host}:{port}"));
+    if let Ok(value) = HeaderValue::from_str(&target_authority) {
+        headers.insert(header::HOST, value);
+    }
+    let peer_ip = request
+        .original()
+        .peer_address
+        .as_deref()
+        .and_then(|peer| peer.parse::<std::net::SocketAddr>().ok())
+        .map(|peer| peer.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    if let Ok(value) = HeaderValue::from_str(&peer_ip) {
+        headers.insert(HeaderName::from_static("x-forwarded-for"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(request.scheme()) {
+        headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(request.authority()) {
+        headers.insert(HeaderName::from_static("x-forwarded-host"), value);
+    }
+    let forwarded = format!(
+        "for=\"{}\";proto={};host=\"{}\"",
+        escape_forwarded(&peer_ip),
+        request.scheme(),
+        escape_forwarded(request.authority())
+    );
+    if let Ok(value) = HeaderValue::from_str(&forwarded) {
+        headers.insert(HeaderName::from_static("forwarded"), value);
+    }
+}
+
+fn escape_forwarded(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn remove_hop_by_hop(headers: &mut HeaderMap) {
+    let nominated = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_str(name.trim()).ok())
+        .collect::<Vec<_>>();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        header::CONNECTION,
+        HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderName::from_static("proxy-authorization"),
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+        HeaderName::from_static("proxy-connection"),
+    ] {
+        headers.remove(name);
     }
 }
 

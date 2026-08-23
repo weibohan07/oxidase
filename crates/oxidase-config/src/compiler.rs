@@ -485,12 +485,13 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 || url.host_str().is_none()
                 || !url.username().is_empty()
                 || url.password().is_some()
+                || url.query().is_some()
                 || url.fragment().is_some()
             {
                 return Err(semantic_error(
                     "resource.endpoint",
                     format!(
-                        "endpoint `{endpoint}` must be an http(s) origin without credentials or fragment"
+                        "endpoint `{endpoint}` must be an http(s) origin/path without credentials, query, or fragment"
                     ),
                     located,
                 ));
