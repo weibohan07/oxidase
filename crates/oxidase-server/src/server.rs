@@ -736,17 +736,14 @@ async fn run_admin_listener(
                 };
                 let store = store.clone();
                 let metrics = metrics.clone();
+                let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
-                    let service = service_fn(move |request| {
-                        handle_admin_request(request, store.clone(), metrics.clone())
-                    });
-                    if let Err(error) = http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
-                        tracing::debug!(error = %error, "admin HTTP connection ended with an error");
-                    }
+                    serve_admin_connection(
+                        stream,
+                        store,
+                        metrics,
+                        connection_shutdown,
+                    ).await;
                 });
             }
             result = connections.join_next(), if !connections.is_empty() => {
@@ -764,6 +761,30 @@ async fn run_admin_listener(
     {
         connections.abort_all();
         while connections.join_next().await.is_some() {}
+    }
+}
+
+async fn serve_admin_connection(
+    stream: TcpStream,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let service =
+        service_fn(move |request| handle_admin_request(request, store.clone(), metrics.clone()));
+    let connection = http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        () = wait_for_shutdown(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "admin HTTP connection ended with an error");
     }
 }
 
@@ -867,6 +888,7 @@ async fn run_listener(
                 let store = store.clone();
                 let proxy = proxy.clone();
                 let metrics = metrics.clone();
+                let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     serve_connection(
                         stream,
@@ -875,6 +897,7 @@ async fn run_listener(
                         store,
                         proxy,
                         metrics,
+                        connection_shutdown,
                     ).await;
                 });
             }
@@ -914,6 +937,7 @@ async fn serve_connection(
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
     metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let service = service_fn(move |request| {
         handle_request(
@@ -925,12 +949,30 @@ async fn serve_connection(
             metrics.clone(),
         )
     });
-    if let Err(error) = http1::Builder::new()
+    let connection = http1::Builder::new()
         .keep_alive(true)
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-    {
+        .serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        () = wait_for_shutdown(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = result {
         tracing::debug!(error = %error, "HTTP connection ended with an error");
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -1184,6 +1226,33 @@ mod tests {
             .unwrap_or_else(|| panic!("wire response is missing `{name}`"))
     }
 
+    async fn read_until_contains(stream: &mut tokio::net::TcpStream, needle: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut response = Vec::new();
+            let mut buffer = [0u8; 512];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("response is readable");
+                assert!(read > 0, "connection closed before complete response");
+                response.extend_from_slice(&buffer[..read]);
+                let response_text = String::from_utf8_lossy(&response);
+                if response_text.contains(needle) {
+                    return String::from_utf8(response).expect("response is UTF-8");
+                }
+            }
+        })
+        .await
+        .expect("response arrives before timeout")
+    }
+
+    fn available_address() -> std::net::SocketAddr {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("temporary port can be reserved");
+        listener.local_addr().expect("reserved address is known")
+    }
+
     async fn spawn_upstream() -> (
         std::net::SocketAddr,
         Arc<AtomicUsize>,
@@ -1284,13 +1353,22 @@ mod tests {
     }
 
     fn write_respond_gateway(path: &std::path::Path, body: &str, extra_listener: Option<&str>) {
+        write_respond_gateway_at(path, body, "127.0.0.1:0", extra_listener);
+    }
+
+    fn write_respond_gateway_at(
+        path: &std::path::Path,
+        body: &str,
+        bind: &str,
+        extra_listener: Option<&str>,
+    ) {
         let extra_listener = extra_listener.map_or(String::new(), |bind| {
             format!("  - name: extra\n    bind: {bind}\n    service:\n      ref: root\n")
         });
         fs::write(
             path,
             format!(
-                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices:\n  root:\n    type: respond\n    body:\n      text: {body}\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    service:\n      ref: root\n{extra_listener}"
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices:\n  root:\n    type: respond\n    body:\n      text: {body}\nlisteners:\n  - name: test\n    bind: {bind}\n    service:\n      ref: root\n{extra_listener}"
             ),
         )
         .expect("gateway config can be written");
@@ -1993,6 +2071,124 @@ listeners:
     }
 
     #[tokio::test]
+    async fn retired_listener_closes_idle_keep_alive_and_starts_replacement() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "old", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let old_address = running.local_addresses()[0].1;
+        let mut idle = tokio::net::TcpStream::connect(old_address)
+            .await
+            .expect("idle keep-alive connects");
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .expect("request can be written");
+        let response = read_until_contains(&mut idle, "\r\n\r\nold").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let replacement = available_address();
+        write_respond_gateway_at(&config, "new", &replacement.to_string(), None);
+        let report = running
+            .reload_path(&config)
+            .await
+            .expect("replacement listener commits");
+        assert_eq!(report.listeners_removed, vec!["test"]);
+        assert_eq!(report.listeners_added, vec!["test"]);
+        assert!(
+            report
+                .local_addresses
+                .contains(&("test".to_owned(), replacement))
+        );
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), idle.read(&mut byte))
+            .await
+            .expect("idle keep-alive closes promptly")
+            .expect("idle connection closes cleanly");
+        assert_eq!(read, 0);
+        assert!(request(replacement, "/", "").await.ends_with("new"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn retired_listener_aborts_requests_after_drain_timeout() {
+        let (upstream, accepts, upstream_shutdown, upstream_task) = spawn_upstream().await;
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("initial config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let mut server = GatewayServer::bind(snapshot).await.expect("gateway binds");
+        server.drain_timeout = Duration::from_millis(30);
+        let running = server.spawn();
+        let old_address = running.local_addresses()[0].1;
+        let old_request = tokio::spawn(request(old_address, "/slow-timeout", ""));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepts.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old request reaches upstream");
+
+        let replacement = available_address();
+        write_respond_gateway_at(&config, "replacement", &replacement.to_string(), None);
+        running
+            .reload_path(&config)
+            .await
+            .expect("replacement listener commits");
+        assert!(request(replacement, "/", "").await.ends_with("replacement"));
+
+        match tokio::time::timeout(Duration::from_secs(1), old_request).await {
+            Ok(Ok(response)) => {
+                assert!(
+                    !response.contains("/slow-timeout||"),
+                    "timed-out request must not complete: {response}"
+                );
+            }
+            Ok(Err(_aborted_or_panicked)) => {}
+            Err(_) => panic!("timed-out request connection must be aborted"),
+        }
+
+        running.shutdown().await.expect("gateway shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("upstream task shuts down");
+    }
+
+    #[tokio::test]
     async fn long_request_keeps_old_snapshot_while_new_requests_switch() {
         let (upstream, accepts, upstream_shutdown, upstream_task) = spawn_upstream().await;
         let directory = tempdir().expect("temporary directory is available");
@@ -2040,6 +2236,7 @@ listeners:
         .await
         .expect("old request reaches upstream");
 
+        let replacement = available_address();
         fs::write(
             &config,
             format!(
@@ -2059,7 +2256,7 @@ services:
       text: new-version
 listeners:
   - name: test
-    bind: 127.0.0.1:0
+    bind: {replacement}
     service:
       ref: root
 "#
@@ -2068,7 +2265,9 @@ listeners:
         .expect("new config can be written");
         let report = running.reload_path(&config).await.expect("reload commits");
         assert_eq!(report.reused_clusters, 1);
-        assert!(request(address, "/", "").await.ends_with("new-version"));
+        assert_eq!(report.listeners_removed, vec!["test"]);
+        assert_eq!(report.listeners_added, vec!["test"]);
+        assert!(request(replacement, "/", "").await.ends_with("new-version"));
         let old_response = old_request.await.expect("old request task completes");
         assert!(old_response.starts_with("HTTP/1.1 200 OK"));
         assert!(old_response.contains("/slow||"));
