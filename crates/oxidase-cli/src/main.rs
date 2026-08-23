@@ -184,7 +184,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                     let _body_length = match response.body {
                         PreparedSiteBody::Empty => 0,
                         PreparedSiteBody::Bytes(bytes) => bytes.len(),
-                        PreparedSiteBody::Asset(asset) => asset.length as usize,
+                        PreparedSiteBody::Asset(asset) => asset.identity.length as usize,
                     };
                     let mut output = ResponseHead::new(
                         response.status,

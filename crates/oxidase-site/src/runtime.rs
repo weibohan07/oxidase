@@ -18,27 +18,99 @@ pub enum SiteMissing {
 
 #[derive(Debug, Clone)]
 pub struct AssetPlan {
-    pub path: PathBuf,
-    pub length: u64,
-    pub modified: Option<SystemTime>,
-    pub etag: Option<String>,
+    pub identity: AssetRepresentation,
+    pub brotli: Option<AssetRepresentation>,
+    pub gzip: Option<AssetRepresentation>,
     pub content_type: String,
     pub range_requests: bool,
-    pub brotli: Option<CompressedAsset>,
-    pub gzip: Option<CompressedAsset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentEncoding {
+    Brotli,
+    Gzip,
+}
+
+impl ContentEncoding {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Brotli => "br",
+            Self::Gzip => "gzip",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct CompressedAsset {
+pub struct AssetRepresentation {
+    pub encoding: Option<ContentEncoding>,
     pub path: PathBuf,
     pub length: u64,
+    pub etag: Option<EntityTag>,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityTag {
+    weak: bool,
+    opaque: String,
+}
+
+impl EntityTag {
+    #[must_use]
+    pub fn new(weak: bool, opaque: impl Into<String>) -> Self {
+        Self {
+            weak,
+            opaque: opaque.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_weak(&self) -> bool {
+        self.weak
+    }
+
+    #[must_use]
+    pub fn parse(source: &str) -> Option<Self> {
+        let source = source.trim();
+        let (weak, source) = source
+            .strip_prefix("W/")
+            .map_or((false, source), |source| (true, source));
+        let opaque = source.strip_prefix('"')?.strip_suffix('"')?;
+        if opaque
+            .bytes()
+            .any(|byte| byte == b'"' || byte < 0x21 || byte == 0x7f)
+        {
+            return None;
+        }
+        Some(Self::new(weak, opaque))
+    }
+
+    #[must_use]
+    pub fn to_header_value(&self) -> String {
+        if self.weak {
+            format!("W/\"{}\"", self.opaque)
+        } else {
+            format!("\"{}\"", self.opaque)
+        }
+    }
+
+    #[must_use]
+    pub fn weak_eq(&self, other: &Self) -> bool {
+        self.opaque == other.opaque
+    }
+
+    #[must_use]
+    pub fn strong_eq(&self, other: &Self) -> bool {
+        !self.weak && !other.weak && self.opaque == other.opaque
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum PreparedSiteBody {
     Empty,
     Bytes(Bytes),
-    Asset(AssetPlan),
+    Asset(Box<AssetPlan>),
 }
 
 #[derive(Debug, Clone)]
@@ -133,15 +205,11 @@ impl SiteSnapshot {
 
         let (status, body) = match &plan.kind {
             SiteResponseKind::Asset(asset) => {
-                apply_asset_headers(asset, &mut headers)?;
-                if is_not_modified(request, asset) {
-                    return Ok(PreparedSiteResponse {
-                        status: StatusCode::NOT_MODIFIED,
-                        headers,
-                        body: PreparedSiteBody::Empty,
-                        head_only: true,
-                    });
-                }
+                ensure_content_type(
+                    &mut headers,
+                    plan.content_type.as_deref(),
+                    &asset.content_type,
+                )?;
                 (plan.status, PreparedSiteBody::Asset(asset.clone()))
             }
             SiteResponseKind::Empty => (plan.status, PreparedSiteBody::Empty),
@@ -274,7 +342,7 @@ pub(crate) struct SiteResponsePlan {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SiteResponseKind {
-    Asset(AssetPlan),
+    Asset(Box<AssetPlan>),
     Empty,
     Text(CompiledTemplate),
     Json(CompiledValue),
@@ -342,30 +410,6 @@ fn apply_headers(
     Ok(())
 }
 
-fn apply_asset_headers(asset: &AssetPlan, headers: &mut HeaderMap) -> Result<(), SiteError> {
-    ensure_content_type(headers, Some(&asset.content_type), &asset.content_type)?;
-    headers.insert(
-        header::CONTENT_LENGTH,
-        header_value(asset.length.to_string())?,
-    );
-    if let Some(etag) = &asset.etag {
-        headers.insert(header::ETAG, header_value(etag.clone())?);
-    }
-    if let Some(modified) = asset.modified {
-        headers.insert(
-            header::LAST_MODIFIED,
-            header_value(httpdate::fmt_http_date(modified))?,
-        );
-    }
-    if asset.range_requests {
-        headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    }
-    if asset.brotli.is_some() || asset.gzip.is_some() {
-        headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
-    }
-    Ok(())
-}
-
 fn ensure_content_type(
     headers: &mut HeaderMap,
     configured: Option<&str>,
@@ -378,27 +422,6 @@ fn ensure_content_type(
         );
     }
     Ok(())
-}
-
-fn is_not_modified(request: &RequestFrame, asset: &AssetPlan) -> bool {
-    let headers = request.headers();
-    if let (Some(expected), Some(actual)) =
-        (asset.etag.as_deref(), headers.get(header::IF_NONE_MATCH))
-        && actual.to_str().ok().is_some_and(|actual| {
-            actual
-                .split(',')
-                .any(|value| value.trim() == expected || value.trim() == "*")
-        })
-    {
-        return true;
-    }
-    if let (Some(modified), Some(actual)) = (asset.modified, headers.get(header::IF_MODIFIED_SINCE))
-        && let Ok(actual) = actual.to_str()
-        && let Ok(since) = httpdate::parse_http_date(actual)
-    {
-        return modified <= since + std::time::Duration::from_secs(1);
-    }
-    false
 }
 
 fn header_value(value: String) -> Result<HeaderValue, SiteError> {

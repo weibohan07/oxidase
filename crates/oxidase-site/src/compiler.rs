@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{CompiledTemplate, Expression, ResourceId, Value, is_forbidden_user_header};
@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 
 use crate::error::SiteCompileError;
 use crate::runtime::{
-    AssetPlan, CompressedAsset, HeaderPlan, RedirectQuery, SiteMissing, SiteResponseKind,
-    SiteResponsePlan, SiteSnapshot, path_is_within,
+    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, RedirectQuery,
+    SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
 };
 use crate::source::{
     AutoescapeSource, EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource,
@@ -131,7 +131,7 @@ impl SiteCompiler {
                 )?,
                 content_type: None,
                 page: BTreeMap::new(),
-                kind: SiteResponseKind::Asset(compile_asset(asset, &source)?),
+                kind: SiteResponseKind::Asset(Box::new(compile_asset(asset, &source)?)),
                 source: asset.clone(),
             };
             insert_with_index_aliases(&mut entries, logical_path, plan, &source)?;
@@ -617,7 +617,7 @@ fn compile_oxr_body(
         }
         dependencies.push(asset.clone());
         return Ok((
-            SiteResponseKind::Asset(compile_asset(&asset, manifest)?),
+            SiteResponseKind::Asset(Box::new(compile_asset(&asset, manifest)?)),
             Some(asset),
         ));
     }
@@ -868,15 +868,6 @@ fn compile_user_header_name(
 }
 
 fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, SiteCompileError> {
-    let metadata = path
-        .metadata()
-        .map_err(|error| SiteCompileError::io(path, error))?;
-    if !metadata.is_file() {
-        return Err(SiteCompileError::source(
-            path,
-            "asset is not a regular file",
-        ));
-    }
     let extension = path
         .extension()
         .map(|extension| format!(".{}", extension.to_string_lossy()));
@@ -889,47 +880,73 @@ fn compile_asset(path: &Path, source: &ManifestSource) -> Result<AssetPlan, Site
                 .first_or_octet_stream()
                 .to_string()
         });
-    let modified = if source.assets.last_modified {
-        metadata.modified().ok()
-    } else {
-        None
-    };
-    let etag = match source.assets.etag {
-        EtagSource::None => None,
-        EtagSource::Weak => Some(format!(
-            "W/\"{:x}-{:x}\"",
-            metadata.len(),
-            modified
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |value| value.as_secs())
-        )),
-        EtagSource::Strong => Some(format!("\"{:016x}\"", hash_file(path)?)),
-    };
     Ok(AssetPlan {
-        path: path.to_path_buf(),
-        length: metadata.len(),
-        modified,
-        etag,
+        identity: compile_representation(path, None, source)?,
+        brotli: compressed_representation(
+            path,
+            source.assets.precompressed.brotli.as_deref(),
+            ContentEncoding::Brotli,
+            source,
+        )?,
+        gzip: compressed_representation(
+            path,
+            source.assets.precompressed.gzip.as_deref(),
+            ContentEncoding::Gzip,
+            source,
+        )?,
         content_type,
         range_requests: source.assets.range_requests,
-        brotli: compressed_asset(path, source.assets.precompressed.brotli.as_deref())?,
-        gzip: compressed_asset(path, source.assets.precompressed.gzip.as_deref())?,
     })
 }
 
-fn compressed_asset(
+fn compile_representation(
+    path: &Path,
+    encoding: Option<ContentEncoding>,
+    source: &ManifestSource,
+) -> Result<AssetRepresentation, SiteCompileError> {
+    let metadata = path
+        .metadata()
+        .map_err(|error| SiteCompileError::io(path, error))?;
+    if !metadata.is_file() {
+        return Err(SiteCompileError::source(
+            path,
+            "asset representation is not a regular file",
+        ));
+    }
+    let etag = match source.assets.etag {
+        EtagSource::None => None,
+        EtagSource::Weak | EtagSource::Strong => Some(EntityTag::new(
+            matches!(source.assets.etag, EtagSource::Weak),
+            format!("{:016x}", hash_file(path)?),
+        )),
+    };
+    Ok(AssetRepresentation {
+        encoding,
+        path: path.to_path_buf(),
+        length: metadata.len(),
+        etag,
+        modified: source
+            .assets
+            .last_modified
+            .then(|| metadata.modified().ok())
+            .flatten(),
+    })
+}
+
+fn compressed_representation(
     path: &Path,
     suffix: Option<&str>,
-) -> Result<Option<CompressedAsset>, SiteCompileError> {
+    encoding: ContentEncoding,
+    source: &ManifestSource,
+) -> Result<Option<AssetRepresentation>, SiteCompileError> {
     let Some(suffix) = suffix else {
         return Ok(None);
     };
     let candidate = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
     match candidate.metadata() {
-        Ok(metadata) if metadata.is_file() => Ok(Some(CompressedAsset {
-            path: candidate,
-            length: metadata.len(),
-        })),
+        Ok(metadata) if metadata.is_file() => {
+            compile_representation(&candidate, Some(encoding), source).map(Some)
+        }
         Ok(_) => Err(SiteCompileError::source(
             candidate,
             "precompressed asset is not a regular file",

@@ -17,7 +17,9 @@ use oxidase_core::{
     ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
 use oxidase_runtime::{BoxLeafFuture, LeafExecutor, RuntimeSnapshot};
-use oxidase_site::{AssetPlan, PreparedSiteBody, PreparedSiteResponse, SiteError};
+use oxidase_site::{
+    AssetPlan, AssetRepresentation, EntityTag, PreparedSiteBody, PreparedSiteResponse, SiteError,
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
@@ -300,69 +302,59 @@ async fn stream_asset(
     head_only: bool,
 ) -> Result<GatewayBodyPlan, ServiceError> {
     let range_requested = request_headers.contains_key(header::RANGE);
-    let encoding = if range_requested {
-        None
-    } else {
-        select_encoding(request_headers, asset)
+    clear_representation_headers(response_headers);
+    if asset.brotli.is_some() || asset.gzip.is_some() {
+        merge_vary(response_headers, "accept-encoding");
+    }
+    let Some(representation) = select_representation(request_headers, asset, range_requested)
+    else {
+        *status = StatusCode::NOT_ACCEPTABLE;
+        return Ok(GatewayBodyPlan::Empty);
     };
-    let (path, length) = match encoding {
-        Some(SelectedEncoding::Brotli) => {
-            let compressed = asset.brotli.as_ref().ok_or_else(|| {
-                ServiceError::new(ErrorClass::InvalidState, "selected Brotli asset is missing")
-            })?;
-            response_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
-            vary_etag(response_headers, "br");
-            response_headers.remove(header::ACCEPT_RANGES);
-            (&compressed.path, compressed.length)
-        }
-        Some(SelectedEncoding::Gzip) => {
-            let compressed = asset.gzip.as_ref().ok_or_else(|| {
-                ServiceError::new(ErrorClass::InvalidState, "selected gzip asset is missing")
-            })?;
-            response_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-            vary_etag(response_headers, "gzip");
-            response_headers.remove(header::ACCEPT_RANGES);
-            (&compressed.path, compressed.length)
-        }
-        None => (&asset.path, asset.length),
-    };
+    apply_representation_headers(asset, representation, response_headers)?;
 
-    let range = if asset.range_requests && encoding.is_none() {
-        match request_headers.get(header::RANGE) {
-            Some(value) => match value
-                .to_str()
-                .ok()
-                .and_then(|value| parse_range(value, length))
-            {
-                Some(range) => Some(range),
-                None => {
-                    *status = StatusCode::RANGE_NOT_SATISFIABLE;
-                    response_headers.insert(
-                        header::CONTENT_RANGE,
-                        header_value(format!("bytes */{length}"))?,
-                    );
-                    response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-                    return Ok(GatewayBodyPlan::Empty);
-                }
-            },
-            None => None,
+    if *status == StatusCode::OK && is_not_modified(request_headers, representation) {
+        *status = StatusCode::NOT_MODIFIED;
+        return Ok(GatewayBodyPlan::Empty);
+    }
+    if status.is_informational()
+        || *status == StatusCode::NO_CONTENT
+        || *status == StatusCode::NOT_MODIFIED
+    {
+        return Ok(GatewayBodyPlan::Empty);
+    }
+
+    let range = if *status == StatusCode::OK
+        && asset.range_requests
+        && range_requested
+        && if_range_matches(request_headers, representation)
+    {
+        match requested_range(request_headers, representation.length) {
+            Ok(range) => range,
+            Err(()) => {
+                *status = StatusCode::RANGE_NOT_SATISFIABLE;
+                response_headers.insert(
+                    header::CONTENT_RANGE,
+                    header_value(format!("bytes */{}", representation.length))?,
+                );
+                return Ok(GatewayBodyPlan::Empty);
+            }
         }
     } else {
         None
     };
 
-    let (offset, response_length) = range.map_or((0, length), |range| {
+    let (offset, response_length) = range.map_or((0, representation.length), |range| {
         *status = StatusCode::PARTIAL_CONTENT;
         (range.start, range.end - range.start + 1)
     });
-    response_headers.insert(
-        header::CONTENT_LENGTH,
-        header_value(response_length.to_string())?,
-    );
     if let Some(range) = range {
         response_headers.insert(
             header::CONTENT_RANGE,
-            header_value(format!("bytes {}-{}/{length}", range.start, range.end))?,
+            header_value(format!(
+                "bytes {}-{}/{}",
+                range.start, range.end, representation.length
+            ))?,
         );
     }
     if head_only {
@@ -371,19 +363,27 @@ async fn stream_asset(
         });
     }
 
-    let mut file = tokio::fs::File::open(path).await.map_err(|error| {
-        ServiceError::new(
-            ErrorClass::SiteIo,
-            format!("cannot open compiled asset `{}`: {error}", path.display()),
-        )
-    })?;
+    let mut file = tokio::fs::File::open(&representation.path)
+        .await
+        .map_err(|error| {
+            ServiceError::new(
+                ErrorClass::SiteIo,
+                format!(
+                    "cannot open compiled asset `{}`: {error}",
+                    representation.path.display()
+                ),
+            )
+        })?;
     if offset > 0 {
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(|error| {
                 ServiceError::new(
                     ErrorClass::SiteIo,
-                    format!("cannot seek compiled asset `{}`: {error}", path.display()),
+                    format!(
+                        "cannot seek compiled asset `{}`: {error}",
+                        representation.path.display()
+                    ),
                 )
             })?;
     }
@@ -403,79 +403,283 @@ struct ByteRange {
     end: u64,
 }
 
-fn parse_range(value: &str, length: u64) -> Option<ByteRange> {
-    let value = value.strip_prefix("bytes=")?;
-    if value.contains(',') || length == 0 {
-        return None;
+fn requested_range(headers: &HeaderMap, length: u64) -> Result<Option<ByteRange>, ()> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
     }
-    let (start, end) = value.split_once('-')?;
+    parse_range(value.to_str().map_err(|_| ())?, length).map(Some)
+}
+
+fn parse_range(value: &str, length: u64) -> Result<ByteRange, ()> {
+    let (unit, value) = value.trim().split_once('=').ok_or(())?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err(());
+    }
+    let value = value.trim();
+    if value.contains(',') || length == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let start = start.trim();
+    let end = end.trim();
     if start.is_empty() {
-        let suffix = end.parse::<u64>().ok()?.min(length);
+        let suffix = end.parse::<u64>().map_err(|_| ())?.min(length);
         if suffix == 0 {
-            return None;
+            return Err(());
         }
-        return Some(ByteRange {
+        return Ok(ByteRange {
             start: length - suffix,
             end: length - 1,
         });
     }
-    let start = start.parse::<u64>().ok()?;
+    let start = start.parse::<u64>().map_err(|_| ())?;
     if start >= length {
-        return None;
+        return Err(());
     }
     let end = if end.is_empty() {
         length - 1
     } else {
-        end.parse::<u64>().ok()?.min(length - 1)
+        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
     };
-    (start <= end).then_some(ByteRange { start, end })
+    (start <= end).then_some(ByteRange { start, end }).ok_or(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectedEncoding {
-    Brotli,
-    Gzip,
+#[derive(Debug, Clone, Copy)]
+struct EncodingPreferences {
+    brotli: u16,
+    gzip: u16,
+    identity: u16,
 }
 
-fn select_encoding(headers: &HeaderMap, asset: &AssetPlan) -> Option<SelectedEncoding> {
-    let value = headers.get(header::ACCEPT_ENCODING)?.to_str().ok()?;
-    if asset.brotli.is_some() && accepts_encoding(value, "br") {
-        Some(SelectedEncoding::Brotli)
-    } else if asset.gzip.is_some() && accepts_encoding(value, "gzip") {
-        Some(SelectedEncoding::Gzip)
-    } else {
-        None
+fn select_representation<'a>(
+    headers: &HeaderMap,
+    asset: &'a AssetPlan,
+    range_requested: bool,
+) -> Option<&'a AssetRepresentation> {
+    let preferences = encoding_preferences(headers);
+    if range_requested {
+        return (preferences.identity > 0).then_some(&asset.identity);
+    }
+    let mut selected = (preferences.identity, 0u8, &asset.identity);
+    if let Some(gzip) = &asset.gzip
+        && (preferences.gzip, 1) > (selected.0, selected.1)
+    {
+        selected = (preferences.gzip, 1, gzip);
+    }
+    if let Some(brotli) = &asset.brotli
+        && (preferences.brotli, 2) > (selected.0, selected.1)
+    {
+        selected = (preferences.brotli, 2, brotli);
+    }
+    (selected.0 > 0).then_some(selected.2)
+}
+
+fn encoding_preferences(headers: &HeaderMap) -> EncodingPreferences {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return EncodingPreferences {
+            brotli: 0,
+            gzip: 0,
+            identity: 1_000,
+        };
+    }
+    let mut brotli: Option<u16> = None;
+    let mut gzip: Option<u16> = None;
+    let mut identity: Option<u16> = None;
+    let mut wildcard: Option<u16> = None;
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for item in value.split(',') {
+            let mut parts = item.trim().split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            if coding.is_empty() {
+                continue;
+            }
+            let mut quality = 1_000;
+            let mut seen_quality = false;
+            let mut malformed = false;
+            for parameter in parts {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    malformed = true;
+                    continue;
+                };
+                if !name.trim().eq_ignore_ascii_case("q") || seen_quality {
+                    malformed = true;
+                    continue;
+                }
+                seen_quality = true;
+                match parse_quality(value.trim()) {
+                    Some(value) => quality = value,
+                    None => malformed = true,
+                }
+            }
+            if malformed {
+                quality = 0;
+            }
+            let target = if coding.eq_ignore_ascii_case("br") {
+                Some(&mut brotli)
+            } else if coding.eq_ignore_ascii_case("gzip") {
+                Some(&mut gzip)
+            } else if coding.eq_ignore_ascii_case("identity") {
+                Some(&mut identity)
+            } else if coding == "*" {
+                Some(&mut wildcard)
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                *target = Some((*target).map_or(quality, |current| current.min(quality)));
+            }
+        }
+    }
+    let wildcard = wildcard.unwrap_or(0);
+    EncodingPreferences {
+        brotli: brotli.unwrap_or(wildcard),
+        gzip: gzip.unwrap_or(wildcard),
+        identity: identity.unwrap_or_else(|| {
+            if wildcard == 0 && headers_contains_wildcard(headers) {
+                0
+            } else {
+                1_000
+            }
+        }),
     }
 }
 
-fn accepts_encoding(header: &str, expected: &str) -> bool {
-    header.split(',').any(|item| {
-        let mut parts = item.trim().split(';');
-        let name = parts.next().unwrap_or("").trim();
-        let quality_zero = parts.any(|parameter| {
-            parameter
-                .trim()
-                .strip_prefix("q=")
-                .is_some_and(|quality| quality == "0" || quality == "0.0" || quality == "0.00")
-        });
-        !quality_zero && (name.eq_ignore_ascii_case(expected) || name == "*")
-    })
+fn headers_contains_wildcard(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|item| item.trim().split(';').next())
+        .any(|coding| coding.trim() == "*")
 }
 
-fn vary_etag(headers: &mut HeaderMap, encoding: &str) {
-    let Some(etag) = headers
-        .get(header::ETAG)
+fn parse_quality(source: &str) -> Option<u16> {
+    let (integer, fraction) = source.split_once('.').map_or((source, ""), |parts| parts);
+    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match integer {
+        "0" => {
+            let padded = format!("{fraction:0<3}");
+            padded.parse().ok()
+        }
+        "1" if fraction.bytes().all(|byte| byte == b'0') => Some(1_000),
+        _ => None,
+    }
+}
+
+fn clear_representation_headers(headers: &mut HeaderMap) {
+    for name in [
+        header::CONTENT_ENCODING,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::ACCEPT_RANGES,
+        header::CONTENT_RANGE,
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn apply_representation_headers(
+    asset: &AssetPlan,
+    representation: &AssetRepresentation,
+    headers: &mut HeaderMap,
+) -> Result<(), ServiceError> {
+    if let Some(encoding) = representation.encoding {
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(encoding.as_str()),
+        );
+    }
+    if let Some(etag) = &representation.etag {
+        headers.insert(header::ETAG, header_value(etag.to_header_value())?);
+    }
+    if let Some(modified) = representation.modified {
+        headers.insert(
+            header::LAST_MODIFIED,
+            header_value(httpdate::fmt_http_date(modified))?,
+        );
+    }
+    if asset.range_requests && representation.encoding.is_none() {
+        headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    Ok(())
+}
+
+fn merge_vary(headers: &mut HeaderMap, token: &'static str) {
+    let present = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|value| value == "*" || value.eq_ignore_ascii_case(token))
+        })
+    });
+    if !present {
+        headers.append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+}
+
+fn is_not_modified(headers: &HeaderMap, representation: &AssetRepresentation) -> bool {
+    if headers.contains_key(header::IF_NONE_MATCH) {
+        return headers.get_all(header::IF_NONE_MATCH).iter().any(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value.split(',').any(|candidate| {
+                    let candidate = candidate.trim();
+                    candidate == "*"
+                        || representation.etag.as_ref().is_some_and(|etag| {
+                            EntityTag::parse(candidate)
+                                .is_some_and(|candidate| etag.weak_eq(&candidate))
+                        })
+                })
+            })
+        });
+    }
+    let Some(modified) = representation.modified else {
+        return false;
+    };
+    headers
+        .get(header::IF_MODIFIED_SINCE)
         .and_then(|value| value.to_str().ok())
-    else {
-        return;
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .is_some_and(|since| modified_not_after(modified, since))
+}
+
+fn if_range_matches(headers: &HeaderMap, representation: &AssetRepresentation) -> bool {
+    let Some(value) = headers.get(header::IF_RANGE) else {
+        return true;
     };
-    let varied = if let Some(value) = etag.strip_suffix('"') {
-        format!("{value}-{encoding}\"")
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    if let Some(candidate) = EntityTag::parse(value) {
+        return representation
+            .etag
+            .as_ref()
+            .is_some_and(|etag| etag.strong_eq(&candidate));
+    }
+    let (Some(modified), Ok(date)) = (
+        representation.modified,
+        httpdate::parse_http_date(value.trim()),
+    ) else {
+        return false;
+    };
+    modified_not_after(modified, date)
+}
+
+fn modified_not_after(modified: std::time::SystemTime, validator: std::time::SystemTime) -> bool {
+    if let Some(upper_bound) = validator.checked_add(Duration::from_secs(1)) {
+        modified < upper_bound
     } else {
-        format!("{etag}-{encoding}")
-    };
-    if let Ok(varied) = HeaderValue::from_str(&varied) {
-        headers.insert(header::ETAG, varied);
+        modified <= validator
     }
 }
 
@@ -490,29 +694,117 @@ fn header_value(value: String) -> Result<HeaderValue, ServiceError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteRange, accepts_encoding, parse_range};
+    use std::path::PathBuf;
+
+    use http::{HeaderMap, HeaderValue, header};
+    use oxidase_site::{AssetPlan, AssetRepresentation, ContentEncoding};
+
+    use super::{ByteRange, parse_quality, parse_range, select_representation};
+
+    fn representation(encoding: Option<ContentEncoding>) -> AssetRepresentation {
+        AssetRepresentation {
+            encoding,
+            path: PathBuf::from("fixture"),
+            length: 10,
+            etag: None,
+            modified: None,
+        }
+    }
+
+    fn asset() -> AssetPlan {
+        AssetPlan {
+            identity: representation(None),
+            brotli: Some(representation(Some(ContentEncoding::Brotli))),
+            gzip: Some(representation(Some(ContentEncoding::Gzip))),
+            content_type: "application/octet-stream".to_owned(),
+            range_requests: true,
+        }
+    }
+
+    fn encoding_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_str(value).expect("valid test header"),
+        );
+        headers
+    }
 
     #[test]
     fn parses_single_byte_ranges() {
         assert_eq!(
             parse_range("bytes=2-5", 10).map(|range| (range.start, range.end)),
-            Some((2, 5))
+            Ok((2, 5))
         );
         assert_eq!(
             parse_range("bytes=-3", 10).map(|range| (range.start, range.end)),
-            Some((7, 9))
+            Ok((7, 9))
         );
         assert_eq!(
             parse_range("bytes=8-", 10).map(|range| (range.start, range.end)),
-            Some((8, 9))
+            Ok((8, 9))
         );
-        assert!(parse_range("bytes=11-12", 10).is_none());
+        assert!(parse_range("bytes=11-12", 10).is_err());
+        assert!(parse_range("bytes=0-1,4-5", 10).is_err());
+        assert!(parse_range("items=0-1", 10).is_err());
         let _type_check = ByteRange { start: 0, end: 0 };
     }
 
     #[test]
-    fn honors_zero_quality_encoding() {
-        assert!(accepts_encoding("gzip, br;q=1", "br"));
-        assert!(!accepts_encoding("br;q=0, gzip", "br"));
+    fn orders_encoding_quality_and_uses_a_stable_tie_break() {
+        let asset = asset();
+        let selected =
+            select_representation(&encoding_headers("br;q=0.2, gzip;q=1"), &asset, false)
+                .expect("gzip is acceptable");
+        assert_eq!(selected.encoding, Some(ContentEncoding::Gzip));
+
+        let selected = select_representation(
+            &encoding_headers("identity;q=0.5, gzip;q=0.5, br;q=0.5"),
+            &asset,
+            false,
+        )
+        .expect("an encoding is acceptable");
+        assert_eq!(selected.encoding, Some(ContentEncoding::Brotli));
+
+        let selected = select_representation(&HeaderMap::new(), &asset, false)
+            .expect("identity is the default");
+        assert_eq!(selected.encoding, None);
+    }
+
+    #[test]
+    fn honors_zero_quality_and_malformed_parameters_conservatively() {
+        let asset = asset();
+        assert!(
+            select_representation(
+                &encoding_headers("br;q=0, gzip;q=0, identity;q=0"),
+                &asset,
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            select_representation(
+                &encoding_headers("br;level=9;q=1, gzip;q=0, identity;q=0"),
+                &asset,
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(parse_quality("0"), Some(0));
+        assert_eq!(parse_quality("0.125"), Some(125));
+        assert_eq!(parse_quality("1.000"), Some(1_000));
+        assert_eq!(parse_quality("1.1"), None);
+        assert_eq!(parse_quality("0.1234"), None);
+    }
+
+    #[test]
+    fn range_forces_identity_and_respects_identity_exclusion() {
+        let asset = asset();
+        let selected = select_representation(&encoding_headers("br"), &asset, true)
+            .expect("implicit identity remains acceptable");
+        assert_eq!(selected.encoding, None);
+        assert!(
+            select_representation(&encoding_headers("br, identity;q=0"), &asset, true,).is_none()
+        );
     }
 }

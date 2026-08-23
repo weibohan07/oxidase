@@ -15,6 +15,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+httpdate.workspace = true
 oxidase-core = { path = "../oxidase-core" }
 oxidase-config = { path = "../oxidase-config" }
 oxidase-runtime = { path = "../oxidase-runtime" }

@@ -9,7 +9,8 @@ mod template;
 pub use compiler::SiteCompiler;
 pub use error::{SiteCompileError, SiteError};
 pub use runtime::{
-    AssetPlan, CompressedAsset, PreparedSiteBody, PreparedSiteResponse, SiteMissing, SiteSnapshot,
+    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, PreparedSiteBody,
+    PreparedSiteResponse, SiteMissing, SiteSnapshot,
 };
 pub use template::{CompiledOxt, TemplateLimits};
 

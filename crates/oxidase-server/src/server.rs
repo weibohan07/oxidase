@@ -1003,6 +1003,23 @@ mod tests {
             .expect("wire response contains a header terminator")
     }
 
+    fn raw_header_values(response: &str, name: &str) -> Vec<String> {
+        let (headers, _) = raw_response_parts(response);
+        headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(candidate, _)| candidate.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_owned())
+            .collect()
+    }
+
+    fn raw_header(response: &str, name: &str) -> String {
+        raw_header_values(response, name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("wire response is missing `{name}`"))
+    }
+
     async fn spawn_upstream() -> (
         std::net::SocketAddr,
         Arc<AtomicUsize>,
@@ -1314,6 +1331,234 @@ listeners:
         assert!(headers.to_ascii_lowercase().contains("content-length: 10"));
         assert!(body.is_empty());
         running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn negotiates_asset_representations_validators_and_if_range() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            r#"oxista: site/v1
+assets:
+  precompressed:
+    brotli: .br
+    gzip: .gz
+defaults:
+  response:
+    headers:
+      set:
+        Vary: Origin
+        Cache-Control: "public, max-age=60"
+"#,
+        )
+        .expect("manifest can be written");
+        fs::write(site.join("asset.txt"), "identity-v1").expect("identity can be written");
+        fs::write(site.join("asset.txt.br"), "brotli-v1").expect("Brotli can be written");
+        fs::write(site.join("asset.txt.gz"), "gzip-v1").expect("gzip can be written");
+        fs::write(
+            site.join("asset.txt.oxr"),
+            r#"---
+oxista: response/v1
+response:
+  content_type: application/x-asset
+  body:
+    asset: sibling
+---
+"#,
+        )
+        .expect("OXR can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway config compiles"),
+        )
+        .expect("snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let identity = request(address, "/asset.txt", "").await;
+        assert!(identity.starts_with("HTTP/1.1 200 OK"));
+        assert!(identity.ends_with("identity-v1"));
+        assert_eq!(raw_header(&identity, "content-type"), "application/x-asset");
+        let identity_etag = raw_header(&identity, "etag");
+        let identity_modified = raw_header(&identity, "last-modified");
+
+        let brotli = request(address, "/asset.txt", "Accept-Encoding: br\r\n").await;
+        assert!(brotli.ends_with("brotli-v1"));
+        assert_eq!(raw_header(&brotli, "content-encoding"), "br");
+        let brotli_etag = raw_header(&brotli, "etag");
+
+        let gzip = request(address, "/asset.txt", "Accept-Encoding: gzip\r\n").await;
+        assert!(gzip.ends_with("gzip-v1"));
+        assert_eq!(raw_header(&gzip, "content-encoding"), "gzip");
+        let gzip_etag = raw_header(&gzip, "etag");
+        assert_ne!(identity_etag, brotli_etag);
+        assert_ne!(identity_etag, gzip_etag);
+        assert_ne!(brotli_etag, gzip_etag);
+
+        let vary = raw_header_values(&brotli, "vary").join(",");
+        assert!(vary.to_ascii_lowercase().contains("origin"));
+        assert_eq!(
+            vary.split(',')
+                .filter(|value| value.trim().eq_ignore_ascii_case("accept-encoding"))
+                .count(),
+            1
+        );
+
+        let preferred = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br;q=0.2, gzip;q=1\r\n",
+        )
+        .await;
+        assert_eq!(raw_header(&preferred, "content-encoding"), "gzip");
+        assert!(preferred.ends_with("gzip-v1"));
+        let excluded = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br;q=0, gzip;q=0, identity;q=0\r\n",
+        )
+        .await;
+        assert!(excluded.starts_with("HTTP/1.1 406 Not Acceptable"));
+        let malformed = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br;level=9;q=1, gzip;q=0, identity;q=0\r\n",
+        )
+        .await;
+        assert!(malformed.starts_with("HTTP/1.1 406 Not Acceptable"));
+
+        let not_modified = request(
+            address,
+            "/asset.txt",
+            &format!("Accept-Encoding: br\r\nIf-None-Match: {brotli_etag}\r\n"),
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&not_modified);
+        assert!(headers.starts_with("HTTP/1.1 304 Not Modified"));
+        assert!(body.is_empty());
+        assert_eq!(raw_header(&not_modified, "etag"), brotli_etag);
+        assert_eq!(raw_header(&not_modified, "content-encoding"), "br");
+        assert_eq!(
+            raw_header(&not_modified, "cache-control"),
+            "public, max-age=60"
+        );
+        assert!(!raw_header_values(&not_modified, "last-modified").is_empty());
+        assert!(!raw_header_values(&not_modified, "vary").is_empty());
+
+        let weak_candidate = format!("W/{identity_etag}");
+        let weak_match = request(
+            address,
+            "/asset.txt",
+            &format!("If-None-Match: {weak_candidate}\r\n"),
+        )
+        .await;
+        assert!(weak_match.starts_with("HTTP/1.1 304 Not Modified"));
+
+        let precedence = request(
+            address,
+            "/asset.txt",
+            &format!("If-None-Match: \"different\"\r\nIf-Modified-Since: {identity_modified}\r\n"),
+        )
+        .await;
+        assert!(precedence.starts_with("HTTP/1.1 200 OK"));
+        assert!(precedence.ends_with("identity-v1"));
+
+        let matching_range = request(
+            address,
+            "/asset.txt",
+            &format!("Range: bytes=2-5\r\nIf-Range: {identity_etag}\r\n"),
+        )
+        .await;
+        assert!(matching_range.starts_with("HTTP/1.1 206 Partial Content"));
+        assert!(matching_range.ends_with("enti"));
+        let mismatching_range = request(
+            address,
+            "/asset.txt",
+            "Range: bytes=2-5\r\nIf-Range: \"different\"\r\n",
+        )
+        .await;
+        assert!(mismatching_range.starts_with("HTTP/1.1 200 OK"));
+        assert!(mismatching_range.ends_with("identity-v1"));
+        let matching_date = request(
+            address,
+            "/asset.txt",
+            &format!("Range: bytes=-3\r\nIf-Range: {identity_modified}\r\n"),
+        )
+        .await;
+        assert!(matching_date.starts_with("HTTP/1.1 206 Partial Content"));
+        assert!(matching_date.ends_with("-v1"));
+        let stale_date = request(
+            address,
+            "/asset.txt",
+            "Range: bytes=-3\r\nIf-Range: Sun, 06 Nov 1994 08:49:37 GMT\r\n",
+        )
+        .await;
+        assert!(stale_date.starts_with("HTTP/1.1 200 OK"));
+
+        let range_ignores_compression = request(
+            address,
+            "/asset.txt",
+            "Accept-Encoding: br\r\nRange: bytes=0-2\r\n",
+        )
+        .await;
+        assert!(range_ignores_compression.starts_with("HTTP/1.1 206 Partial Content"));
+        assert!(raw_header_values(&range_ignores_compression, "content-encoding").is_empty());
+        assert!(range_ignores_compression.ends_with("ide"));
+
+        let head_range = raw_request(
+            address,
+            &format!(
+                "HEAD /asset.txt HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\nRange: bytes=2-5\r\nIf-Range: {identity_etag}\r\n\r\n"
+            ),
+        )
+        .await;
+        let (headers, body) = raw_response_parts(&head_range);
+        assert!(headers.starts_with("HTTP/1.1 206 Partial Content"));
+        assert!(headers.to_ascii_lowercase().contains("content-length: 4"));
+        assert!(body.is_empty());
+
+        for value in ["bytes=99-100", "bytes=0-1,4-5"] {
+            let invalid = request(address, "/asset.txt", &format!("Range: {value}\r\n")).await;
+            assert!(invalid.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
+            assert_eq!(raw_header(&invalid, "content-range"), "bytes */11");
+        }
+
+        fs::write(site.join("asset.txt.br"), "brotli-v2-changed")
+            .expect("Brotli representation can change");
+        running
+            .reload_path(&config)
+            .await
+            .expect("changed representation reloads");
+        let changed = request(address, "/asset.txt", "Accept-Encoding: br\r\n").await;
+        assert_ne!(raw_header(&changed, "etag"), brotli_etag);
+        assert!(changed.ends_with("brotli-v2-changed"));
+
+        running.shutdown().await.expect("gateway shuts down");
     }
 
     #[tokio::test]
