@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use oxidase_config::{
-    ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
+    ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary, RetryBodyMode,
 };
 use oxidase_core::{
     ConfigVersion, ContentDigest, ContentDigestBuilder, Diagnostic, ResourceId, ServiceGraph,
@@ -12,6 +12,7 @@ use oxidase_core::{
 };
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
+use crate::cluster::PreparedCluster;
 use crate::tls::{
     CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
     PreparedListenerPlan, TlsListenerPreparationErrorKind, TlsListenerPreparationFailure,
@@ -20,7 +21,7 @@ use crate::tls::{
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
     pub certificates: BTreeMap<ResourceId, Arc<PreparedCertificate>>,
-    pub clusters: BTreeMap<ResourceId, Arc<ClusterSpec>>,
+    pub clusters: BTreeMap<ResourceId, Arc<PreparedCluster>>,
     pub sites: BTreeMap<ResourceId, Arc<SiteSnapshot>>,
 }
 
@@ -128,14 +129,20 @@ impl RuntimeSnapshot {
         let mut cluster_fingerprints = BTreeMap::new();
         for (id, source) in gateway.resources.clusters {
             let fingerprint = cluster_fingerprint(&source);
-            let cluster = previous
+            let previous_cluster =
+                previous.and_then(|previous| previous.resources.clusters.get(&id));
+            let unchanged = previous
                 .filter(|previous| previous.cluster_fingerprints.get(&id) == Some(&fingerprint))
-                .and_then(|previous| previous.resources.clusters.get(&id).cloned());
-            let cluster = if let Some(cluster) = cluster {
+                .and_then(|_| previous_cluster.cloned());
+            let cluster = if let Some(cluster) = unchanged {
                 reuse.clusters += 1;
+                reuse.cluster_endpoints += cluster.endpoints().len();
                 cluster
             } else {
-                Arc::new(source)
+                let (cluster, reused_endpoints) =
+                    PreparedCluster::prepare(source, previous_cluster.map(Arc::as_ref));
+                reuse.cluster_endpoints += reused_endpoints;
+                Arc::new(cluster)
             };
             cluster_fingerprints.insert(id.clone(), fingerprint);
             clusters.insert(id, cluster);
@@ -221,6 +228,8 @@ pub struct ResourceReuse {
     pub certificates: usize,
     pub sites: usize,
     pub clusters: usize,
+    /// Endpoint runtime states reused even when the immutable Cluster policy changed.
+    pub cluster_endpoints: usize,
 }
 
 #[derive(Debug)]
@@ -320,12 +329,104 @@ fn normalize_dependencies(dependencies: &mut Vec<std::path::PathBuf>) {
 }
 
 fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
-    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v2");
+    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v3");
     hash.field_bytes("protocol", source.protocol.as_str().as_bytes());
     hash.field_u64("endpoint_count", source.endpoints.len() as u64);
     for endpoint in &source.endpoints {
-        hash.field_bytes("endpoint", endpoint.as_str().as_bytes());
+        hash.field_bytes("endpoint_name", endpoint.name.as_bytes())
+            .field_bytes("endpoint_url", endpoint.url.as_str().as_bytes())
+            .field_u64("endpoint_weight", u64::from(endpoint.weight));
     }
+    hash.field_bytes("load_balance", source.load_balance.as_str().as_bytes());
+    if let Some(active) = &source.health.active {
+        hash.field_bytes("active_health", b"present")
+            .field_bytes("active_path", active.path.as_bytes())
+            .field_u128("active_interval_ns", active.interval.as_nanos())
+            .field_u128("active_timeout_ns", active.timeout.as_nanos())
+            .field_u64(
+                "active_healthy_threshold",
+                u64::from(active.healthy_threshold),
+            )
+            .field_u64(
+                "active_unhealthy_threshold",
+                u64::from(active.unhealthy_threshold),
+            );
+        let mut statuses = active.healthy_statuses.clone();
+        statuses.sort_by_key(|range| (range.start, range.end));
+        hash.field_u64("active_status_count", statuses.len() as u64);
+        for status in statuses {
+            hash.field_u64("active_status_start", u64::from(status.start))
+                .field_u64("active_status_end", u64::from(status.end));
+        }
+    } else {
+        hash.field_bytes("active_health", b"absent");
+    }
+    if let Some(passive) = &source.health.passive {
+        hash.field_bytes("passive_health", b"present")
+            .field_u64(
+                "passive_consecutive_failures",
+                u64::from(passive.consecutive_failures),
+            )
+            .field_u128("passive_eject_for_ns", passive.eject_for.as_nanos());
+    } else {
+        hash.field_bytes("passive_health", b"absent");
+    }
+    hash.field_u64("retry_max_attempts", u64::from(source.retry.max_attempts));
+    let mut methods = source
+        .retry
+        .methods
+        .iter()
+        .map(http::Method::as_str)
+        .collect::<Vec<_>>();
+    methods.sort_unstable();
+    methods.dedup();
+    hash.field_u64("retry_method_count", methods.len() as u64);
+    for method in methods {
+        hash.field_bytes("retry_method", method.as_bytes());
+    }
+    let mut causes = source
+        .retry
+        .retry_on
+        .iter()
+        .map(|cause| cause.as_str())
+        .collect::<Vec<_>>();
+    causes.sort_unstable();
+    causes.dedup();
+    hash.field_u64("retry_cause_count", causes.len() as u64);
+    for cause in causes {
+        hash.field_bytes("retry_cause", cause.as_bytes());
+    }
+    let mut retry_statuses = source.retry.statuses.clone();
+    retry_statuses.sort_by_key(|range| (range.start, range.end));
+    hash.field_u64("retry_status_count", retry_statuses.len() as u64);
+    for status in retry_statuses {
+        hash.field_u64("retry_status_start", u64::from(status.start))
+            .field_u64("retry_status_end", u64::from(status.end));
+    }
+    hash.field_bytes(
+        "retry_body_mode",
+        match source.retry.request_body.mode {
+            RetryBodyMode::None => b"none".as_slice(),
+            RetryBodyMode::Buffer => b"buffer".as_slice(),
+        },
+    )
+    .field_u64("retry_body_max_bytes", source.retry.request_body.max_bytes)
+    .field_u64(
+        "retry_max_concurrent",
+        u64::from(source.retry.max_concurrent_retries),
+    )
+    .field_u64(
+        "limit_cluster_in_flight",
+        u64::from(source.limits.max_in_flight),
+    )
+    .field_u64(
+        "limit_endpoint_in_flight",
+        u64::from(source.limits.max_in_flight_per_endpoint),
+    )
+    .field_u128(
+        "limit_queue_timeout_ns",
+        source.limits.queue_timeout.as_nanos(),
+    );
     hash.field_u128("connect_timeout_ns", source.connect_timeout.as_nanos());
     hash.field_u128("response_timeout_ns", source.response_timeout.as_nanos());
     hash.finish()
@@ -402,7 +503,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use oxidase_config::{ClusterProtocol, ClusterSpec, Compiler};
+    use oxidase_config::{
+        ClusterEndpointSpec, ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec,
+        Compiler, LoadBalancePolicy, RetryBodyMode, RetryRequestBodySpec, RetrySpec,
+    };
     use oxidase_core::{ResourceId, SourceSpan};
     use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
     use tempfile::tempdir;
@@ -458,8 +562,38 @@ listeners:
             protocol,
             endpoints: endpoints
                 .iter()
-                .map(|endpoint| Url::parse(endpoint).expect("fixture endpoint is valid"))
+                .enumerate()
+                .map(|(index, endpoint)| ClusterEndpointSpec {
+                    name: format!("endpoint-{index}"),
+                    url: Url::parse(endpoint).expect("fixture endpoint is valid"),
+                    weight: 1,
+                    name_source: SourceSpan::synthetic("clusters.api.endpoints.name"),
+                    url_source: SourceSpan::synthetic("clusters.api.endpoints.url"),
+                    weight_source: SourceSpan::synthetic("clusters.api.endpoints.weight"),
+                    source: SourceSpan::synthetic("clusters.api.endpoints"),
+                })
                 .collect(),
+            load_balance: LoadBalancePolicy::RoundRobin,
+            health: ClusterHealthSpec::default(),
+            retry: RetrySpec {
+                max_attempts: 1,
+                methods: Vec::new(),
+                retry_on: Vec::new(),
+                statuses: Vec::new(),
+                request_body: RetryRequestBodySpec {
+                    mode: RetryBodyMode::None,
+                    max_bytes: 64 * 1024,
+                    source: SourceSpan::synthetic("clusters.api.retry.request_body"),
+                },
+                max_concurrent_retries: 32,
+                source: SourceSpan::synthetic("clusters.api.retry"),
+            },
+            limits: ClusterLimits {
+                max_in_flight: 1024,
+                max_in_flight_per_endpoint: 256,
+                queue_timeout: Duration::ZERO,
+                source: SourceSpan::synthetic("clusters.api.limits"),
+            },
             connect_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_secs(2),
             protocol_source: SourceSpan::synthetic("clusters.api.protocol"),

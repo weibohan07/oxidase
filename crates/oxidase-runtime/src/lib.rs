@@ -1,5 +1,6 @@
 //! Transactional Service execution and immutable runtime snapshots.
 
+mod cluster;
 mod executor;
 mod snapshot;
 mod tls;
@@ -20,3 +21,8 @@ pub use tls::{
 };
 
 pub const RUNTIME_FORMAT_VERSION: u32 = 1;
+pub use cluster::{
+    ClusterAdmissionError, ClusterRequestPermit, ClusterRetryPermit, ClusterRuntimeStatus,
+    EndpointHealthState, EndpointRuntimeState, EndpointRuntimeStatus, EndpointStatusSnapshot,
+    PreparedCluster, PreparedEndpoint,
+};
