@@ -19,6 +19,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{Error as RustlsError, InconsistentKeys, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use x509_parser::parse_x509_certificate;
 
 /// One validated certificate chain and signing key prepared before publication.
 ///
@@ -77,6 +78,7 @@ impl PreparedCertificate {
                 )
             })?;
         }
+        validate_certificate_chain(&certificates, source)?;
 
         if appears_to_be_encrypted_private_key(&private_key_pem) {
             return Err(CertificatePreparationFailure::new(
@@ -513,6 +515,10 @@ pub enum CertificatePreparationErrorKind {
     CertificatePem,
     CertificateChainEmpty,
     CertificateX509,
+    CertificateExpired,
+    CertificateNotYetValid,
+    CertificateChainOrder,
+    CertificateChainConstraints,
     PrivateKeyMissingFile,
     PrivateKeyNotFile,
     PrivateKeyRead,
@@ -534,6 +540,14 @@ impl fmt::Display for CertificatePreparationErrorKind {
             Self::CertificatePem => "certificate chain PEM is invalid",
             Self::CertificateChainEmpty => "certificate chain is empty",
             Self::CertificateX509 => "certificate chain contains invalid X.509",
+            Self::CertificateExpired => "certificate chain contains an expired certificate",
+            Self::CertificateNotYetValid => {
+                "certificate chain contains a certificate that is not yet valid"
+            }
+            Self::CertificateChainOrder => "certificate chain is not ordered leaf first",
+            Self::CertificateChainConstraints => {
+                "certificate chain contains an issuer that is not allowed to sign certificates"
+            }
             Self::PrivateKeyMissingFile => "private key file does not exist",
             Self::PrivateKeyNotFile => "private key path is not a regular file",
             Self::PrivateKeyRead => "private key file cannot be read",
@@ -546,6 +560,146 @@ impl fmt::Display for CertificatePreparationErrorKind {
             Self::KeyMatchUnavailable => "private-key consistency cannot be established",
         })
     }
+}
+
+fn validate_certificate_chain(
+    certificates: &[CertificateDer<'_>],
+    source: &CertificateSpec,
+) -> Result<(), CertificatePreparationFailure> {
+    let now = x509_parser::time::ASN1Time::now();
+    for (index, certificate) in certificates.iter().enumerate() {
+        let (_, parsed) = parse_x509_certificate(certificate.as_ref()).map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} is not valid X.509: {error}",
+                    index + 1
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+        if now < parsed.validity().not_before {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateNotYetValid,
+                "tls.certificate_not_yet_valid",
+                format!("certificate chain entry {} is not yet valid", index + 1),
+                source.cert_chain_source.clone(),
+            )
+            .with_help("install a certificate whose validity period includes the current time"));
+        }
+        if now > parsed.validity().not_after {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateExpired,
+                "tls.certificate_expired",
+                format!("certificate chain entry {} has expired", index + 1),
+                source.cert_chain_source.clone(),
+            )
+            .with_help("renew the certificate before activating this configuration"));
+        }
+    }
+
+    for (index, pair) in certificates.windows(2).enumerate() {
+        let (_, child) = parse_x509_certificate(pair[0].as_ref()).map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} is not valid X.509: {error}",
+                    index + 1
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+        let (_, issuer) = parse_x509_certificate(pair[1].as_ref()).map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} is not valid X.509: {error}",
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+        if child.issuer() != issuer.subject() {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateChainOrder,
+                "tls.certificate_chain_order",
+                format!(
+                    "certificate chain entry {} is not issued by entry {}; chains must be leaf first",
+                    index + 1,
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+            .with_help("order the PEM sections as leaf certificate followed by its issuers"));
+        }
+        if child.verify_signature(Some(issuer.public_key())).is_err() {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateChainOrder,
+                "tls.certificate_chain_order",
+                format!(
+                    "certificate chain entry {} is not signed by entry {}; chains must be leaf first",
+                    index + 1,
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+            .with_help(
+                "supply the actual issuer certificates in leaf-first order without unrelated entries",
+            ));
+        }
+        let basic_constraints = issuer.basic_constraints().map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} has invalid basic constraints: {error}",
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+        if !basic_constraints.is_some_and(|extension| extension.value.ca) {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateChainConstraints,
+                "tls.certificate_chain_constraints",
+                format!(
+                    "certificate chain entry {} is an issuer but does not declare CA=true",
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+            .with_help("replace the issuer with a CA certificate whose Basic Constraints permit certificate signing"));
+        }
+        let key_usage = issuer.key_usage().map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} has invalid key usage: {error}",
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+        if key_usage.is_some_and(|extension| !extension.value.key_cert_sign()) {
+            return Err(CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateChainConstraints,
+                "tls.certificate_chain_constraints",
+                format!(
+                    "certificate chain entry {} key usage does not permit certificate signing",
+                    index + 2
+                ),
+                source.cert_chain_source.clone(),
+            )
+            .with_help(
+                "replace the issuer with a CA certificate whose Key Usage includes keyCertSign",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,7 +914,11 @@ mod tests {
 
     use oxidase_config::{CertificateSpec, SniCertificateSpec, SniPattern, TlsListenerSpec};
     use oxidase_core::{ResourceId, SourceSpan};
-    use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedKey as GeneratedCertificate,
+        DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, date_time_ymd,
+        generate_simple_self_signed,
+    };
     use tempfile::tempdir;
 
     use super::{
@@ -783,6 +941,107 @@ mod tests {
         TestIdentity {
             certificate_pem: cert.pem(),
             private_key_pem: signing_key.serialize_pem(),
+        }
+    }
+
+    fn identity_with_validity(
+        name: &str,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> TestIdentity {
+        let mut params =
+            CertificateParams::new(vec![name.to_owned()]).expect("test DNS name is valid");
+        params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
+        let signing_key = KeyPair::generate().expect("test-only signing key can be generated");
+        let cert = params
+            .self_signed(&signing_key)
+            .expect("test-only certificate can be generated");
+        TestIdentity {
+            certificate_pem: cert.pem(),
+            private_key_pem: signing_key.serialize_pem(),
+        }
+    }
+
+    fn chained_identity() -> (TestIdentity, String) {
+        let mut ca_params =
+            CertificateParams::new(Vec::new()).expect("an empty CA subjectAltName list is valid");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Oxidase test CA");
+        let ca_key = KeyPair::generate().expect("test-only CA key can be generated");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("test-only CA certificate can be generated");
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut leaf_params = CertificateParams::new(vec!["chain.example.test".to_owned()])
+            .expect("test DNS name is valid");
+        leaf_params.distinguished_name = DistinguishedName::new();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "chain.example.test");
+        let leaf_key = KeyPair::generate().expect("test-only leaf key can be generated");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("test-only leaf certificate can be signed");
+        let ordered_chain = format!("{}{}", leaf.pem(), ca.pem());
+        let reversed_chain = format!("{}{}", ca.pem(), leaf.pem());
+        (
+            TestIdentity {
+                certificate_pem: ordered_chain,
+                private_key_pem: leaf_key.serialize_pem(),
+            },
+            reversed_chain,
+        )
+    }
+
+    fn three_level_identity(
+        intermediate_is_ca: bool,
+        intermediate_key_usages: Vec<KeyUsagePurpose>,
+    ) -> TestIdentity {
+        let mut root_params =
+            CertificateParams::new(Vec::new()).expect("empty root CA SANs are valid");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.distinguished_name = DistinguishedName::new();
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Oxidase test root");
+        let root_key = KeyPair::generate().expect("test root key can be generated");
+        let root = root_params
+            .self_signed(&root_key)
+            .expect("test root certificate can be generated");
+        let root_issuer = Issuer::new(root_params, root_key);
+
+        let mut intermediate_params =
+            CertificateParams::new(Vec::new()).expect("empty intermediate SANs are valid");
+        intermediate_params.is_ca = if intermediate_is_ca {
+            IsCa::Ca(BasicConstraints::Unconstrained)
+        } else {
+            IsCa::NoCa
+        };
+        intermediate_params.key_usages = intermediate_key_usages;
+        intermediate_params.distinguished_name = DistinguishedName::new();
+        intermediate_params
+            .distinguished_name
+            .push(DnType::CommonName, "Oxidase test intermediate");
+        let intermediate_key = KeyPair::generate().expect("test intermediate key can be generated");
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_key, &root_issuer)
+            .expect("test intermediate certificate can be signed");
+        let intermediate_issuer = Issuer::new(intermediate_params, intermediate_key);
+
+        let leaf_params = CertificateParams::new(vec!["chain.example.test".to_owned()])
+            .expect("leaf DNS name is valid");
+        let leaf_key = KeyPair::generate().expect("test leaf key can be generated");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &intermediate_issuer)
+            .expect("test leaf certificate can be signed");
+        TestIdentity {
+            certificate_pem: format!("{}{}{}", leaf.pem(), intermediate.pem(), root.pem()),
+            private_key_pem: leaf_key.serialize_pem(),
         }
     }
 
@@ -843,6 +1102,152 @@ mod tests {
             CertificatePreparationErrorKind::CertificatePem
         );
         assert_eq!(failure.diagnostic.code, "tls.certificate_pem");
+    }
+
+    #[test]
+    fn rejects_expired_and_not_yet_valid_certificate_chains() {
+        let directory = tempdir().expect("temporary directory is available");
+        let expired = identity_with_validity("expired.example.test", (2000, 1, 1), (2001, 1, 1));
+        let source = certificate_spec(
+            directory.path(),
+            "expired",
+            &expired.certificate_pem,
+            &expired.private_key_pem,
+        );
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("an expired certificate must not be published");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateExpired
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_expired");
+
+        let future = identity_with_validity("future.example.test", (2099, 1, 1), (2100, 1, 1));
+        let source = certificate_spec(
+            directory.path(),
+            "future",
+            &future.certificate_pem,
+            &future.private_key_pem,
+        );
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("a not-yet-valid certificate must not be published");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateNotYetValid
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_not_yet_valid");
+    }
+
+    #[test]
+    fn accepts_leaf_first_chain_and_rejects_reversed_chain_order() {
+        let directory = tempdir().expect("temporary directory is available");
+        let (ordered, reversed_chain) = chained_identity();
+        let ordered_source = certificate_spec(
+            directory.path(),
+            "ordered",
+            &ordered.certificate_pem,
+            &ordered.private_key_pem,
+        );
+        let prepared = PreparedCertificate::prepare(&ordered_source)
+            .expect("a leaf-first certificate chain prepares");
+        assert_eq!(prepared.certificate_count(), 2);
+
+        let reversed_source = certificate_spec(
+            directory.path(),
+            "reversed",
+            &reversed_chain,
+            &ordered.private_key_pem,
+        );
+        let failure = PreparedCertificate::prepare(&reversed_source)
+            .expect_err("a reversed certificate chain must not be published");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateChainOrder
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_chain_order");
+    }
+
+    #[test]
+    fn rejects_same_subject_issuer_that_did_not_sign_the_leaf() {
+        let directory = tempdir().expect("temporary directory is available");
+
+        let mut signer_params =
+            CertificateParams::new(Vec::new()).expect("empty CA SANs are valid");
+        signer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        signer_params.distinguished_name = DistinguishedName::new();
+        signer_params
+            .distinguished_name
+            .push(DnType::CommonName, "Same subject test CA");
+        let signer_key = KeyPair::generate().expect("test signer key can be generated");
+        let signer = Issuer::new(signer_params, signer_key);
+
+        let mut unrelated_params =
+            CertificateParams::new(Vec::new()).expect("empty CA SANs are valid");
+        unrelated_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        unrelated_params.distinguished_name = DistinguishedName::new();
+        unrelated_params
+            .distinguished_name
+            .push(DnType::CommonName, "Same subject test CA");
+        let unrelated_key = KeyPair::generate().expect("unrelated CA key can be generated");
+        let unrelated = unrelated_params
+            .self_signed(&unrelated_key)
+            .expect("unrelated CA certificate can be generated");
+
+        let leaf_params = CertificateParams::new(vec!["chain.example.test".to_owned()])
+            .expect("leaf DNS name is valid");
+        let leaf_key = KeyPair::generate().expect("leaf key can be generated");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &signer)
+            .expect("leaf can be signed by the intended issuer");
+        let wrong_chain = format!("{}{}", leaf.pem(), unrelated.pem());
+        let source = certificate_spec(
+            directory.path(),
+            "same-subject-wrong-key",
+            &wrong_chain,
+            &leaf_key.serialize_pem(),
+        );
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("issuer names alone cannot establish a chain link");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateChainOrder
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_chain_order");
+    }
+
+    #[test]
+    fn rejects_non_ca_and_non_signing_intermediate_certificates() {
+        let directory = tempdir().expect("temporary directory is available");
+
+        let non_ca = three_level_identity(false, Vec::new());
+        let source = certificate_spec(
+            directory.path(),
+            "non-ca-intermediate",
+            &non_ca.certificate_pem,
+            &non_ca.private_key_pem,
+        );
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("a non-CA intermediate must not be published");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateChainConstraints
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_chain_constraints");
+
+        let non_signing_ca = three_level_identity(true, vec![KeyUsagePurpose::DigitalSignature]);
+        let source = certificate_spec(
+            directory.path(),
+            "non-signing-intermediate",
+            &non_signing_ca.certificate_pem,
+            &non_signing_ca.private_key_pem,
+        );
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("an intermediate without keyCertSign must not be published");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateChainConstraints
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_chain_constraints");
     }
 
     #[test]

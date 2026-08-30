@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `hardening/v0.3-alpha`
-- public starting point: resilient-Cluster merge `f72021b`
+- active milestone branch: `hardening/v0.4-security-conformance`
+- public starting point: v0.3 merge `05aedd1`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -82,11 +82,13 @@ Last updated: 2026-08-30
   arbitrary root Service execution, connection-derived peer/scheme metadata, safe
   root outcome mapping, structured tracing fields, and bounded graceful drain.
 - Certificate resources are prepared before publication with strict PEM/X.509
-  parsing, exactly one PKCS#8/PKCS#1/SEC1 private key, positive key/leaf consistency
-  validation, and no private material in Debug, diagnostics, manifests, logs, or
-  metrics. Certificate and key paths remain reload dependencies. Reuse identity is
-  the public certificate chain digest; a candidate private key is nevertheless
-  parsed and matched on every preparation before old signing state can be reused.
+  parsing, exactly one PKCS#8/PKCS#1/SEC1 private key, positive key/leaf consistency,
+  current-time validity for every chain entry, and leaf-first adjacent issuer-name
+  plus signature verification. Expired, not-yet-valid, misordered, unrelated, or
+  mismatched candidates fail with field diagnostics and preserve last-known-good.
+  No private material enters Debug, diagnostics, manifests, logs, or metrics.
+  Certificate/key paths remain reload dependencies. Reuse identity is the public
+  chain digest; a candidate key is still parsed and matched before reuse.
 - HTTPS listeners use rustls with safe TLS 1.2/1.3 defaults and an explicit ring
   crypto provider. Exact ASCII SNI names take precedence over one-label left-most
   wildcards and then the default certificate; SNI rules are checked against leaf
@@ -100,6 +102,12 @@ Last updated: 2026-08-30
   request start rather than pinning one Service snapshot for the entire connection.
   Request expressions expose connection-derived HTTP version and TLS enabled/SNI/
   ALPN/version metadata.
+- HTTP/1 ingress has conservative hard defaults of 100 decoded fields, 64 KiB
+  decoded head storage, and an 8 KiB request target in addition to its header-read
+  timeout. Duplicate/empty/missing Host, unsupported authority-form/CONNECT, and
+  ambiguous targets fail before Service execution. Absolute-form and H2 authority
+  replace any conflicting Host so expressions, forwarding metadata, and upstream
+  Host observe one canonical value.
 - A retained listener socket loads the published transport plan for each accept.
   Certificate, Service, protocol, and HTTP-setting changes therefore affect new
   connections without rebinding, while existing TLS connections retain their old
@@ -145,6 +153,14 @@ Last updated: 2026-08-30
   happens before request-body consumption. Active checks start only after commit,
   passive failure thresholds eject endpoints, and compatible reloads retain health
   and counters without a global state map.
+- Active-health failure now uses an atomic conditional transition and cannot race
+  with a passive ejection to overwrite `PassivelyEjected`. Active success at the
+  configured threshold remains the one deliberate early-recovery path. Passive
+  ejection expiry and a concurrent new ejection are serialized, and health-policy
+  reloads isolate supervisor generations while retaining shared endpoint admission.
+  Deterministic concurrent tests cover stale observations, admission, retry permits,
+  supervisor activation, snapshot publication, body cancellation, and
+  transport/tunnel guards.
 - Retry is disabled by default. A retry requires an explicitly listed method and
   pre-response-head cause/status, an untried eligible endpoint, an available
   non-waiting retry permit, and an empty or explicitly bounded replay body. Buffer
@@ -159,6 +175,14 @@ Last updated: 2026-08-30
   fields; HTTP/1 continues to remove Connection-nominated and hop-by-hop fields. A
   TLS/H2 black-box fixture proves request/response trailers and opaque multi-message
   gRPC forwarding, including terminal `grpc-status` and `grpc-message` trailers.
+- Request and response trailer guards reject late routing, authentication,
+  request-condition, response-control, cookie, and representation-metadata fields in
+  addition to framing/hop-by-hop and connection-derived forwarding identity fields.
+  H2-to-H1 request trailers require an exact initial declaration; undeclared frames
+  fail explicitly instead of being silently discarded by the H1 encoder. Malformed
+  downstream body framing retains explicit provenance across Hyper's upstream client
+  and maps to a safe 400 before any upstream response head rather than being
+  misclassified as an upstream 502.
 - HTTP/1 ingress and Proxy now carry a server-local trusted Upgrade capability.
   Validation requires a single protocol and matching upstream 101; non-Proxy
   Services and user Header policy cannot construct it. Focused tests cover malformed
@@ -237,6 +261,20 @@ Last updated: 2026-08-30
   dispatch. Dependency-policy, security, contributing, operations, migration, and
   benchmark entrypoints are present. The superseded v0.1 implementation remains in
   Git history.
+- Security documentation inventories downstream/upstream/config/admin/file/DNS/
+  telemetry trust boundaries and every current exhaustion owner/release path. A
+  separate manual conformance workflow pins and SHA-256 verifies h2spec, Autobahn,
+  tlsfuzzer, tlslite-ng, HTTPWookiee, and their direct Python wheels; normal CI has
+  no dependency on those downloads. Raw results are uploaded per suite and are not
+  interpreted as passing merely because a tool process exited zero.
+- The PR1 local campaigns actually ran: h2spec covered 147 cases with no unexpected
+  failure after exact-fingerprint triage of known protocol/tool divergences and
+  focused raw-frame safety regressions; fixed tlsfuzzer probes passed 12/12;
+  Autobahn covered 247 cases with no failed behavior; and HTTPWookiee ran 243 tests
+  with no unexpected failure/error after fixing malformed-body 502 classification.
+  Eight explicitly named HTTPWookiee parser-boundary divergences remain documented
+  and backed by raw single-message tests. These are local results, not Hosted status;
+  see `docs/security/conformance-audit.md`.
 - `examples/secure-resilient-gateway` compiles an HTTPS H2/H1 Listener, test-only
   Certificate Resource, observed route, weighted H2 Cluster with health/retry/
   admission policy, and Oxista Site. Its local fixture configuration provides two
@@ -298,11 +336,12 @@ Last updated: 2026-08-30
   and H2-to-H2 Proxy paths preserve validated trailers. Basic transparent gRPC
   forwards opaque DATA and terminal trailers only; protobuf inspection, gRPC-Web,
   and a new `100-continue` policy remain unimplemented.
-- H2-to-HTTP/1 response trailers require both downstream `TE: trailers` and an
-  initial trusted `Trailer` declaration; an unsafe or undeclared late field ends the
-  body with a protocol error rather than being dropped. Wire fixtures cover both
-  H1-to-H2 request trailers and declared/rejected H2-to-H1 response cases. HTTP/1
-  Upgrade is Proxy-only and capability-gated; H2 extended CONNECT remains rejected.
+- H2-to-HTTP/1 request and response trailers require an initial trusted `Trailer`
+  declaration; responses additionally require downstream `TE: trailers`. An unsafe
+  or undeclared late field ends the body with a protocol error rather than being
+  dropped. Wire fixtures cover H1-to-H2 request trailers and declared/rejected
+  H2-to-H1 request and response cases. HTTP/1 Upgrade is Proxy-only and
+  capability-gated; H2 extended CONNECT remains rejected.
 - TLS uses rustls defaults for TLS 1.2/1.3. Client certificates/mTLS, ACME, OCSP
   stapling, custom cipher-suite policy, and automatic certificate issuance are not
   implemented. SNI wildcards match exactly one left-most DNS label and must appear
@@ -329,6 +368,9 @@ Last updated: 2026-08-30
   redirects require a future explicit allow policy.
 - The admin listener is CLI-configured rather than part of the gateway source and is
   not dynamically rebound during config reload.
+- HTTP/1 field/head/target limits and the TLS handshake concurrency gate are safe
+  fixed defaults in this hardening PR; per-Listener and per-IP configurable ingress
+  governance is not implemented until the dedicated v0.4 ingress PR.
 
 ## Validation boundary
 
@@ -339,6 +381,10 @@ Last updated: 2026-08-30
 - Loopback TLS/H2/gRPC/WebSocket/Cluster tests require permission to bind ephemeral
   ports. Ordinary CI runs bounded integration fixtures and does not run an indefinite
   soak or fuzz campaign.
+- External conformance is a manually dispatched per-suite matrix using pinned Action
+  commits, source checksums, an immutable Autobahn image digest, loopback fixtures,
+  real failure exit propagation, and raw artifacts. Tool findings still require
+  protocol-boundary triage; fetching or compiling a suite is not a campaign.
 - Manual regression entrypoints cover TLS handshake plus H1/H2 traffic, SNI lookup,
   weighted/least-request selection, retry admission, health transitions, shared
   ServiceGraph execution, typed include/render, Site preparation, and RequestFrame

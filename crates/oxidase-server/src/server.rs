@@ -38,7 +38,7 @@ use crate::metrics::{
     ConnectionProtocol, H2Shutdown, ListenerTransportMetrics, Metrics, ProductionObserver, TlsAlpn,
     TlsHandshakeOutcome, TunnelTermination as TunnelMetricTermination,
 };
-use crate::protocol::{WireProtocol, http1_accepts_trailers};
+use crate::protocol::{RequestTrailerGuard, WireProtocol, http1_accepts_trailers};
 use crate::response::{
     FinalizedResponse, ResponseFinalizationContext, ResponseFinalizationError, ResponseFinalizer,
 };
@@ -49,6 +49,9 @@ use crate::upgrade::{
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HTTP1_MAX_HEADER_BYTES: usize = 64 * 1024;
+const DEFAULT_HTTP1_MAX_HEADERS: usize = 100;
+const DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 const MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER: usize = 128;
 
 fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
@@ -56,6 +59,8 @@ fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
     builder
         .keep_alive(true)
         .timer(TokioTimer::new())
+        .max_headers(DEFAULT_HTTP1_MAX_HEADERS)
+        .max_buf_size(DEFAULT_HTTP1_MAX_HEADER_BYTES)
         .header_read_timeout(header_read_timeout);
     builder
 }
@@ -1520,6 +1525,23 @@ async fn handle_request(
     let wire_protocol = wire_protocol(request.version());
     let accepts_http1_trailers =
         wire_protocol == WireProtocol::Http1 && http1_accepts_trailers(request.headers());
+    let request_trailer_guard = match RequestTrailerGuard::from_request_headers(
+        wire_protocol,
+        request.headers(),
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::debug!(request_id, error = %error, "request trailer declaration is invalid");
+            metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
+            let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
+            return Ok(instrument_response_body_with_snapshot(
+                response,
+                metrics,
+                active_request,
+                Some(snapshot),
+            ));
+        }
+    };
     let pending_upgrade = match validate_upgrade_request(&request) {
         Ok(Some(candidate)) => Some(candidate.pending(hyper::upgrade::on(&mut request))),
         Ok(None) => None,
@@ -1535,14 +1557,53 @@ async fn handle_request(
             ));
         }
     };
-    let (parts, body) = request.into_parts();
-    let authority = parts
-        .headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| parts.uri.authority().map(ToString::to_string))
-        .unwrap_or_default();
+    let (mut parts, body) = request.into_parts();
+    if wire_protocol == WireProtocol::Http1
+        && decoded_header_bytes(&parts.headers) > DEFAULT_HTTP1_MAX_HEADER_BYTES
+    {
+        metrics.record_request(
+            "failed",
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            started.elapsed(),
+        );
+        let response = safe_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Request Header Fields Too Large",
+            &request_method,
+        );
+        return Ok(instrument_response_body_with_snapshot(
+            response,
+            metrics,
+            active_request,
+            Some(snapshot),
+        ));
+    }
+    if wire_protocol == WireProtocol::Http1
+        && request_target_length(&parts.uri) > DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES
+    {
+        metrics.record_request("failed", StatusCode::URI_TOO_LONG, started.elapsed());
+        let response = safe_response(StatusCode::URI_TOO_LONG, "URI Too Long", &request_method);
+        return Ok(instrument_response_body_with_snapshot(
+            response,
+            metrics,
+            active_request,
+            Some(snapshot),
+        ));
+    }
+    let authority = match normalize_ingress_authority(&mut parts) {
+        Ok(authority) => authority,
+        Err(error) => {
+            tracing::warn!(request_id, error, "request authority is invalid");
+            metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
+            let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
+            return Ok(instrument_response_body_with_snapshot(
+                response,
+                metrics,
+                active_request,
+                Some(snapshot),
+            ));
+        }
+    };
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -1575,7 +1636,11 @@ async fn handle_request(
     let report = Executor::new(&program, &leaves)
         .execute_observed(
             RequestFrame::new(metadata),
-            Some(GatewayRequestPayload::new(body, pending_upgrade)),
+            Some(GatewayRequestPayload::new(
+                body,
+                pending_upgrade,
+                request_trailer_guard,
+            )),
             &observer,
         )
         .await;
@@ -1673,6 +1738,73 @@ async fn handle_request(
         active_request,
         Some(snapshot),
     ))
+}
+
+fn decoded_header_bytes(headers: &http::HeaderMap) -> usize {
+    headers.iter().fold(0_usize, |total, (name, value)| {
+        total
+            .saturating_add(name.as_str().len())
+            .saturating_add(": ".len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add("\r\n".len())
+    })
+}
+
+fn request_target_length(uri: &http::Uri) -> usize {
+    if let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) {
+        scheme.as_str().len()
+            + "://".len()
+            + authority.as_str().len()
+            + uri
+                .path_and_query()
+                .map_or(0, |path_and_query| path_and_query.as_str().len())
+    } else if let Some(authority) = uri.authority() {
+        authority.as_str().len()
+    } else {
+        uri.path_and_query()
+            .map_or(0, |path_and_query| path_and_query.as_str().len())
+    }
+}
+
+fn normalize_ingress_authority(parts: &mut http::request::Parts) -> Result<String, &'static str> {
+    let mut host_values = parts.headers.get_all(header::HOST).iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
+        return Err("request contains multiple Host fields");
+    }
+    if parts.version == Version::HTTP_11 {
+        let Some(host) = host else {
+            return Err("HTTP/1.1 requires exactly one Host field");
+        };
+        if host.as_bytes().is_empty() {
+            return Err("HTTP/1.1 Host field is empty");
+        }
+    }
+
+    if parts.version != Version::HTTP_2
+        && parts.uri.authority().is_some()
+        && parts.uri.scheme().is_none()
+    {
+        return Err("authority-form is only valid for CONNECT");
+    }
+
+    // For absolute-form requests, RFC 9112 requires recipients to use the
+    // request-target authority instead of a potentially conflicting Host
+    // field. H2 also carries its trusted `:authority` value in the URI.
+    let authority = parts
+        .uri
+        .authority()
+        .map(ToString::to_string)
+        .or_else(|| {
+            host.and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+        .ok_or("request has no valid authority")?;
+    let canonical_host = HeaderValue::try_from(authority.as_str())
+        .map_err(|_| "request authority is not a valid Host field value")?;
+    parts.headers.remove(header::HOST);
+    parts.headers.insert(header::HOST, canonical_host);
+    Ok(authority)
 }
 
 fn response_from_head(

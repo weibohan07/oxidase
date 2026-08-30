@@ -29,10 +29,12 @@ use tokio_util::io::ReaderStream;
 
 use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
 use crate::protocol::{
-    TrailerGuard, WireProtocol, http1_accepts_trailers, sanitize_runtime_headers,
+    RequestTrailerGuard, TrailerGuard, TrailerValidationError, WireProtocol,
+    http1_accepts_trailers, sanitize_runtime_headers,
 };
 use crate::proxy_body::{
-    BufferRequestError, ClusterResponseBody, ProxyRequestBody, ReplayBody, buffer_for_replay,
+    BufferRequestError, ClusterResponseBody, DownstreamRequestBodyError, ProxyRequestBody,
+    ReplayBody, buffer_for_replay,
 };
 use crate::upgrade::GatewayRequestPayload;
 
@@ -75,9 +77,11 @@ enum AttemptBody {
 }
 
 impl AttemptBody {
-    fn next(&mut self) -> Option<ProxyRequestBody> {
+    fn next(&mut self, trailer_guard: &RequestTrailerGuard) -> Option<ProxyRequestBody> {
         match self {
-            Self::Streaming(body) => body.take().map(ProxyRequestBody::streaming),
+            Self::Streaming(body) => body
+                .take()
+                .map(|body| ProxyRequestBody::streaming(body, trailer_guard.clone())),
             Self::Empty => Some(ProxyRequestBody::empty()),
             Self::Replay(body) => Some(body.new_attempt()),
         }
@@ -279,7 +283,7 @@ impl ProxyClient {
                 "Proxy request body is unavailable",
             ));
         };
-        let (incoming, mut pending_upgrade) = payload.into_parts();
+        let (incoming, mut pending_upgrade, request_trailer_guard) = payload.into_parts();
         let retry = &cluster.spec().retry;
         let retry_method = pending_upgrade.is_none()
             && retry.max_attempts > 1
@@ -288,10 +292,24 @@ impl ProxyClient {
                 .iter()
                 .any(|method| method == request.method());
         let incoming_is_empty = incoming.is_end_stream();
+        let request_trailer_guard = request_trailer_guard.for_upstream(
+            if pending_upgrade.is_some() {
+                ProxyPoolKind::Http1
+            } else {
+                configured_pool
+            }
+            .request_wire_protocol(),
+        );
         let mut attempt_body = if retry_method && incoming_is_empty {
             AttemptBody::Empty
         } else if retry_method && retry.request_body.mode == RetryBodyMode::Buffer {
-            match buffer_for_replay(incoming, retry.request_body.max_bytes).await {
+            match buffer_for_replay(
+                incoming,
+                retry.request_body.max_bytes,
+                &request_trailer_guard,
+            )
+            .await
+            {
                 Ok(body) => AttemptBody::Replay(body),
                 Err(BufferRequestError::LimitExceeded) => {
                     return ServiceOutcome::Handled(ResponseHead::new(
@@ -300,6 +318,12 @@ impl ProxyClient {
                     ));
                 }
                 Err(error) => {
+                    if error_chain_contains_request_validation(&error) {
+                        return ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::BAD_REQUEST,
+                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
+                        ));
+                    }
                     return ServiceOutcome::Failed(ServiceError::new(
                         ErrorClass::BodyUnavailable,
                         format!("request body cannot be replayed safely: {error}"),
@@ -337,7 +361,7 @@ impl ProxyClient {
             } else {
                 configured_pool
             };
-            let Some(request_body) = attempt_body.next() else {
+            let Some(request_body) = attempt_body.next(&request_trailer_guard) else {
                 return ServiceOutcome::Failed(ServiceError::new(
                     ErrorClass::BodyUnavailable,
                     "Proxy request body is not replayable for another attempt",
@@ -355,6 +379,9 @@ impl ProxyClient {
                     "request contains invalid connection-specific metadata",
                 ));
             }
+            if let Some(declaration) = request_trailer_guard.forwarded_declaration() {
+                upstream.headers_mut().insert(header::TRAILER, declaration);
+            }
             if let Some(upgrade) = &pending_upgrade {
                 upstream
                     .headers_mut()
@@ -371,6 +398,12 @@ impl ProxyClient {
             let mut response = match response {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
+                    if error_chain_contains_request_validation(&error) {
+                        return ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::BAD_REQUEST,
+                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
+                        ));
+                    }
                     let failure = classify_proxy_error(&error);
                     cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
                     let detail =
@@ -600,6 +633,19 @@ fn classify_proxy_error(error: &hyper_util::client::legacy::Error) -> AttemptFai
         source = error.source();
     }
     AttemptFailure::Protocol
+}
+
+fn error_chain_contains_request_validation(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<TrailerValidationError>().is_some()
+            || error.downcast_ref::<DownstreamRequestBodyError>().is_some()
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn build_proxy_pool(connector: HttpsConnector<HttpConnector>, http2_only: bool) -> ProxyPool {

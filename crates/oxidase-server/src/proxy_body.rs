@@ -11,13 +11,36 @@ use hyper::body::Incoming;
 use oxidase_runtime::{ClusterRequestPermit, PreparedCluster};
 
 use crate::body::BoxError;
+use crate::protocol::RequestTrailerGuard;
+
+/// Marks an error produced while decoding the untrusted downstream request
+/// body. Keeping this provenance through Hyper's client error chain lets Proxy
+/// return a safe 400 before any upstream response head, rather than misclassify
+/// malformed chunking as an upstream 502.
+#[derive(Debug)]
+pub(crate) struct DownstreamRequestBodyError(hyper::Error);
+
+impl std::fmt::Display for DownstreamRequestBodyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("downstream request body framing is invalid or incomplete")
+    }
+}
+
+impl std::error::Error for DownstreamRequestBodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 /// The single body type accepted by every long-lived upstream client pool.
 ///
 /// Normal requests wrap Hyper's incoming stream without collection. `Replay`
 /// is constructed only for an explicitly configured, bounded retry policy.
 pub(crate) enum ProxyRequestBody {
-    Streaming(Incoming),
+    Streaming {
+        body: Incoming,
+        trailer_guard: RequestTrailerGuard,
+    },
     Empty,
     Replay {
         data: Option<Bytes>,
@@ -26,8 +49,11 @@ pub(crate) enum ProxyRequestBody {
 }
 
 impl ProxyRequestBody {
-    pub(crate) fn streaming(body: Incoming) -> Self {
-        Self::Streaming(body)
+    pub(crate) fn streaming(body: Incoming, trailer_guard: RequestTrailerGuard) -> Self {
+        Self::Streaming {
+            body,
+            trailer_guard,
+        }
     }
 
     pub(crate) const fn empty() -> Self {
@@ -44,9 +70,24 @@ impl Body for ProxyRequestBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match &mut *self {
-            Self::Streaming(body) => Pin::new(body)
-                .poll_frame(context)
-                .map(|frame| frame.map(|frame| frame.map_err(|error| Box::new(error) as BoxError))),
+            Self::Streaming {
+                body,
+                trailer_guard,
+            } => match Pin::new(body).poll_frame(context) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(trailers) = frame.trailers_ref()
+                        && let Err(error) = trailer_guard.validate(trailers)
+                    {
+                        return Poll::Ready(Some(Err(Box::new(error))));
+                    }
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    Poll::Ready(Some(Err(Box::new(DownstreamRequestBodyError(error)))))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
             Self::Empty => Poll::Ready(None),
             Self::Replay { data, trailers } => {
                 if let Some(data) = data.take()
@@ -66,7 +107,7 @@ impl Body for ProxyRequestBody {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Streaming(body) => body.is_end_stream(),
+            Self::Streaming { body, .. } => body.is_end_stream(),
             Self::Empty => true,
             Self::Replay { data, trailers } => {
                 data.as_ref().is_none_or(Bytes::is_empty)
@@ -77,7 +118,7 @@ impl Body for ProxyRequestBody {
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Streaming(body) => body.size_hint(),
+            Self::Streaming { body, .. } => body.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
             Self::Replay { data, .. } => {
                 SizeHint::with_exact(data.as_ref().map_or(0, |data| data.len() as u64))
@@ -141,16 +182,16 @@ impl std::error::Error for BufferRequestError {
 pub(crate) async fn buffer_for_replay(
     mut body: Incoming,
     max_bytes: u64,
+    trailer_guard: &RequestTrailerGuard,
 ) -> Result<ReplayBody, BufferRequestError> {
     use http_body_util::BodyExt as _;
 
     let mut data = BytesMut::new();
     let mut trailers = None;
-    while let Some(frame) = body
-        .frame()
-        .await
-        .transpose()
-        .map_err(|error| BufferRequestError::Body(Box::new(error)))?
+    while let Some(frame) =
+        body.frame().await.transpose().map_err(|error| {
+            BufferRequestError::Body(Box::new(DownstreamRequestBodyError(error)))
+        })?
     {
         let frame = match frame.into_data() {
             Ok(chunk) => {
@@ -163,10 +204,13 @@ pub(crate) async fn buffer_for_replay(
             }
             Err(frame) => frame,
         };
-        if let Ok(frame_trailers) = frame.into_trailers()
-            && trailers.replace(frame_trailers).is_some()
-        {
-            return Err(BufferRequestError::MultipleTrailerFrames);
+        if let Ok(frame_trailers) = frame.into_trailers() {
+            trailer_guard
+                .validate(&frame_trailers)
+                .map_err(|error| BufferRequestError::Body(Box::new(error)))?;
+            if trailers.replace(frame_trailers).is_some() {
+                return Err(BufferRequestError::MultipleTrailerFrames);
+            }
         }
     }
     Ok(ReplayBody {

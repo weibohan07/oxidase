@@ -76,6 +76,96 @@ impl TrailerDeclaration {
     }
 }
 
+/// Validates trailer frames received from an untrusted downstream request.
+///
+/// HTTP/1 request trailers must match the initial `Trailer` declaration. HTTP/2
+/// does not require that declaration, but both protocols reject framing,
+/// routing, and connection-nominated fields in a trailer frame.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestTrailerGuard {
+    protocol: WireProtocol,
+    requires_declaration: bool,
+    declaration: Option<TrailerDeclaration>,
+    connection_nominated: Vec<HeaderName>,
+}
+
+impl RequestTrailerGuard {
+    pub(crate) fn from_request_headers(
+        protocol: WireProtocol,
+        headers: &HeaderMap,
+    ) -> Result<Self, TrailerValidationError> {
+        let mut connection_nominated = connection_nominated_headers(headers)
+            .map_err(|_| TrailerValidationError::InvalidConnectionValue)?;
+        connection_nominated.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        connection_nominated.dedup();
+        let declaration = TrailerDeclaration::parse(headers)?;
+        if connection_nominated
+            .binary_search_by(|name| name.as_str().cmp(header::TRAILER.as_str()))
+            .is_ok()
+            || declaration.as_ref().is_some_and(|declaration| {
+                declaration.names.iter().any(|name| {
+                    connection_nominated
+                        .binary_search_by(|candidate| candidate.as_str().cmp(name.as_str()))
+                        .is_ok()
+                })
+            })
+        {
+            return Err(TrailerValidationError::ForbiddenField(header::TRAILER));
+        }
+        Ok(Self {
+            protocol,
+            requires_declaration: protocol == WireProtocol::Http1,
+            declaration,
+            connection_nominated,
+        })
+    }
+
+    /// Returns the request guard for the selected upstream wire protocol.
+    /// HTTP/2 permits undeclared trailers, but HTTP/1 encoders cannot preserve
+    /// their field names unless the initial request declared them.
+    pub(crate) fn for_upstream(&self, protocol: WireProtocol) -> Self {
+        let mut guard = self.clone();
+        guard.requires_declaration |= protocol == WireProtocol::Http1;
+        guard
+    }
+
+    pub(crate) fn forwarded_declaration(&self) -> Option<HeaderValue> {
+        self.declaration
+            .as_ref()
+            .map(TrailerDeclaration::normalized_value)
+    }
+
+    pub(crate) fn validate(&self, trailers: &HeaderMap) -> Result<(), TrailerValidationError> {
+        if trailers.is_empty() {
+            return Ok(());
+        }
+        for name in trailers.keys() {
+            if is_forbidden_trailer_field(name)
+                || self
+                    .connection_nominated
+                    .binary_search_by(|candidate| candidate.as_str().cmp(name.as_str()))
+                    .is_ok()
+            {
+                return Err(TrailerValidationError::ForbiddenField(name.clone()));
+            }
+        }
+        if self.protocol == WireProtocol::Http2 && !self.requires_declaration {
+            return Ok(());
+        }
+        let Some(declaration) = &self.declaration else {
+            return Err(TrailerValidationError::UndeclaredField(
+                trailers.keys().next().cloned().unwrap_or(header::TRAILER),
+            ));
+        };
+        for name in trailers.keys() {
+            if !declaration.contains(name) {
+                return Err(TrailerValidationError::UndeclaredField(name.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Why a trailer declaration or trailer frame cannot cross the selected wire
 /// protocol safely.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,7 +360,42 @@ fn is_forbidden_trailer_field(name: &HeaderName) -> bool {
         || name == header::UPGRADE
         || matches!(
             name.as_str(),
-            "keep-alive" | "proxy-connection" | "proxy-authenticate" | "proxy-authorization"
+            "accept-ranges"
+                | "age"
+                | "authorization"
+                | "cache-control"
+                | "content-disposition"
+                | "content-encoding"
+                | "content-language"
+                | "content-location"
+                | "content-range"
+                | "content-type"
+                | "cookie"
+                | "date"
+                | "etag"
+                | "expect"
+                | "expires"
+                | "forwarded"
+                | "if-match"
+                | "if-modified-since"
+                | "if-none-match"
+                | "if-range"
+                | "if-unmodified-since"
+                | "keep-alive"
+                | "last-modified"
+                | "location"
+                | "max-forwards"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "range"
+                | "retry-after"
+                | "set-cookie"
+                | "vary"
+                | "www-authenticate"
+                | "x-forwarded-for"
+                | "x-forwarded-host"
+                | "x-forwarded-proto"
         )
 }
 
@@ -364,8 +489,8 @@ mod tests {
     use oxidase_core::is_forbidden_user_header;
 
     use super::{
-        HeaderSanitizationError, TrailerDeclaration, TrailerGuard, TrailerValidationError,
-        WireProtocol, http1_accepts_trailers, sanitize_runtime_headers,
+        HeaderSanitizationError, RequestTrailerGuard, TrailerDeclaration, TrailerGuard,
+        TrailerValidationError, WireProtocol, http1_accepts_trailers, sanitize_runtime_headers,
     };
 
     #[test]
@@ -395,6 +520,21 @@ mod tests {
             "upgrade",
             "host",
             "keep-alive",
+            "authorization",
+            "cookie",
+            "set-cookie",
+            "www-authenticate",
+            "content-type",
+            "content-encoding",
+            "content-range",
+            "cache-control",
+            "location",
+            "range",
+            "vary",
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -416,6 +556,59 @@ mod tests {
             TrailerDeclaration::parse(&malformed),
             Err(TrailerValidationError::InvalidDeclarationName)
         );
+    }
+
+    #[test]
+    fn request_and_response_trailers_cannot_modify_auth_or_representation_metadata() {
+        for name in [
+            "authorization",
+            "set-cookie",
+            "content-type",
+            "cache-control",
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+        ] {
+            let name = HeaderName::from_bytes(name.as_bytes()).expect("fixture name is valid");
+            let mut trailers = HeaderMap::new();
+            trailers.insert(name.clone(), HeaderValue::from_static("late"));
+
+            let request_guard =
+                RequestTrailerGuard::from_request_headers(WireProtocol::Http2, &HeaderMap::new())
+                    .expect("empty HTTP/2 request declaration is valid");
+            assert_eq!(
+                request_guard.validate(&trailers),
+                Err(TrailerValidationError::ForbiddenField(name.clone()))
+            );
+            assert_eq!(
+                TrailerGuard::new(WireProtocol::Http2, false, None).validate(&trailers),
+                Err(TrailerValidationError::ForbiddenField(name))
+            );
+        }
+    }
+
+    #[test]
+    fn http2_to_http1_request_trailers_require_an_initial_declaration() {
+        let source =
+            RequestTrailerGuard::from_request_headers(WireProtocol::Http2, &HeaderMap::new())
+                .expect("empty HTTP/2 declaration is valid");
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        assert!(source.validate(&trailers).is_ok());
+        assert_eq!(
+            source.for_upstream(WireProtocol::Http1).validate(&trailers),
+            Err(TrailerValidationError::UndeclaredField(
+                HeaderName::from_static("grpc-status")
+            ))
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::TRAILER, HeaderValue::from_static("grpc-status"));
+        let declared = RequestTrailerGuard::from_request_headers(WireProtocol::Http2, &headers)
+            .expect("HTTP/2 request declaration is valid")
+            .for_upstream(WireProtocol::Http1);
+        assert!(declared.validate(&trailers).is_ok());
     }
 
     #[test]

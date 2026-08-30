@@ -20,6 +20,7 @@ rustls-webpki.workspace = true
 serde.workspace = true
 tokio.workspace = true
 url.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

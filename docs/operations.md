@@ -182,9 +182,13 @@ retry amplification from creating another queue. See
 [`configuration/clusters.md`](configuration/clusters.md) for the complete contract.
 
 Compatible endpoint health/counter state is reused across reload only when Cluster
-ID, endpoint name, canonical URL, and upstream protocol all match. Candidate prepare
-does not start a supervisor. Removed Cluster supervisors stop after old pinned
-snapshots release them; URL/protocol changes receive fresh endpoint state.
+ID, endpoint name, canonical URL, upstream protocol, and the complete health policy
+match. A health-policy change creates a new health generation so a supervisor held
+by an old pinned snapshot cannot write the new policy's state. The endpoint admission
+counter remains shared across that generation boundary, so old requests continue to
+count toward the new per-endpoint limit. Candidate prepare does not start a
+supervisor. Removed Cluster supervisors stop after old pinned snapshots release
+them; URL/protocol changes receive fresh endpoint and admission state.
 
 ## Asset request order
 

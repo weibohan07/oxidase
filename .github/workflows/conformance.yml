@@ -1,0 +1,94 @@
+name: External conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Pinned external suite to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - h2spec
+          - autobahn
+          - tlsfuzzer
+          - httpwookiee
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Conformance (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(inputs.suite == 'all' && '["h2spec","autobahn","tlsfuzzer","httpwookiee"]' || format('["{0}"]', inputs.suite)) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        if: matrix.suite == 'h2spec'
+        with:
+          go-version: 1.24.6
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: 3.12.11
+      - name: Record tested revision
+        run: |
+          mkdir -p conformance-results
+          git rev-parse HEAD > conformance-results/commit.txt
+          printf '%s\n' '${{ matrix.suite }}' > conformance-results/suite.txt
+          {
+            uname -a
+            rustc -Vv
+            cargo -V
+            python3 --version
+            docker version --format '{{json .Server}}' || true
+            go version || true
+          } > conformance-results/environment.txt 2>&1
+      - name: Fetch and verify pinned tools
+        run: tools/conformance/fetch.sh "$RUNNER_TEMP/oxidase-conformance-tools"
+      - name: Preserve source checksums
+        run: |
+          cp "$RUNNER_TEMP/oxidase-conformance-tools/downloads/"* conformance-results/
+          sha256sum conformance-results/*.tar.gz conformance-results/*.whl \
+            > conformance-results/sources.sha256
+      - name: Build Oxidase fixture
+        run: cargo build --workspace --release --locked
+      - name: Start loopback fixture
+        run: |
+          target/release/oxidase serve tools/conformance/fixture/oxidase.yaml \
+            >conformance-results/oxidase.log 2>&1 &
+          echo "$!" > conformance-results/oxidase.pid
+          python3 tools/conformance/wait-for-ports.py 18080 18081 18443
+      - name: Run h2spec
+        if: matrix.suite == 'h2spec'
+        run: tools/conformance/run-h2spec.sh "$RUNNER_TEMP/oxidase-conformance-tools" conformance-results
+      - name: Run Autobahn WebSocket transport suite
+        if: matrix.suite == 'autobahn'
+        run: tools/conformance/run-autobahn.sh conformance-results
+      - name: Run tlsfuzzer interoperability subset
+        if: matrix.suite == 'tlsfuzzer'
+        run: tools/conformance/run-tlsfuzzer.sh "$RUNNER_TEMP/oxidase-conformance-tools" conformance-results
+      - name: Run HTTPWookiee reverse-proxy corpus
+        if: matrix.suite == 'httpwookiee'
+        run: tools/conformance/run-httpwookiee.sh "$RUNNER_TEMP/oxidase-conformance-tools" conformance-results
+      - name: Stop fixture
+        if: always()
+        run: |
+          if test -f conformance-results/oxidase.pid; then
+            kill "$(cat conformance-results/oxidase.pid)" || true
+          fi
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: conformance-${{ matrix.suite }}-${{ github.sha }}
+          path: conformance-results/
+          if-no-files-found: error

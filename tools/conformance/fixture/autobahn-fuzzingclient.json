@@ -1,0 +1,12 @@
+{
+  "outdir": "/reports",
+  "servers": [
+    {
+      "agent": "oxidase-http1-upgrade",
+      "url": "ws://host.docker.internal:18081/"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": ["9.*", "12.*", "13.*"],
+  "exclude-agent-cases": {}
+}

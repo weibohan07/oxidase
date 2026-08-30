@@ -982,7 +982,7 @@ fn push_counter(output: &mut String, name: &str, value: u64) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     use http::StatusCode;
@@ -1219,6 +1219,60 @@ listeners:
             output.contains("oxidase_active_connections{listener=\"public\",protocol=\"h2\"} 0")
         );
         assert!(output.contains("oxidase_http2_active_streams{listener=\"public\"} 0"));
+    }
+
+    #[test]
+    fn concurrent_transport_guard_drop_is_exact_and_cancellation_safe() {
+        const WORKERS: usize = 32;
+
+        let metrics = Arc::new(Metrics::default());
+        let transport = metrics.listener_transport("concurrent");
+        let all_active = Arc::new(Barrier::new(WORKERS + 1));
+        let release = Arc::new(Barrier::new(WORKERS + 1));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let transport = transport.clone();
+                let all_active = Arc::clone(&all_active);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    let connection = transport.connection_accepted(ConnectionProtocol::Http2);
+                    let stream = transport.h2_stream_started();
+                    let tunnel = transport.tunnel_started();
+                    all_active.wait();
+                    release.wait();
+                    drop(tunnel);
+                    drop(stream);
+                    drop(connection);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        all_active.wait();
+        let output = metrics.render_prometheus();
+        assert!(output.contains(&format!(
+            "oxidase_active_connections{{listener=\"concurrent\",protocol=\"h2\"}} {WORKERS}"
+        )));
+        assert!(output.contains(&format!(
+            "oxidase_http2_active_streams{{listener=\"concurrent\"}} {WORKERS}"
+        )));
+        assert!(output.contains(&format!(
+            "oxidase_active_tunnels{{listener=\"concurrent\"}} {WORKERS}"
+        )));
+
+        release.wait();
+        for worker in workers {
+            worker.join().expect("transport worker does not panic");
+        }
+        let output = metrics.render_prometheus();
+        assert!(
+            output
+                .contains("oxidase_active_connections{listener=\"concurrent\",protocol=\"h2\"} 0")
+        );
+        assert!(output.contains("oxidase_http2_active_streams{listener=\"concurrent\"} 0"));
+        assert!(output.contains("oxidase_active_tunnels{listener=\"concurrent\"} 0"));
+        assert!(output.contains(&format!(
+            "oxidase_tunnel_terminations_total{{listener=\"concurrent\",reason=\"cancelled\"}} {WORKERS}"
+        )));
     }
 
     #[test]

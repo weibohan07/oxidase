@@ -364,7 +364,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -528,6 +528,49 @@ mod tests {
             output.contains("oxidase_response_body_terminations_total{reason=\"cancelled\"} 1")
         );
         assert!(output.contains("oxidase_active_requests 0"));
+    }
+
+    #[test]
+    fn concurrent_body_cancellation_releases_every_request_guard_once() {
+        const WORKERS: usize = 32;
+
+        let metrics = Arc::new(Metrics::default());
+        let all_active = Arc::new(Barrier::new(WORKERS + 1));
+        let release = Arc::new(Barrier::new(WORKERS + 1));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                let all_active = Arc::clone(&all_active);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    let active = metrics.request_started();
+                    let response = instrument_response_body(
+                        Response::new(full_body(Bytes::from_static(b"not-polled"))),
+                        Arc::clone(&metrics),
+                        active,
+                    );
+                    all_active.wait();
+                    release.wait();
+                    drop(response);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        all_active.wait();
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains(&format!("oxidase_active_requests {WORKERS}"))
+        );
+        release.wait();
+        for worker in workers {
+            worker.join().expect("body worker does not panic");
+        }
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_active_requests 0"));
+        assert!(output.contains(&format!(
+            "oxidase_response_body_terminations_total{{reason=\"cancelled\"}} {WORKERS}"
+        )));
     }
 
     #[tokio::test]
