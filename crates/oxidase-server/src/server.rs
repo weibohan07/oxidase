@@ -401,7 +401,7 @@ impl ReloadHandle {
             if let Some(delay) = preparation_delay {
                 std::thread::sleep(delay);
             }
-            let gateway = match oxidase_config::Compiler::compile_path(path) {
+            let mut gateway = match oxidase_config::Compiler::compile_path(path) {
                 Ok(gateway) => gateway,
                 Err(error) => {
                     let dependencies = error.discovered_dependencies;
@@ -412,15 +412,18 @@ impl ReloadHandle {
                 }
             };
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
+            let warnings = std::mem::take(&mut gateway.warnings);
             match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
-                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies)),
+                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies, warnings)),
                 Err(error) => {
                     let mut dependencies = attempt_dependencies;
                     dependencies.extend(error.candidate_dependencies.iter().cloned());
                     dependencies.sort();
                     dependencies.dedup();
+                    let mut diagnostics = warnings;
+                    diagnostics.extend(error.into_diagnostics());
                     Err((
-                        ServerError::Reload(ReloadError::new(error.into_diagnostics())),
+                        ServerError::Reload(ReloadError::new(diagnostics)),
                         dependencies,
                     ))
                 }
@@ -428,7 +431,7 @@ impl ReloadHandle {
         })
         .await
         .map_err(|error| ServerError::Task(format!("reload compiler worker failed: {error}")))?;
-        let (snapshot, reuse, attempt_dependencies) = match prepared {
+        let (snapshot, reuse, attempt_dependencies, warnings) = match prepared {
             Ok(prepared) => prepared,
             Err((error, dependencies)) => {
                 self.record_attempt_dependencies(dependencies);
@@ -446,7 +449,8 @@ impl ReloadHandle {
             })
             .await
             .map_err(|_| ServerError::ControlClosed)?;
-        let report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        let mut report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        report.warnings = warnings;
         self.record_published_dependencies(published_dependencies);
         Ok(report)
     }
@@ -562,6 +566,8 @@ pub struct ReloadReport {
     pub listeners_removed: Vec<String>,
     pub listeners_retained: Vec<String>,
     pub local_addresses: Vec<(String, SocketAddr)>,
+    /// Non-fatal diagnostics emitted while compiling this committed candidate.
+    pub warnings: Vec<Diagnostic>,
 }
 
 fn start_listener(
@@ -714,6 +720,7 @@ async fn apply_reload(
             .iter()
             .map(|(name, listener)| (name.clone(), listener.local_address))
             .collect(),
+        warnings: Vec::new(),
     })
 }
 
@@ -4110,6 +4117,68 @@ listeners:
             .expect("removed listener drains");
         assert_eq!(removed.listeners_removed, vec!["extra"]);
         assert!(request(address, "/", "").await.ends_with("four"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn successful_reload_reports_non_fatal_compiler_warnings() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "old", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+      retry:
+        max_attempts: 2
+        methods: [POST]
+        retry_on: [connect_failure]
+services:
+  root:
+    type: respond
+    body:
+      text: warning-committed
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("warning candidate can be written");
+
+        let report = running
+            .reload_path(&config)
+            .await
+            .expect("warning does not reject reload");
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "resource.cluster_retry_post");
+        assert_eq!(
+            report.warnings[0].primary.field_path,
+            "resources.clusters.api.retry.methods[0]"
+        );
+        assert!(
+            request(address, "/", "")
+                .await
+                .ends_with("warning-committed")
+        );
+
         running.shutdown().await.expect("gateway shuts down");
     }
 

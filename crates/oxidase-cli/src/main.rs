@@ -72,7 +72,7 @@ async fn main() {
     let root = DiagnosticRoot::for_config(cli.config_path());
     let reporter = Reporter::new(format);
     let (diagnostics, failed, stdout_payload) = match run(cli, &reporter).await {
-        Ok(success) => (Vec::new(), false, success.stdout_payload),
+        Ok(success) => (success.diagnostics, false, success.stdout_payload),
         Err(failure) => (failure.diagnostics, true, false),
     };
     if !(format == DiagnosticFormat::Json && stdout_payload)
@@ -101,6 +101,16 @@ impl Cli {
 #[derive(Debug, Default)]
 struct RunSuccess {
     stdout_payload: bool,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl RunSuccess {
+    fn with_diagnostics(diagnostics: Vec<Diagnostic>) -> Self {
+        Self {
+            stdout_payload: false,
+            diagnostics,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,6 +123,16 @@ impl CliFailure {
         Self {
             diagnostics: vec![diagnostic],
         }
+    }
+
+    fn with_prior(mut self, prior: &[Diagnostic]) -> Self {
+        if prior.is_empty() {
+            return self;
+        }
+        let mut diagnostics = prior.to_vec();
+        diagnostics.append(&mut self.diagnostics);
+        self.diagnostics = diagnostics;
+        self
     }
 }
 
@@ -127,7 +147,10 @@ impl From<oxidase_config::CompileError> for CliFailure {
 async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
     match cli.command {
         Command::Check { config } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             reporter.human_stdout(format!(
                 "configuration {} is valid: {} listener(s), {} service node(s), {} resource(s)",
                 gateway.config_version,
@@ -137,14 +160,16 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     + gateway.resources.clusters.len()
                     + gateway.resources.sites.len()
             ));
-            Ok(RunSuccess::default())
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Explain {
             config,
             request,
             listener,
         } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway, ..
+            } = prepare_snapshot(&config)?;
             let request_source =
                 Compiler::parse_request_file(&request).map_err(CliFailure::from)?;
             let output = explain(&gateway, listener.as_deref(), &request_source, &request).await?;
@@ -159,10 +184,14 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
             println!("{output}");
             Ok(RunSuccess {
                 stdout_payload: true,
+                diagnostics: Vec::new(),
             })
         }
         Command::Compile { config, output } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             let manifest = CompilationManifest {
                 format: "oxidase.snapshot-manifest/v1",
                 summary: gateway.summary().clone(),
@@ -174,6 +203,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &config,
                     "compile.output",
                 ))
+                .with_prior(&warnings)
             })?;
             std::fs::write(&output, manifest).map_err(|error| {
                 CliFailure::one(diagnostic_at(
@@ -185,20 +215,29 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &output,
                     "compile.output",
                 ))
+                .with_prior(&warnings)
             })?;
-            Ok(RunSuccess::default())
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Test { config } => {
-            let gateway = prepare_snapshot(&config)?;
-            run_config_tests(&gateway, &config, reporter).await?;
-            Ok(RunSuccess::default())
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
+            run_config_tests(&gateway, &config, reporter)
+                .await
+                .map_err(|failure| failure.with_prior(&warnings))?;
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Serve {
             config,
             watch,
             admin_bind,
         } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             let listener_protocols = gateway
                 .listeners
                 .iter()
@@ -216,14 +255,17 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                         .unwrap_or_else(|_| "oxidase=info".into()),
                 )
                 .try_init();
+            trace_compile_warnings(&warnings);
             let mut server = oxidase_server::GatewayServer::bind(gateway)
                 .await
-                .map_err(server_failure)?;
+                .map_err(server_failure)
+                .map_err(|failure| failure.with_prior(&warnings))?;
             if let Some(admin_bind) = admin_bind {
                 server = server
                     .with_admin_listener(admin_bind)
                     .await
-                    .map_err(server_failure)?;
+                    .map_err(server_failure)
+                    .map_err(|failure| failure.with_prior(&warnings))?;
             }
             for (name, address) in server.local_addresses() {
                 let protocol = listener_protocols
@@ -250,6 +292,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &config,
                     "serve.signal",
                 ))
+                .with_prior(&warnings)
             })?;
             let _ = stop_watcher.send(true);
             if let Some(watcher) = watcher {
@@ -260,10 +303,15 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                         &config,
                         "serve.watch",
                     ))
+                    .with_prior(&warnings)
                 })?;
             }
-            running.shutdown().await.map_err(server_failure)?;
-            Ok(RunSuccess::default())
+            running
+                .shutdown()
+                .await
+                .map_err(server_failure)
+                .map_err(|failure| failure.with_prior(&warnings))?;
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
     }
 }
@@ -285,11 +333,32 @@ fn listener_protocol_label(protocol: ListenerProtocol, versions: &[HttpVersion])
     }
 }
 
-fn prepare_snapshot(config: &Path) -> Result<RuntimeSnapshot, CliFailure> {
-    let gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
-    RuntimeSnapshot::prepare(gateway).map_err(|error| CliFailure {
-        diagnostics: error.into_diagnostics(),
-    })
+struct PreparedSnapshot {
+    snapshot: RuntimeSnapshot,
+    warnings: Vec<Diagnostic>,
+}
+
+fn prepare_snapshot(config: &Path) -> Result<PreparedSnapshot, CliFailure> {
+    let mut gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
+    let warnings = std::mem::take(&mut gateway.warnings);
+    let snapshot = RuntimeSnapshot::prepare(gateway).map_err(|error| {
+        CliFailure {
+            diagnostics: error.into_diagnostics(),
+        }
+        .with_prior(&warnings)
+    })?;
+    Ok(PreparedSnapshot { snapshot, warnings })
+}
+
+fn trace_compile_warnings(warnings: &[Diagnostic]) {
+    for warning in warnings {
+        tracing::warn!(
+            diagnostic_code = warning.code,
+            field_path = %warning.primary.field_path,
+            message = %warning.message,
+            "configuration compiled with a warning"
+        );
+    }
 }
 
 fn server_failure(error: oxidase_server::ServerError) -> CliFailure {
@@ -754,6 +823,7 @@ async fn watch_dependencies_with_timing(
                 let before_attempt = dependency_stamp(&dependencies_before).await;
                 match reload.reload_path(&config).await {
                     Ok(report) => {
+                        trace_compile_warnings(&report.warnings);
                         tracing::info!(
                             previous_version = report.previous_version,
                             current_version = report.current_version,
@@ -825,12 +895,53 @@ mod tests {
     use std::time::Duration;
 
     use oxidase_config::{Compiler, HttpVersion, ListenerProtocol};
-    use oxidase_core::{RespondBody, ServiceKind};
+    use oxidase_core::{DiagnosticSeverity, RespondBody, ServiceKind};
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{listener_protocol_label, watch_dependencies_with_timing};
+    use super::{listener_protocol_label, prepare_snapshot, watch_dependencies_with_timing};
+
+    #[test]
+    fn snapshot_preparation_preserves_non_fatal_compiler_warnings() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+      retry:
+        max_attempts: 2
+        methods: [POST]
+        retry_on: [connect_failure]
+services:
+  root:
+    type: respond
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("warning fixture can be written");
+
+        let prepared = prepare_snapshot(&config).expect("warning does not reject preparation");
+        assert_eq!(prepared.warnings.len(), 1);
+        assert_eq!(prepared.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(prepared.warnings[0].code, "resource.cluster_retry_post");
+        assert_eq!(
+            prepared.warnings[0].primary.field_path,
+            "resources.clusters.api.retry.methods[0]"
+        );
+        assert_eq!(prepared.snapshot.resources.clusters.len(), 1);
+    }
 
     #[test]
     fn listener_protocol_labels_describe_cleartext_and_tls_alpn() {
