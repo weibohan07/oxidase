@@ -570,10 +570,14 @@ fn admission_failure(
 fn retry_allows_failure(retry: &RetrySpec, failure: AttemptFailure) -> bool {
     failure
         .retry_cause()
-        .is_some_and(|cause| retry.retry_on.contains(&cause))
+        .is_some_and(|cause| retry_allows_cause(retry, cause))
 }
 
-fn retry_allows_status(retry: &RetrySpec, status: StatusCode) -> bool {
+pub(crate) fn retry_allows_cause(retry: &RetrySpec, cause: RetryCause) -> bool {
+    retry.retry_on.contains(&cause)
+}
+
+pub(crate) fn retry_allows_status(retry: &RetrySpec, status: StatusCode) -> bool {
     retry
         .statuses
         .iter()

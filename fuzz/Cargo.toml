@@ -8,10 +8,15 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
+http = "1"
 libfuzzer-sys = "0.4"
+oxidase-cli = { path = "../crates/oxidase-cli", features = ["fuzzing"] }
 oxidase-config = { path = "../crates/oxidase-config" }
 oxidase-core = { path = "../crates/oxidase-core" }
+oxidase-runtime = { path = "../crates/oxidase-runtime" }
+oxidase-server = { path = "../crates/oxidase-server", features = ["fuzzing"] }
 oxidase-site = { path = "../crates/oxidase-site" }
+serde_json = "1"
 tempfile = "3"
 
 [[bin]]
@@ -58,6 +63,34 @@ bench = false
 [[bin]]
 name = "site_path"
 path = "fuzz_targets/site_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_config"
+path = "fuzz_targets/transport_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cluster_runtime"
+path = "fuzz_targets/cluster_runtime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_boundary"
+path = "fuzz_targets/protocol_boundary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diagnostic_json"
+path = "fuzz_targets/diagnostic_json.rs"
 test = false
 doc = false
 bench = false

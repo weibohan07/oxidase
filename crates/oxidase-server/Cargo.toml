@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
