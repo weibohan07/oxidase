@@ -1,6 +1,6 @@
 # Operations
 
-Oxidase v0.2 remains an alpha. The current gates exercise the implementation, but
+Oxidase v0.3 remains an alpha. The current gates exercise the implementation, but
 this document does not claim production readiness.
 
 ## Startup and validation
@@ -160,6 +160,32 @@ close, reload with an old pinned tunnel and a new Listener, bounded drain-time a
 non-Proxy 101 isolation, and tunnel metrics. HTTP/2 extended CONNECT, arbitrary
 CONNECT tunnels, h2c Upgrade, and WebTransport are rejected.
 
+## Cluster operation
+
+Prepared Clusters select only eligible endpoints and obtain Cluster plus endpoint
+permits before consuming the request body. A Cluster with no eligible endpoint
+fails as `UpstreamUnavailable`; exhausted or timed-out admission fails as
+`UpstreamOverloaded`. Both have a safe default 503 and remain separately recoverable.
+
+Active health tasks start only after a snapshot commits. They make direct bounded
+requests with their own timeout and never traverse the Service graph or retry.
+Unhealthy endpoints remain probed. Consecutive active successes can restore an
+unhealthy or passively ejected endpoint; passive ejection also expires after its
+configured duration. Client cancellation is not counted as endpoint failure.
+
+Retry is disabled unless `max_attempts` exceeds one and explicit methods plus causes
+or statuses are configured. It ends before a downstream response head, prefers an
+untried eligible endpoint, and never becomes Fallback. Empty bodies are replayable;
+non-empty bodies require `request_body.mode: buffer` and are rejected with 413 when
+they exceed `max_bytes`. The independent retry semaphore is non-waiting, preventing
+retry amplification from creating another queue. See
+[`configuration/clusters.md`](configuration/clusters.md) for the complete contract.
+
+Compatible endpoint health/counter state is reused across reload only when Cluster
+ID, endpoint name, canonical URL, and upstream protocol all match. Candidate prepare
+does not start a supervisor. Removed Cluster supervisors stop after old pinned
+snapshots release them; URL/protocol changes receive fresh endpoint state.
+
 ## Asset request order
 
 For a Site asset, request handling is fixed to this order:
@@ -201,7 +227,8 @@ It serves:
 - `/health/live`: process/event-loop liveness;
 - `/health/ready`: a prepared snapshot with at least one user listener;
 - `/metrics`: Prometheus text with fixed outcome, status-class, latency, active
-  request, and reload counters.
+  request, reload, transport, tunnel, and Cluster counters;
+- `/api/v1/clusters`: deterministic read-only Cluster/endpoint runtime status.
 
 An explicit `Observe` wrapper adds bounded production series:
 
@@ -235,6 +262,14 @@ Dropping an unfinished tunnel guard records `cancelled`, so a drain-time abort d
 not leak the active gauge. Upgrade protocol values and WebSocket application data
 are never labels.
 
+Cluster telemetry uses only configured `cluster`/`endpoint` names and fixed
+protocol, policy, health, and result enums. It includes selection, active requests,
+success/failure, health checks/transitions, passive ejection, retry, and admission
+series. The JSON admin view contains the same conservative names and counters plus
+last transition/ejection remaining. Neither endpoint origins nor request data,
+credentials, certificate material, paths, queries, client addresses, or error
+strings are returned or used as labels.
+
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service
 source values.
@@ -256,6 +291,43 @@ OXIDASE_SOAK_ITERATIONS=1000 cargo test -p oxidase-server \
 It combines one persistent HTTP/1 client, periodic atomic reload, downstream
 cancellation, and an 8 MiB streaming Asset. Treat the output as an observation aid
 for memory/fd monitoring, not as a performance or reliability guarantee.
+
+## Manual regression benchmarks
+
+These ignored/manual entrypoints are local regression tools. They do not run in the
+ordinary test suite, set no CI latency threshold, and are not performance or capacity
+guarantees:
+
+```bash
+# TLS handshakes plus sequential H1 and multiplexed H2 requests (binds loopback)
+cargo test -p oxidase-server --test tls_h2 \
+  tls_http1_http2_smoke_benchmark --release --locked -- --ignored --nocapture
+
+# compiled exact/wildcard/default SNI resolution
+cargo test -p oxidase-runtime sni_resolver_smoke_benchmark \
+  --release --locked -- --ignored --nocapture
+
+# weighted RR, least requests, retry permits, and health transitions
+cargo test -p oxidase-runtime cluster_policy_smoke_benchmark \
+  --release --locked -- --ignored --nocapture
+
+# short path through a large shared ServiceGraph
+cargo run -p oxidase-runtime --example service_program_bench --release --locked
+
+# typed OXT include/render and synthetic Site preparation
+cargo test -p oxidase-site typed_include_render_smoke_benchmark \
+  --release --locked -- --ignored --nocapture
+cargo test -p oxidase-site synthetic_site_preparation_smoke_benchmark \
+  --release --locked -- --ignored --nocapture
+
+# frame-local RequestFrame evaluation caches
+cargo test -p oxidase-core request_evaluation_context_smoke_benchmark \
+  --release --locked -- --ignored --nocapture
+```
+
+Record the exact commit, command, machine, build profile, iteration count, and output
+when using these tools. Compare only like-for-like runs; a one-machine smoke result
+must not be published as a general performance claim.
 
 ## Logging
 

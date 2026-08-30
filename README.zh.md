@@ -26,7 +26,7 @@ Fallback 只在 `Declined` 时继续；HTTP 404 和 500 仍是正常的 Handled 
 overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄弟分支泄漏捕获
 或改写。
 
-## 当前 v0.2 alpha
+## 当前 v0.3 alpha
 
 当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1
 或 HTTP/2 的 HTTPS；所有现有 Service 节点均可在选定协议上运行。Proxy 继续通过
@@ -43,6 +43,13 @@ Cluster 可选择 `auto`、强制 `http1` 或强制 `h2` 的上游连接池。�
 也不实现 gRPC-Web。额外 socket fixture 已验证 HTTP/1 chunked request trailer 转发到
 H2，以及声明过的 H2 response trailer 转发给接受 trailer 的 HTTP/1 client；未声明的
 trailer 会使 stream 失败，而不会被静默丢弃。
+
+Cluster 已是准备完成的运行时 Resource，不再是请求期临时解释的 URL 列表。命名
+endpoint 支持确定性 round robin、平滑 weighted round robin 与加权 least-requests。
+可选主动健康检查与被动摘除决定 endpoint 是否 eligible；Cluster 与 endpoint 两级
+semaphore 会在读取 request body 前执行有界 admission。Retry 默认关闭，只有显式
+method、response head 前的 cause/status，以及空 body 或显式有界 replay buffer 同时
+满足时才会发生。健康状态与计数只在 reload endpoint identity 兼容时复用。
 
 所有 Listener program 共享一张不可变 `ServiceGraph`；普通请求既不复制整图，也
 不收集 explain trace。所有已处理响应统一经过 framing finalizer，Gateway/Oxista
@@ -94,9 +101,11 @@ extended CONNECT、任意 CONNECT、明文 h2c、gRPC-Web、客户端证书认�
 OCSP stapling 与用户自定义 cipher suite 均未实现；OXT `extends/block` 同样不支持。
 
 使用 `serve --watch` 可以启用保留 last-known-good 的原子 reload；通过独立、显式的
-`--admin-bind` 可启用健康检查与有界指标。准确边界见
+`--admin-bind` 可启用健康检查、有界指标与只读 `/api/v1/clusters` 状态。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
-本版本仍是 `0.2.0-alpha`，不宣称 production-ready。
+当前 workspace 版本为 `0.3.0-alpha.1`；Gateway API 仍为
+`oxidase.dev/v1alpha1`，Oxista 仍为 v1。本版本不宣称 production-ready 或 API stable。
+版本变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 运行垂直切片
 
@@ -109,6 +118,8 @@ cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch \
   --admin-bind 127.0.0.1:7590
+cargo run -p oxidase-cli --locked -- \
+  check examples/secure-resilient-gateway/oxidase.yaml
 ```
 
 示例覆盖：
@@ -164,6 +175,13 @@ sequence 以及 literal/folded block scalar。Import/reference cycle 会被检�
 [`docs/configuration/http2.md`](docs/configuration/http2.md)。HTTPS Listener 默认
 `versions: [h2, http1]`；明文 Listener 默认 `http1`，若配置 `h2` 会明确拒绝，而
 不会暗示支持 h2c。
+
+Prepared Cluster 契约见
+[`docs/configuration/clusters.md`](docs/configuration/clusters.md)；协议桥接与 framing
+边界分别记录在 [`gRPC`](docs/protocols/grpc.md) 与
+[`HTTP/1 Upgrade/WebSocket`](docs/protocols/websocket.md)。
+[`secure-resilient-gateway`](examples/secure-resilient-gateway) 示例使用明确标注的
+test-only 证书串联这些能力。
 
 ## CLI
 
