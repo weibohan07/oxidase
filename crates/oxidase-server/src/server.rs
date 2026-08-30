@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,7 +14,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use oxidase_core::{RequestFrame, RequestMetadata, ServiceOutcome};
+use oxidase_core::{Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan};
 use oxidase_runtime::{Executor, ResourceReuse, RuntimeSnapshot, SnapshotStore};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -85,6 +86,7 @@ enum Control {
 struct BoundListener {
     name: String,
     configured_address: SocketAddr,
+    source_span: SourceSpan,
     listener: TcpListener,
     local_address: SocketAddr,
 }
@@ -99,6 +101,7 @@ impl GatewayServer {
                     .map_err(|source| ServerError::Bind {
                         listener: configured.name.clone(),
                         address: configured.bind,
+                        source_span: Box::new(configured.source.clone()),
                         source,
                     })?;
             let local_address =
@@ -106,11 +109,13 @@ impl GatewayServer {
                     .local_addr()
                     .map_err(|source| ServerError::LocalAddress {
                         listener: configured.name.clone(),
+                        source_span: Box::new(configured.source.clone()),
                         source,
                     })?;
             listeners.push(BoundListener {
                 name: configured.name.clone(),
                 configured_address: configured.bind,
+                source_span: configured.source.clone(),
                 listener,
                 local_address,
             });
@@ -131,12 +136,14 @@ impl GatewayServer {
             .map_err(|source| ServerError::Bind {
                 listener: "@admin".to_owned(),
                 address: bind,
+                source_span: Box::new(SourceSpan::synthetic("serve.admin_bind")),
                 source,
             })?;
         let local_address = listener
             .local_addr()
             .map_err(|source| ServerError::LocalAddress {
                 listener: "@admin".to_owned(),
+                source_span: Box::new(SourceSpan::synthetic("serve.admin_bind")),
                 source,
             })?;
         self.admin = Some(BoundAdmin {
@@ -378,9 +385,10 @@ impl ReloadHandle {
             let gateway = match oxidase_config::Compiler::compile_path(path) {
                 Ok(gateway) => gateway,
                 Err(error) => {
+                    let dependencies = error.discovered_dependencies;
                     return Err((
-                        ServerError::Reload(error.to_string()),
-                        error.discovered_dependencies,
+                        ServerError::Reload(ReloadError::new(error.diagnostics)),
+                        dependencies,
                     ));
                 }
             };
@@ -392,7 +400,10 @@ impl ReloadHandle {
                     dependencies.extend(error.candidate_dependencies.iter().cloned());
                     dependencies.sort();
                     dependencies.dedup();
-                    Err((ServerError::Reload(error.to_string()), dependencies))
+                    Err((
+                        ServerError::Reload(ReloadError::new(error.into_diagnostics())),
+                        dependencies,
+                    ))
                 }
             }
         })
@@ -607,17 +618,20 @@ async fn apply_reload(
                 .map_err(|source| ServerError::Bind {
                     listener: configured.name.clone(),
                     address: configured.bind,
+                    source_span: Box::new(configured.source.clone()),
                     source,
                 })?;
         let local_address = listener
             .local_addr()
             .map_err(|source| ServerError::LocalAddress {
                 listener: configured.name.clone(),
+                source_span: Box::new(configured.source.clone()),
                 source,
             })?;
         prepared.push(BoundListener {
             name: configured.name.clone(),
             configured_address: configured.bind,
+            source_span: configured.source.clone(),
             listener,
             local_address,
         });
@@ -894,6 +908,7 @@ async fn run_listener(
                     Err(source) => {
                         accept_error = Some(ServerError::Accept {
                             listener: listener.name.clone(),
+                            source_span: Box::new(listener.source_span.clone()),
                             source,
                         });
                         break;
@@ -1137,24 +1152,62 @@ fn safe_response(
     ResponseFinalizer::new(method).finalize(response)
 }
 
+#[derive(Debug, Clone)]
+pub struct ReloadError {
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl ReloadError {
+    fn new(diagnostics: Vec<Diagnostic>) -> Self {
+        Self { diagnostics }
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    #[must_use]
+    pub fn into_diagnostics(self) -> Vec<Diagnostic> {
+        self.diagnostics
+    }
+}
+
+impl fmt::Display for ReloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if index > 0 {
+                writeln!(formatter)?;
+            }
+            write!(formatter, "{diagnostic}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ReloadError {}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("cannot bind listener `{listener}` to {address}: {source}")]
     Bind {
         listener: String,
         address: SocketAddr,
+        source_span: Box<SourceSpan>,
         #[source]
         source: std::io::Error,
     },
     #[error("cannot read local address for listener `{listener}`: {source}")]
     LocalAddress {
         listener: String,
+        source_span: Box<SourceSpan>,
         #[source]
         source: std::io::Error,
     },
     #[error("listener `{listener}` failed while accepting a connection: {source}")]
     Accept {
         listener: String,
+        source_span: Box<SourceSpan>,
         #[source]
         source: std::io::Error,
     },
@@ -1163,9 +1216,71 @@ pub enum ServerError {
     #[error("cannot initialize HTTP data plane: {0}")]
     DataPlane(String),
     #[error("reload failed: {0}")]
-    Reload(String),
+    Reload(#[source] ReloadError),
     #[error("server control channel is closed")]
     ControlClosed,
+}
+
+impl ServerError {
+    /// Produces renderer-neutral diagnostics for command-line and management
+    /// boundaries without flattening reload compiler errors into one string.
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        match self {
+            Self::Bind {
+                listener,
+                address,
+                source_span,
+                source,
+            } => vec![Diagnostic::new(
+                "server.listener_bind",
+                format!("cannot bind listener `{listener}` to {address}: {source}"),
+                source_span.as_ref().clone(),
+            )],
+            Self::LocalAddress {
+                listener,
+                source_span,
+                source,
+            } => vec![Diagnostic::new(
+                "server.listener_local_address",
+                format!("cannot read local address for listener `{listener}`: {source}"),
+                source_span.as_ref().clone(),
+            )],
+            Self::Accept {
+                listener,
+                source_span,
+                source,
+            } => vec![Diagnostic::new(
+                "server.listener_accept",
+                format!("listener `{listener}` failed while accepting a connection: {source}"),
+                source_span.as_ref().clone(),
+            )],
+            Self::Task(message) => vec![Diagnostic::new(
+                "server.task",
+                message.clone(),
+                SourceSpan::synthetic("server.task"),
+            )],
+            Self::DataPlane(message) => vec![Diagnostic::new(
+                "server.data_plane",
+                message.clone(),
+                SourceSpan::synthetic("server.data_plane"),
+            )],
+            Self::Reload(error) => error.diagnostics().to_vec(),
+            Self::ControlClosed => vec![Diagnostic::new(
+                "server.control_closed",
+                "server control channel is closed",
+                SourceSpan::synthetic("server.control"),
+            )],
+        }
+    }
+
+    #[must_use]
+    pub fn into_diagnostics(self) -> Vec<Diagnostic> {
+        match self {
+            Self::Reload(error) => error.into_diagnostics(),
+            error => error.diagnostics(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1183,12 +1298,29 @@ mod tests {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use oxidase_config::Compiler;
+    use oxidase_core::SourceSpan;
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{oneshot, watch};
 
-    use super::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayServer, http1_builder};
+    use super::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayServer, ServerError, http1_builder};
+
+    #[test]
+    fn listener_errors_expose_stable_structured_diagnostics() {
+        let error = ServerError::Bind {
+            listener: "public".to_owned(),
+            address: "127.0.0.1:8443".parse().expect("fixture address is valid"),
+            source_span: Box::new(SourceSpan::synthetic("listeners[0].bind")),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "already in use"),
+        };
+
+        let diagnostics = error.into_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "server.listener_bind");
+        assert_eq!(diagnostics[0].primary.field_path, "listeners[0].bind");
+        assert!(diagnostics[0].message.contains("public"));
+    }
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
         raw_request(
@@ -2911,7 +3043,14 @@ listeners:
             "api_version: oxidase.dev/v1alpha1\nkind: gateway\nunknown: true\n",
         )
         .expect("invalid config can be written");
-        assert!(running.reload_path(&config).await.is_err());
+        let error = running
+            .reload_path(&config)
+            .await
+            .expect_err("invalid reload must be rejected");
+        let diagnostics = error.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "source.parse");
+        assert_eq!(diagnostics[0].primary.line, 3);
         assert_eq!(
             running
                 .reload_handle()
