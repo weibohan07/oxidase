@@ -10,7 +10,8 @@ pub use executor::{
     TraceEvent, TraceSink,
 };
 pub use snapshot::{
-    PreparationError, ResourceRegistry, ResourceReuse, RuntimeSnapshot, SnapshotStore,
+    PreparationError, PreparationErrorKind, ResourceRegistry, ResourceReuse, RuntimeSnapshot,
+    SnapshotStore,
 };
 
 pub const RUNTIME_FORMAT_VERSION: u32 = 1;

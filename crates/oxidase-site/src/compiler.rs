@@ -8,12 +8,12 @@ use std::time::{Duration, SystemTime};
 
 use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{
-    CompiledTemplate, ContentDigest, ContentDigestBuilder, ContentHasher, Expression, ResourceId,
-    SourceSpan, Value, is_forbidden_user_header,
+    CompiledTemplate, ContentDigest, ContentDigestBuilder, ContentHasher, Diagnostic,
+    DiagnosticReference, Expression, ResourceId, SourceSpan, Value, is_forbidden_user_header,
 };
 use walkdir::WalkDir;
 
-use oxidase_source::FieldSpanIndex;
+use oxidase_source::{FieldSpanIndex, field_path_child};
 
 use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
@@ -27,6 +27,73 @@ use crate::source::{
 };
 use crate::template::{CompiledOxt, CompiledValue, TemplateLimits, normalize_template_name};
 use crate::{RESPONSE_API_VERSION, SITE_API_VERSION, TEMPLATE_API_VERSION};
+
+#[derive(Debug, Clone, Copy)]
+struct SourceLocator<'a> {
+    path: &'a Path,
+    spans: Option<&'a FieldSpanIndex>,
+}
+
+impl<'a> SourceLocator<'a> {
+    const fn new(path: &'a Path, spans: Option<&'a FieldSpanIndex>) -> Self {
+        Self { path, spans }
+    }
+
+    fn value(self, field_path: &str) -> SourceSpan {
+        self.span(field_path, false)
+    }
+
+    fn key(self, field_path: &str) -> SourceSpan {
+        self.span(field_path, true)
+    }
+
+    fn span(self, field_path: &str, use_key: bool) -> SourceSpan {
+        let range = self
+            .spans
+            .and_then(|spans| spans.nearest(field_path))
+            .map(|field| if use_key { &field.key } else { &field.value });
+        let Some(range) = range else {
+            return SourceSpan {
+                file: self.path.to_path_buf(),
+                start_byte: 0,
+                end_byte: 0,
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                field_path: field_path.to_owned(),
+            };
+        };
+        SourceSpan {
+            file: self.path.to_path_buf(),
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            line: range.start_line,
+            column: range.start_column,
+            end_line: range.end_line,
+            end_column: range.end_column,
+            field_path: field_path.to_owned(),
+        }
+    }
+
+    fn error(
+        self,
+        code: &'static str,
+        field_path: &str,
+        message: impl Into<String>,
+    ) -> SiteCompileError {
+        SiteCompileError::at(code, self.value(field_path), message)
+    }
+
+    fn key_error(
+        self,
+        code: &'static str,
+        field_path: &str,
+        message: impl Into<String>,
+    ) -> SiteCompileError {
+        SiteCompileError::at(code, self.key(field_path), message)
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct SiteCompiler;
@@ -140,10 +207,7 @@ impl SiteCompiler {
         track_candidate(&mut dependencies, &manifest);
         scan_site_source(&root, &manifest, &mut dependencies).map_err(|error| {
             normalize_paths(&mut dependencies);
-            SiteCompileFailure {
-                error,
-                discovered_dependencies: dependencies,
-            }
+            SiteCompileFailure::new(error, dependencies)
         })
     }
 
@@ -162,13 +226,19 @@ impl SiteCompiler {
         index: &SiteSourceIndex,
         inputs: BTreeMap<String, Value>,
     ) -> Result<SiteSnapshot, SiteCompileFailure> {
+        Self::compile_indexed_with_input_spans(id, index, inputs, BTreeMap::new())
+    }
+
+    pub fn compile_indexed_with_input_spans(
+        id: ResourceId,
+        index: &SiteSourceIndex,
+        inputs: BTreeMap<String, Value>,
+        input_spans: BTreeMap<String, SourceSpan>,
+    ) -> Result<SiteSnapshot, SiteCompileFailure> {
         let mut dependencies = index.dependencies.clone();
-        Self::compile_inner(id, index, inputs, &mut dependencies).map_err(|error| {
+        Self::compile_inner(id, index, inputs, &input_spans, &mut dependencies).map_err(|error| {
             normalize_paths(&mut dependencies);
-            SiteCompileFailure {
-                error,
-                discovered_dependencies: dependencies,
-            }
+            SiteCompileFailure::new(error, dependencies)
         })
     }
 
@@ -176,30 +246,47 @@ impl SiteCompiler {
         id: ResourceId,
         index: &SiteSourceIndex,
         inputs: BTreeMap<String, Value>,
+        input_spans: &BTreeMap<String, SourceSpan>,
         dependencies: &mut Vec<PathBuf>,
     ) -> Result<SiteSnapshot, SiteCompileError> {
         let root = &index.root;
         let manifest = &index.manifest;
         let source = &index.source;
         let files = &index.files;
-        validate_manifest(manifest, source, &inputs)?;
-        let deny_patterns = compile_deny_patterns(manifest, &source.visibility.deny)?;
-        let limits = compile_limits(manifest, source)?;
+        let manifest_locator = SourceLocator::new(manifest, index.spans(manifest));
+        validate_manifest(manifest_locator, source, &inputs, input_spans)?;
+        let deny_patterns = compile_deny_patterns(manifest_locator, &source.visibility.deny)?;
+        let limits = compile_limits(manifest_locator, source)?;
         let mut data = source
             .data
             .iter()
-            .map(|(name, value)| Ok((name.clone(), compile_constant(value)?)))
+            .map(|(name, value)| {
+                let field_path = field_path_child("data", name);
+                Ok((
+                    name.clone(),
+                    compile_constant(value, manifest_locator, &field_path)?,
+                ))
+            })
             .collect::<Result<BTreeMap<_, _>, SiteCompileError>>()?;
         for (name, value) in &inputs {
             if data.insert(name.clone(), value.clone()).is_some() {
-                return Err(SiteCompileError::Input {
-                    name: name.clone(),
-                    message: "conflicts with a site `data` key".to_owned(),
-                });
+                let data_path = field_path_child("data", name);
+                let primary = input_spans
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| manifest_locator.value(&data_path));
+                return Err(SiteCompileError::from_diagnostic(
+                    Diagnostic::new(
+                        "site.input_conflict",
+                        format!("site input `{name}` conflicts with a Site data key"),
+                        primary,
+                    )
+                    .with_related("Site data definition", manifest_locator.key(&data_path)),
+                ));
             }
         }
 
-        let template_roots = template_roots(root, source)?;
+        let template_roots = template_roots(root, source, manifest_locator)?;
         let mut templates = compile_templates(
             index,
             root,
@@ -253,7 +340,7 @@ impl SiteCompiler {
             if is_private(relative, source, &template_roots, root, &deny_patterns) {
                 continue;
             }
-            let headers = compile_resource_base_policy(relative, source, asset)?;
+            let headers = compile_resource_base_policy(relative, source, manifest_locator)?;
             let logical_path = logical_path(relative);
             let plan = SiteResponsePlan {
                 status: StatusCode::OK,
@@ -272,20 +359,31 @@ impl SiteCompiler {
             .errors
             .get(&404)
             .map(|error| {
-                let name = normalize_template_name(&error.template)?;
+                let name = normalize_template_name(&error.template).map_err(|error| {
+                    manifest_locator.error(
+                        "template.reference",
+                        "errors[\"404\"].template",
+                        error.to_string(),
+                    )
+                })?;
                 track_site_dependency(dependencies, &root.join(&name), root);
                 let template = templates.get(&name).ok_or_else(|| {
-                    SiteCompileError::source(
-                        manifest,
+                    manifest_locator.error(
+                        "site.template_missing",
+                        "errors[\"404\"].template",
                         format!("404 error template `{name}` does not exist"),
                     )
                 })?;
-                template.validate_arguments(&BTreeMap::new())?;
+                template.validate_arguments_at(
+                    &BTreeMap::new(),
+                    manifest_locator.value("errors[\"404\"].template"),
+                    &BTreeMap::new(),
+                )?;
                 Ok(crate::runtime::ErrorPagePlan {
                     template: name,
                     headers: compile_response_policy(
                         &source.defaults.response,
-                        manifest,
+                        manifest_locator,
                         "defaults.response",
                     )?,
                 })
@@ -343,18 +441,25 @@ fn scan_site_source(
         .text
         .as_deref()
         .expect("manifest entries retain source text");
-    let source: ManifestSource = parse_yaml(&manifest, manifest_text)?;
+    let manifest_locator = SourceLocator::new(&manifest, manifest_entry.spans.as_deref());
+    let source: ManifestSource = parse_yaml(
+        &manifest,
+        manifest_text,
+        (0, 0),
+        manifest_entry.spans.as_deref(),
+    )?;
     if source.oxista != SITE_API_VERSION {
-        return Err(SiteCompileError::source(
-            &manifest,
+        return Err(manifest_locator.error(
+            "site.version",
+            "oxista",
             format!(
                 "unsupported Oxista version `{}`; expected `{SITE_API_VERSION}`",
                 source.oxista
             ),
         ));
     }
-    let deny_patterns = compile_deny_patterns(&manifest, &source.visibility.deny)?;
-    let template_roots = template_roots(&root, &source)?;
+    let deny_patterns = compile_deny_patterns(manifest_locator, &source.visibility.deny)?;
+    let template_roots = template_roots(&root, &source, manifest_locator)?;
     let collection = collect_files(
         &root,
         &source,
@@ -490,7 +595,7 @@ fn read_site_source_entry(
     let spans = match (kind, text.as_deref()) {
         (SiteSourceKind::Manifest, Some(text)) => Some(Arc::new(
             oxidase_source::parse_document::<serde_yaml_ng::Value>(source_path, text)
-                .map_err(|error| SiteCompileError::source(source_path, error.to_string()))?
+                .map_err(|error| strict_yaml_error(source_path, text, (0, 0), error))?
                 .spans,
         )),
         (SiteSourceKind::Response | SiteSourceKind::Template, Some(text)) => {
@@ -498,7 +603,9 @@ fn read_site_source_entry(
             let byte_offset = text.split_inclusive('\n').next().map_or(0, str::len);
             let spans =
                 oxidase_source::parse_document::<serde_yaml_ng::Value>(source_path, front_matter)
-                    .map_err(|error| SiteCompileError::source(source_path, error.to_string()))?
+                    .map_err(|error| {
+                        strict_yaml_error(source_path, front_matter, (byte_offset, 1), error)
+                    })?
                     .spans
                     .shifted(byte_offset, 1);
             Some(Arc::new(spans))
@@ -609,98 +716,135 @@ fn track_precompressed_candidates(
 }
 
 fn validate_manifest(
-    path: &Path,
+    locator: SourceLocator<'_>,
     source: &ManifestSource,
     inputs: &BTreeMap<String, Value>,
+    input_spans: &BTreeMap<String, SourceSpan>,
 ) -> Result<(), SiteCompileError> {
     if !matches!(source.paths.trailing_slash, TrailingSlashSource::Canonical) {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.unsupported_field",
+            "paths.trailing_slash",
             "paths.trailing_slash only supports `canonical` in Oxista v1; remove the field or set it to `canonical`",
         ));
     }
     if source.paths.directory_listing {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.unsupported_field",
+            "paths.directory_listing",
             "directory_listing is intentionally unavailable in Oxista v1",
         ));
     }
     if source.paths.clean_html_urls {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.unsupported_field",
+            "paths.clean_html_urls",
             "clean_html_urls is not implemented in this release",
         ));
     }
     if matches!(source.templates.default_output, OutputSource::Json) {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "template.output",
+            "templates.default_output",
             "templates.default_output `json` is not supported; use an OXR structured JSON body",
         ));
     }
     if let Some(status) = source.errors.keys().find(|status| **status != 404) {
-        return Err(SiteCompileError::source(
-            path,
+        let field_path = field_path_child("errors", &status.to_string());
+        return Err(locator.key_error(
+            "site.unsupported_error_status",
+            &field_path,
             format!(
                 "errors.{status} is not supported in Oxista v1 alpha; only a 404 template is implemented"
             ),
         ));
     }
     for (name, contract) in &source.inputs {
-        validate_input_kind(path, name, &contract.kind)?;
+        let input_path = field_path_child("inputs", name);
+        validate_input_kind(locator, &format!("{input_path}.type"), name, &contract.kind)?;
         match inputs.get(name) {
             None if contract.required => {
-                return Err(SiteCompileError::Input {
-                    name: name.clone(),
-                    message: "is required but was not injected".to_owned(),
-                });
+                return Err(locator.error(
+                    "site.input_missing",
+                    &format!("{input_path}.required"),
+                    format!("site input `{name}` is required but was not injected"),
+                ));
             }
             Some(value) if !input_accepts(&contract.kind, value) => {
-                return Err(SiteCompileError::Input {
-                    name: name.clone(),
-                    message: format!(
-                        "expects type `{}`, received {}",
+                let declaration = locator.value(&format!("{input_path}.type"));
+                let mut diagnostic = Diagnostic::new(
+                    "site.input_type",
+                    format!(
+                        "site input `{name}` expects type `{}`, received {}",
                         contract.kind,
                         value.type_name()
                     ),
-                });
+                    declaration.clone(),
+                );
+                if let Some(injected) = input_spans.get(name) {
+                    diagnostic = diagnostic
+                        .with_label("injected value", injected.clone())
+                        .with_related("Site input declaration", declaration)
+                        .with_reference_chain([
+                            DiagnosticReference::new("Gateway injected value", injected.clone()),
+                            DiagnosticReference::new(
+                                "Site input declaration",
+                                locator.value(&input_path),
+                            ),
+                        ]);
+                }
+                return Err(SiteCompileError::from_diagnostic(diagnostic));
             }
             _ => {}
         }
     }
     for name in inputs.keys() {
         if !source.inputs.contains_key(name) {
-            return Err(SiteCompileError::Input {
-                name: name.clone(),
-                message: "is not declared by the site manifest".to_owned(),
-            });
+            let declaration_container = locator.value("inputs");
+            let primary = input_spans
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| declaration_container.clone());
+            return Err(SiteCompileError::from_diagnostic(
+                Diagnostic::new(
+                    "site.input_unknown",
+                    format!("site input `{name}` is not declared by the Site manifest"),
+                    primary,
+                )
+                .with_related("Site input declarations", declaration_container),
+            ));
         }
     }
-    for index in &source.paths.indexes {
+    for (position, index) in source.paths.indexes.iter().enumerate() {
         if index.contains('/') || index.contains('\\') || index.is_empty() {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "site.index_name",
+                &format!("paths.indexes[{position}]"),
                 format!("index name `{index}` must be one file name"),
             ));
         }
     }
-    for policy in source
-        .profiles
-        .values()
-        .chain(std::iter::once(&source.defaults.response))
-        .chain(source.defaults.by_extension.values())
-    {
-        validate_cache_policy(path, policy)?;
-    }
-    compile_response_policy(&source.defaults.response, path, "defaults.response")?;
+    validate_cache_policy(locator, &source.defaults.response, "defaults.response")?;
+    compile_response_policy(&source.defaults.response, locator, "defaults.response")?;
     for (extension, policy) in &source.defaults.by_extension {
-        compile_response_policy(
-            policy,
-            path,
-            &format!("defaults.by_extension[\"{extension}\"]"),
-        )?;
+        let field_path = field_path_child("defaults.by_extension", extension);
+        validate_cache_policy(locator, policy, &field_path)?;
+        compile_response_policy(policy, locator, &field_path)?;
     }
     for (name, policy) in &source.profiles {
-        compile_response_policy(policy, path, &format!("profiles.{name}"))?;
+        let field_path = field_path_child("profiles", name);
+        validate_cache_policy(locator, policy, &field_path)?;
+        compile_response_policy(policy, locator, &field_path)?;
+    }
+    for (extension, content_type) in &source.assets.mime_overrides {
+        let field_path = field_path_child("assets.mime_overrides", extension);
+        HeaderValue::from_str(content_type).map_err(|_| {
+            locator.error(
+                "site.asset_content_type",
+                &field_path,
+                format!("asset MIME override `{content_type}` is not a valid HTTP header value"),
+            )
+        })?;
     }
     Ok(())
 }
@@ -740,7 +884,7 @@ impl DenyPattern {
 }
 
 fn compile_deny_patterns(
-    path: &Path,
+    locator: SourceLocator<'_>,
     patterns: &[String],
 ) -> Result<Vec<DenyPattern>, SiteCompileError> {
     patterns
@@ -748,8 +892,9 @@ fn compile_deny_patterns(
         .enumerate()
         .map(|(index, pattern)| {
             compile_deny_pattern(pattern).map_err(|message| {
-                SiteCompileError::source(
-                    path,
+                locator.error(
+                    "site.visibility_pattern",
+                    &format!("visibility.deny[{index}]"),
                     format!(
                         "visibility.deny[{index}] `{pattern}` is invalid: {message}; use an exact relative path, `**/name`, or `**/*.ext`"
                     ),
@@ -807,11 +952,17 @@ fn looks_like_windows_absolute(pattern: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
-fn validate_input_kind(path: &Path, name: &str, kind: &str) -> Result<(), SiteCompileError> {
+fn validate_input_kind(
+    locator: SourceLocator<'_>,
+    field_path: &str,
+    name: &str,
+    kind: &str,
+) -> Result<(), SiteCompileError> {
     let base = kind.strip_suffix('?').unwrap_or(kind);
     if base == "safe_html" {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.input_type",
+            field_path,
             format!(
                 "inputs.{name}.type `safe_html` is unavailable because runtime values do not carry trusted HTML provenance; use `string`"
             ),
@@ -821,8 +972,9 @@ fn validate_input_kind(path: &Path, name: &str, kind: &str) -> Result<(), SiteCo
         base,
         "any" | "null" | "bool" | "int" | "float" | "string" | "url"
     ) {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.input_type",
+            field_path,
             format!("inputs.{name}.type uses unknown value type `{kind}`"),
         ));
     }
@@ -849,34 +1001,44 @@ fn input_accepts(kind: &str, value: &Value) -> bool {
 }
 
 fn validate_cache_policy(
-    path: &Path,
+    locator: SourceLocator<'_>,
     policy: &ResponsePolicySource,
+    field_path: &str,
 ) -> Result<(), SiteCompileError> {
     if let Some(cache) = &policy.cache {
         if let Some(visibility) = &cache.visibility
             && !matches!(visibility.as_str(), "public" | "private" | "no_store")
         {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "site.cache_visibility",
+                &format!("{field_path}.cache.visibility"),
                 format!("invalid cache visibility `{visibility}`"),
             ));
         }
         if let Some(max_age) = &cache.max_age {
-            parse_seconds(max_age).map_err(|message| SiteCompileError::source(path, message))?;
+            parse_seconds(max_age).map_err(|message| {
+                locator.error(
+                    "site.cache_max_age",
+                    &format!("{field_path}.cache.max_age"),
+                    message,
+                )
+            })?;
         }
     }
     Ok(())
 }
 
 fn compile_limits(
-    path: &Path,
+    locator: SourceLocator<'_>,
     source: &ManifestSource,
 ) -> Result<TemplateLimits, SiteCompileError> {
     Ok(TemplateLimits {
-        render_time: parse_duration(&source.templates.limits.render_time)
-            .map_err(|message| SiteCompileError::source(path, message))?,
-        output_size: parse_size(&source.templates.limits.output_size)
-            .map_err(|message| SiteCompileError::source(path, message))?,
+        render_time: parse_duration(&source.templates.limits.render_time).map_err(|message| {
+            locator.error("template.limit", "templates.limits.render_time", message)
+        })?,
+        output_size: parse_size(&source.templates.limits.output_size).map_err(|message| {
+            locator.error("template.limit", "templates.limits.output_size", message)
+        })?,
         loop_iterations: source.templates.limits.loop_iterations,
         include_depth: source.templates.limits.include_depth,
         expression_steps: source.templates.limits.expression_steps,
@@ -989,22 +1151,28 @@ fn validate_symlink(
     Ok(canonical)
 }
 
-fn template_roots(root: &Path, source: &ManifestSource) -> Result<Vec<PathBuf>, SiteCompileError> {
+fn template_roots(
+    root: &Path,
+    source: &ManifestSource,
+    locator: SourceLocator<'_>,
+) -> Result<Vec<PathBuf>, SiteCompileError> {
     source
         .templates
         .roots
         .iter()
-        .map(|template_root| {
+        .enumerate()
+        .map(|(index, template_root)| {
             let relative = Path::new(template_root);
             if relative.is_absolute()
                 || relative.components().any(|component| {
                     matches!(component, Component::ParentDir | Component::Prefix(_))
                 })
             {
-                return Err(SiteCompileError::UnsafePath {
-                    path: relative.to_path_buf(),
-                    message: "template root must be relative and cannot contain `..`".to_owned(),
-                });
+                return Err(locator.error(
+                    "template.root",
+                    &format!("templates.roots[{index}]"),
+                    "template root must be relative and cannot contain `..`",
+                ));
             }
             Ok(root.join(relative))
         })
@@ -1046,10 +1214,18 @@ fn compile_templates(
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
-        let metadata: crate::source::OxtMetadataSource = parse_yaml(path, front_matter)?;
+        let front_matter_offset = text.split_inclusive('\n').next().map_or(0, str::len);
+        let metadata: crate::source::OxtMetadataSource = parse_yaml(
+            path,
+            front_matter,
+            (front_matter_offset, 1),
+            index.spans(path),
+        )?;
+        let locator = SourceLocator::new(path, index.spans(path));
         if metadata.oxista != TEMPLATE_API_VERSION {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "template.version",
+                "oxista",
                 format!("expected `oxista: {TEMPLATE_API_VERSION}`"),
             ));
         }
@@ -1057,14 +1233,16 @@ fn compile_templates(
             name.clone(),
             path,
             &metadata,
+            index.spans(path),
             body,
             (body_offset, body_line_offset),
             default_output,
             default_autoescape,
         )?;
         if templates.insert(name.clone(), template).is_some() {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "template.duplicate",
+                "oxista",
                 format!("duplicate template name `{name}`"),
             ));
         }
@@ -1091,16 +1269,37 @@ fn validate_template_graph(
             let edges = cycle
                 .windows(2)
                 .map(|edge| {
-                    templates
+                    let span = templates
                         .get(&edge[0])
                         .and_then(|template| template.include_span(&edge[1]))
-                        .map_or_else(
-                            || format!("{} -> {}", edge[0], edge[1]),
-                            |span| format!("{} -> {} at {span}", edge[0], edge[1]),
-                        )
+                        .cloned()
+                        .unwrap_or_else(|| SourceSpan::synthetic("template.include.target"));
+                    (edge[0].clone(), edge[1].clone(), span)
                 })
                 .collect::<Vec<_>>();
-            return Err(SiteCompileError::TemplateCycle(edges.join("; ")));
+            let primary = edges
+                .first()
+                .map(|(_, _, span)| span.clone())
+                .unwrap_or_else(|| SourceSpan::synthetic("template.include.target"));
+            let mut diagnostic = Diagnostic::new(
+                "template.include_cycle",
+                format!("template dependency cycle: {}", cycle.join(" -> ")),
+                primary,
+            );
+            for (index, (caller, target, span)) in edges.iter().enumerate() {
+                if index > 0 {
+                    diagnostic = diagnostic
+                        .with_related(format!("`{caller}` includes `{target}`"), span.clone());
+                }
+            }
+            diagnostic =
+                diagnostic.with_reference_chain(edges.iter().map(|(caller, target, span)| {
+                    DiagnosticReference::new(
+                        format!("`{caller}` includes `{target}`"),
+                        span.clone(),
+                    )
+                }));
+            return Err(SiteCompileError::from_diagnostic(diagnostic));
         }
         let template = templates.get(name).ok_or_else(|| {
             SiteCompileError::source(name, format!("included template `{name}` does not exist"))
@@ -1132,18 +1331,31 @@ fn compile_oxr(
 ) -> Result<(String, SiteResponsePlan, Option<PathBuf>), SiteCompileError> {
     let text = index.text(path)?;
     let (front_matter, inline_body) = split_front_matter(path, text)?;
-    let source: OxrSource = parse_yaml(path, front_matter)?;
+    let front_matter_offset = text.split_inclusive('\n').next().map_or(0, str::len);
+    let locator = SourceLocator::new(path, index.spans(path));
+    let manifest_locator = SourceLocator::new(&index.manifest, index.spans(&index.manifest));
+    let source: OxrSource = parse_yaml(
+        path,
+        front_matter,
+        (front_matter_offset, 1),
+        index.spans(path),
+    )?;
     if source.oxista != RESPONSE_API_VERSION {
-        return Err(SiteCompileError::source(
-            path,
+        return Err(locator.error(
+            "site.response_version",
+            "oxista",
             format!("expected `oxista: {RESPONSE_API_VERSION}`"),
         ));
     }
     if source.response.redirect.is_some() && source.response.body.is_some() {
-        return Err(SiteCompileError::source(
-            path,
+        let diagnostic = Diagnostic::new(
+            "site.response_shape",
             "OXR response cannot contain both `redirect` and `body`",
-        ));
+            locator.value("response"),
+        )
+        .with_label("redirect is selected", locator.value("response.redirect"))
+        .with_label("body is selected", locator.value("response.body"));
+        return Err(SiteCompileError::from_diagnostic(diagnostic));
     }
 
     let relative = path
@@ -1159,15 +1371,20 @@ fn compile_oxr(
             .ok_or_else(|| SiteCompileError::source(path, "OXR must end with `.oxr`"))?,
     );
     let logical_path = logical_path(&relative_without_oxr);
-    let mut headers = compile_resource_base_policy(&relative_without_oxr, manifest, path)?;
-    for profile in &source.apply {
+    let mut headers =
+        compile_resource_base_policy(&relative_without_oxr, manifest, manifest_locator)?;
+    for (index, profile) in source.apply.iter().enumerate() {
         let policy = manifest.profiles.get(profile).ok_or_else(|| {
-            SiteCompileError::source(path, format!("unknown response profile `{profile}`"))
+            locator.error(
+                "site.profile_reference",
+                &format!("apply[{index}]"),
+                format!("unknown response profile `{profile}`"),
+            )
         })?;
         headers.merge(compile_response_policy(
             policy,
-            path,
-            &format!("profiles.{profile}"),
+            manifest_locator,
+            &field_path_child("profiles", profile),
         )?);
     }
     headers.merge(compile_headers(
@@ -1179,17 +1396,36 @@ fn compile_oxr(
     let page = source
         .page
         .iter()
-        .map(|(name, value)| Ok((name.clone(), compile_value(value, path)?)))
+        .map(|(name, value)| {
+            let field_path = field_path_child("page", name);
+            Ok((name.clone(), compile_value(value, locator, &field_path)?))
+        })
         .collect::<Result<_, SiteCompileError>>()?;
 
-    let status = StatusCode::from_u16(source.response.status.unwrap_or(200))
-        .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+    let status = StatusCode::from_u16(source.response.status.unwrap_or(200)).map_err(|error| {
+        locator.error("site.response_status", "response.status", error.to_string())
+    })?;
+    if let Some(content_type) = source.response.content_type.as_deref() {
+        HeaderValue::from_str(content_type).map_err(|_| {
+            locator.error(
+                "site.response_content_type",
+                "response.content_type",
+                "response.content_type is not a valid HTTP header value",
+            )
+        })?;
+    }
     let (kind, backing) = if let Some(redirect) = &source.response.redirect {
-        let status = StatusCode::from_u16(redirect.status)
-            .map_err(|error| SiteCompileError::source(path, error.to_string()))?;
+        let status = StatusCode::from_u16(redirect.status).map_err(|error| {
+            locator.error(
+                "site.redirect_status",
+                "response.redirect.status",
+                error.to_string(),
+            )
+        })?;
         if !status.is_redirection() {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "site.redirect_status",
+                "response.redirect.status",
                 "redirect status must be 3xx",
             ));
         }
@@ -1198,8 +1434,9 @@ fn compile_oxr(
                 || redirect.location.starts_with("//")
                 || redirect.location.contains('\\'))
         {
-            return Err(SiteCompileError::source(
-                path,
+            return Err(locator.error(
+                "site.redirect_location",
+                "response.redirect.location",
                 "redirect Location must be a local absolute path",
             ));
         }
@@ -1207,8 +1444,9 @@ fn compile_oxr(
             RedirectQuerySource::Drop => RedirectQuery::Drop,
             RedirectQuerySource::Preserve => RedirectQuery::Preserve,
             RedirectQuerySource::Replace => {
-                return Err(SiteCompileError::source(
-                    path,
+                return Err(locator.error(
+                    "site.redirect_query",
+                    "response.redirect.query",
                     "response.redirect.query `replace` is not supported because Oxista v1 has no replacement query field; use `drop`, `preserve`, or include a fixed query in `location`",
                 ));
             }
@@ -1216,21 +1454,37 @@ fn compile_oxr(
         (
             SiteResponseKind::Redirect {
                 status,
-                location: CompiledTemplate::compile(&redirect.location)
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
+                location: CompiledTemplate::compile(&redirect.location).map_err(|error| {
+                    locator.error(
+                        "site.redirect_location",
+                        "response.redirect.location",
+                        error.to_string(),
+                    )
+                })?,
                 query,
             },
             None,
         )
     } else {
         let body = source.response.body.as_ref().ok_or_else(|| {
-            SiteCompileError::source(path, "OXR response requires `redirect` or `body`")
+            locator.error(
+                "site.response_shape",
+                "response",
+                "OXR response requires `redirect` or `body`",
+            )
         })?;
+        let body_offset = text.len() - inline_body.len();
+        let body_line_offset = text[..body_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
         compile_oxr_body(
             index,
             path,
+            locator,
             body,
             inline_body,
+            (body_offset, body_line_offset),
             manifest,
             templates,
             dependencies,
@@ -1250,11 +1504,14 @@ fn compile_oxr(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_oxr_body(
     index: &SiteSourceIndex,
     oxr: &Path,
+    locator: SourceLocator<'_>,
     body: &OxrBodySource,
     inline_body: &str,
+    inline_origin: (usize, usize),
     manifest: &ManifestSource,
     templates: &mut BTreeMap<String, CompiledOxt>,
     dependencies: &mut Vec<PathBuf>,
@@ -1266,37 +1523,59 @@ fn compile_oxr_body(
         + usize::from(body.empty)
         + usize::from(body.text.is_some());
     if selected != 1 {
-        return Err(SiteCompileError::source(
-            oxr,
+        let mut diagnostic = Diagnostic::new(
+            "site.response_body_shape",
             "OXR body must select exactly one of asset, template, json, empty, or text",
-        ));
+            locator.value("response.body"),
+        );
+        for field in ["asset", "template", "json", "empty", "text"] {
+            let field_path = format!("response.body.{field}");
+            if locator
+                .spans
+                .is_some_and(|spans| spans.get(&field_path).is_some())
+            {
+                diagnostic = diagnostic.with_label(
+                    format!("body alternative `{field}` is selected"),
+                    locator.value(&field_path),
+                );
+            }
+        }
+        return Err(SiteCompileError::from_diagnostic(diagnostic));
     }
     if let Some(asset) = &body.asset {
         let asset = if asset == "sibling" {
-            PathBuf::from(
-                oxr.to_string_lossy()
-                    .strip_suffix(".oxr")
-                    .ok_or_else(|| SiteCompileError::source(oxr, "invalid sibling OXR path"))?,
-            )
+            PathBuf::from(oxr.to_string_lossy().strip_suffix(".oxr").ok_or_else(|| {
+                locator.error(
+                    "site.asset_path",
+                    "response.body.asset",
+                    "invalid sibling OXR path",
+                )
+            })?)
         } else {
             let relative = Path::new(asset);
             if relative.is_absolute() {
-                return Err(SiteCompileError::UnsafePath {
-                    path: relative.to_path_buf(),
-                    message: "OXR asset path must be relative".to_owned(),
-                });
+                return Err(locator.error(
+                    "site.asset_path",
+                    "response.body.asset",
+                    "OXR asset path must be relative",
+                ));
             }
             oxr.parent().unwrap_or(root).join(relative)
         };
         track_site_dependency(dependencies, &asset, root);
-        let asset = asset
-            .canonicalize()
-            .map_err(|error| SiteCompileError::io(&asset, error))?;
+        let asset = asset.canonicalize().map_err(|error| {
+            locator.error(
+                "site.asset_missing",
+                "response.body.asset",
+                format!("cannot access backing asset `{}`: {error}", asset.display()),
+            )
+        })?;
         if !path_is_within(&asset, root) || has_source_extension(&asset) {
-            return Err(SiteCompileError::UnsafePath {
-                path: asset,
-                message: "OXR backing asset escapes the root or references source".to_owned(),
-            });
+            return Err(locator.error(
+                "site.asset_path",
+                "response.body.asset",
+                "OXR backing asset escapes the root or references source",
+            ));
         }
         dependencies.push(asset.clone());
         return Ok((
@@ -1308,8 +1587,9 @@ fn compile_oxr_body(
         return match template {
             TemplateReferenceSource::Inline(kind) if kind == "inline" => {
                 if inline_body.is_empty() {
-                    return Err(SiteCompileError::source(
-                        oxr,
+                    return Err(locator.error(
+                        "template.inline_empty",
+                        "response.body.template",
                         "inline template body is empty",
                     ));
                 }
@@ -1319,7 +1599,9 @@ fn compile_oxr_body(
                 );
                 let template = CompiledOxt::inline_with_output(
                     name.clone(),
+                    oxr,
                     inline_body,
+                    inline_origin,
                     manifest.templates.default_output,
                     manifest.templates.default_autoescape,
                 )?;
@@ -1332,35 +1614,67 @@ fn compile_oxr_body(
                     None,
                 ))
             }
-            TemplateReferenceSource::Inline(kind) => Err(SiteCompileError::source(
-                oxr,
+            TemplateReferenceSource::Inline(kind) => Err(locator.error(
+                "template.reference",
+                "response.body.template",
                 format!("unknown template mode `{kind}`"),
             )),
             TemplateReferenceSource::External(external) => {
-                let name = normalize_template_name(&external.source)?;
+                let name = normalize_template_name(&external.source).map_err(|error| {
+                    locator.error(
+                        "template.reference",
+                        "response.body.template.source",
+                        error.to_string(),
+                    )
+                })?;
                 track_site_dependency(dependencies, &root.join(&name), root);
                 let template = templates.get(&name).ok_or_else(|| {
-                    SiteCompileError::source(oxr, format!("template `{name}` does not exist"))
+                    locator.error(
+                        "template.missing",
+                        "response.body.template.source",
+                        format!("template `{name}` does not exist"),
+                    )
                 })?;
                 let arguments = external
                     .arguments
                     .iter()
-                    .map(|(name, value)| Ok((name.clone(), compile_value(value, oxr)?)))
+                    .map(|(name, value)| {
+                        let field_path = field_path_child("response.body.template.with", name);
+                        Ok((name.clone(), compile_value(value, locator, &field_path)?))
+                    })
                     .collect::<Result<BTreeMap<_, _>, SiteCompileError>>()?;
-                template.validate_arguments(&arguments)?;
+                let argument_spans = external
+                    .arguments
+                    .keys()
+                    .map(|name| {
+                        let field_path = field_path_child("response.body.template.with", name);
+                        (name.clone(), locator.value(&field_path))
+                    })
+                    .collect();
+                template.validate_arguments_at(
+                    &arguments,
+                    locator.value("response.body.template.source"),
+                    &argument_spans,
+                )?;
                 Ok((SiteResponseKind::Template { name, arguments }, None))
             }
         };
     }
     if let Some(json) = &body.json {
-        return Ok((SiteResponseKind::Json(compile_value(json, oxr)?), None));
+        return Ok((
+            SiteResponseKind::Json(compile_value(json, locator, "response.body.json")?),
+            None,
+        ));
     }
     if let Some(text) = &body.text {
         return Ok((
-            SiteResponseKind::Text(
-                CompiledTemplate::compile(text)
-                    .map_err(|error| SiteCompileError::source(oxr, error.to_string()))?,
-            ),
+            SiteResponseKind::Text(CompiledTemplate::compile(text).map_err(|error| {
+                locator.error(
+                    "template.expression",
+                    "response.body.text",
+                    error.to_string(),
+                )
+            })?),
             None,
         ));
     }
@@ -1369,7 +1683,8 @@ fn compile_oxr_body(
 
 fn compile_value(
     source: &serde_yaml_ng::Value,
-    path: &Path,
+    locator: SourceLocator<'_>,
+    field_path: &str,
 ) -> Result<CompiledValue, SiteCompileError> {
     match source {
         serde_yaml_ng::Value::Mapping(values) if values.len() == 1 => {
@@ -1377,42 +1692,59 @@ fn compile_value(
             if let Some(serde_yaml_ng::Value::String(expression)) = values.get(&expression_key) {
                 return Expression::compile(expression)
                     .map(CompiledValue::Expression)
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()));
+                    .map_err(|error| {
+                        locator.error(
+                            "site.expression",
+                            &format!("{field_path}.$expr"),
+                            error.to_string(),
+                        )
+                    });
             }
-            compile_value_mapping(values, path)
+            compile_value_mapping(values, locator, field_path)
         }
-        serde_yaml_ng::Value::Mapping(values) => compile_value_mapping(values, path),
+        serde_yaml_ng::Value::Mapping(values) => compile_value_mapping(values, locator, field_path),
         serde_yaml_ng::Value::Sequence(values) => values
             .iter()
-            .map(|value| compile_value(value, path))
+            .enumerate()
+            .map(|(index, value)| compile_value(value, locator, &format!("{field_path}[{index}]")))
             .collect::<Result<Vec<_>, _>>()
             .map(CompiledValue::List),
         serde_yaml_ng::Value::String(value) if value.contains("{{") => {
             CompiledTemplate::compile(value)
                 .map(CompiledValue::Template)
-                .map_err(|error| SiteCompileError::source(path, error.to_string()))
+                .map_err(|error| locator.error("site.expression", field_path, error.to_string()))
         }
-        value => compile_constant(value).map(CompiledValue::Constant),
+        value => compile_constant(value, locator, field_path).map(CompiledValue::Constant),
     }
 }
 
 fn compile_value_mapping(
     values: &serde_yaml_ng::Mapping,
-    path: &Path,
+    locator: SourceLocator<'_>,
+    field_path: &str,
 ) -> Result<CompiledValue, SiteCompileError> {
     values
         .iter()
         .map(|(key, value)| {
             let serde_yaml_ng::Value::String(key) = key else {
-                return Err(SiteCompileError::source(path, "map keys must be strings"));
+                return Err(locator.error(
+                    "site.value_key",
+                    field_path,
+                    "map keys must be strings",
+                ));
             };
-            Ok((key.clone(), compile_value(value, path)?))
+            let child_path = field_path_child(field_path, key);
+            Ok((key.clone(), compile_value(value, locator, &child_path)?))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()
         .map(CompiledValue::Map)
 }
 
-fn compile_constant(source: &serde_yaml_ng::Value) -> Result<Value, SiteCompileError> {
+fn compile_constant(
+    source: &serde_yaml_ng::Value,
+    locator: SourceLocator<'_>,
+    field_path: &str,
+) -> Result<Value, SiteCompileError> {
     match source {
         serde_yaml_ng::Value::Null => Ok(Value::Null),
         serde_yaml_ng::Value::Bool(value) => Ok(Value::Bool(*value)),
@@ -1421,44 +1753,52 @@ fn compile_constant(source: &serde_yaml_ng::Value) -> Result<Value, SiteCompileE
             .map(Value::Integer)
             .or_else(|| value.as_f64().map(Value::Float))
             .ok_or_else(|| {
-                SiteCompileError::source("<value>", "number is outside the supported range")
+                locator.error(
+                    "site.value_range",
+                    field_path,
+                    "number is outside the supported range",
+                )
             }),
         serde_yaml_ng::Value::String(value) => Ok(Value::String(value.clone())),
         serde_yaml_ng::Value::Sequence(values) => values
             .iter()
-            .map(compile_constant)
+            .enumerate()
+            .map(|(index, value)| {
+                compile_constant(value, locator, &format!("{field_path}[{index}]"))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
         serde_yaml_ng::Value::Mapping(values) => values
             .iter()
             .map(|(key, value)| {
                 let serde_yaml_ng::Value::String(key) = key else {
-                    return Err(SiteCompileError::source(
-                        "<value>",
+                    return Err(locator.error(
+                        "site.value_key",
+                        field_path,
                         "map keys must be strings",
                     ));
                 };
-                Ok((key.clone(), compile_constant(value)?))
+                let child_path = field_path_child(field_path, key);
+                Ok((key.clone(), compile_constant(value, locator, &child_path)?))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()
             .map(Value::Map),
-        serde_yaml_ng::Value::Tagged(_) => Err(SiteCompileError::source(
-            "<value>",
-            "YAML tags are not supported",
-        )),
+        serde_yaml_ng::Value::Tagged(_) => {
+            Err(locator.error("site.value_tag", field_path, "YAML tags are not supported"))
+        }
     }
 }
 
 fn compile_response_policy(
     source: &ResponsePolicySource,
-    path: &Path,
+    locator: SourceLocator<'_>,
     field_path: &str,
 ) -> Result<HeaderPlan, SiteCompileError> {
     let mut headers = compile_headers(
         &source.headers,
-        path,
+        locator.path,
         &format!("{field_path}.headers"),
-        None,
+        locator.spans,
     )?;
     if let Some(cache) = &source.cache {
         let mut directives = Vec::new();
@@ -1468,8 +1808,13 @@ fn compile_response_policy(
         if let Some(max_age) = &cache.max_age {
             directives.push(format!(
                 "max-age={}",
-                parse_seconds(max_age)
-                    .map_err(|message| SiteCompileError::source(path, message))?
+                parse_seconds(max_age).map_err(|message| {
+                    locator.error(
+                        "site.cache_max_age",
+                        &format!("{field_path}.cache.max_age"),
+                        message,
+                    )
+                })?
             ));
         }
         if cache.immutable {
@@ -1482,8 +1827,13 @@ fn compile_response_policy(
                 .expect("compiled header policy always has one layer");
             layer.set.push((
                 HeaderName::from_static("cache-control"),
-                CompiledTemplate::compile(directives.join(", "))
-                    .map_err(|error| SiteCompileError::source(path, error.to_string()))?,
+                CompiledTemplate::compile(directives.join(", ")).map_err(|error| {
+                    locator.error(
+                        "site.cache_policy",
+                        &format!("{field_path}.cache"),
+                        error.to_string(),
+                    )
+                })?,
             ));
         }
     }
@@ -1520,11 +1870,11 @@ fn compile_headers(
 fn compile_resource_base_policy(
     logical_relative_path: &Path,
     manifest: &ManifestSource,
-    source_path: &Path,
+    manifest_locator: SourceLocator<'_>,
 ) -> Result<HeaderPlan, SiteCompileError> {
     let mut headers = compile_response_policy(
         &manifest.defaults.response,
-        source_path,
+        manifest_locator,
         "defaults.response",
     )?;
     if let Some(extension) = logical_relative_path
@@ -1534,8 +1884,8 @@ fn compile_resource_base_policy(
     {
         headers.merge(compile_response_policy(
             policy,
-            source_path,
-            &format!("defaults.by_extension[\"{extension}\"]"),
+            manifest_locator,
+            &field_path_child("defaults.by_extension", &extension),
         )?);
     }
     Ok(headers)
@@ -1550,18 +1900,32 @@ fn compile_header_map(
     source
         .iter()
         .map(|(name, value)| {
-            let header_path = format!("{field_path}.{name}");
+            let header_path = field_path_child(field_path, name);
             let name = compile_user_header_name(name, path, &header_path, spans)?;
-            let template = CompiledTemplate::compile(value)
-                .map_err(|error| site_source_error(path, &header_path, spans, error.to_string()))?;
+            let template = CompiledTemplate::compile(value).map_err(|error| {
+                site_source_error(
+                    "site.header_value",
+                    path,
+                    &header_path,
+                    spans,
+                    error.to_string(),
+                )
+            })?;
             if template.is_constant() {
                 let rendered = template
                     .render(&oxidase_core::EvalContext::default())
                     .map_err(|error| {
-                        site_source_error(path, &header_path, spans, error.to_string())
+                        site_source_error(
+                            "site.header_value",
+                            path,
+                            &header_path,
+                            spans,
+                            error.to_string(),
+                        )
                     })?;
                 HeaderValue::from_str(&rendered).map_err(|_| {
                     site_source_error(
+                        "site.header_value",
                         path,
                         &header_path,
                         spans,
@@ -1582,6 +1946,7 @@ fn compile_user_header_name(
 ) -> Result<HeaderName, SiteCompileError> {
     let name = HeaderName::from_str(source).map_err(|error| {
         site_source_key_error(
+            "site.header_name",
             path,
             field_path,
             spans,
@@ -1590,6 +1955,7 @@ fn compile_user_header_name(
     })?;
     if is_forbidden_user_header(&name) {
         return Err(site_source_key_error(
+            "site.forbidden_header",
             path,
             field_path,
             spans,
@@ -1600,24 +1966,27 @@ fn compile_user_header_name(
 }
 
 fn site_source_error(
+    code: &'static str,
     path: &Path,
     field_path: &str,
     spans: Option<&FieldSpanIndex>,
     message: impl Into<String>,
 ) -> SiteCompileError {
-    site_source_error_at(path, field_path, spans, false, message)
+    site_source_error_at(code, path, field_path, spans, false, message)
 }
 
 fn site_source_key_error(
+    code: &'static str,
     path: &Path,
     field_path: &str,
     spans: Option<&FieldSpanIndex>,
     message: impl Into<String>,
 ) -> SiteCompileError {
-    site_source_error_at(path, field_path, spans, true, message)
+    site_source_error_at(code, path, field_path, spans, true, message)
 }
 
 fn site_source_error_at(
+    code: &'static str,
     path: &Path,
     field_path: &str,
     spans: Option<&FieldSpanIndex>,
@@ -1626,10 +1995,15 @@ fn site_source_error_at(
 ) -> SiteCompileError {
     let message = message.into();
     let Some(source) = spans.and_then(|spans| spans.nearest(field_path)) else {
-        return SiteCompileError::source(path, format!("{field_path}: {message}"));
+        return SiteCompileError::at(
+            code,
+            SourceLocator::new(path, spans).value(field_path),
+            format!("{field_path}: {message}"),
+        );
     };
     let source = if use_key { &source.key } else { &source.value };
-    SiteCompileError::source_span(
+    SiteCompileError::at(
+        code,
         SourceSpan {
             file: path.to_path_buf(),
             start_byte: source.start_byte,
@@ -1920,16 +2294,98 @@ fn split_front_matter<'a>(
 fn parse_yaml<T: serde::de::DeserializeOwned>(
     path: &Path,
     source: &str,
+    origin: (usize, usize),
+    spans: Option<&FieldSpanIndex>,
 ) -> Result<T, SiteCompileError> {
-    oxidase_source::parse(path, source).map_err(|error| {
-        SiteCompileError::source(
-            error.path,
-            format!(
-                "error[{}] at {}:{}: {}",
-                error.code, error.line, error.column, error.message
-            ),
-        )
-    })
+    oxidase_source::parse(path, source)
+        .map_err(|error| strict_yaml_error_with_spans(path, source, origin, spans, error))
+}
+
+fn strict_yaml_error(
+    path: &Path,
+    source: &str,
+    origin: (usize, usize),
+    error: oxidase_source::StrictYamlError,
+) -> SiteCompileError {
+    strict_yaml_error_with_spans(path, source, origin, None, error)
+}
+
+fn strict_yaml_error_with_spans(
+    path: &Path,
+    source: &str,
+    origin: (usize, usize),
+    spans: Option<&FieldSpanIndex>,
+    error: oxidase_source::StrictYamlError,
+) -> SiteCompileError {
+    let physical_line = origin.1 + error.line;
+    let field_path = spans
+        .and_then(|spans| {
+            spans
+                .iter()
+                .filter_map(|(path, field)| {
+                    let ranges = [&field.value, &field.key];
+                    ranges
+                        .into_iter()
+                        .find(|range| {
+                            range.start_line <= physical_line
+                                && physical_line <= range.end_line
+                                && (range.start_line != physical_line
+                                    || range.start_column <= error.column)
+                                && (range.end_line != physical_line
+                                    || error.column <= range.end_column)
+                        })
+                        .map(|range| (path, range.end_byte.saturating_sub(range.start_byte)))
+                })
+                .min_by_key(|(_, length)| *length)
+                .map(|(path, _)| path)
+        })
+        .unwrap_or("source");
+    let span = point_source_span(path, source, origin, error.line, error.column, "source");
+    let mut span = span;
+    span.field_path = field_path.to_owned();
+    let mut diagnostic = Diagnostic::new(error.code, error.message, span);
+    if let Some(help) = error.help {
+        diagnostic = diagnostic.with_help(help);
+    }
+    SiteCompileError::from_diagnostic(diagnostic)
+}
+
+fn point_source_span(
+    path: &Path,
+    source: &str,
+    origin: (usize, usize),
+    line: usize,
+    column: usize,
+    field_path: &str,
+) -> SourceSpan {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |length| line_start + length);
+    let line_text = &source[line_start..line_end];
+    let column_byte = line_text
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map_or(line_text.len(), |(offset, _)| offset);
+    let start = line_start + column_byte;
+    let end = source[start..line_end]
+        .chars()
+        .next()
+        .map_or(start, |character| start + character.len_utf8());
+    SourceSpan {
+        file: path.to_path_buf(),
+        start_byte: origin.0 + start,
+        end_byte: origin.0 + end,
+        line: origin.1 + line,
+        column,
+        end_line: origin.1 + line,
+        end_column: column + usize::from(end > start),
+        field_path: field_path.to_owned(),
+    }
 }
 
 fn parse_duration(source: &str) -> Result<Duration, String> {
@@ -2544,7 +3000,7 @@ response:
 ---
 "#,
                 ),
-                "profiles.cached.headers.add.Transfer-Encoding",
+                "profiles.cached.headers.add[\"Transfer-Encoding\"]",
             ),
             (
                 "oxista: site/v1\n",
@@ -2628,15 +3084,14 @@ response:
             BTreeMap::new(),
         )
         .expect_err("managed header must be rejected");
-        let message = error.to_string();
-        assert!(
-            message.contains(" at 6:7-6:17:"),
-            "unexpected source location: {message}"
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "site.forbidden_header");
+        assert_eq!((diagnostic.primary.line, diagnostic.primary.column), (6, 7));
+        assert_eq!(
+            diagnostic.primary.field_path,
+            "response.headers.set.Connection"
         );
-        assert!(
-            message.contains("response.headers.set.Connection"),
-            "{message}"
-        );
+        assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
     }
 
     #[test]
@@ -2903,9 +3358,17 @@ params:
             BTreeMap::new(),
         )
         .expect_err("404 with a required parameter is not callable");
-        let message = failure.to_string();
-        assert!(message.contains("_templates/404.oxt"), "{message}");
-        assert!(message.contains("reason"), "{message}");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.argument_missing");
+        assert_eq!(diagnostic.primary.field_path, "errors[\"404\"].template");
+        assert_eq!(diagnostic.related.len(), 1);
+        assert!(
+            diagnostic.related[0]
+                .span
+                .file
+                .ends_with("_templates/404.oxt")
+        );
+        assert_eq!(diagnostic.related[0].span.field_path, "params.reason");
     }
 
     #[test]
@@ -3237,12 +3700,16 @@ params:
             BTreeMap::new(),
         )
         .expect_err("missing include argument must fail preparation");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.include_argument_missing");
         assert!(
-            failure
-                .to_string()
-                .contains("missing required parameter `item`"),
-            "{failure}"
+            diagnostic
+                .message
+                .contains("missing required parameter `item`")
         );
+        assert_eq!(diagnostic.primary.field_path, "template.include.target");
+        assert_eq!(diagnostic.related.len(), 1);
+        assert_eq!(diagnostic.related[0].span.field_path, "params.item");
 
         fs::write(
             &parent_path,
@@ -3272,9 +3739,22 @@ params:
             BTreeMap::new(),
         )
         .expect_err("include cycle must fail preparation");
-        assert!(failure.to_string().contains("template dependency cycle"));
-        assert!(failure.to_string().contains("a.oxt"));
-        assert!(failure.to_string().contains("b.oxt"));
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.include_cycle");
+        assert!(diagnostic.message.contains("template dependency cycle"));
+        assert!(diagnostic.message.contains("a.oxt"));
+        assert!(diagnostic.message.contains("b.oxt"));
+        assert_eq!(diagnostic.primary.field_path, "template.include.target");
+        assert_eq!(diagnostic.related.len(), 1);
+        assert_eq!(diagnostic.reference_chain.len(), 2);
+        assert!(
+            diagnostic
+                .reference_chain
+                .iter()
+                .all(|edge| edge.span.as_ref().is_some_and(|span| {
+                    span.field_path == "template.include.target" && span.end_byte > span.start_byte
+                }))
+        );
     }
 
     #[test]
@@ -3446,12 +3926,11 @@ templates:
             BTreeMap::new(),
         )
         .expect_err("invalid interpolation must fail");
-        let message = failure.to_string();
-        assert!(
-            message.contains(page.to_string_lossy().as_ref()),
-            "{message}"
-        );
-        assert!(message.contains("at 4:6-4:11"), "{message}");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.expression");
+        assert!(diagnostic.primary.file.ends_with("_templates/page.oxt"));
+        assert_eq!((diagnostic.primary.line, diagnostic.primary.column), (4, 6));
+        assert_eq!(diagnostic.primary.field_path, "template");
 
         fs::write(
             root.join("_templates/child.oxt"),
@@ -3470,9 +3949,248 @@ templates:
             BTreeMap::new(),
         )
         .expect_err("unknown include argument must fail");
-        let message = failure.to_string();
-        assert!(message.contains("unknown parameter `extra`"), "{message}");
-        assert!(message.contains("at 4:6-4:"), "{message}");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.include_argument_unknown");
+        assert!(diagnostic.message.contains("unknown parameter `extra`"));
+        assert_eq!(
+            (diagnostic.primary.line, diagnostic.primary.column),
+            (4, 42)
+        );
+        assert_eq!(
+            diagnostic.primary.field_path,
+            "template.include.arguments.extra"
+        );
+    }
+
+    #[test]
+    fn manifest_semantic_diagnostics_retain_exact_field_spans() {
+        let cases = [
+            (
+                "oxista: site/v1\ninputs:\n  unsafe:\n    type: safe_html\n",
+                "site.input_type",
+                "inputs.unsafe.type",
+            ),
+            (
+                "oxista: site/v1\ndefaults:\n  response:\n    cache:\n      visibility: shared\n",
+                "site.cache_visibility",
+                "defaults.response.cache.visibility",
+            ),
+            (
+                "oxista: site/v1\nprofiles:\n  public:\n    cache:\n      max_age: soon\n",
+                "site.cache_max_age",
+                "profiles.public.cache.max_age",
+            ),
+            (
+                "oxista: site/v1\nerrors:\n  500:\n    template: _templates/error.oxt\n",
+                "site.unsupported_error_status",
+                "errors[\"500\"]",
+            ),
+            (
+                "oxista: site/v1\nvisibility:\n  deny:\n    - ../private\n",
+                "site.visibility_pattern",
+                "visibility.deny[0]",
+            ),
+            (
+                "oxista: site/v1\ntemplates:\n  limits:\n    render_time: eventually\n",
+                "template.limit",
+                "templates.limits.render_time",
+            ),
+        ];
+
+        for (manifest_source, code, field_path) in cases {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir(&root).expect("site directory can be created");
+            let manifest = root.join("site.oxsite");
+            fs::write(&manifest, manifest_source).expect("manifest can be written");
+            let failure = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                &manifest,
+                BTreeMap::new(),
+            )
+            .expect_err("invalid manifest field must fail");
+            let diagnostic = &failure.diagnostics[0];
+            assert_eq!(diagnostic.code, code, "{diagnostic}");
+            assert_eq!(diagnostic.primary.field_path, field_path, "{diagnostic}");
+            assert!(diagnostic.primary.file.ends_with("site.oxsite"));
+            assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(
+            &manifest,
+            concat!(
+                "oxista: site/v1\r\n",
+                "data:\r\n",
+                "  note: |\r\n",
+                "    雪: literal content\r\n",
+                "assets:\r\n",
+                "  mime_overrides:\r\n",
+                "    \".txt\": \"bad\\nvalue\"\r\n",
+            ),
+        )
+        .expect("CRLF manifest can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("invalid MIME override must fail");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "site.asset_content_type");
+        assert_eq!(
+            diagnostic.primary.field_path,
+            "assets.mime_overrides[\".txt\"]"
+        );
+        assert_eq!(
+            (diagnostic.primary.line, diagnostic.primary.column),
+            (7, 13)
+        );
+    }
+
+    #[test]
+    fn oxr_semantic_diagnostics_retain_nested_field_spans() {
+        let cases = [
+            (
+                "apply: [missing]\nresponse:\n  body:\n    empty: true\n",
+                "site.profile_reference",
+                "apply[0]",
+            ),
+            (
+                "page:\n  value:\n    $expr: \"page.\"\nresponse:\n  body:\n    empty: true\n",
+                "site.expression",
+                "page.value.$expr",
+            ),
+            (
+                "response:\n  status: 99\n  body:\n    empty: true\n",
+                "site.response_status",
+                "response.status",
+            ),
+            (
+                "response:\n  content_type: \"bad\\nvalue\"\n  body:\n    empty: true\n",
+                "site.response_content_type",
+                "response.content_type",
+            ),
+            (
+                "response:\n  redirect:\n    status: 200\n    location: /next\n",
+                "site.redirect_status",
+                "response.redirect.status",
+            ),
+            (
+                "response:\n  body:\n    asset: sibling\n    text: duplicate\n",
+                "site.response_body_shape",
+                "response.body",
+            ),
+            (
+                "response:\n  body:\n    template:\n      source: _templates/missing.oxt\n",
+                "template.missing",
+                "response.body.template.source",
+            ),
+            (
+                "response:\n  body:\n    asset: /absolute.txt\n",
+                "site.asset_path",
+                "response.body.asset",
+            ),
+            (
+                "response:\n  body:\n    json:\n      nested:\n        $expr: \"page.\"\n",
+                "site.expression",
+                "response.body.json.nested.$expr",
+            ),
+        ];
+
+        for (front_matter, code, field_path) in cases {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir(&root).expect("site directory can be created");
+            let manifest = root.join("site.oxsite");
+            fs::write(&manifest, "oxista: site/v1\n").expect("manifest can be written");
+            let oxr = root.join("page.oxr");
+            fs::write(
+                &oxr,
+                format!("---\noxista: response/v1\n{front_matter}---\n"),
+            )
+            .expect("OXR can be written");
+            let failure = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                &manifest,
+                BTreeMap::new(),
+            )
+            .expect_err("invalid OXR field must fail");
+            let diagnostic = &failure.diagnostics[0];
+            assert_eq!(diagnostic.code, code, "{diagnostic}");
+            assert_eq!(diagnostic.primary.field_path, field_path, "{diagnostic}");
+            assert!(diagnostic.primary.file.ends_with("page.oxr"));
+            assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
+        }
+    }
+
+    #[test]
+    fn oxt_metadata_and_inline_body_diagnostics_use_physical_sources() {
+        for (metadata, code, field_path) in [
+            ("output: json\n", "template.output", "output"),
+            (
+                "params:\n  item: unknown\n",
+                "template.parameter_type",
+                "params.item",
+            ),
+            ("autoescape: invalid\n", "source.parse", "autoescape"),
+        ] {
+            let directory = tempdir().expect("temporary site directory is available");
+            let root = directory.path().join("site");
+            fs::create_dir_all(root.join("_templates")).expect("template directory can be created");
+            let manifest = root.join("site.oxsite");
+            fs::write(
+                &manifest,
+                "oxista: site/v1\ntemplates:\n  roots: [_templates]\n",
+            )
+            .expect("manifest can be written");
+            fs::write(
+                root.join("_templates/page.oxt"),
+                format!("---\noxista: template/v1\n{metadata}---\nbody\n"),
+            )
+            .expect("OXT can be written");
+            let failure = SiteCompiler::compile(
+                ResourceId::new("site:web"),
+                &root,
+                &manifest,
+                BTreeMap::new(),
+            )
+            .expect_err("invalid OXT metadata must fail");
+            let diagnostic = &failure.diagnostics[0];
+            assert_eq!(diagnostic.code, code, "{diagnostic}");
+            assert_eq!(diagnostic.primary.field_path, field_path, "{diagnostic}");
+            assert!(diagnostic.primary.file.ends_with("_templates/page.oxt"));
+            assert!(diagnostic.primary.line >= 3);
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        let manifest = root.join("site.oxsite");
+        fs::write(&manifest, "oxista: site/v1\n").expect("manifest can be written");
+        let oxr = root.join("inline.oxr");
+        fs::write(
+            &oxr,
+            "---\noxista: response/v1\nresponse:\n  body:\n    template: inline\n---\n雪 {{ page. }}\n",
+        )
+        .expect("inline OXR can be written");
+        let failure = SiteCompiler::compile(
+            ResourceId::new("site:web"),
+            &root,
+            &manifest,
+            BTreeMap::new(),
+        )
+        .expect_err("invalid inline expression must fail");
+        let diagnostic = &failure.diagnostics[0];
+        assert_eq!(diagnostic.code, "template.expression");
+        assert!(diagnostic.primary.file.ends_with("inline.oxr"));
+        assert_eq!((diagnostic.primary.line, diagnostic.primary.column), (7, 6));
     }
 
     #[test]

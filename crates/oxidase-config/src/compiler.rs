@@ -20,7 +20,7 @@ use oxidase_core::{
 use serde::Serialize;
 use url::Url;
 
-use oxidase_source::{FieldSpanIndex, SourceDocument};
+use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
@@ -108,6 +108,7 @@ pub struct SiteSpec {
     pub root: PathBuf,
     pub manifest: PathBuf,
     pub inputs: BTreeMap<String, Value>,
+    pub input_spans: BTreeMap<String, SourceSpan>,
     pub source: SourceSpan,
 }
 
@@ -670,6 +671,18 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
         let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
         let root = directory.join(&located.value.root);
         let manifest = root.join(&located.value.manifest);
+        let input_spans: BTreeMap<String, SourceSpan> = located
+            .value
+            .inputs
+            .keys()
+            .map(|name| {
+                let with_path = field_path_child(&located.field_path, "with");
+                (
+                    name.clone(),
+                    located.span_at(&field_path_child(&with_path, name)),
+                )
+            })
+            .collect();
         let inputs = located
             .value
             .inputs
@@ -678,11 +691,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 yaml_value(value)
                     .map(|value| (name.clone(), value))
                     .map_err(|message| {
-                        semantic_error_at(
-                            "resource.site_input",
-                            message,
-                            located.span_at(&format!("{}.with.{name}", located.field_path)),
-                        )
+                        semantic_error_at("resource.site_input", message, input_spans[name].clone())
                     })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -694,6 +703,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 root,
                 manifest,
                 inputs,
+                input_spans,
                 source: located.span(),
             },
         );

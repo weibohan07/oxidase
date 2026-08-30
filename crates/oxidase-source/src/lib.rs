@@ -304,7 +304,10 @@ fn build_field_span_index(source: &str) -> FieldSpanIndex {
     FieldSpanIndex { spans }
 }
 
-fn append_field_path(parent: &str, key: &str) -> String {
+/// Appends one mapping key using the canonical diagnostic field-path syntax.
+/// Identifier-like keys use `.name`; all other keys use a quoted bracket form.
+#[must_use]
+pub fn field_path_child(parent: &str, key: &str) -> String {
     if valid_field_component(key) {
         if parent.is_empty() {
             key.to_owned()
@@ -315,6 +318,10 @@ fn append_field_path(parent: &str, key: &str) -> String {
         let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
         format!("{parent}[\"{escaped}\"]")
     }
+}
+
+fn append_field_path(parent: &str, key: &str) -> String {
+    field_path_child(parent, key)
 }
 
 fn valid_field_component(value: &str) -> bool {
