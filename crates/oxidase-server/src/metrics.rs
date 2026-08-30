@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
@@ -11,6 +11,23 @@ use oxidase_runtime::{
 };
 
 const LATENCY_BOUNDS_MS: [u64; 9] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
+const MAX_OBSERVE_SERIES: usize = 4_096;
+const MAX_TRANSPORT_SERIES: usize = 4_096;
+const MAX_GOVERNANCE_SERIES: usize = 4_096;
+const GOVERNANCE_RESULTS: [&str; 10] = [
+    "admitted",
+    "evaluated",
+    "saturated",
+    "queue_full",
+    "timeout",
+    "invalid_key",
+    "capacity",
+    "rate",
+    "rejected",
+    "missing_state",
+];
+type GovernanceNameMap = BTreeMap<Box<str>, Arc<GovernanceSeries>>;
+type GovernanceSeriesMap = BTreeMap<Box<str>, GovernanceNameMap>;
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -24,10 +41,13 @@ pub struct Metrics {
     reload_success: AtomicU64,
     reload_failure: AtomicU64,
     observe: Mutex<BTreeMap<String, Arc<ObserveSeries>>>,
+    observe_overflow: Arc<ObserveSeries>,
     response_body_bytes: AtomicU64,
     response_body_terminations: [AtomicU64; 4],
     response_body_lifetime_buckets: [AtomicU64; 10],
     transport: Mutex<BTreeMap<String, Arc<TransportSeries>>>,
+    transport_overflow: Arc<TransportSeries>,
+    governance: RwLock<GovernanceSeriesMap>,
 }
 
 impl Metrics {
@@ -74,10 +94,15 @@ impl Metrics {
             .observe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        observe
-            .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(ObserveSeries::default()))
-            .clone()
+        if let Some(series) = observe.get(name) {
+            return Arc::clone(series);
+        }
+        if observe.len() >= MAX_OBSERVE_SERIES {
+            return Arc::clone(&self.observe_overflow);
+        }
+        let series = Arc::new(ObserveSeries::default());
+        observe.insert(name.to_owned(), Arc::clone(&series));
+        series
     }
 
     pub(crate) fn record_response_body(
@@ -97,12 +122,62 @@ impl Metrics {
             .transport
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ListenerTransportMetrics {
-            series: transport
-                .entry(listener.to_owned())
-                .or_insert_with(|| Arc::new(TransportSeries::default()))
-                .clone(),
+        if let Some(series) = transport.get(listener) {
+            return ListenerTransportMetrics {
+                series: Arc::clone(series),
+            };
         }
+        if transport.len() >= MAX_TRANSPORT_SERIES {
+            return ListenerTransportMetrics {
+                series: Arc::clone(&self.transport_overflow),
+            };
+        }
+        let series = Arc::new(TransportSeries::default());
+        transport.insert(listener.to_owned(), Arc::clone(&series));
+        ListenerTransportMetrics { series }
+    }
+
+    pub(crate) fn record_governance(&self, kind: &'static str, name: &str, result: &'static str) {
+        let Some(result_index) = GOVERNANCE_RESULTS
+            .iter()
+            .position(|candidate| *candidate == result)
+        else {
+            return;
+        };
+        if !matches!(
+            kind,
+            "request_body_limit" | "concurrency_limit" | "rate_limit"
+        ) {
+            return;
+        }
+        {
+            let governance = self
+                .governance
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(series) = governance.get(kind).and_then(|names| names.get(name)) {
+                series.results[result_index].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        let mut governance = self
+            .governance
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(series) = governance.get(kind).and_then(|names| names.get(name)) {
+            series.results[result_index].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let series_count = governance.values().map(BTreeMap::len).sum::<usize>();
+        if series_count >= MAX_GOVERNANCE_SERIES {
+            return;
+        }
+        let series = Arc::new(GovernanceSeries::default());
+        governance
+            .entry(Box::<str>::from(kind))
+            .or_default()
+            .insert(Box::<str>::from(name), Arc::clone(&series));
+        series.results[result_index].fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -298,6 +373,23 @@ impl Metrics {
                 ));
             }
         }
+        drop(transport);
+        let governance = self
+            .governance
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (kind, names) in governance.iter() {
+            let kind = escape_label(kind);
+            for (name, series) in names {
+                let name = escape_label(name);
+                for (index, result) in GOVERNANCE_RESULTS.iter().enumerate() {
+                    output.push_str(&format!(
+                        "oxidase_governance_total{{kind=\"{kind}\",name=\"{name}\",result=\"{result}\"}} {}\n",
+                        series.results[index].load(Ordering::Relaxed)
+                    ));
+                }
+            }
+        }
         output
     }
 
@@ -391,6 +483,11 @@ impl Metrics {
         }
         output
     }
+}
+
+#[derive(Debug, Default)]
+struct GovernanceSeries {
+    results: [AtomicU64; GOVERNANCE_RESULTS.len()],
 }
 
 const CLUSTER_HEALTH_STATES: [EndpointHealthState; 4] = [
@@ -995,8 +1092,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ConnectionProtocol, H2Shutdown, Metrics, ProductionObserver, TlsAlpn, TlsHandshakeOutcome,
-        TunnelTermination,
+        ConnectionProtocol, H2Shutdown, MAX_OBSERVE_SERIES, MAX_TRANSPORT_SERIES, Metrics,
+        ProductionObserver, TlsAlpn, TlsHandshakeOutcome, TunnelTermination,
     };
 
     #[test]
@@ -1011,6 +1108,51 @@ mod tests {
         assert!(output.contains("outcome=\"handled\""));
         assert!(output.contains("class=\"2xx\""));
         assert!(!output.contains("http://"));
+    }
+
+    #[test]
+    fn governance_metrics_never_accept_dynamic_keys_or_result_labels() {
+        let metrics = Metrics::default();
+        metrics.record_governance("rate_limit", "public-api", "rate");
+        metrics.record_governance("rate_limit", "public-api", "tenant-secret");
+        metrics.record_governance("dynamic-kind", "/users?id=secret", "rate");
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "oxidase_governance_total{kind=\"rate_limit\",name=\"public-api\",result=\"rate\"} 1"
+        ));
+        assert!(!output.contains("tenant-secret"));
+        assert!(!output.contains("/users"));
+        assert!(!output.contains("id=secret"));
+    }
+
+    #[test]
+    fn configured_metric_series_remain_bounded_across_name_churn() {
+        let metrics = Metrics::default();
+        for index in 0..(MAX_OBSERVE_SERIES + 32) {
+            let name = format!("observe-{index}");
+            let _ = metrics.observe_series(&name);
+        }
+        for index in 0..(MAX_TRANSPORT_SERIES + 32) {
+            let name = format!("listener-{index}");
+            let _ = metrics.listener_transport(&name);
+        }
+        assert_eq!(
+            metrics
+                .observe
+                .lock()
+                .expect("observe metrics mutex is not poisoned")
+                .len(),
+            MAX_OBSERVE_SERIES
+        );
+        assert_eq!(
+            metrics
+                .transport
+                .lock()
+                .expect("transport metrics mutex is not poisoned")
+                .len(),
+            MAX_TRANSPORT_SERIES
+        );
     }
 
     #[tokio::test]

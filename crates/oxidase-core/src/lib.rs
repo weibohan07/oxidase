@@ -24,8 +24,8 @@ pub use outcome::{ErrorClass, ResponseHead, ServiceError, ServiceOutcome};
 pub use pattern::{CompiledPattern, PatternContext, PatternError};
 pub use program::{
     CompiledMetadata, HeaderPredicate, HeaderTransform, HeaderTransforms, PredicatePlan,
-    RecoverHandler, RequestTransform, RespondBody, ResponseTransform, RouteCase, ServiceGraph,
-    ServiceKind, ServiceNode, ServiceProgram, ServiceProgramError,
+    RateLimitKey, RecoverHandler, RequestTransform, RespondBody, ResponseTransform, RouteCase,
+    ServiceGraph, ServiceKind, ServiceNode, ServiceProgram, ServiceProgramError,
 };
 pub use request::{
     Bindings, BodyState, RequestFrame, RequestMetadata, RequestMetadataError, RequestOverlay,

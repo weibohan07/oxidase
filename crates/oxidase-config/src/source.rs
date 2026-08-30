@@ -299,7 +299,73 @@ pub(crate) struct ListenerSource {
     pub tls: Option<TlsListenerSource>,
     #[serde(default)]
     pub http: HttpListenerSource,
+    #[serde(default)]
+    pub limits: ListenerLimitsSource,
     pub service: ServiceSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListenerLimitsSource {
+    #[serde(default = "default_listener_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_listener_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+    #[serde(default = "default_listener_idle_timeout")]
+    pub idle_timeout: String,
+    #[serde(default = "default_listener_body_idle_timeout")]
+    pub request_body_idle_timeout: String,
+    #[serde(default = "default_listener_body_idle_timeout")]
+    pub response_body_idle_timeout: String,
+    #[serde(default = "default_listener_max_header_bytes")]
+    pub max_header_bytes: String,
+    #[serde(default = "default_listener_max_headers")]
+    pub max_headers: u32,
+    #[serde(default = "default_listener_max_requests_per_connection")]
+    pub max_requests_per_connection: u32,
+}
+
+impl Default for ListenerLimitsSource {
+    fn default() -> Self {
+        Self {
+            max_connections: default_listener_max_connections(),
+            max_connections_per_ip: default_listener_max_connections_per_ip(),
+            idle_timeout: default_listener_idle_timeout(),
+            request_body_idle_timeout: default_listener_body_idle_timeout(),
+            response_body_idle_timeout: default_listener_body_idle_timeout(),
+            max_header_bytes: default_listener_max_header_bytes(),
+            max_headers: default_listener_max_headers(),
+            max_requests_per_connection: default_listener_max_requests_per_connection(),
+        }
+    }
+}
+
+fn default_listener_max_connections() -> u32 {
+    10_000
+}
+
+fn default_listener_max_connections_per_ip() -> u32 {
+    100
+}
+
+fn default_listener_idle_timeout() -> String {
+    "2m".to_owned()
+}
+
+fn default_listener_body_idle_timeout() -> String {
+    "30s".to_owned()
+}
+
+fn default_listener_max_header_bytes() -> String {
+    "64KiB".to_owned()
+}
+
+fn default_listener_max_headers() -> u32 {
+    100
+}
+
+fn default_listener_max_requests_per_connection() -> u32 {
+    1_000
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -453,6 +519,27 @@ pub(crate) enum InlineServiceSource {
         duration: String,
         service: Box<ServiceSource>,
     },
+    RequestBodyLimit {
+        max_bytes: String,
+        service: Box<ServiceSource>,
+    },
+    ConcurrencyLimit {
+        name: String,
+        max_in_flight: u32,
+        #[serde(default = "default_queue_timeout")]
+        queue_timeout: String,
+        #[serde(default)]
+        on_reject: ConcurrencyRejectSource,
+        service: Box<ServiceSource>,
+    },
+    RateLimit {
+        name: String,
+        key: RateLimitKeySource,
+        rate: RateSource,
+        burst: u64,
+        state: RateLimitStateSource,
+        service: Box<ServiceSource>,
+    },
     Recover {
         service: Box<ServiceSource>,
         handlers: Vec<RecoverSource>,
@@ -476,6 +563,46 @@ pub(crate) enum InlineServiceSource {
         #[serde(default)]
         default: Option<Box<ServiceSource>>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConcurrencyRejectSource {
+    #[serde(default = "default_service_unavailable_status")]
+    pub status: u16,
+}
+
+impl Default for ConcurrencyRejectSource {
+    fn default() -> Self {
+        Self {
+            status: default_service_unavailable_status(),
+        }
+    }
+}
+
+fn default_service_unavailable_status() -> u16 {
+    503
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RateLimitKeySource {
+    PeerIp,
+    Binding { name: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RateSource {
+    pub requests: u64,
+    pub per: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RateLimitStateSource {
+    pub max_keys: u32,
+    pub idle_ttl: String,
 }
 
 fn default_status_ok() -> u16 {

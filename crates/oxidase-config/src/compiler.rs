@@ -11,11 +11,11 @@ use http::{HeaderName, HeaderValue, Method, StatusCode, uri::PathAndQuery};
 use oxidase_core::{
     CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ContentDigest,
     ContentDigestBuilder, DiagnosticReference, ErrorClass, Expression, HeaderPredicate,
-    HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
-    RequestMetadataError, RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase,
-    RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
-    is_forbidden_user_header, parse_transform_authority, parse_transform_path_and_query,
-    parse_transform_scheme,
+    HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RateLimitKey,
+    RecoverHandler, RequestMetadataError, RequestTransform, ResourceId, RespondBody,
+    ResponseTransform, RouteCase, RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode,
+    ServiceProgram, SourceSpan, Value, is_forbidden_user_header, parse_transform_authority,
+    parse_transform_path_and_query, parse_transform_scheme,
 };
 use serde::Serialize;
 use url::Url;
@@ -28,10 +28,10 @@ use crate::source::{
     ActiveHealthSource, BodySource, CertificateSource, ClusterEndpointSource, ClusterSource,
     ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource, Http1SettingsSource,
     Http2SettingsSource, HttpListenerSource, HttpVersionSource, InlineServiceSource,
-    ListenerProtocolSource, ListenerSource, PassiveHealthSource, PredicateSource,
-    RedirectQuerySource, RequestTransformSource, ResourcesSource, ResponseTransformSource,
-    RetryRequestBodySource, RetrySource, ServiceSource, SiteSource, StatusRangeSource,
-    TlsListenerSource,
+    ListenerLimitsSource, ListenerProtocolSource, ListenerSource, PassiveHealthSource,
+    PredicateSource, RateLimitKeySource, RedirectQuerySource, RequestTransformSource,
+    ResourcesSource, ResponseTransformSource, RetryRequestBodySource, RetrySource, ServiceSource,
+    SiteSource, StatusRangeSource, TlsListenerSource,
 };
 
 #[derive(Debug, Clone)]
@@ -310,7 +310,21 @@ pub struct CompiledListener {
     pub protocol: ListenerProtocol,
     pub tls: Option<TlsListenerSpec>,
     pub http: HttpListenerSpec,
+    pub limits: ListenerLimits,
     pub service: ServiceId,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerLimits {
+    pub max_connections: u32,
+    pub max_connections_per_ip: u32,
+    pub idle_timeout: Duration,
+    pub request_body_idle_timeout: Duration,
+    pub response_body_idle_timeout: Duration,
+    pub max_header_bytes: u32,
+    pub max_headers: u32,
+    pub max_requests_per_connection: u32,
     pub source: SourceSpan,
 }
 
@@ -1314,6 +1328,79 @@ fn compile_http_listener(
     })
 }
 
+fn compile_listener_limits(
+    source: &ListenerLimitsSource,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<ListenerLimits, CompileError> {
+    validate_positive(
+        source.max_connections,
+        "listener.limit.max_connections",
+        "max_connections",
+        context.span(&format!("{field_path}.max_connections")),
+    )?;
+    validate_positive(
+        source.max_connections_per_ip,
+        "listener.limit.max_connections_per_ip",
+        "max_connections_per_ip",
+        context.span(&format!("{field_path}.max_connections_per_ip")),
+    )?;
+    validate_positive(
+        source.max_headers,
+        "listener.limit.max_headers",
+        "max_headers",
+        context.span(&format!("{field_path}.max_headers")),
+    )?;
+    validate_positive(
+        source.max_requests_per_connection,
+        "listener.limit.max_requests_per_connection",
+        "max_requests_per_connection",
+        context.span(&format!("{field_path}.max_requests_per_connection")),
+    )?;
+    let max_header_bytes_span = context.span(&format!("{field_path}.max_header_bytes"));
+    let max_header_bytes = parse_byte_size(&source.max_header_bytes, &max_header_bytes_span)?;
+    if max_header_bytes < 8 * 1_024 {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "listener.limit.max_header_bytes",
+                "max_header_bytes must be at least 8KiB",
+                max_header_bytes_span,
+            )
+            .with_help("use `8KiB` or greater; the HTTP/1 parser requires this minimum"),
+        ));
+    }
+    let max_header_bytes = u32::try_from(max_header_bytes).map_err(|_| {
+        CompileError::one(
+            Diagnostic::new(
+                "listener.limit.max_header_bytes",
+                "max_header_bytes cannot exceed 4GiB - 1 byte",
+                max_header_bytes_span,
+            )
+            .with_help("use a smaller positive byte size"),
+        )
+    })?;
+    Ok(ListenerLimits {
+        max_connections: source.max_connections,
+        max_connections_per_ip: source.max_connections_per_ip,
+        idle_timeout: parse_duration(
+            &source.idle_timeout,
+            &context.span(&format!("{field_path}.idle_timeout")),
+        )?,
+        request_body_idle_timeout: parse_duration(
+            &source.request_body_idle_timeout,
+            &context.span(&format!("{field_path}.request_body_idle_timeout")),
+        )?,
+        response_body_idle_timeout: parse_duration(
+            &source.response_body_idle_timeout,
+            &context.span(&format!("{field_path}.response_body_idle_timeout")),
+        )?,
+        max_header_bytes,
+        max_headers: source.max_headers,
+        max_requests_per_connection: source.max_requests_per_connection,
+        source: context.span(field_path),
+    })
+}
+
 fn compile_http1_settings(
     source: Option<&Http1SettingsSource>,
     versions: &BTreeSet<HttpVersion>,
@@ -1529,6 +1616,11 @@ impl<'a> ProgramBuilder<'a> {
                 context,
                 &located.field_path,
             )?;
+            let limits = compile_listener_limits(
+                &located.value.limits,
+                context,
+                &format!("{}.limits", located.field_path),
+            )?;
             let service = self.compile_service(
                 &located.value.service,
                 context,
@@ -1541,6 +1633,7 @@ impl<'a> ProgramBuilder<'a> {
                 protocol,
                 tls,
                 http,
+                limits,
                 service,
                 source: located.span(),
             });
@@ -1757,6 +1850,131 @@ impl<'a> ProgramBuilder<'a> {
                     &format!("{field_path}.service"),
                 )?,
             }),
+            InlineServiceSource::RequestBodyLimit { max_bytes, service } => {
+                Ok(ServiceKind::RequestBodyLimit {
+                    max_bytes: parse_byte_size(
+                        max_bytes,
+                        &context.span(&format!("{field_path}.max_bytes")),
+                    )?,
+                    service: self.compile_service(
+                        service,
+                        context,
+                        &format!("{field_path}.service"),
+                    )?,
+                })
+            }
+            InlineServiceSource::ConcurrencyLimit {
+                name,
+                max_in_flight,
+                queue_timeout,
+                on_reject,
+                service,
+            } => {
+                validate_policy_name(
+                    name,
+                    "service.concurrency_limit.name",
+                    context.span(&format!("{field_path}.name")),
+                )?;
+                validate_positive(
+                    *max_in_flight,
+                    "service.concurrency_limit.max_in_flight",
+                    "max_in_flight",
+                    context.span(&format!("{field_path}.max_in_flight")),
+                )?;
+                let reject_status = status_code(
+                    on_reject.status,
+                    context,
+                    &format!("{field_path}.on_reject"),
+                )?;
+                if !(reject_status.is_client_error() || reject_status.is_server_error()) {
+                    return Err(CompileError::one(
+                        Diagnostic::new(
+                            "service.concurrency_limit.reject_status",
+                            "on_reject.status must be a 4xx or 5xx response status",
+                            context.span(&format!("{field_path}.on_reject.status")),
+                        )
+                        .with_help("use `429` or `503`"),
+                    ));
+                }
+                Ok(ServiceKind::ConcurrencyLimit {
+                    name: name.clone(),
+                    max_in_flight: *max_in_flight,
+                    queue_timeout: parse_nonnegative_duration(
+                        queue_timeout,
+                        &context.span(&format!("{field_path}.queue_timeout")),
+                    )?,
+                    reject_status,
+                    service: self.compile_service(
+                        service,
+                        context,
+                        &format!("{field_path}.service"),
+                    )?,
+                })
+            }
+            InlineServiceSource::RateLimit {
+                name,
+                key,
+                rate,
+                burst,
+                state,
+                service,
+            } => {
+                validate_policy_name(
+                    name,
+                    "service.rate_limit.name",
+                    context.span(&format!("{field_path}.name")),
+                )?;
+                if rate.requests == 0 {
+                    return Err(semantic_error_at(
+                        "service.rate_limit.requests",
+                        "rate.requests must be greater than zero",
+                        context.span(&format!("{field_path}.rate.requests")),
+                    ));
+                }
+                if *burst == 0 {
+                    return Err(semantic_error_at(
+                        "service.rate_limit.burst",
+                        "burst must be greater than zero",
+                        context.span(&format!("{field_path}.burst")),
+                    ));
+                }
+                validate_positive(
+                    state.max_keys,
+                    "service.rate_limit.max_keys",
+                    "state.max_keys",
+                    context.span(&format!("{field_path}.state.max_keys")),
+                )?;
+                let key = match key {
+                    RateLimitKeySource::PeerIp => RateLimitKey::PeerIp,
+                    RateLimitKeySource::Binding { name } => {
+                        validate_binding_name(
+                            name,
+                            context.span(&format!("{field_path}.key.name")),
+                        )?;
+                        RateLimitKey::Binding(name.clone())
+                    }
+                };
+                Ok(ServiceKind::RateLimit {
+                    name: name.clone(),
+                    key,
+                    requests: rate.requests,
+                    per: parse_duration(
+                        &rate.per,
+                        &context.span(&format!("{field_path}.rate.per")),
+                    )?,
+                    burst: *burst,
+                    max_keys: state.max_keys,
+                    idle_ttl: parse_duration(
+                        &state.idle_ttl,
+                        &context.span(&format!("{field_path}.state.idle_ttl")),
+                    )?,
+                    service: self.compile_service(
+                        service,
+                        context,
+                        &format!("{field_path}.service"),
+                    )?,
+                })
+            }
             InlineServiceSource::Recover { service, handlers } => {
                 let service =
                     self.compile_service(service, context, &format!("{field_path}.service"))?;
@@ -2762,6 +2980,50 @@ fn validate_positive(
     Ok(())
 }
 
+fn validate_policy_name(
+    value: &str,
+    code: &'static str,
+    source: SourceSpan,
+) -> Result<(), CompileError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'));
+    if valid {
+        Ok(())
+    } else {
+        Err(CompileError::one(
+            Diagnostic::new(
+                code,
+                "policy name must be 1-128 ASCII letters, digits, `_`, `-`, `.`, or `:`",
+                source,
+            )
+            .with_help("use a short static configuration name suitable for bounded metrics"),
+        ))
+    }
+}
+
+fn validate_binding_name(value: &str, source: SourceSpan) -> Result<(), CompileError> {
+    let mut bytes = value.bytes();
+    let valid_start = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    let valid_tail = bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid_start && valid_tail {
+        Ok(())
+    } else {
+        Err(CompileError::one(
+            Diagnostic::new(
+                "service.rate_limit.binding",
+                format!("invalid lexical binding name `{value}`"),
+                source,
+            )
+            .with_help("use an identifier such as `tenant_id`"),
+        ))
+    }
+}
+
 fn parse_byte_size(source: &str, source_span: &SourceSpan) -> Result<u64, CompileError> {
     let (number, multiplier) = if let Some(number) = source.strip_suffix("KiB") {
         (number, 1_024u64)
@@ -2970,7 +3232,8 @@ mod tests {
 
     use http::StatusCode;
     use oxidase_core::{
-        ErrorClass, HeaderTransforms, RespondBody, ServiceId, ServiceKind, ServiceNode, SourceSpan,
+        ErrorClass, HeaderTransforms, RateLimitKey, RespondBody, ServiceId, ServiceKind,
+        ServiceNode, SourceSpan,
     };
     use tempfile::tempdir;
 
@@ -3044,6 +3307,258 @@ listeners:
             ServiceKind::Transform { .. }
         ));
         assert_eq!(gateway.listeners.len(), 1);
+    }
+
+    #[test]
+    fn compiles_listener_limits_and_all_ingress_governance_services() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  governed:
+    type: rate_limit
+    name: tenant-rate
+    key:
+      source: binding
+      name: tenant_id
+    rate:
+      requests: 100
+      per: 1s
+    burst: 200
+    state:
+      max_keys: 100000
+      idle_ttl: 10m
+    service:
+      type: concurrency_limit
+      name: upstream-admission
+      max_in_flight: 100
+      queue_timeout: 50ms
+      on_reject:
+        status: 429
+      service:
+        type: request_body_limit
+        max_bytes: 16MiB
+        service:
+          type: respond
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    limits:
+      max_connections: 8000
+      max_connections_per_ip: 80
+      idle_timeout: 90s
+      request_body_idle_timeout: 20s
+      response_body_idle_timeout: 25s
+      max_header_bytes: 32KiB
+      max_headers: 64
+      max_requests_per_connection: 500
+    service:
+      ref: governed
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("governance source compiles");
+        let limits = &gateway.listeners[0].limits;
+        assert_eq!(limits.max_connections, 8_000);
+        assert_eq!(limits.max_connections_per_ip, 80);
+        assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(90));
+        assert_eq!(
+            limits.request_body_idle_timeout,
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            limits.response_body_idle_timeout,
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(limits.max_header_bytes, 32 * 1_024);
+        assert_eq!(limits.max_headers, 64);
+        assert_eq!(limits.max_requests_per_connection, 500);
+        assert_eq!(limits.source.field_path, "listeners[0].limits");
+
+        let rate = gateway
+            .graph
+            .get(&ServiceId::new("service:governed"))
+            .expect("rate node");
+        let ServiceKind::RateLimit {
+            name,
+            key,
+            requests,
+            per,
+            burst,
+            max_keys,
+            idle_ttl,
+            service: concurrency,
+        } = &rate.kind
+        else {
+            panic!("expected RateLimit, got {:?}", rate.kind);
+        };
+        assert_eq!(name, "tenant-rate");
+        assert_eq!(key, &RateLimitKey::Binding("tenant_id".to_owned()));
+        assert_eq!((*requests, *burst, *max_keys), (100, 200, 100_000));
+        assert_eq!(*per, std::time::Duration::from_secs(1));
+        assert_eq!(*idle_ttl, std::time::Duration::from_secs(600));
+
+        let ServiceKind::ConcurrencyLimit {
+            name,
+            max_in_flight,
+            queue_timeout,
+            reject_status,
+            service: body_limit,
+        } = &gateway
+            .graph
+            .get(concurrency)
+            .expect("concurrency node")
+            .kind
+        else {
+            panic!("expected ConcurrencyLimit");
+        };
+        assert_eq!(name, "upstream-admission");
+        assert_eq!(*max_in_flight, 100);
+        assert_eq!(*queue_timeout, std::time::Duration::from_millis(50));
+        assert_eq!(*reject_status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(matches!(
+            gateway.graph.get(body_limit).expect("body limit node").kind,
+            ServiceKind::RequestBodyLimit {
+                max_bytes: 16_777_216,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn listener_governance_defaults_are_safe_and_backwards_compatible() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: concurrency_limit
+      name: default-reject
+      max_in_flight: 1
+      service:
+        type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("defaults compile");
+        let limits = &gateway.listeners[0].limits;
+        assert_eq!(limits.max_connections, 10_000);
+        assert_eq!(limits.max_connections_per_ip, 100);
+        assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(limits.max_header_bytes, 65_536);
+        assert_eq!(limits.max_headers, 100);
+        assert_eq!(limits.max_requests_per_connection, 1_000);
+        let entry = gateway
+            .graph
+            .get(&gateway.listeners[0].service)
+            .expect("entry node");
+        assert!(matches!(
+            entry.kind,
+            ServiceKind::ConcurrencyLimit {
+                queue_timeout: std::time::Duration::ZERO,
+                reject_status: StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn governance_validation_reports_the_exact_semantic_field() {
+        let fixtures = [
+            (
+                "limits:\n      max_connections: 0",
+                "type: respond",
+                "listener.limit.max_connections",
+                "listeners[0].limits.max_connections",
+            ),
+            (
+                "limits:\n      max_header_bytes: 4KiB",
+                "type: respond",
+                "listener.limit.max_header_bytes",
+                "listeners[0].limits.max_header_bytes",
+            ),
+            (
+                "",
+                "type: request_body_limit\n      max_bytes: 0B\n      service:\n        type: respond",
+                "config.byte_size",
+                "listeners[0].service.max_bytes",
+            ),
+            (
+                "",
+                "type: concurrency_limit\n      name: bad/name\n      max_in_flight: 1\n      service:\n        type: respond",
+                "service.concurrency_limit.name",
+                "listeners[0].service.name",
+            ),
+            (
+                "",
+                "type: concurrency_limit\n      name: good\n      max_in_flight: 0\n      service:\n        type: respond",
+                "service.concurrency_limit.max_in_flight",
+                "listeners[0].service.max_in_flight",
+            ),
+            (
+                "",
+                "type: concurrency_limit\n      name: good\n      max_in_flight: 1\n      on_reject:\n        status: 200\n      service:\n        type: respond",
+                "service.concurrency_limit.reject_status",
+                "listeners[0].service.on_reject.status",
+            ),
+            (
+                "",
+                "type: rate_limit\n      name: rate\n      key:\n        source: binding\n        name: bad-name\n      rate:\n        requests: 1\n        per: 1s\n      burst: 1\n      state:\n        max_keys: 10\n        idle_ttl: 1m\n      service:\n        type: respond",
+                "service.rate_limit.binding",
+                "listeners[0].service.key.name",
+            ),
+            (
+                "",
+                "type: rate_limit\n      name: rate\n      key:\n        source: peer_ip\n      rate:\n        requests: 0\n        per: 1s\n      burst: 1\n      state:\n        max_keys: 10\n        idle_ttl: 1m\n      service:\n        type: respond",
+                "service.rate_limit.requests",
+                "listeners[0].service.rate.requests",
+            ),
+            (
+                "",
+                "type: rate_limit\n      name: rate\n      key:\n        source: peer_ip\n      rate:\n        requests: 1\n        per: 1s\n      burst: 0\n      state:\n        max_keys: 10\n        idle_ttl: 1m\n      service:\n        type: respond",
+                "service.rate_limit.burst",
+                "listeners[0].service.burst",
+            ),
+            (
+                "",
+                "type: rate_limit\n      name: rate\n      key:\n        source: peer_ip\n      rate:\n        requests: 1\n        per: 1s\n      burst: 1\n      state:\n        max_keys: 0\n        idle_ttl: 1m\n      service:\n        type: respond",
+                "service.rate_limit.max_keys",
+                "listeners[0].service.state.max_keys",
+            ),
+        ];
+
+        for (listener_limits, service, code, field_path) in fixtures {
+            let (_directory, path) = write_config(&format!(
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    {listener_limits}\n    service:\n      {service}\n"
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid governance field fails");
+            assert_eq!(error.diagnostics[0].code, code);
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+            assert!(
+                error.diagnostics[0].primary.end_byte > error.diagnostics[0].primary.start_byte
+            );
+        }
+    }
+
+    #[test]
+    fn governance_sources_reject_unknown_inert_fields() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    limits:
+      max_connections: 100
+      magic_overflow_policy: ignore
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("unknown limit must fail");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+        assert!(error.to_string().contains("magic_overflow_policy"));
     }
 
     #[test]

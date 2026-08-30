@@ -120,6 +120,125 @@ Forwarded/X-Forwarded scheme metadata is constructed from the accepted connectio
 not from client-supplied forwarding Headers. Raw SNI and peer addresses may appear
 as controlled tracing fields but never as metric labels.
 
+## Ingress governance
+
+Each Listener accepts an optional finite `limits` policy:
+
+```yaml
+listeners:
+  - name: public
+    bind: 0.0.0.0:8443
+    protocol: https
+    limits:
+      max_connections: 10000
+      max_connections_per_ip: 100
+      idle_timeout: 2m
+      request_body_idle_timeout: 30s
+      response_body_idle_timeout: 30s
+      max_header_bytes: 64KiB
+      max_headers: 100
+      max_requests_per_connection: 1000
+    service:
+      ref: public
+```
+
+These values are the defaults when `limits` is absent. The retained listening socket
+owns total and per-peer connection accounting, so an accepted socket remains counted
+through TLS handshake, HTTP service, and any trusted Upgrade tunnel. A compatible
+reload applies the new policy to new accepts without forgetting connections admitted
+under the old plan. Rebind creates a new socket-owned state.
+
+The peer key is the kernel socket IP, with IPv4-mapped IPv6 normalized to IPv4; port
+and client-supplied `Forwarded`/`X-Forwarded-For` values do not participate. The peer
+identity table is bounded by `max_connections`, removes identities after they have no
+active connection for `idle_timeout` on a later admission, and preferentially evicts
+older idle identities at capacity. Active identities are never evicted to admit a new
+peer. Total and per-peer counters use RAII ownership, so handshake failure,
+cancellation, drain, and task abort release them.
+
+`idle_timeout` is a connection-wide no-wire-progress deadline. The request-body idle
+deadline applies while a descendant polls incoming DATA; the response-body deadline
+applies both to a stalled response frame source and to a downstream socket that stops
+accepting writes. These are idle intervals, not maximum request or transfer lifetimes.
+Header count and decoded field-block bytes are checked for both HTTP versions.
+HTTP/1 reserves separate bounded parser space for the fixed 8 KiB request-target
+ceiling and line framing, so a valid target does not consume the configured Header
+budget. HTTP/2 uses the smaller of this Listener byte limit and its
+`http2.max_header_list_size` setting.
+
+`max_requests_per_connection` counts accepted HTTP/1 requests or accepted HTTP/2
+streams. The last permitted HTTP/1 request closes the keep-alive connection after its
+response. The last permitted H2 stream initiates graceful GOAWAY; later streams are
+not sent through the Service graph. `http2.max_concurrent_streams` remains a separate
+simultaneous-stream limit.
+
+### Protection wrappers
+
+The same Service graph supports three orthogonal wrappers:
+
+```yaml
+services:
+  public:
+    type: rate_limit
+    name: public-api
+    key:
+      source: peer_ip
+    rate:
+      requests: 100
+      per: 1s
+    burst: 200
+    state:
+      max_keys: 100000
+      idle_ttl: 10m
+    service:
+      type: concurrency_limit
+      name: public-admission
+      max_in_flight: 100
+      queue_timeout: 50ms
+      on_reject:
+        status: 503
+      service:
+        type: request_body_limit
+        max_bytes: 16MiB
+        service:
+          type: proxy
+          cluster: api
+```
+
+`request_body_limit` is lexical and streaming. Nested limits use the smaller byte
+ceiling. A known Content-Length above the ceiling returns 413 before running the
+child. For an unknown-length HTTP/1 chunked or HTTP/2 request, each DATA frame is
+counted when the body-consuming descendant (currently Proxy) polls it; trailers do
+not count and no whole-body buffer is introduced. Explicit retry replay uses the
+smaller of its configured buffer and this limit. If overflow is discovered before a
+downstream response head, Proxy returns 413 and cancels the upstream send. If a head
+has already been committed, the stream is cancelled and recorded as a body error;
+Oxidase cannot replace an already-sent response with a synthetic 413. A declined or
+failed child does not leak the lexical limit to a Fallback sibling.
+Bodyless requests use an allocation-free empty payload path and do not construct a
+request-body idle timer.
+
+`concurrency_limit` obtains a permit before child execution or body consumption. Its
+waiter queue is bounded to `max_in_flight`; `queue_timeout: 0ms` rejects immediately,
+while a positive value waits no longer than that duration. Rejection produces the
+configured 4xx/5xx `on_reject.status` (503 by default) as a handled response. A
+handled permit transfers to the response body or trusted Upgrade tunnel and is
+released only on completion, error, cancellation, timeout, drain, or drop. Declined,
+Failed, and rejected paths release immediately. State is keyed by compiler-owned
+Service identity and reused across compatible reloads, so work pinned to an older
+snapshot remains included while the new limit governs subsequent admission.
+
+`rate_limit` is a monotonic fixed-point token bucket. `key.source` is either
+`peer_ip`, using the actual normalized transport peer, or `binding`, naming a lexical
+Boolean, integer, or string binding. Binding text must be non-empty and at most 256
+bytes; missing, composite, or oversized keys fail closed with 429. Each limiter map
+is bounded by `state.max_keys`; idle buckets restart after `idle_ttl`, and a new key
+fails closed when capacity remains full after stale eviction. Rejection includes a
+whole-second `Retry-After` rounded up to at least one second. Rate state is reused
+only when key source, rate, burst, capacity, and idle TTL are unchanged; a policy
+change starts a fresh bounded generation. This alpha has no trusted-proxy identity,
+arbitrary Header key, shared cross-process limiter, or distributed quota.
+
 ## Protocol bridging
 
 A Cluster's upstream protocol is `auto`, `http1`, or `h2`. `auto` uses HTTPS ALPN
@@ -231,7 +350,7 @@ It serves:
 - `/health/live`: process/event-loop liveness;
 - `/health/ready`: a prepared snapshot with at least one user listener;
 - `/metrics`: Prometheus text with fixed outcome, status-class, latency, active
-  request, reload, transport, tunnel, and Cluster counters;
+  request, reload, transport, tunnel, ingress-governance, and Cluster counters;
 - `/api/v1/clusters`: deterministic read-only Cluster/endpoint runtime status.
 
 An explicit `Observe` wrapper adds bounded production series:
@@ -274,9 +393,24 @@ last transition/ejection remaining. Neither endpoint origins nor request data,
 credentials, certificate material, paths, queries, client addresses, or error
 strings are returned or used as labels.
 
+Protection wrappers export
+`oxidase_governance_total{kind,name,result}`. `kind` is one of the three compiled
+wrapper kinds, `name` is the configured limiter name (or the compiler-owned static
+Service identity for an unnamed request-body wrapper), and `result` is a closed
+decision enum. For `request_body_limit`, `evaluated` means that the wrapper installed
+a lexical streaming ceiling; it is deliberately not reported as `admitted` before
+an unknown-length body completes. Response-status and body-lifecycle metrics carry
+later streaming outcomes. Governance, Observe, and Listener transport series tables
+each have a fixed reload-churn capacity of 4,096; new series are dropped after those
+bounds. Peer/binding key values, paths, queries, Headers, and client-provided
+identifiers are never labels.
+
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service
 source values.
+The current CLI-configured admin listener has a fixed 256-connection admission cap
+and incrementally reaps completed connection tasks. Source-configured authentication
+and per-admin policy remain part of the secure-control-plane work.
 
 User HTTP/1 mode and the management HTTP/1 listener use Hyper's timer-backed request
 header read timeout (30 seconds by default). TLS has a separate handshake timeout

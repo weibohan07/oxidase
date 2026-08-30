@@ -7,10 +7,9 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
-use hyper::body::Incoming;
 use oxidase_runtime::{ClusterRequestPermit, PreparedCluster};
 
-use crate::body::BoxError;
+use crate::body::{BoxError, GatewayRequestBody};
 use crate::protocol::RequestTrailerGuard;
 
 /// Marks an error produced while decoding the untrusted downstream request
@@ -32,14 +31,27 @@ impl std::error::Error for DownstreamRequestBodyError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RequestBodyLimitExceeded;
+
+impl std::fmt::Display for RequestBodyLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("request body exceeds the configured Service limit")
+    }
+}
+
+impl std::error::Error for RequestBodyLimitExceeded {}
+
 /// The single body type accepted by every long-lived upstream client pool.
 ///
 /// Normal requests wrap Hyper's incoming stream without collection. `Replay`
 /// is constructed only for an explicitly configured, bounded retry policy.
 pub(crate) enum ProxyRequestBody {
     Streaming {
-        body: Incoming,
+        body: GatewayRequestBody,
         trailer_guard: RequestTrailerGuard,
+        max_bytes: Option<u64>,
+        seen_bytes: u64,
     },
     Empty,
     Replay {
@@ -49,10 +61,16 @@ pub(crate) enum ProxyRequestBody {
 }
 
 impl ProxyRequestBody {
-    pub(crate) fn streaming(body: Incoming, trailer_guard: RequestTrailerGuard) -> Self {
+    pub(crate) fn streaming(
+        body: impl Into<GatewayRequestBody>,
+        trailer_guard: RequestTrailerGuard,
+        max_bytes: Option<u64>,
+    ) -> Self {
         Self::Streaming {
-            body,
+            body: body.into(),
             trailer_guard,
+            max_bytes,
+            seen_bytes: 0,
         }
     }
 
@@ -73,8 +91,16 @@ impl Body for ProxyRequestBody {
             Self::Streaming {
                 body,
                 trailer_guard,
+                max_bytes,
+                seen_bytes,
             } => match Pin::new(body).poll_frame(context) {
                 Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        *seen_bytes = seen_bytes.saturating_add(data.len() as u64);
+                        if max_bytes.is_some_and(|limit| *seen_bytes > limit) {
+                            return Poll::Ready(Some(Err(Box::new(RequestBodyLimitExceeded))));
+                        }
+                    }
                     if let Some(trailers) = frame.trailers_ref()
                         && let Err(error) = trailer_guard.validate(trailers)
                     {
@@ -83,7 +109,7 @@ impl Body for ProxyRequestBody {
                     Poll::Ready(Some(Ok(frame)))
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    Poll::Ready(Some(Err(Box::new(DownstreamRequestBodyError(error)))))
+                    Poll::Ready(Some(Err(classify_downstream_body_error(error))))
                 }
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
@@ -180,18 +206,20 @@ impl std::error::Error for BufferRequestError {
 /// This function is never used by the default Proxy path. Callers must acquire
 /// Cluster admission before entering it so overload never consumes an upload.
 pub(crate) async fn buffer_for_replay(
-    mut body: Incoming,
+    body: impl Into<GatewayRequestBody>,
     max_bytes: u64,
     trailer_guard: &RequestTrailerGuard,
 ) -> Result<ReplayBody, BufferRequestError> {
     use http_body_util::BodyExt as _;
 
+    let mut body = body.into();
     let mut data = BytesMut::new();
     let mut trailers = None;
-    while let Some(frame) =
-        body.frame().await.transpose().map_err(|error| {
-            BufferRequestError::Body(Box::new(DownstreamRequestBodyError(error)))
-        })?
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|error| BufferRequestError::Body(classify_downstream_body_error(error)))?
     {
         let frame = match frame.into_data() {
             Ok(chunk) => {
@@ -217,6 +245,13 @@ pub(crate) async fn buffer_for_replay(
         data: data.freeze(),
         trailers,
     })
+}
+
+fn classify_downstream_body_error(error: BoxError) -> BoxError {
+    match error.downcast::<hyper::Error>() {
+        Ok(error) => Box::new(DownstreamRequestBodyError(*error)),
+        Err(error) => error,
+    }
 }
 
 /// Holds admission until the proxied response body ends or is dropped.
@@ -308,5 +343,39 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use http::HeaderMap;
+    use http_body_util::BodyExt as _;
+
+    use super::{ProxyRequestBody, RequestBodyLimitExceeded};
+    use crate::body::full_body;
+    use crate::protocol::{RequestTrailerGuard, WireProtocol};
+
+    fn guard() -> RequestTrailerGuard {
+        RequestTrailerGuard::from_request_headers(WireProtocol::Http2, &HeaderMap::new())
+            .expect("empty HTTP/2 trailer declaration is valid")
+    }
+
+    #[tokio::test]
+    async fn streaming_request_body_limit_has_exact_byte_boundary() {
+        let exact =
+            ProxyRequestBody::streaming(full_body(Bytes::from_static(b"four")), guard(), Some(4))
+                .collect()
+                .await
+                .expect("body exactly at the limit is forwarded")
+                .to_bytes();
+        assert_eq!(exact, Bytes::from_static(b"four"));
+
+        let error =
+            ProxyRequestBody::streaming(full_body(Bytes::from_static(b"five!")), guard(), Some(4))
+                .collect()
+                .await
+                .expect_err("body above the limit fails before forwarding that frame");
+        assert!(error.downcast_ref::<RequestBodyLimitExceeded>().is_some());
     }
 }

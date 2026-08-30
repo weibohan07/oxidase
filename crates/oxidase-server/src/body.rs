@@ -3,6 +3,7 @@ use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
-use oxidase_runtime::RuntimeSnapshot;
+use oxidase_runtime::{ConcurrencyPermit, RuntimeSnapshot};
 use tokio::time::{Instant, Sleep};
 
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
@@ -20,6 +21,69 @@ use crate::upgrade::TunnelPlan;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
+
+/// Connection-owned provenance for downstream socket write timeouts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DownstreamTimeoutSignal(Arc<AtomicBool>);
+
+impl DownstreamTimeoutSignal {
+    pub(crate) fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Downstream request body with an allocation-free empty fast path.
+///
+/// Hyper reports bodyless requests as end-of-stream immediately. Dropping that
+/// empty `Incoming` avoids constructing both a boxed adapter and an idle timer;
+/// streaming requests retain the frame-preserving timeout wrapper.
+pub(crate) enum GatewayRequestBody {
+    Empty,
+    Stream(GatewayBody),
+}
+
+impl From<GatewayBody> for GatewayRequestBody {
+    fn from(body: GatewayBody) -> Self {
+        if body.is_end_stream() {
+            Self::Empty
+        } else {
+            Self::Stream(body)
+        }
+    }
+}
+
+impl Body for GatewayRequestBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            Self::Empty => Poll::Ready(None),
+            Self::Stream(body) => Pin::new(body).poll_frame(context),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Stream(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Empty => SizeHint::with_exact(0),
+            Self::Stream(body) => body.size_hint(),
+        }
+    }
+}
 
 pub enum GatewayBodyPlan {
     Empty,
@@ -31,6 +95,10 @@ pub enum GatewayBodyPlan {
     },
     Head {
         representation_length: Option<u64>,
+    },
+    Guarded {
+        body: Box<GatewayBodyPlan>,
+        permit: ConcurrencyPermit,
     },
     TrustedUpgrade(TunnelPlan),
 }
@@ -58,6 +126,7 @@ impl std::fmt::Debug for GatewayBodyPlan {
                 .debug_struct("Head")
                 .field("representation_length", representation_length)
                 .finish(),
+            Self::Guarded { body, .. } => formatter.debug_tuple("Guarded").field(body).finish(),
             Self::TrustedUpgrade(plan) => {
                 formatter.debug_tuple("TrustedUpgrade").field(plan).finish()
             }
@@ -74,7 +143,39 @@ impl GatewayBodyPlan {
             Self::Head {
                 representation_length,
             } => *representation_length,
+            Self::Guarded { body, .. } => body.representation_length(),
             Self::TrustedUpgrade(_) => None,
+        }
+    }
+
+    pub(crate) fn trailer_guard(&self) -> Option<&TrailerGuard> {
+        match self {
+            Self::Stream {
+                trailer_guard: Some(guard),
+                ..
+            } => Some(guard),
+            Self::Guarded { body, .. } => body.trailer_guard(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn can_have_trailers(&self) -> bool {
+        match self {
+            Self::Stream { .. } => true,
+            Self::Guarded { body, .. } => body.can_have_trailers(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn retain_concurrency_permit(self, permit: ConcurrencyPermit) -> Self {
+        match self {
+            Self::TrustedUpgrade(plan) => {
+                Self::TrustedUpgrade(plan.retain_concurrency_permit(permit))
+            }
+            body => Self::Guarded {
+                body: Box::new(body),
+                permit,
+            },
         }
     }
 
@@ -87,8 +188,49 @@ impl GatewayBodyPlan {
             Self::Bytes(bytes) => full_body(bytes),
             Self::Stream { body, .. } => body,
             Self::Head { .. } => empty_body(),
+            Self::Guarded { body, permit } => {
+                GuardedBody::new(body.into_body(false), permit).boxed_unsync()
+            }
             Self::TrustedUpgrade(_) => empty_body(),
         }
+    }
+}
+
+struct GuardedBody {
+    inner: GatewayBody,
+    permit: Option<ConcurrencyPermit>,
+}
+
+impl GuardedBody {
+    fn new(inner: GatewayBody, permit: ConcurrencyPermit) -> Self {
+        Self {
+            inner,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl Body for GuardedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.inner).poll_frame(context);
+        if matches!(frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.permit.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -106,8 +248,22 @@ fn infallible_to_box(error: Infallible) -> BoxError {
     match error {}
 }
 
-pub(crate) fn timeout_incoming_body(body: Incoming, timeout: Duration) -> GatewayBody {
-    TimeoutBody::new(body, timeout).boxed_unsync()
+pub(crate) fn timeout_request_body(body: Incoming, timeout: Duration) -> GatewayRequestBody {
+    if body.is_end_stream() {
+        GatewayRequestBody::Empty
+    } else {
+        GatewayRequestBody::Stream(
+            TimeoutBody::new(body, timeout, BodyIdleDirection::Request).boxed_unsync(),
+        )
+    }
+}
+
+pub(crate) fn timeout_upstream_response_body(body: Incoming, timeout: Duration) -> GatewayBody {
+    TimeoutBody::new(body, timeout, BodyIdleDirection::UpstreamResponse).boxed_unsync()
+}
+
+fn timeout_downstream_response_body(body: GatewayBody, timeout: Duration) -> GatewayBody {
+    TimeoutBody::new(body, timeout, BodyIdleDirection::DownstreamResponse).boxed_unsync()
 }
 
 /// Preserves streaming body frames while enforcing the downstream trailer
@@ -195,14 +351,38 @@ pub(crate) fn instrument_response_body(
 ///
 /// The pin is released on end-of-stream, body error, or cancellation/drop. It
 /// does not inspect or buffer body frames.
+#[cfg(test)]
 pub(crate) fn instrument_response_body_with_snapshot(
     response: http::Response<GatewayBody>,
     metrics: Arc<Metrics>,
     active_request: ActiveRequest,
     snapshot: Option<Arc<RuntimeSnapshot>>,
 ) -> http::Response<GatewayBody> {
+    instrument_response_body_with_snapshot_timeout(
+        response,
+        metrics,
+        active_request,
+        snapshot,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn instrument_response_body_with_snapshot_timeout(
+    response: http::Response<GatewayBody>,
+    metrics: Arc<Metrics>,
+    active_request: ActiveRequest,
+    snapshot: Option<Arc<RuntimeSnapshot>>,
+    response_body_idle_timeout: Option<Duration>,
+    downstream_timeout: Option<DownstreamTimeoutSignal>,
+) -> http::Response<GatewayBody> {
     let (parts, body) = response.into_parts();
-    let body = InstrumentedBody::new(body, metrics, active_request, snapshot).boxed_unsync();
+    let body = match response_body_idle_timeout {
+        Some(timeout) => timeout_downstream_response_body(body, timeout),
+        None => body,
+    };
+    let body = InstrumentedBody::new(body, metrics, active_request, snapshot, downstream_timeout)
+        .boxed_unsync();
     http::Response::from_parts(parts, body)
 }
 
@@ -214,6 +394,7 @@ struct InstrumentedBody {
     bytes: u64,
     termination: Option<BodyTermination>,
     snapshot: Option<Arc<RuntimeSnapshot>>,
+    downstream_timeout: Option<DownstreamTimeoutSignal>,
 }
 
 impl InstrumentedBody {
@@ -222,6 +403,7 @@ impl InstrumentedBody {
         metrics: Arc<Metrics>,
         active_request: ActiveRequest,
         snapshot: Option<Arc<RuntimeSnapshot>>,
+        downstream_timeout: Option<DownstreamTimeoutSignal>,
     ) -> Self {
         let mut body = Self {
             inner,
@@ -231,6 +413,7 @@ impl InstrumentedBody {
             bytes: 0,
             termination: None,
             snapshot,
+            downstream_timeout,
         };
         if body.inner.is_end_stream() {
             body.finish(BodyTermination::Completed);
@@ -273,6 +456,7 @@ impl Body for InstrumentedBody {
                 let termination = if error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                    || error.downcast_ref::<BodyIdleTimeout>().is_some()
                 {
                     BodyTermination::Timeout
                 } else {
@@ -301,7 +485,16 @@ impl Body for InstrumentedBody {
 impl Drop for InstrumentedBody {
     fn drop(&mut self) {
         if self.termination.is_none() {
-            self.finish(BodyTermination::Cancelled);
+            let termination = if self
+                .downstream_timeout
+                .as_ref()
+                .is_some_and(DownstreamTimeoutSignal::is_marked)
+            {
+                BodyTermination::Timeout
+            } else {
+                BodyTermination::Cancelled
+            };
+            self.finish(termination);
         }
     }
 }
@@ -310,17 +503,49 @@ struct TimeoutBody<B> {
     inner: Pin<Box<B>>,
     deadline: Pin<Box<Sleep>>,
     timeout: Duration,
+    direction: BodyIdleDirection,
 }
 
 impl<B> TimeoutBody<B> {
-    fn new(inner: B, timeout: Duration) -> Self {
+    fn new(inner: B, timeout: Duration, direction: BodyIdleDirection) -> Self {
         Self {
             inner: Box::pin(inner),
             deadline: Box::pin(tokio::time::sleep(timeout)),
             timeout,
+            direction,
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyIdleDirection {
+    Request,
+    UpstreamResponse,
+    DownstreamResponse,
+}
+
+#[derive(Debug)]
+pub(crate) struct BodyIdleTimeout {
+    direction: BodyIdleDirection,
+}
+
+impl BodyIdleTimeout {
+    pub(crate) const fn direction(&self) -> BodyIdleDirection {
+        self.direction
+    }
+}
+
+impl std::fmt::Display for BodyIdleTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.direction {
+            BodyIdleDirection::Request => "downstream request body idle timeout",
+            BodyIdleDirection::UpstreamResponse => "upstream response body idle timeout",
+            BodyIdleDirection::DownstreamResponse => "downstream response body idle timeout",
+        })
+    }
+}
+
+impl std::error::Error for BodyIdleTimeout {}
 
 impl<B> Body for TimeoutBody<B>
 where
@@ -343,10 +568,9 @@ where
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => match self.deadline.as_mut().poll(context) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream response body idle timeout",
-                ))))),
+                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(BodyIdleTimeout {
+                    direction: self.direction,
+                })))),
                 Poll::Pending => Poll::Pending,
             },
         }
@@ -363,6 +587,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll};
@@ -374,11 +599,12 @@ mod tests {
     use http_body_util::BodyExt;
 
     use oxidase_config::Compiler;
-    use oxidase_runtime::RuntimeSnapshot;
+    use oxidase_core::{ServiceGraph, ServiceId, ServiceKind, ServiceNode, SourceSpan};
+    use oxidase_runtime::{ConcurrencyRejection, GovernanceRegistry, RuntimeSnapshot};
 
     use super::{
-        BoxError, GatewayBody, ProtocolBody, TimeoutBody, full_body, instrument_response_body,
-        instrument_response_body_with_snapshot,
+        BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBody, GatewayBodyPlan, ProtocolBody,
+        TimeoutBody, full_body, instrument_response_body, instrument_response_body_with_snapshot,
     };
     use crate::metrics::Metrics;
     use crate::protocol::{TrailerDeclaration, TrailerGuard, TrailerValidationError, WireProtocol};
@@ -604,6 +830,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_response_body_holds_concurrency_until_completion() {
+        let id = ServiceId::new("limit");
+        let node = ServiceNode {
+            id: id.clone(),
+            source: SourceSpan::synthetic("limit"),
+            kind: ServiceKind::ConcurrencyLimit {
+                name: "body".to_owned(),
+                max_in_flight: 1,
+                queue_timeout: Duration::ZERO,
+                reject_status: http::StatusCode::SERVICE_UNAVAILABLE,
+                service: ServiceId::new("child"),
+            },
+        };
+        let graph = ServiceGraph::new(BTreeMap::from([(id.clone(), node)]));
+        let registry = GovernanceRegistry::prepare(&graph, None).0;
+        let permit = registry
+            .acquire_concurrency(&id, 1, Duration::ZERO)
+            .await
+            .expect("first request is admitted");
+        let body = GatewayBodyPlan::Bytes(Bytes::from_static(b"streaming"))
+            .retain_concurrency_permit(permit)
+            .into_body(false);
+        assert!(matches!(
+            registry.acquire_concurrency(&id, 1, Duration::ZERO).await,
+            Err(ConcurrencyRejection::Saturated)
+        ));
+        assert_eq!(
+            body.collect()
+                .await
+                .expect("guarded response body completes")
+                .to_bytes(),
+            Bytes::from_static(b"streaming")
+        );
+        let permit = registry
+            .acquire_concurrency(&id, 1, Duration::ZERO)
+            .await
+            .expect("body completion releases the permit");
+        drop(permit);
+    }
+
+    #[tokio::test]
     async fn timeout_body_forwards_data_and_trailer_frames_unchanged() {
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", HeaderValue::from_static("0"));
@@ -612,10 +879,14 @@ mod tests {
             Ok(Frame::trailers(trailers.clone())),
         ]);
 
-        let collected = TimeoutBody::new(source, Duration::from_secs(1))
-            .collect()
-            .await
-            .expect("timed body completes");
+        let collected = TimeoutBody::new(
+            source,
+            Duration::from_secs(1),
+            BodyIdleDirection::UpstreamResponse,
+        )
+        .collect()
+        .await
+        .expect("timed body completes");
 
         assert_eq!(collected.trailers(), Some(&trailers));
         assert_eq!(collected.to_bytes(), Bytes::from_static(b"payload"));
@@ -623,14 +894,18 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_body_still_reports_idle_timeout_without_a_frame() {
-        let error = TimeoutBody::new(PendingBody, Duration::from_millis(5))
-            .collect()
-            .await
-            .expect_err("idle body must time out");
+        let error = TimeoutBody::new(
+            PendingBody,
+            Duration::from_millis(5),
+            BodyIdleDirection::UpstreamResponse,
+        )
+        .collect()
+        .await
+        .expect_err("idle body must time out");
         let error = error
-            .downcast_ref::<std::io::Error>()
-            .expect("timeout remains an io error");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            .downcast_ref::<BodyIdleTimeout>()
+            .expect("timeout retains its typed direction");
+        assert_eq!(error.direction(), BodyIdleDirection::UpstreamResponse);
     }
 
     #[tokio::test]
@@ -639,10 +914,14 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture closed"),
         ))]);
 
-        let error = TimeoutBody::new(source, Duration::from_secs(1))
-            .collect()
-            .await
-            .expect_err("source error must pass through");
+        let error = TimeoutBody::new(
+            source,
+            Duration::from_secs(1),
+            BodyIdleDirection::UpstreamResponse,
+        )
+        .collect()
+        .await
+        .expect_err("source error must pass through");
         let error = error
             .downcast_ref::<std::io::Error>()
             .expect("source io error remains directly downcastable");

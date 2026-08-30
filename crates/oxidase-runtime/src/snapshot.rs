@@ -13,6 +13,7 @@ use oxidase_core::{
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
 use crate::cluster::PreparedCluster;
+use crate::governance::GovernanceRegistry;
 use crate::tls::{
     CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
     PreparedListenerPlan, TlsListenerPreparationErrorKind, TlsListenerPreparationFailure,
@@ -30,6 +31,7 @@ pub struct RuntimeSnapshot {
     pub config_version: ConfigVersion,
     pub dependencies: Vec<std::path::PathBuf>,
     pub graph: Arc<ServiceGraph>,
+    pub governance: GovernanceRegistry,
     pub resources: ResourceRegistry,
     pub listeners: Vec<CompiledListener>,
     pub prepared_listeners: Vec<PreparedListenerPlan>,
@@ -53,6 +55,12 @@ impl RuntimeSnapshot {
         let mut sites = BTreeMap::new();
         let mut site_fingerprints = BTreeMap::new();
         let mut reuse = ResourceReuse::default();
+        let (governance, governance_reuse) = GovernanceRegistry::prepare(
+            &gateway.graph,
+            previous.map(|previous| &previous.governance),
+        );
+        reuse.concurrency_limiters = governance_reuse.concurrency;
+        reuse.rate_limiters = governance_reuse.rate_limits;
         let mut dependencies = gateway.dependencies.clone();
         for (id, source) in &gateway.resources.sites {
             let index = SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
@@ -185,6 +193,7 @@ impl RuntimeSnapshot {
                 config_version,
                 dependencies,
                 graph: gateway.graph,
+                governance,
                 resources: ResourceRegistry {
                     certificates,
                     clusters,
@@ -230,6 +239,10 @@ pub struct ResourceReuse {
     pub clusters: usize,
     /// Endpoint runtime states reused even when the immutable Cluster policy changed.
     pub cluster_endpoints: usize,
+    /// Concurrency counters reused by compiler-owned Service identity.
+    pub concurrency_limiters: usize,
+    /// Token-bucket maps reused only when their complete policy is unchanged.
+    pub rate_limiters: usize,
 }
 
 #[derive(Debug)]

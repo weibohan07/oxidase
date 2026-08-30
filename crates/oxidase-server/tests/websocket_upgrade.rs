@@ -244,6 +244,40 @@ listeners:
     .expect("plain proxy config can be written");
 }
 
+fn write_concurrency_limited_proxy(path: &Path, bind: &str, upstream: std::net::SocketAddr) {
+    fs::write(
+        path,
+        format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    upstream:
+      protocol: http1
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+services:
+  root:
+    type: concurrency_limit
+    name: tunnel-boundary
+    max_in_flight: 1
+    queue_timeout: 0ms
+    service:
+      type: proxy
+      cluster: upstream
+listeners:
+  - name: public
+    bind: {bind}
+    service:
+      ref: root
+"#
+        ),
+    )
+    .expect("concurrency-limited proxy config can be written");
+}
+
 fn write_plain_respond(path: &Path, bind: &str, status: u16, body: &str) {
     fs::write(
         path,
@@ -332,6 +366,13 @@ async fn plain_proxy_gateway(upstream: std::net::SocketAddr) -> TestGateway {
     let directory = tempdir().expect("temporary gateway directory is available");
     let config = directory.path().join("oxidase.yaml");
     write_plain_proxy(&config, "127.0.0.1:0", upstream);
+    launch_gateway(directory, config).await
+}
+
+async fn concurrency_limited_proxy_gateway(upstream: std::net::SocketAddr) -> TestGateway {
+    let directory = tempdir().expect("temporary gateway directory is available");
+    let config = directory.path().join("oxidase.yaml");
+    write_concurrency_limited_proxy(&config, "127.0.0.1:0", upstream);
     launch_gateway(directory, config).await
 }
 
@@ -435,6 +476,40 @@ async fn plain_http1_upgrade_forwards_websocket_style_bytes_and_client_close() {
         "oxidase_tunnel_bytes_total{{listener=\"public\",direction=\"downstream_to_upstream\"}} {}",
         CLIENT_FRAME.len()
     )));
+    gateway
+        .running
+        .shutdown()
+        .await
+        .expect("gateway shuts down");
+}
+
+#[tokio::test]
+async fn concurrency_limit_permit_lives_through_the_upgrade_tunnel() {
+    let upstream = spawn_upgrade_upstream(UpstreamMode::Echo).await;
+    let gateway = concurrency_limited_proxy_gateway(upstream.address).await;
+    let mut tunnel = TcpStream::connect(gateway.address)
+        .await
+        .expect("Upgrade client connects");
+    perform_upgrade(&mut tunnel).await;
+
+    let overlap = plain_get(gateway.address).await;
+    assert!(
+        overlap.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "{overlap}"
+    );
+
+    tunnel.shutdown().await.expect("client half-closes cleanly");
+    drop(tunnel);
+    tokio::time::timeout(Duration::from_secs(2), upstream.peer_closed.notified())
+        .await
+        .expect("client close propagates to the upstream tunnel");
+    upstream.finish().await;
+
+    let after = plain_get(gateway.address).await;
+    assert!(
+        after.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+        "the released permit admits a fresh Proxy attempt: {after}"
+    );
     gateway
         .running
         .shutdown()

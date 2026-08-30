@@ -9,7 +9,6 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt, StreamBody};
-use hyper::body::Incoming;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -19,7 +18,8 @@ use oxidase_core::{
     ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
 use oxidase_runtime::{
-    BoxLeafFuture, ClusterAdmissionError, ClusterRetryPermit, LeafExecutor, RuntimeSnapshot,
+    BoxLeafFuture, ClusterAdmissionError, ClusterRetryPermit, ConcurrencyPermit,
+    GovernanceRegistry, LeafExecutor, RuntimeSnapshot,
 };
 use oxidase_site::{
     AssetPlan, AssetRepresentation, EntityTag, PreparedSiteBody, PreparedSiteResponse, SiteError,
@@ -27,25 +27,38 @@ use oxidase_site::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
+use crate::body::{
+    BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBodyPlan, GatewayRequestBody,
+    timeout_upstream_response_body,
+};
+use crate::metrics::Metrics;
 use crate::protocol::{
     RequestTrailerGuard, TrailerGuard, TrailerValidationError, WireProtocol,
     http1_accepts_trailers, sanitize_runtime_headers,
 };
 use crate::proxy_body::{
     BufferRequestError, ClusterResponseBody, DownstreamRequestBodyError, ProxyRequestBody,
-    ReplayBody, buffer_for_replay,
+    ReplayBody, RequestBodyLimitExceeded, buffer_for_replay,
 };
 use crate::upgrade::GatewayRequestPayload;
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
     proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
 }
 
 impl HyperLeaves {
-    pub(crate) fn new(snapshot: Arc<RuntimeSnapshot>, proxy: Arc<ProxyClient>) -> Self {
-        Self { snapshot, proxy }
+    pub(crate) fn new(
+        snapshot: Arc<RuntimeSnapshot>,
+        proxy: Arc<ProxyClient>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            snapshot,
+            proxy,
+            metrics,
+        }
     }
 }
 
@@ -71,17 +84,21 @@ enum ProxyPoolKind {
 }
 
 enum AttemptBody {
-    Streaming(Option<Incoming>),
+    Streaming(Option<GatewayRequestBody>),
     Empty,
     Replay(ReplayBody),
 }
 
 impl AttemptBody {
-    fn next(&mut self, trailer_guard: &RequestTrailerGuard) -> Option<ProxyRequestBody> {
+    fn next(
+        &mut self,
+        trailer_guard: &RequestTrailerGuard,
+        max_request_body_bytes: Option<u64>,
+    ) -> Option<ProxyRequestBody> {
         match self {
-            Self::Streaming(body) => body
-                .take()
-                .map(|body| ProxyRequestBody::streaming(body, trailer_guard.clone())),
+            Self::Streaming(body) => body.take().map(|body| {
+                ProxyRequestBody::streaming(body, trailer_guard.clone(), max_request_body_bytes)
+            }),
             Self::Empty => Some(ProxyRequestBody::empty()),
             Self::Replay(body) => Some(body.new_attempt()),
         }
@@ -255,6 +272,7 @@ impl ProxyClient {
         request: &RequestFrame,
         body: &mut Option<GatewayRequestPayload>,
         snapshot: &Arc<RuntimeSnapshot>,
+        max_request_body_bytes: Option<u64>,
     ) -> ServiceOutcome<GatewayBodyPlan> {
         let Some(cluster) = snapshot.resources.clusters.get(cluster_id).cloned() else {
             return ServiceOutcome::Failed(ServiceError::new(
@@ -303,13 +321,11 @@ impl ProxyClient {
         let mut attempt_body = if retry_method && incoming_is_empty {
             AttemptBody::Empty
         } else if retry_method && retry.request_body.mode == RetryBodyMode::Buffer {
-            match buffer_for_replay(
-                incoming,
-                retry.request_body.max_bytes,
-                &request_trailer_guard,
-            )
-            .await
-            {
+            let replay_limit = max_request_body_bytes
+                .map_or(retry.request_body.max_bytes, |limit| {
+                    limit.min(retry.request_body.max_bytes)
+                });
+            match buffer_for_replay(incoming, replay_limit, &request_trailer_guard).await {
                 Ok(body) => AttemptBody::Replay(body),
                 Err(BufferRequestError::LimitExceeded) => {
                     return ServiceOutcome::Handled(ResponseHead::new(
@@ -318,6 +334,12 @@ impl ProxyClient {
                     ));
                 }
                 Err(error) => {
+                    if error_chain_contains_request_body_idle_timeout(&error) {
+                        return ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::REQUEST_TIMEOUT,
+                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
+                        ));
+                    }
                     if error_chain_contains_request_validation(&error) {
                         return ServiceOutcome::Handled(ResponseHead::new(
                             StatusCode::BAD_REQUEST,
@@ -361,7 +383,9 @@ impl ProxyClient {
             } else {
                 configured_pool
             };
-            let Some(request_body) = attempt_body.next(&request_trailer_guard) else {
+            let Some(request_body) =
+                attempt_body.next(&request_trailer_guard, max_request_body_bytes)
+            else {
                 return ServiceOutcome::Failed(ServiceError::new(
                     ErrorClass::BodyUnavailable,
                     "Proxy request body is not replayable for another attempt",
@@ -398,6 +422,18 @@ impl ProxyClient {
             let mut response = match response {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
+                    if error_chain_contains_request_body_limit(&error) {
+                        return ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Payload Too Large")),
+                        ));
+                    }
+                    if error_chain_contains_request_body_idle_timeout(&error) {
+                        return ServiceOutcome::Handled(ResponseHead::new(
+                            StatusCode::REQUEST_TIMEOUT,
+                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
+                        ));
+                    }
                     if error_chain_contains_request_validation(&error) {
                         return ServiceOutcome::Handled(ResponseHead::new(
                             StatusCode::BAD_REQUEST,
@@ -559,7 +595,7 @@ impl ProxyClient {
                     representation_length: None,
                 }
             } else {
-                let body = timeout_incoming_body(body, cluster.spec().response_timeout);
+                let body = timeout_upstream_response_body(body, cluster.spec().response_timeout);
                 GatewayBodyPlan::Stream {
                     body: ClusterResponseBody::new(
                         body,
@@ -648,6 +684,33 @@ fn error_chain_contains_request_validation(error: &(dyn std::error::Error + 'sta
     false
 }
 
+fn error_chain_contains_request_body_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<RequestBodyLimitExceeded>().is_some() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn error_chain_contains_request_body_idle_timeout(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<BodyIdleTimeout>()
+            .is_some_and(|timeout| timeout.direction() == BodyIdleDirection::Request)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 fn build_proxy_pool(connector: HttpsConnector<HttpConnector>, http2_only: bool) -> ProxyPool {
     let mut builder = Client::builder(TokioExecutor::new());
     builder
@@ -713,8 +776,31 @@ impl LeafExecutor<GatewayRequestPayload, GatewayBodyPlan> for HyperLeaves {
         cluster: &'a ResourceId,
         request: &'a RequestFrame,
         body: &'a mut Option<GatewayRequestPayload>,
+        max_request_body_bytes: Option<u64>,
     ) -> BoxLeafFuture<'a, GatewayBodyPlan> {
-        Box::pin(self.proxy.execute(cluster, request, body, &self.snapshot))
+        Box::pin(self.proxy.execute(
+            cluster,
+            request,
+            body,
+            &self.snapshot,
+            max_request_body_bytes,
+        ))
+    }
+
+    fn governance(&self) -> Option<&GovernanceRegistry> {
+        Some(&self.snapshot.governance)
+    }
+
+    fn retain_concurrency_permit(
+        &self,
+        body: GatewayBodyPlan,
+        permit: ConcurrencyPermit,
+    ) -> GatewayBodyPlan {
+        body.retain_concurrency_permit(permit)
+    }
+
+    fn record_governance_result(&self, kind: &'static str, name: &str, result: &'static str) {
+        self.metrics.record_governance(kind, name, result);
     }
 }
 

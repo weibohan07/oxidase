@@ -12,8 +12,9 @@ Oxidase 是一个使用 Rust 编写的声明式 HTTP Service 程序编译器与�
 
 - **Listener**：管理传输层元数据，并指向根 Service。
 - **Service Program**：组合终结型（`Respond`、`Redirect`、`Site`、`Proxy`）、
-  包装型（`Transform`、`Observe`、`Timeout`、`Recover`）与组合型（`Route`、
-  `Fallback`、`Reenter`）节点。
+  包装型（`Transform`、`Observe`、`Timeout`、`RequestBodyLimit`、
+  `ConcurrencyLimit`、`RateLimit`、`Recover`）与组合型（`Route`、`Fallback`、
+  `Reenter`）节点。
 - **Resource Registry**：持有已验证的 Certificate、可复用 SiteSnapshot、Cluster 等
   共享状态；Resource 不是 Service。
 - **Router DSL**：可选的源码语法，在执行前降解为普通 Service IR；运行时没有
@@ -50,6 +51,14 @@ endpoint 支持确定性 round robin、平滑 weighted round robin 与加权 lea
 semaphore 会在读取 request body 前执行有界 admission。Retry 默认关闭，只有显式
 method、response head 前的 cause/status，以及空 body 或显式有界 replay buffer 同时
 满足时才会发生。健康状态与计数只在 reload endpoint identity 兼容时复用。
+
+入站治理同时覆盖 transport 与 Service 边界。Listener limits 限制全局连接数、真实
+peer IP 的连接数、空闲读写进度、Header 字节数/数量，以及每条 HTTP/1 connection 的
+请求数或每条 HTTP/2 connection 接受的 stream 数。包装型 Service
+`request_body_limit`、`concurrency_limit`、`rate_limit` 分别提供流式 body 字节上限、
+持续到 response body 或 trusted tunnel 结束的 cancellation-safe admission，以及仅以
+真实 peer IP 或命名词法 binding 为 key 的有界单调 token bucket。客户端 forwarding
+Header 不会被信任为身份，运行时 key 也不会进入指标 label。
 
 所有 Listener program 共享一张不可变 `ServiceGraph`；普通请求既不复制整图，也
 不收集 explain trace。所有已处理响应统一经过 framing finalizer，Gateway/Oxista
@@ -175,6 +184,12 @@ sequence 以及 literal/folded block scalar。Import/reference cycle 会被检�
 [`docs/configuration/http2.md`](docs/configuration/http2.md)。HTTPS Listener 默认
 `versions: [h2, http1]`；明文 Listener 默认 `http1`，若配置 `h2` 会明确拒绝，而
 不会暗示支持 h2c。
+
+Listener 入站限制与保护 wrapper 的契约记录在
+[`ADR 0009`](docs/adr/0009-ingress-resource-governance.md)。有限默认值为：总连接
+10,000、每 peer IP 100、connection idle 2 分钟、request/response body idle 各 30 秒、
+decoded Header 64 KiB/100 个，以及每 connection 1,000 个 request/stream。这些只是
+alpha 安全默认值，不是容量建议；部署时仍需按真实负载选择限制。
 
 Prepared Cluster 契约见
 [`docs/configuration/clusters.md`](docs/configuration/clusters.md)；协议桥接与 framing

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oxidase_config::{
-    CertificateSpec, CompiledListener, HttpListenerSpec, HttpVersion, ListenerProtocol, SniPattern,
-    TlsListenerSpec,
+    CertificateSpec, CompiledListener, HttpListenerSpec, HttpVersion, ListenerLimits,
+    ListenerProtocol, SniPattern, TlsListenerSpec,
 };
 use oxidase_core::{
     ContentDigest, ContentDigestBuilder, Diagnostic, ListenerId, ResourceId, ServiceId, SourceSpan,
@@ -355,6 +355,7 @@ pub struct PreparedListenerPlan {
     pub bind: SocketAddr,
     pub protocol: ListenerProtocol,
     pub http: HttpListenerSpec,
+    pub limits: ListenerLimits,
     pub service: ServiceId,
     pub source: SourceSpan,
     pub tls: Option<PreparedTlsListener>,
@@ -448,6 +449,36 @@ impl PreparedListenerPlan {
                     settings.keep_alive_timeout.as_nanos(),
                 );
         }
+        digest
+            .field_u64(
+                "limit_max_connections",
+                u64::from(source.limits.max_connections),
+            )
+            .field_u64(
+                "limit_max_connections_per_ip",
+                u64::from(source.limits.max_connections_per_ip),
+            )
+            .field_u128(
+                "limit_idle_timeout_ns",
+                source.limits.idle_timeout.as_nanos(),
+            )
+            .field_u128(
+                "limit_request_body_idle_timeout_ns",
+                source.limits.request_body_idle_timeout.as_nanos(),
+            )
+            .field_u128(
+                "limit_response_body_idle_timeout_ns",
+                source.limits.response_body_idle_timeout.as_nanos(),
+            )
+            .field_u64(
+                "limit_max_header_bytes",
+                u64::from(source.limits.max_header_bytes),
+            )
+            .field_u64("limit_max_headers", u64::from(source.limits.max_headers))
+            .field_u64(
+                "limit_max_requests_per_connection",
+                u64::from(source.limits.max_requests_per_connection),
+            );
         if let Some(tls_source) = &source.tls {
             digest
                 .field_u128(
@@ -475,6 +506,7 @@ impl PreparedListenerPlan {
             bind: source.bind,
             protocol: source.protocol,
             http: source.http.clone(),
+            limits: source.limits.clone(),
             service: source.service.clone(),
             source: source.source.clone(),
             tls,
@@ -499,6 +531,7 @@ impl fmt::Debug for PreparedListenerPlan {
             .field("bind", &self.bind)
             .field("protocol", &self.protocol)
             .field("http", &self.http)
+            .field("limits", &self.limits)
             .field("service", &self.service)
             .field("source", &self.source)
             .field("tls", &self.tls)
