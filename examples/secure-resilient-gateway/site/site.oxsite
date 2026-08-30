@@ -1,0 +1,12 @@
+oxista: site/v1
+
+defaults:
+  response:
+    headers:
+      set:
+        X-Content-Type-Options: nosniff
+  by_extension:
+    .html:
+      cache:
+        visibility: public
+        max_age: 5m
