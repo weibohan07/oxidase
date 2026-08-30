@@ -275,6 +275,28 @@ impl Metrics {
                     series.h2_shutdowns[shutdown.index()].load(Ordering::Relaxed)
                 ));
             }
+            output.push_str(&format!(
+                "oxidase_tunnels_started_total{{listener=\"{listener}\"}} {}\n",
+                series.tunnels_started.load(Ordering::Relaxed)
+            ));
+            output.push_str(&format!(
+                "oxidase_active_tunnels{{listener=\"{listener}\"}} {}\n",
+                series.active_tunnels.load(Ordering::Relaxed)
+            ));
+            for direction in TunnelDirection::ALL {
+                output.push_str(&format!(
+                    "oxidase_tunnel_bytes_total{{listener=\"{listener}\",direction=\"{}\"}} {}\n",
+                    direction.as_str(),
+                    series.tunnel_bytes[direction.index()].load(Ordering::Relaxed)
+                ));
+            }
+            for termination in TunnelTermination::ALL {
+                output.push_str(&format!(
+                    "oxidase_tunnel_terminations_total{{listener=\"{listener}\",reason=\"{}\"}} {}\n",
+                    termination.as_str(),
+                    series.tunnel_terminations[termination.index()].load(Ordering::Relaxed)
+                ));
+            }
         }
         output
     }
@@ -427,6 +449,69 @@ impl H2Shutdown {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelDirection {
+    DownstreamToUpstream,
+    UpstreamToDownstream,
+}
+
+impl TunnelDirection {
+    const ALL: [Self; 2] = [Self::DownstreamToUpstream, Self::UpstreamToDownstream];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::DownstreamToUpstream => 0,
+            Self::UpstreamToDownstream => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DownstreamToUpstream => "downstream_to_upstream",
+            Self::UpstreamToDownstream => "upstream_to_downstream",
+        }
+    }
+}
+
+/// Fixed, protocol-independent reasons for a tunnel to stop.
+///
+/// The variants deliberately cannot carry request data or error messages, so
+/// they remain safe Prometheus label values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunnelTermination {
+    DownstreamClosed,
+    UpstreamClosed,
+    Error,
+    Cancelled,
+}
+
+impl TunnelTermination {
+    const ALL: [Self; 4] = [
+        Self::DownstreamClosed,
+        Self::UpstreamClosed,
+        Self::Error,
+        Self::Cancelled,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::DownstreamClosed => 0,
+            Self::UpstreamClosed => 1,
+            Self::Error => 2,
+            Self::Cancelled => 3,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DownstreamClosed => "downstream_closed",
+            Self::UpstreamClosed => "upstream_closed",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TransportSeries {
     connections_accepted: [AtomicU64; 2],
@@ -436,6 +521,10 @@ struct TransportSeries {
     tls_alpn: [AtomicU64; 4],
     h2_active_streams: AtomicU64,
     h2_shutdowns: [AtomicU64; 2],
+    tunnels_started: AtomicU64,
+    active_tunnels: AtomicU64,
+    tunnel_bytes: [AtomicU64; 2],
+    tunnel_terminations: [AtomicU64; 4],
 }
 
 /// Low-cost handle to transport counters for one configured listener name.
@@ -481,6 +570,20 @@ impl ListenerTransportMetrics {
     pub(crate) fn record_h2_shutdown(&self, shutdown: H2Shutdown) {
         self.series.h2_shutdowns[shutdown.index()].fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Starts one connection-owned bidirectional tunnel.
+    ///
+    /// A guard that is dropped without [`ActiveTunnel::finish`] records a
+    /// cancellation. This covers task abortion during listener drain without
+    /// requiring an async cleanup path.
+    pub(crate) fn tunnel_started(&self) -> ActiveTunnel {
+        self.series.tunnels_started.fetch_add(1, Ordering::Relaxed);
+        self.series.active_tunnels.fetch_add(1, Ordering::Relaxed);
+        ActiveTunnel {
+            series: self.series.clone(),
+            finished: false,
+        }
+    }
 }
 
 #[must_use = "dropping the guard immediately records the connection as inactive"]
@@ -505,6 +608,41 @@ impl Drop for ActiveH2Stream {
         self.series
             .h2_active_streams
             .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[must_use = "dropping an unfinished guard records the tunnel as cancelled"]
+pub(crate) struct ActiveTunnel {
+    series: Arc<TransportSeries>,
+    finished: bool,
+}
+
+impl ActiveTunnel {
+    /// Records the final byte counts and termination reason, then closes the
+    /// active lifecycle. Bytes are DATA transferred in each direction; protocol
+    /// metadata such as WebSocket framing is intentionally not labelled.
+    pub(crate) fn finish(
+        mut self,
+        downstream_to_upstream_bytes: u64,
+        upstream_to_downstream_bytes: u64,
+        termination: TunnelTermination,
+    ) {
+        self.series.tunnel_bytes[TunnelDirection::DownstreamToUpstream.index()]
+            .fetch_add(downstream_to_upstream_bytes, Ordering::Relaxed);
+        self.series.tunnel_bytes[TunnelDirection::UpstreamToDownstream.index()]
+            .fetch_add(upstream_to_downstream_bytes, Ordering::Relaxed);
+        self.series.tunnel_terminations[termination.index()].fetch_add(1, Ordering::Relaxed);
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveTunnel {
+    fn drop(&mut self) {
+        self.series.active_tunnels.fetch_sub(1, Ordering::Relaxed);
+        if !self.finished {
+            self.series.tunnel_terminations[TunnelTermination::Cancelled.index()]
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -744,6 +882,7 @@ mod tests {
 
     use super::{
         ConnectionProtocol, H2Shutdown, Metrics, ProductionObserver, TlsAlpn, TlsHandshakeOutcome,
+        TunnelTermination,
     };
 
     #[test]
@@ -876,6 +1015,55 @@ mod tests {
         ));
         assert!(!output.contains("secret.example"));
         assert!(!output.contains("user=42"));
+    }
+
+    #[test]
+    fn tunnel_guard_records_directional_bytes_and_fixed_termination() {
+        let metrics = Metrics::default();
+        let transport = metrics.listener_transport("public");
+        let tunnel = transport.tunnel_started();
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_tunnels_started_total{listener=\"public\"} 1"));
+        assert!(output.contains("oxidase_active_tunnels{listener=\"public\"} 1"));
+
+        tunnel.finish(17, 29, TunnelTermination::DownstreamClosed);
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_active_tunnels{listener=\"public\"} 0"));
+        assert!(output.contains(
+            "oxidase_tunnel_bytes_total{listener=\"public\",direction=\"downstream_to_upstream\"} 17"
+        ));
+        assert!(output.contains(
+            "oxidase_tunnel_bytes_total{listener=\"public\",direction=\"upstream_to_downstream\"} 29"
+        ));
+        assert!(output.contains(
+            "oxidase_tunnel_terminations_total{listener=\"public\",reason=\"downstream_closed\"} 1"
+        ));
+        assert!(output.contains(
+            "oxidase_tunnel_terminations_total{listener=\"public\",reason=\"cancelled\"} 0"
+        ));
+    }
+
+    #[test]
+    fn dropping_unfinished_tunnel_records_cancellation() {
+        let metrics = Metrics::default();
+        let transport = metrics.listener_transport("public");
+        let tunnel = transport.tunnel_started();
+
+        drop(tunnel);
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_active_tunnels{listener=\"public\"} 0"));
+        assert!(output.contains(
+            "oxidase_tunnel_terminations_total{listener=\"public\",reason=\"cancelled\"} 1"
+        ));
+        assert!(
+            output.contains(
+                "oxidase_tunnel_terminations_total{listener=\"public\",reason=\"error\"} 0"
+            )
+        );
+        assert!(!output.contains("http://"));
     }
 
     #[test]
