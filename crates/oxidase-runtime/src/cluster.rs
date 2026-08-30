@@ -648,13 +648,13 @@ impl PreparedCluster {
     }
 
     fn try_acquire_round_robin(&self, eligible: &[usize]) -> EndpointAcquire {
-        let sequence = self.round_robin_sequence.load(Ordering::Relaxed);
+        // Reserve a unique starting slot before probing. Concurrent requests do
+        // not all observe the same cursor even when endpoint capacity is > 1.
+        let sequence = self.round_robin_sequence.fetch_add(1, Ordering::Relaxed);
         let start = sequence as usize % eligible.len();
         for offset in 0..eligible.len() {
             let index = eligible[(start + offset) % eligible.len()];
             if let Some(permit) = self.try_endpoint_permit(index) {
-                self.round_robin_sequence
-                    .fetch_add((offset + 1) as u64, Ordering::Relaxed);
                 return self.acquired_endpoint(index, permit);
             }
         }
