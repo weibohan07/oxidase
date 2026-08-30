@@ -616,6 +616,10 @@ pub struct TestExpectationSource {
     pub status: Option<u16>,
     pub service: Option<String>,
     pub cluster: Option<String>,
+    /// Upstream protocol policy expected for the selected Cluster.
+    pub cluster_protocol: Option<String>,
+    /// Load-balancing policy expected for the selected Cluster.
+    pub load_balance: Option<String>,
     pub site: Option<String>,
     pub rewritten_path: Option<String>,
 }

@@ -149,9 +149,16 @@ names, policy, health state, active requests, counters, last transition, and
 remaining ejection time. It does not expose request data, credentials, certificate
 material, or private-key data.
 
-Explain reports Cluster protocol and summaries of balancing, health, retry, and
-limits. It explicitly states that real endpoint choice depends on runtime state;
-ordinary declarative tests do not predict a live endpoint.
+For a symbolic Proxy leaf, Explain emits a `cluster` plan with the protocol,
+load-balancing policy, endpoint count, active/passive health thresholds, retry
+contract, and concurrency limits. Its fixed `endpoint_selection` note says that
+actual endpoint selection is runtime-state dependent. It deliberately emits no
+selected endpoint: eligibility, ejection, and least-request counters do not exist
+in symbolic execution.
+
+Declarative tests can assert `cluster`, `cluster_protocol`, and `load_balance`.
+They validate the compiled resource and immutable policy only; ordinary tests do
+not predict a live endpoint or health state.
 
 ## Consequences
 

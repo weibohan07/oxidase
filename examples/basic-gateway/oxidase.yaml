@@ -74,6 +74,8 @@ tests:
     expect:
       service: public
       cluster: api
+      cluster_protocol: auto
+      load_balance: round_robin
       rewritten_path: /users
 
   - name: site asset
@@ -98,4 +100,3 @@ tests:
     expect:
       service: public
       status: 404
-

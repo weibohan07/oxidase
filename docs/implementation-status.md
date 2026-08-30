@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `feat/v0.3-protocol-bridging`
-- public starting point: inbound TLS/H2 merge `c96943ece30c701d1bb89066b8cba30e4d273ba2`
+- active milestone branch: `feat/v0.3-resilient-clusters`
+- public starting point: protocol-bridging merge `150046085e58c71d88b322d2693a4e588e1d1d78`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -138,6 +138,21 @@ Last updated: 2026-08-30
   server owns one long-lived pool for each policy: `auto` uses HTTPS ALPN and
   cleartext HTTP/1, `http1` forces HTTP/1.1, and `h2` requires TLS H2 or uses
   cleartext H2 prior knowledge. Protocol changes participate in Cluster identity.
+- Cluster resources prepare into immutable plans plus reload-compatible endpoint
+  runtime state. Round robin, smooth weighted round robin, and weighted
+  least-requests select only eligible endpoints; bounded Cluster/endpoint admission
+  happens before request-body consumption. Active checks start only after commit,
+  passive failure thresholds eject endpoints, and compatible reloads retain health
+  and counters without a global state map.
+- Retry is disabled by default. A retry requires an explicitly listed method and
+  pre-response-head cause/status, an untried eligible endpoint, an available
+  non-waiting retry permit, and an empty or explicitly bounded replay body. Buffer
+  overflow returns 413 before an upstream attempt; post-head stream errors cannot
+  retry or become Fallback.
+- Symbolic Proxy explain output includes the Cluster protocol, load-balancing
+  policy, health/retry/limit summary, and an explicit runtime-dependent endpoint
+  selection note. Declarative tests can assert the Cluster resource, protocol, and
+  load-balancing policy without pretending to predict live endpoint state.
 - Proxy body adapters preserve DATA, trailer, end-of-stream, and error frames.
   HTTP/2 retains only the exact `TE: trailers` value and rejects connection-specific
   fields; HTTP/1 continues to remove Connection-nominated and hop-by-hop fields. A
@@ -231,6 +246,9 @@ Last updated: 2026-08-30
   WebSocket traffic, over cleartext or TLS. Socket fixtures cover both byte/close
   directions, snapshot pinning across reload, new-Listener publication, bounded
   retirement drain, trusted-capability isolation, and tunnel telemetry.
+- A Proxy backed by a prepared Cluster applies configured load balancing, health
+  eligibility, bounded admission, and safe pre-head retry while preserving the
+  same streaming H1/H2 pools and request-pinned snapshot semantics.
 
 ## Not implemented
 
@@ -238,7 +256,7 @@ Last updated: 2026-08-30
 - Cleartext h2c, client-certificate authentication/mTLS, ACME, OCSP stapling,
   user-configurable TLS cipher suites, HTTP/3, HTTP/2 extended CONNECT, arbitrary
   CONNECT tunneling, and WebTransport.
-- Cluster health checks/retries, WASM/plugins, Web UI, Kubernetes integration, and a
+- Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
 
 ## Known limitations
@@ -278,9 +296,12 @@ Last updated: 2026-08-30
   stapling, custom cipher-suite policy, and automatic certificate issuance are not
   implemented. SNI wildcards match exactly one left-most DNS label and must appear
   literally in the selected leaf certificate subjectAltName.
-- Cluster health checks, retry policy, stable per-cluster health state, and
-  configurable Forwarded trust policy are not implemented. The current secure
-  default always replaces incoming forwarding metadata.
+- Cluster endpoints are static configuration: dynamic DNS/service discovery,
+  cross-process health consensus, hedging, and arbitrary retry scripting are not
+  implemented. Retry never occurs after a downstream response head and request-body
+  replay exists only through explicit bounded buffering. Configurable Forwarded
+  trust policy is not implemented; the current secure default always replaces
+  incoming forwarding metadata.
 - The response-header timeout currently bounds connect plus upload/header latency as
   one deadline; per-phase connect/write timing is not separately observable yet.
 - The adversarial streaming fixtures cover representative disconnect and timeout
@@ -333,9 +354,9 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Complete the protocol-bridging PR's locked local and hosted gates without
-   weakening the tested framing boundaries.
-2. Build PreparedCluster health, balancing, concurrency, and safe retry semantics on
-   the now-qualified H1/H2 pools.
+1. Complete the resilient-Cluster PR's locked local and hosted gates without
+   weakening streaming or retry boundaries.
+2. Add the secure/resilient example and operator documentation for the compiled
+   Cluster contract.
 3. Add sustained protocol/cluster fuzz and soak campaigns during final v0.3 alpha
    hardening; ordinary CI should retain only bounded integration smoke coverage.

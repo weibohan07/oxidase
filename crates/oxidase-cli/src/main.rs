@@ -403,6 +403,7 @@ enum ExplainBody {
         resource: String,
         request_path: String,
         symbolic: bool,
+        cluster: Option<Box<ClusterPlanDescription>>,
     },
 }
 
@@ -442,6 +443,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                             resource: resource.to_string(),
                             request_path: request.path_and_query().to_owned(),
                             symbolic: false,
+                            cluster: None,
                         },
                     );
                     output.headers = response.headers;
@@ -469,6 +471,12 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
         request: &'a RequestFrame,
         _body: &'a mut Option<()>,
     ) -> BoxLeafFuture<'a, ExplainBody> {
+        let cluster = self
+            .snapshot
+            .resources
+            .clusters
+            .get(resource)
+            .map(|cluster| Box::new(describe_cluster_plan(cluster)));
         Box::pin(async move {
             ServiceOutcome::Handled(ResponseHead::new(
                 StatusCode::OK,
@@ -477,6 +485,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                     resource: resource.to_string(),
                     request_path: request.path_and_query().to_owned(),
                     symbolic: true,
+                    cluster,
                 },
             ))
         })
@@ -505,8 +514,127 @@ enum BodyDescription {
         resource: String,
         request_path: String,
         symbolic: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cluster: Option<Box<ClusterPlanDescription>>,
     },
     SafeError,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterPlanDescription {
+    protocol: &'static str,
+    load_balance: &'static str,
+    endpoint_count: usize,
+    health: ClusterHealthDescription,
+    retry: ClusterRetryDescription,
+    limits: ClusterLimitsDescription,
+    endpoint_selection: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterHealthDescription {
+    active: Option<ActiveHealthDescription>,
+    passive: Option<PassiveHealthDescription>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveHealthDescription {
+    healthy_statuses: Vec<String>,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PassiveHealthDescription {
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterRetryDescription {
+    max_attempts: u32,
+    methods: Vec<String>,
+    retry_on: Vec<&'static str>,
+    statuses: Vec<String>,
+    request_body: &'static str,
+    request_body_max_bytes: u64,
+    max_concurrent_retries: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterLimitsDescription {
+    max_in_flight: u32,
+    max_in_flight_per_endpoint: u32,
+}
+
+fn describe_cluster_plan(cluster: &oxidase_runtime::PreparedCluster) -> ClusterPlanDescription {
+    let spec = cluster.spec();
+    ClusterPlanDescription {
+        protocol: spec.protocol.as_str(),
+        load_balance: spec.load_balance.as_str(),
+        endpoint_count: spec.endpoints.len(),
+        health: ClusterHealthDescription {
+            active: spec
+                .health
+                .active
+                .as_ref()
+                .map(|active| ActiveHealthDescription {
+                    healthy_statuses: active
+                        .healthy_statuses
+                        .iter()
+                        .map(|status| describe_status_range(status.start, status.end))
+                        .collect(),
+                    healthy_threshold: active.healthy_threshold,
+                    unhealthy_threshold: active.unhealthy_threshold,
+                }),
+            passive: spec
+                .health
+                .passive
+                .as_ref()
+                .map(|passive| PassiveHealthDescription {
+                    consecutive_failures: passive.consecutive_failures,
+                }),
+        },
+        retry: ClusterRetryDescription {
+            max_attempts: spec.retry.max_attempts,
+            methods: spec
+                .retry
+                .methods
+                .iter()
+                .map(|method| method.as_str().to_owned())
+                .collect(),
+            retry_on: spec
+                .retry
+                .retry_on
+                .iter()
+                .map(|cause| cause.as_str())
+                .collect(),
+            statuses: spec
+                .retry
+                .statuses
+                .iter()
+                .map(|status| describe_status_range(status.start, status.end))
+                .collect(),
+            request_body: match spec.retry.request_body.mode {
+                oxidase_config::RetryBodyMode::None => "none",
+                oxidase_config::RetryBodyMode::Buffer => "buffer",
+            },
+            request_body_max_bytes: spec.retry.request_body.max_bytes,
+            max_concurrent_retries: spec.retry.max_concurrent_retries,
+        },
+        limits: ClusterLimitsDescription {
+            max_in_flight: spec.limits.max_in_flight,
+            max_in_flight_per_endpoint: spec.limits.max_in_flight_per_endpoint,
+        },
+        endpoint_selection: "actual endpoint selection is runtime state dependent",
+    }
+}
+
+fn describe_status_range(start: u16, end: u16) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -620,11 +748,13 @@ fn describe_report(
                     resource,
                     request_path,
                     symbolic,
+                    cluster,
                 } => BodyDescription::Leaf {
                     service: kind,
                     resource,
                     request_path,
                     symbolic,
+                    cluster,
                 },
             };
             ("handled", response.status.as_u16(), body)
@@ -743,7 +873,35 @@ fn compare_expectation(
         BodyDescription::Bytes { .. } | BodyDescription::SafeError => None,
     };
     compare_leaf(expected, leaf, &mut mismatches);
+    compare_cluster_plan(output, expected, &mut mismatches);
     mismatches
+}
+
+fn compare_cluster_plan(
+    output: &ExplainOutput,
+    expected: &TestExpectationSource,
+    mismatches: &mut Vec<ExpectationMismatch>,
+) {
+    let cluster = match &output.body {
+        BodyDescription::Leaf { cluster, .. } => cluster.as_ref(),
+        BodyDescription::Bytes { .. } | BodyDescription::SafeError => None,
+    };
+    if let Some(protocol) = &expected.cluster_protocol
+        && !cluster.is_some_and(|cluster| cluster.protocol == protocol)
+    {
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_cluster_protocol",
+            message: format!("expected Cluster protocol `{protocol}`"),
+        });
+    }
+    if let Some(policy) = &expected.load_balance
+        && !cluster.is_some_and(|cluster| cluster.load_balance == policy)
+    {
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_load_balance",
+            message: format!("expected Cluster load-balancing policy `{policy}`"),
+        });
+    }
 }
 
 fn compare_leaf(
@@ -889,18 +1047,147 @@ async fn dependency_stamp(dependencies: &[PathBuf]) -> WatchStamp {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
 
-    use oxidase_config::{Compiler, HttpVersion, ListenerProtocol};
+    use oxidase_config::{
+        Compiler, ExplainRequestSource, HttpVersion, ListenerProtocol, TestExpectationSource,
+    };
     use oxidase_core::{DiagnosticSeverity, RespondBody, ServiceKind};
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{listener_protocol_label, prepare_snapshot, watch_dependencies_with_timing};
+    use super::{
+        compare_expectation, explain, listener_protocol_label, prepare_snapshot,
+        watch_dependencies_with_timing,
+    };
+
+    #[tokio::test]
+    async fn explain_and_declarative_tests_describe_runtime_cluster_policy() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+          weight: 2
+        - name: secondary
+          url: http://127.0.0.1:3001
+          weight: 1
+      load_balance:
+        policy: least_requests
+      health:
+        active:
+          path: /healthz
+          interval: 5s
+          timeout: 1s
+          healthy_statuses: ["200-299"]
+          healthy_threshold: 2
+          unhealthy_threshold: 3
+        passive:
+          consecutive_failures: 4
+          eject_for: 30s
+      retry:
+        max_attempts: 2
+        methods: [GET, HEAD]
+        retry_on: [connect_failure, refused_stream]
+        statuses: [503]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 7
+      limits:
+        max_in_flight: 100
+        max_in_flight_per_endpoint: 40
+        queue_timeout: 0ms
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("Cluster explain fixture can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("Cluster explain fixture compiles"),
+        )
+        .expect("Cluster explain fixture prepares");
+        let request = ExplainRequestSource {
+            method: "GET".to_owned(),
+            scheme: "http".to_owned(),
+            host: "example.test".to_owned(),
+            path: "/api".to_owned(),
+            headers: BTreeMap::new(),
+        };
+
+        let output = explain(&snapshot, None, &request, &config)
+            .await
+            .expect("symbolic Cluster request explains");
+        let json = serde_json::to_value(&output).expect("Explain output serializes");
+        assert_eq!(json["body"]["cluster"]["protocol"], "h2");
+        assert_eq!(json["body"]["cluster"]["load_balance"], "least_requests");
+        assert_eq!(json["body"]["cluster"]["endpoint_count"], 2);
+        assert_eq!(
+            json["body"]["cluster"]["health"]["active"]["healthy_statuses"],
+            serde_json::json!(["200-299"])
+        );
+        assert_eq!(
+            json["body"]["cluster"]["health"]["passive"]["consecutive_failures"],
+            4
+        );
+        assert_eq!(json["body"]["cluster"]["retry"]["max_attempts"], 2);
+        assert_eq!(
+            json["body"]["cluster"]["retry"]["retry_on"],
+            serde_json::json!(["connect_failure", "refused_stream"])
+        );
+        assert_eq!(json["body"]["cluster"]["limits"]["max_in_flight"], 100);
+        assert_eq!(
+            json["body"]["cluster"]["endpoint_selection"],
+            "actual endpoint selection is runtime state dependent"
+        );
+
+        let expected = TestExpectationSource {
+            cluster: Some("api".to_owned()),
+            cluster_protocol: Some("h2".to_owned()),
+            load_balance: Some("least_requests".to_owned()),
+            ..TestExpectationSource::default()
+        };
+        assert!(compare_expectation(&output, &expected).is_empty());
+
+        let mismatches = compare_expectation(
+            &output,
+            &TestExpectationSource {
+                cluster_protocol: Some("http1".to_owned()),
+                load_balance: Some("round_robin".to_owned()),
+                ..TestExpectationSource::default()
+            },
+        );
+        assert_eq!(
+            mismatches
+                .iter()
+                .map(|mismatch| mismatch.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "test.expectation_cluster_protocol",
+                "test.expectation_load_balance"
+            ]
+        );
+    }
 
     #[test]
     fn snapshot_preparation_preserves_non_fatal_compiler_warnings() {
