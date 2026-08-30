@@ -7,7 +7,8 @@ use oxidase_config::{
     ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
 };
 use oxidase_core::{
-    ConfigVersion, ContentDigest, ContentDigestBuilder, ResourceId, ServiceGraph, ServiceProgram,
+    ConfigVersion, ContentDigest, ContentDigestBuilder, Diagnostic, ResourceId, ServiceGraph,
+    ServiceProgram, SourceSpan,
 };
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
@@ -45,15 +46,23 @@ impl RuntimeSnapshot {
         let mut reuse = ResourceReuse::default();
         let mut dependencies = gateway.dependencies.clone();
         for (id, source) in &gateway.resources.sites {
-            let index = SiteCompiler::scan(&source.root, &source.manifest)
-                .map_err(|failure| preparation_error_from_site(id, &dependencies, failure))?;
+            let index = SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
+                preparation_error_from_site(id, &source.source, &dependencies, failure)
+            })?;
             let fingerprint = index.fingerprint(&source.inputs).map_err(|message| {
                 let mut candidate_dependencies = dependencies.clone();
                 candidate_dependencies.extend(index.dependencies().iter().cloned());
                 normalize_dependencies(&mut candidate_dependencies);
+                let diagnostic = Diagnostic::new(
+                    "site.fingerprint",
+                    "cannot fingerprint the prepared Site inputs",
+                    source.source.clone(),
+                )
+                .with_note(message.clone());
                 PreparationError {
                     resource: id.clone(),
                     kind: PreparationErrorKind::Fingerprint(message),
+                    diagnostics: vec![diagnostic],
                     candidate_dependencies,
                 }
             })?;
@@ -64,11 +73,15 @@ impl RuntimeSnapshot {
                 reuse.sites += 1;
                 snapshot
             } else {
-                let compiled =
-                    SiteCompiler::compile_indexed(id.clone(), &index, source.inputs.clone())
-                        .map_err(|failure| {
-                            preparation_error_from_site(id, &dependencies, failure)
-                        })?;
+                let compiled = SiteCompiler::compile_indexed_with_input_spans(
+                    id.clone(),
+                    &index,
+                    source.inputs.clone(),
+                    source.input_spans.clone(),
+                )
+                .map_err(|failure| {
+                    preparation_error_from_site(id, &source.source, &dependencies, failure)
+                })?;
                 Arc::new(compiled)
             };
             dependencies.extend(index.dependencies().iter().cloned());
@@ -151,6 +164,7 @@ pub struct ResourceReuse {
 pub struct PreparationError {
     pub resource: ResourceId,
     pub kind: PreparationErrorKind,
+    diagnostics: Vec<Diagnostic>,
     pub candidate_dependencies: Vec<std::path::PathBuf>,
 }
 
@@ -162,16 +176,46 @@ pub enum PreparationErrorKind {
 
 fn preparation_error_from_site(
     resource: &ResourceId,
+    resource_source: &SourceSpan,
     existing_dependencies: &[std::path::PathBuf],
     failure: SiteCompileFailure,
 ) -> PreparationError {
+    let SiteCompileFailure {
+        error,
+        mut diagnostics,
+        discovered_dependencies,
+    } = failure;
     let mut candidate_dependencies = existing_dependencies.to_vec();
-    candidate_dependencies.extend(failure.discovered_dependencies);
+    candidate_dependencies.extend(discovered_dependencies);
     normalize_dependencies(&mut candidate_dependencies);
+    if diagnostics.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            "site.prepare",
+            error.to_string(),
+            resource_source.clone(),
+        ));
+    }
     PreparationError {
         resource: resource.clone(),
-        kind: PreparationErrorKind::Site(Box::new(failure.error)),
+        kind: PreparationErrorKind::Site(error),
+        diagnostics,
         candidate_dependencies,
+    }
+}
+
+impl PreparationError {
+    /// Returns the structured diagnostics produced while preparing the candidate
+    /// snapshot. Dependency discovery remains a separate reload concern.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Consumes the preparation error and preserves its structured diagnostics
+    /// for the CLI or another presentation boundary.
+    #[must_use]
+    pub fn into_diagnostics(self) -> Vec<Diagnostic> {
+        self.diagnostics
     }
 }
 
@@ -435,5 +479,117 @@ listeners:
             &template_changed.resources.sites[&site_id],
             &compressed_changed.resources.sites[&site_id]
         ));
+    }
+
+    #[test]
+    fn preparation_preserves_structured_site_diagnostics() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\npaths:\n  trailing_slash: preserve\n",
+        )
+        .expect("invalid manifest can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+
+        let gateway = Compiler::compile_path(&config).expect("gateway source compiles");
+        let error = RuntimeSnapshot::prepare(gateway)
+            .expect_err("unsupported Site field value must fail preparation");
+        assert_eq!(error.diagnostics().len(), 1);
+        assert_eq!(error.diagnostics()[0].code, "site.unsupported_field");
+        assert_eq!(
+            error.diagnostics()[0].primary.field_path,
+            "paths.trailing_slash"
+        );
+        assert_eq!(error.diagnostics()[0].primary.line, 3);
+
+        let diagnostics = error.into_diagnostics();
+        assert_eq!(diagnostics[0].primary.column, 19);
+    }
+
+    #[test]
+    fn site_input_type_diagnostics_relate_gateway_values_to_manifest_contracts() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("site directory can be created");
+        let manifest = site.join("site.oxsite");
+        fs::write(
+            &manifest,
+            "oxista: site/v1\ninputs:\n  count:\n    type: int\n",
+        )
+        .expect("site manifest can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+      with:
+        count: wrong
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("gateway config can be written");
+
+        let gateway = Compiler::compile_path(&config).expect("gateway source compiles");
+        let error = RuntimeSnapshot::prepare(gateway)
+            .expect_err("injected string must not satisfy an integer contract");
+        let diagnostic = &error.diagnostics()[0];
+        assert_eq!(diagnostic.code, "site.input_type");
+        assert_eq!(
+            diagnostic.primary.file,
+            manifest
+                .canonicalize()
+                .expect("manifest path canonicalizes")
+        );
+        assert_eq!(diagnostic.primary.field_path, "inputs.count.type");
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(
+            diagnostic.labels[0].span.file,
+            config.canonicalize().expect("config path canonicalizes")
+        );
+        assert_eq!(
+            diagnostic.labels[0].span.field_path,
+            "resources.sites.web.with.count"
+        );
+        assert_eq!(diagnostic.reference_chain.len(), 2);
+        assert!(
+            diagnostic
+                .reference_chain
+                .iter()
+                .all(|reference| reference.span.is_some())
+        );
     }
 }

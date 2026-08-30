@@ -304,7 +304,10 @@ fn build_field_span_index(source: &str) -> FieldSpanIndex {
     FieldSpanIndex { spans }
 }
 
-fn append_field_path(parent: &str, key: &str) -> String {
+/// Appends one mapping key using the canonical diagnostic field-path syntax.
+/// Identifier-like keys use `.name`; all other keys use a quoted bracket form.
+#[must_use]
+pub fn field_path_child(parent: &str, key: &str) -> String {
     if valid_field_component(key) {
         if parent.is_empty() {
             key.to_owned()
@@ -315,6 +318,10 @@ fn append_field_path(parent: &str, key: &str) -> String {
         let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
         format!("{parent}[\"{escaped}\"]")
     }
+}
+
+fn append_field_path(parent: &str, key: &str) -> String {
+    field_path_child(parent, key)
 }
 
 fn valid_field_component(value: &str) -> bool {
@@ -713,7 +720,7 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::{parse, parse_document};
+    use super::{field_path_child, parse, parse_document};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -730,6 +737,19 @@ mod tests {
     struct Item {
         name: String,
         value: String,
+    }
+
+    #[test]
+    fn canonical_field_paths_quote_non_identifier_mapping_keys() {
+        assert_eq!(field_path_child("profiles", "public"), "profiles.public");
+        assert_eq!(
+            field_path_child("defaults.by_extension", ".css"),
+            "defaults.by_extension[\".css\"]"
+        );
+        assert_eq!(
+            field_path_child("headers.set", "X.Trace"),
+            "headers.set[\"X.Trace\"]"
+        );
     }
 
     #[test]

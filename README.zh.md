@@ -62,9 +62,11 @@ include 和输出写入前扣费：恰好达到 limit 允许，第 N+1 次不会
 前缀。强 Asset ETag 为最终 representation bytes 对应的
 `"sha256-<64 位小写十六进制>"`。一次 `SiteSourceIndex` 扫描同时提供 Site 复用身份、
 representation ETag、Oxista 源文本与编译 metadata，大 Asset 内容不会常驻内存。
-Gateway semantic diagnostic 与 OXT tag/interpolation 保留精确 byte 和行列范围。
-RequestFrame 的 Header/query/bindings/request namespace 采用 frame-local lazy cache，
-同一未修改 frame 只构造一次。
+Gateway 与 Oxista semantic diagnostic 会保留精确 byte/行列、secondary label、关联定义
+以及 import/include reference chain。所有会编译源码的 CLI 命令均接受
+`--diagnostic-format human|json`；JSON 使用带版本的 `oxidase.diagnostics/v1`
+envelope，stdout 不混入人类输出。RequestFrame 的 Header/query/bindings/request
+namespace 采用 frame-local lazy cache，同一未修改 frame 只构造一次。
 
 入站 TLS/HTTP/2 及 OXT `extends/block` 尚未实现。使用 `serve --watch` 可以启用
 保留 last-known-good 的原子 reload；通过独立、显式的 `--admin-bind` 可启用健康检查
@@ -143,6 +145,10 @@ oxidase explain <config> --request <request-file> [--listener <name>]
 oxidase compile <config> --output <manifest.json>
 oxidase test <config>
 ```
+
+在 `check`、`compile`、`test`、`serve` 或失败的 `explain` 命令后添加
+`--diagnostic-format json` 可获得确定性的机器可读诊断。Alpha schema 与位置约定见
+[`docs/diagnostics.md`](docs/diagnostics.md)。
 
 `compile` 当前输出确定性的检查清单，并非包含全部资源的可执行二进制快照。
 

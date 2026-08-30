@@ -1,12 +1,24 @@
 use std::path::PathBuf;
 
-use oxidase_core::SourceSpan;
+use oxidase_core::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
 #[derive(Debug)]
 pub struct SiteCompileFailure {
-    pub error: SiteCompileError,
+    pub error: Box<SiteCompileError>,
+    pub diagnostics: Vec<Diagnostic>,
     pub discovered_dependencies: Vec<PathBuf>,
+}
+
+impl SiteCompileFailure {
+    pub(crate) fn new(error: SiteCompileError, discovered_dependencies: Vec<PathBuf>) -> Self {
+        let diagnostics = vec![error.diagnostic()];
+        Self {
+            error: Box::new(error),
+            diagnostics,
+            discovered_dependencies,
+        }
+    }
 }
 
 impl std::fmt::Display for SiteCompileFailure {
@@ -29,6 +41,8 @@ pub enum SiteCompileError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0}")]
+    Diagnostic(Box<Diagnostic>),
     #[error("invalid Oxista source `{path}` at {line}:{column}-{end_line}:{end_column}: {message}")]
     Source {
         path: PathBuf,
@@ -61,25 +75,100 @@ impl SiteCompileError {
     }
 
     pub(crate) fn source(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
-        Self::Source {
-            path: path.into(),
-            line: 1,
-            column: 1,
-            end_line: 1,
-            end_column: 1,
-            message: message.into(),
-        }
+        let path = path.into();
+        Self::at(
+            "site.source",
+            SourceSpan {
+                file: path,
+                start_byte: 0,
+                end_byte: 0,
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                field_path: "source".to_owned(),
+            },
+            message,
+        )
     }
 
-    pub(crate) fn source_span(source: SourceSpan, message: impl Into<String>) -> Self {
-        Self::Source {
-            path: source.file,
-            line: source.line,
-            column: source.column,
-            end_line: source.end_line,
-            end_column: source.end_column,
-            message: message.into(),
+    pub(crate) fn at(code: &'static str, source: SourceSpan, message: impl Into<String>) -> Self {
+        Self::Diagnostic(Box::new(Diagnostic::new(code, message, source)))
+    }
+
+    pub(crate) fn from_diagnostic(diagnostic: Diagnostic) -> Self {
+        Self::Diagnostic(Box::new(diagnostic))
+    }
+
+    #[must_use]
+    pub fn diagnostic(&self) -> Diagnostic {
+        match self {
+            Self::Diagnostic(diagnostic) => diagnostic.as_ref().clone(),
+            Self::Io { path, source } => Diagnostic::new(
+                "site.io",
+                format!("cannot access `{}`: {source}", path.display()),
+                point_span(path, "source"),
+            ),
+            Self::Source {
+                path,
+                line,
+                column,
+                end_line,
+                end_column,
+                message,
+            } => Diagnostic::new(
+                "site.source",
+                message.clone(),
+                SourceSpan {
+                    file: path.clone(),
+                    start_byte: 0,
+                    end_byte: 0,
+                    line: *line,
+                    column: *column,
+                    end_line: *end_line,
+                    end_column: *end_column,
+                    field_path: "source".to_owned(),
+                },
+            ),
+            Self::UnsafePath { path, message } => Diagnostic::new(
+                "site.unsafe_path",
+                message.clone(),
+                point_span(path, "source"),
+            ),
+            Self::DuplicatePath {
+                logical_path,
+                first,
+                second,
+            } => Diagnostic::new(
+                "site.duplicate_path",
+                format!("duplicate public site path `{logical_path}`"),
+                point_span(second, "source"),
+            )
+            .with_related("first public path", point_span(first, "source")),
+            Self::TemplateCycle(message) => Diagnostic::new(
+                "template.include_cycle",
+                message.clone(),
+                SourceSpan::synthetic("template.include"),
+            ),
+            Self::Input { name, message } => Diagnostic::new(
+                "site.input",
+                format!("site input `{name}` {message}"),
+                SourceSpan::synthetic(format!("inputs.{name}")),
+            ),
         }
+    }
+}
+
+fn point_span(path: &std::path::Path, field_path: &str) -> SourceSpan {
+    SourceSpan {
+        file: path.to_path_buf(),
+        start_byte: 0,
+        end_byte: 0,
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 1,
+        field_path: field_path.to_owned(),
     }
 }
 

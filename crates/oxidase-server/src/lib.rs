@@ -8,6 +8,8 @@ mod server;
 
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
 pub use metrics::Metrics;
-pub use server::{GatewayServer, ReloadHandle, ReloadReport, RunningServer, ServerError};
+pub use server::{
+    GatewayServer, ReloadError, ReloadHandle, ReloadReport, RunningServer, ServerError,
+};
 
 pub const DATA_PLANE: &str = "hyper";

@@ -10,8 +10,8 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_core::{
     CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ContentDigest,
-    ContentDigestBuilder, ErrorClass, Expression, HeaderPredicate, HeaderTransform,
-    HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
+    ContentDigestBuilder, DiagnosticReference, ErrorClass, Expression, HeaderPredicate,
+    HeaderTransform, HeaderTransforms, ListenerId, PatternContext, PredicatePlan, RecoverHandler,
     RequestMetadataError, RequestTransform, ResourceId, RespondBody, ResponseTransform, RouteCase,
     RouteId, ServiceGraph, ServiceId, ServiceKind, ServiceNode, ServiceProgram, SourceSpan, Value,
     is_forbidden_user_header, parse_transform_authority, parse_transform_path_and_query,
@@ -20,7 +20,7 @@ use oxidase_core::{
 use serde::Serialize;
 use url::Url;
 
-use oxidase_source::{FieldSpanIndex, SourceDocument};
+use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
@@ -108,6 +108,7 @@ pub struct SiteSpec {
     pub root: PathBuf,
     pub manifest: PathBuf,
     pub inputs: BTreeMap<String, Value>,
+    pub input_spans: BTreeMap<String, SourceSpan>,
     pub source: SourceSpan,
 }
 
@@ -288,6 +289,7 @@ impl SourceNodeKey<'_> {
 struct Loader {
     loaded: BTreeSet<PathBuf>,
     stack: Vec<PathBuf>,
+    import_chain: Vec<DiagnosticReference>,
     documents: Vec<SourceDocument<GatewaySource>>,
     dependencies: Vec<PathBuf>,
     discovered_dependencies: BTreeSet<PathBuf>,
@@ -299,16 +301,16 @@ impl Loader {
         self.discovered_dependencies
             .extend(candidate_dependencies(path));
         if let Some(position) = self.stack.iter().position(|candidate| candidate == path) {
-            let mut chain = self.stack[position..]
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>();
-            chain.push(path.display().to_string());
+            let chain = self.import_chain[position..].to_vec();
+            let primary = chain
+                .last()
+                .and_then(|reference| reference.span.clone())
+                .unwrap_or_else(|| span(path, "imports"));
             return Err(CompileError::one(
                 Diagnostic::new(
                     "config.import_cycle",
                     "configuration import cycle detected",
-                    span(path, "imports"),
+                    primary,
                 )
                 .with_reference_chain(chain)
                 .with_help("remove one import edge from the reported cycle"),
@@ -328,26 +330,31 @@ impl Loader {
 
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        for import in &document.value.imports {
+        for (index, import) in document.value.imports.iter().enumerate() {
             let declared = directory.join(import);
             self.discovered_dependencies
                 .extend(candidate_dependencies(&declared));
+            let import_span = indexed_span(path, &format!("imports[{index}]"), &document.spans);
+            let reference = DiagnosticReference::new(
+                format!("`{}` imports `{}`", path.display(), declared.display()),
+                import_span.clone(),
+            );
             let import = declared.canonicalize().map_err(|error| {
+                let mut chain = self.import_chain.clone();
+                chain.push(reference.clone());
                 CompileError::one(
                     Diagnostic::new(
                         "config.import_missing",
                         format!("cannot resolve import `{}`: {error}", declared.display()),
-                        span(path, "imports"),
+                        import_span.clone(),
                     )
-                    .with_reference_chain(
-                        self.stack
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect(),
-                    ),
+                    .with_reference_chain(chain),
                 )
             })?;
-            self.load(&import)?;
+            self.import_chain.push(reference);
+            let result = self.load(&import);
+            self.import_chain.pop();
+            result?;
         }
         self.stack.pop();
 
@@ -541,13 +548,20 @@ fn insert_located<T>(
     kind: &str,
 ) {
     if let Some(previous) = target.get(&name) {
+        let first = previous.span();
+        let duplicate = value.span();
         diagnostics.push(
             Diagnostic::new(
                 "config.duplicate_definition",
                 format!("duplicate {kind} definition `{name}`"),
-                value.span(),
+                duplicate.clone(),
             )
-            .with_reference_chain(vec![previous.span().to_string(), value.span().to_string()]),
+            .with_label("first definition", first.clone())
+            .with_related("previous definition", first.clone())
+            .with_reference_chain([
+                DiagnosticReference::new("first definition", first),
+                DiagnosticReference::new("duplicate definition", duplicate),
+            ]),
         );
     } else {
         target.insert(name, value);
@@ -657,6 +671,18 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
         let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
         let root = directory.join(&located.value.root);
         let manifest = root.join(&located.value.manifest);
+        let input_spans: BTreeMap<String, SourceSpan> = located
+            .value
+            .inputs
+            .keys()
+            .map(|name| {
+                let with_path = field_path_child(&located.field_path, "with");
+                (
+                    name.clone(),
+                    located.span_at(&field_path_child(&with_path, name)),
+                )
+            })
+            .collect();
         let inputs = located
             .value
             .inputs
@@ -665,11 +691,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 yaml_value(value)
                     .map(|value| (name.clone(), value))
                     .map_err(|message| {
-                        semantic_error_at(
-                            "resource.site_input",
-                            message,
-                            located.span_at(&format!("{}.with.{name}", located.field_path)),
-                        )
+                        semantic_error_at("resource.site_input", message, input_spans[name].clone())
                     })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -681,6 +703,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 root,
                 manifest,
                 inputs,
+                input_spans,
                 source: located.span(),
             },
         );
@@ -848,18 +871,24 @@ impl<'a> ProgramBuilder<'a> {
                 entry.insert(node);
                 Ok(())
             }
-            Entry::Occupied(entry) => Err(CompileError::one(
-                Diagnostic::new(
-                    "service.duplicate_internal_id",
-                    format!("duplicate generated Service ID `{}`", node.id),
-                    node.source.clone(),
-                )
-                .with_reference_chain(vec![
-                    entry.get().source.to_string(),
-                    node.source.to_string(),
-                ])
-                .with_help("report this compiler identity collision as an Oxidase bug"),
-            )),
+            Entry::Occupied(entry) => {
+                let first = entry.get().source.clone();
+                let duplicate = node.source.clone();
+                Err(CompileError::one(
+                    Diagnostic::new(
+                        "service.duplicate_internal_id",
+                        format!("duplicate generated Service ID `{}`", node.id),
+                        duplicate.clone(),
+                    )
+                    .with_label("first generated node", first.clone())
+                    .with_related("existing generated node", first.clone())
+                    .with_reference_chain([
+                        DiagnosticReference::new("first generated node", first),
+                        DiagnosticReference::new("duplicate generated node", duplicate),
+                    ])
+                    .with_help("report this compiler identity collision as an Oxidase bug"),
+                ))
+            }
         }
     }
 
@@ -2003,7 +2032,7 @@ listeners:
             write_config("api_version: oxidase.dev/v1alpha1\nkind: gateway\nkind: gateway\n");
         let error = Compiler::compile_path(path).expect_err("duplicate Gateway key must fail");
         assert_eq!(error.diagnostics[0].code, "source.duplicate_key");
-        assert_eq!(error.diagnostics[0].source.line, 3);
+        assert_eq!(error.diagnostics[0].primary.line, 3);
     }
 
     #[test]
@@ -2095,7 +2124,7 @@ listeners:
             assert_eq!(error.diagnostics[0].code, code);
             assert!(
                 error.diagnostics[0]
-                    .source
+                    .primary
                     .field_path
                     .contains(&format!("request.{field}"))
             );
@@ -2187,9 +2216,12 @@ api_version: oxidase.dev/v1alpha1
         let error = Compiler::compile_path(path).expect_err("invalid bind must fail");
         let diagnostic = &error.diagnostics[0];
         assert_eq!(diagnostic.code, "listener.bind");
-        assert_eq!((diagnostic.source.line, diagnostic.source.column), (12, 11));
-        assert_eq!(diagnostic.source.field_path, "listeners[0].bind");
-        assert!(diagnostic.source.end_byte > diagnostic.source.start_byte);
+        assert_eq!(
+            (diagnostic.primary.line, diagnostic.primary.column),
+            (12, 11)
+        );
+        assert_eq!(diagnostic.primary.field_path, "listeners[0].bind");
+        assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
     }
 
     #[test]
@@ -2207,8 +2239,11 @@ listeners:
         let error = Compiler::compile_path(path).expect_err("missing service must fail");
         let diagnostic = &error.diagnostics[0];
         assert_eq!(diagnostic.code, "service.reference");
-        assert_eq!((diagnostic.source.line, diagnostic.source.column), (7, 12));
-        assert_eq!(diagnostic.source.field_path, "listeners[0].service.ref");
+        assert_eq!(
+            (diagnostic.primary.line, diagnostic.primary.column),
+            (7, 12)
+        );
+        assert_eq!(diagnostic.primary.field_path, "listeners[0].service.ref");
     }
 
     #[test]
@@ -2233,10 +2268,62 @@ listeners:
             .iter()
             .find(|diagnostic| diagnostic.code == "config.duplicate_definition")
             .expect("duplicate diagnostic is present");
-        assert_eq!((diagnostic.source.line, diagnostic.source.column), (4, 3));
-        assert!(diagnostic.source.file.ends_with("b.yaml"));
+        assert_eq!((diagnostic.primary.line, diagnostic.primary.column), (4, 3));
+        assert!(diagnostic.primary.file.ends_with("b.yaml"));
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert!(diagnostic.labels[0].span.file.ends_with("a.yaml"));
         assert_eq!(diagnostic.reference_chain.len(), 2);
-        assert!(diagnostic.reference_chain[0].contains("a.yaml:4:3"));
-        assert!(diagnostic.reference_chain[1].contains("b.yaml:4:3"));
+        assert!(
+            diagnostic.reference_chain[0]
+                .span
+                .as_ref()
+                .expect("first definition has a span")
+                .file
+                .ends_with("a.yaml")
+        );
+        assert!(
+            diagnostic.reference_chain[1]
+                .span
+                .as_ref()
+                .expect("duplicate definition has a span")
+                .file
+                .ends_with("b.yaml")
+        );
+    }
+
+    #[test]
+    fn import_cycles_retain_every_exact_edge_span() {
+        let directory = tempdir().expect("temporary directory is available");
+        let root = directory.path().join("oxidase.yaml");
+        let imported = directory.path().join("a.yaml");
+        fs::write(
+            &root,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [a.yaml]\n",
+        )
+        .expect("root config can be written");
+        fs::write(
+            &imported,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [oxidase.yaml]\n",
+        )
+        .expect("import can be written");
+
+        let error = Compiler::compile_path(&root).expect_err("import cycle must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "config.import_cycle");
+        assert_eq!(diagnostic.reference_chain.len(), 2);
+        let spans = diagnostic
+            .reference_chain
+            .iter()
+            .map(|reference| {
+                reference
+                    .span
+                    .as_ref()
+                    .expect("every import edge has an exact span")
+            })
+            .collect::<Vec<_>>();
+        assert!(spans[0].file.ends_with("oxidase.yaml"));
+        assert!(spans[1].file.ends_with("a.yaml"));
+        assert!(spans.iter().all(|span| span.field_path == "imports[0]"));
+        assert_eq!(diagnostic.primary, *spans[1]);
     }
 }
