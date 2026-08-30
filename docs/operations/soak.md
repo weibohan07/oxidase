@@ -115,3 +115,9 @@ campaign, not a gateway qualification result. The follow-up introduced reusable
 H2 connections and paced multi-exchange tunnels, then completed the recorded
 protocol rerun with zero errors.
 
+The checked-in five-minute combined and two-minute protocol records were both
+run from clean commit `df5ff5a` on macOS/arm64. They completed with zero request
+errors and exited normally. RSS and file-descriptor fields are `null` because
+this host does not expose the Linux `/proc` sampling interfaces; these records
+therefore provide transport/lifecycle coverage, not memory or FD stability
+qualification.
