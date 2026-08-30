@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,17 +9,17 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt, StreamBody};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use oxidase_config::{ClusterProtocol, RetryBodyMode, RetryCause, RetrySpec};
 use oxidase_core::{
-    ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
+    ContentDigest, ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
 use oxidase_runtime::{
     BoxLeafFuture, ClusterAdmissionError, ClusterRetryPermit, ConcurrencyPermit,
-    GovernanceRegistry, LeafExecutor, RuntimeSnapshot,
+    GovernanceRegistry, LeafExecutor, PreparedCluster, RuntimeSnapshot,
 };
 use oxidase_site::{
     AssetPlan, AssetRepresentation, EntityTag, PreparedSiteBody, PreparedSiteResponse, SiteError,
@@ -63,9 +63,20 @@ impl HyperLeaves {
 }
 
 pub(crate) struct ProxyClient {
-    tls_config: tokio_rustls::rustls::ClientConfig,
-    default_pools: Arc<ProxyPools>,
-    pools_by_connect_timeout: Mutex<BTreeMap<Duration, Arc<ProxyPools>>>,
+    default_tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    pool_registry: Mutex<ProxyPoolRegistry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProxyPoolKey {
+    connect_timeout: Duration,
+    tls_digest: Option<ContentDigest>,
+}
+
+#[derive(Default)]
+struct ProxyPoolRegistry {
+    active: BTreeMap<ProxyPoolKey, Arc<ProxyPools>>,
+    cached: BTreeMap<ProxyPoolKey, Weak<ProxyPools>>,
 }
 
 struct ProxyPools {
@@ -159,19 +170,16 @@ impl ProxyPoolKind {
     }
 }
 
-fn native_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
+fn cleartext_connector_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
     use tokio_rustls::rustls::RootCertStore;
     use tokio_rustls::rustls::crypto::ring::default_provider;
 
-    let loaded = rustls_native_certs::load_native_certs();
-    let load_errors = loaded.errors.len();
-    let mut roots = RootCertStore::empty();
-    let (accepted, rejected) = roots.add_parsable_certificates(loaded.certs);
-    if accepted == 0 {
-        return Err(format!(
-            "native TLS trust store contains no usable certificates ({rejected} rejected, {load_errors} load errors)"
-        ));
-    }
+    // This connector configuration is used only for clusters whose prepared
+    // endpoint set is entirely cleartext HTTP. Every HTTPS cluster carries a
+    // `PreparedUpstreamTls` built from its explicit/default trust policy. An
+    // empty root set therefore avoids reading host trust merely to serve an
+    // HTTP-only configuration without weakening any TLS request.
+    let roots = RootCertStore::empty();
     tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|error| format!("cannot enable safe upstream TLS versions: {error}"))
@@ -180,11 +188,10 @@ fn native_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
 
 impl ProxyClient {
     pub(crate) fn new() -> Result<Self, String> {
-        let tls_config = native_tls_config()?;
+        let default_tls_config = Arc::new(cleartext_connector_tls_config()?);
         Ok(Self {
-            default_pools: Arc::new(ProxyPools::new(Duration::from_secs(5), &tls_config)),
-            tls_config,
-            pools_by_connect_timeout: Mutex::new(BTreeMap::new()),
+            default_tls_config,
+            pool_registry: Mutex::new(ProxyPoolRegistry::default()),
         })
     }
 
@@ -193,62 +200,116 @@ impl ProxyClient {
             .resources
             .clusters
             .values()
-            .map(|cluster| cluster.spec().connect_timeout)
-            .filter(|timeout| *timeout != Duration::from_secs(5))
-            .collect::<BTreeSet<_>>();
-        let mut cache = self
-            .pools_by_connect_timeout
+            .map(|cluster| (Self::pool_key(cluster), Arc::clone(cluster)))
+            .collect::<BTreeMap<_, _>>();
+        let mut registry = self
+            .pool_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.retain(|timeout, _| active.contains(timeout));
-        for timeout in active {
-            cache
-                .entry(timeout)
-                .or_insert_with(|| Arc::new(ProxyPools::new(timeout, &self.tls_config)));
+        registry.active.retain(|key, _| active.contains_key(key));
+        for (key, cluster) in active {
+            if registry.active.contains_key(&key) {
+                continue;
+            }
+            let pools = registry
+                .cached
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| self.build_pools(&cluster));
+            registry.cached.insert(key, Arc::downgrade(&pools));
+            registry.active.insert(key, pools);
+        }
+        let active_keys = registry.active.keys().copied().collect::<BTreeSet<_>>();
+        registry
+            .cached
+            .retain(|key, pools| active_keys.contains(key) || pools.strong_count() > 0);
+    }
+
+    fn pools(&self, cluster: &Arc<PreparedCluster>) -> Arc<ProxyPools> {
+        let key = Self::pool_key(cluster);
+        let mut registry = self
+            .pool_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pools) = registry.active.get(&key) {
+            return Arc::clone(pools);
+        }
+        if let Some(pools) = registry.cached.get(&key).and_then(Weak::upgrade) {
+            return pools;
+        }
+        // A request pinned to a retired snapshot can first reach Proxy after a
+        // reload. Keep only a weak cache entry so that old transport policy is
+        // released with the pinned request rather than retained indefinitely.
+        let pools = self.build_pools(cluster);
+        registry.cached.insert(key, Arc::downgrade(&pools));
+        pools
+    }
+
+    fn pool_key(cluster: &PreparedCluster) -> ProxyPoolKey {
+        ProxyPoolKey {
+            connect_timeout: cluster.spec().connect_timeout,
+            tls_digest: cluster.upstream_tls().map(|tls| tls.digest()),
         }
     }
 
-    fn pools(&self, connect_timeout: Duration) -> Arc<ProxyPools> {
-        if connect_timeout == Duration::from_secs(5) {
-            return Arc::clone(&self.default_pools);
-        }
-        let mut cache = self
-            .pools_by_connect_timeout
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pools) = cache.get(&connect_timeout) {
-            return Arc::clone(pools);
-        }
-        let pools = Arc::new(ProxyPools::new(connect_timeout, &self.tls_config));
-        cache.insert(connect_timeout, Arc::clone(&pools));
-        pools
+    fn build_pools(&self, cluster: &PreparedCluster) -> Arc<ProxyPools> {
+        let (tls_config, server_name) = cluster.upstream_tls().map_or_else(
+            || (Arc::clone(&self.default_tls_config), None),
+            |tls| (tls.client_config(), tls.server_name()),
+        );
+        Arc::new(ProxyPools::new(
+            cluster.spec().connect_timeout,
+            tls_config.as_ref(),
+            server_name,
+        ))
     }
 }
 
 impl ProxyPools {
-    fn new(connect_timeout: Duration, tls_config: &tokio_rustls::rustls::ClientConfig) -> Self {
+    fn new(
+        connect_timeout: Duration,
+        tls_config: &tokio_rustls::rustls::ClientConfig,
+        server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+    ) -> Self {
         let mut auto_http = HttpConnector::new();
+        auto_http.enforce_http(false);
         auto_http.set_connect_timeout(Some(connect_timeout));
-        let auto_connector = HttpsConnectorBuilder::new()
+        let auto_builder = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config.clone())
-            .https_or_http()
+            .https_or_http();
+        let auto_builder = if let Some(server_name) = server_name.clone() {
+            auto_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
+        } else {
+            auto_builder
+        };
+        let auto_connector = auto_builder
             .enable_http1()
             .enable_http2()
             .wrap_connector(auto_http);
         let mut http1_http = HttpConnector::new();
+        http1_http.enforce_http(false);
         http1_http.set_connect_timeout(Some(connect_timeout));
-        let http1_connector = HttpsConnectorBuilder::new()
+        let http1_builder = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config.clone())
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http1_http);
+            .https_or_http();
+        let http1_builder = if let Some(server_name) = server_name.clone() {
+            http1_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
+        } else {
+            http1_builder
+        };
+        let http1_connector = http1_builder.enable_http1().wrap_connector(http1_http);
         let mut h2_http = HttpConnector::new();
+        h2_http.enforce_http(false);
         h2_http.set_connect_timeout(Some(connect_timeout));
-        let h2_connector = HttpsConnectorBuilder::new()
+        let h2_builder = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config.clone())
-            .https_or_http()
-            .enable_http2()
-            .wrap_connector(h2_http);
+            .https_or_http();
+        let h2_builder = if let Some(server_name) = server_name {
+            h2_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
+        } else {
+            h2_builder
+        };
+        let h2_connector = h2_builder.enable_http2().wrap_connector(h2_http);
         Self {
             auto: build_proxy_pool(auto_connector, false),
             http1: build_proxy_pool(http1_connector, false),
@@ -294,7 +355,7 @@ impl ProxyClient {
             }
         };
         let configured_pool = ProxyPoolKind::for_cluster(cluster.protocol());
-        let pools = self.pools(cluster.spec().connect_timeout);
+        let pools = self.pools(&cluster);
         let Some(payload) = body.take() else {
             return ServiceOutcome::Failed(ServiceError::new(
                 ErrorClass::BodyUnavailable,

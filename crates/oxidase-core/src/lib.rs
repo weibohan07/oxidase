@@ -29,8 +29,8 @@ pub use program::{
 };
 pub use request::{
     Bindings, BodyState, RequestFrame, RequestMetadata, RequestMetadataError, RequestOverlay,
-    TlsConnectionMetadata, parse_transform_authority, parse_transform_path_and_query,
-    parse_transform_scheme,
+    TlsClientMetadata, TlsConnectionMetadata, parse_transform_authority,
+    parse_transform_path_and_query, parse_transform_scheme,
 };
 pub use template::{CompiledTemplate, TemplateError};
 pub use value::Value;

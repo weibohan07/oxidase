@@ -18,6 +18,8 @@ use oxidase_core::ResourceId;
 use serde::Serialize;
 use tokio::sync::Notify;
 
+use crate::PreparedUpstreamTls;
+
 const HEALTH_UNKNOWN_ELIGIBLE: u8 = 0;
 const HEALTH_HEALTHY: u8 = 1;
 const HEALTH_UNHEALTHY: u8 = 2;
@@ -387,6 +389,7 @@ impl PreparedEndpoint {
 /// endpoint state, and cancellation-safe admission permits.
 pub struct PreparedCluster {
     spec: ClusterSpec,
+    upstream_tls: Option<Arc<PreparedUpstreamTls>>,
     endpoints: Vec<Arc<PreparedEndpoint>>,
     runtime: Arc<ClusterRuntimeState>,
     round_robin_sequence: AtomicU64,
@@ -401,6 +404,10 @@ impl fmt::Debug for PreparedCluster {
             .field("id", &self.spec.id)
             .field("protocol", &self.spec.protocol)
             .field("load_balance", &self.spec.load_balance)
+            .field(
+                "upstream_tls",
+                &self.upstream_tls.as_ref().map(|tls| tls.digest()),
+            )
             .field("endpoints", &self.endpoints)
             .finish_non_exhaustive()
     }
@@ -412,9 +419,23 @@ impl PreparedCluster {
     /// The return value counts endpoint states reused from `previous`.
     #[must_use]
     pub fn prepare(spec: ClusterSpec, previous: Option<&Self>) -> (Self, usize) {
+        Self::prepare_with_tls(spec, None, previous)
+    }
+
+    /// Prepares a Cluster with its already-validated upstream TLS policy.
+    #[must_use]
+    pub(crate) fn prepare_with_tls(
+        spec: ClusterSpec,
+        upstream_tls: Option<Arc<PreparedUpstreamTls>>,
+        previous: Option<&Self>,
+    ) -> (Self, usize) {
         let same_cluster = previous.filter(|previous| previous.spec.id == spec.id);
         let same_protocol = same_cluster.filter(|previous| previous.spec.protocol == spec.protocol);
-        let same_health_policy = same_protocol
+        let same_transport = same_protocol.filter(|previous| {
+            previous.upstream_tls.as_ref().map(|tls| tls.digest())
+                == upstream_tls.as_ref().map(|tls| tls.digest())
+        });
+        let same_health_policy = same_transport
             .filter(|previous| health_policy_compatible(&previous.spec.health, &spec.health));
         let runtime = same_cluster.map_or_else(
             || Arc::new(ClusterRuntimeState::default()),
@@ -454,6 +475,7 @@ impl PreparedCluster {
         (
             Self {
                 spec,
+                upstream_tls,
                 endpoints,
                 runtime,
                 round_robin_sequence: AtomicU64::new(0),
@@ -492,6 +514,11 @@ impl PreparedCluster {
     #[must_use]
     pub fn spec(&self) -> &ClusterSpec {
         &self.spec
+    }
+
+    #[must_use]
+    pub fn upstream_tls(&self) -> Option<&Arc<PreparedUpstreamTls>> {
+        self.upstream_tls.as_ref()
     }
 
     #[must_use]
@@ -1155,6 +1182,7 @@ mod tests {
         ClusterSpec {
             id: ResourceId::new("cluster:test"),
             protocol: ClusterProtocol::Auto,
+            tls: None,
             endpoints,
             load_balance: policy,
             health: ClusterHealthSpec {

@@ -37,6 +37,7 @@ fn cluster_spec(endpoints: Vec<ClusterEndpointSpec>) -> ClusterSpec {
     ClusterSpec {
         id: ResourceId::new("cluster:concurrency"),
         protocol: ClusterProtocol::Auto,
+        tls: None,
         endpoints,
         load_balance: LoadBalancePolicy::RoundRobin,
         health: ClusterHealthSpec {

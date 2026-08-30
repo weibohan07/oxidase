@@ -27,6 +27,10 @@ pub(crate) struct ResourcesSource {
     #[serde(default)]
     pub certificates: BTreeMap<String, CertificateSource>,
     #[serde(default)]
+    pub secrets: BTreeMap<String, SecretSource>,
+    #[serde(default)]
+    pub trust_stores: BTreeMap<String, TrustStoreSource>,
+    #[serde(default)]
     pub clusters: BTreeMap<String, ClusterSource>,
     #[serde(default)]
     pub sites: BTreeMap<String, SiteSource>,
@@ -37,6 +41,24 @@ pub(crate) struct ResourcesSource {
 pub(crate) struct CertificateSource {
     pub cert_chain: PathBuf,
     pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretSource {
+    pub file: PathBuf,
+    #[serde(default = "default_secret_max_bytes")]
+    pub max_bytes: String,
+}
+
+fn default_secret_max_bytes() -> String {
+    "64KiB".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrustStoreSource {
+    pub ca_bundle: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,10 +75,41 @@ pub(crate) struct ClusterSource {
     pub retry: RetrySource,
     #[serde(default)]
     pub limits: ClusterLimitsSource,
+    pub tls: Option<ClusterTlsSource>,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: String,
     #[serde(default = "default_response_timeout")]
     pub response_timeout: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClusterTlsSource {
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub trust: ClusterTlsTrustSource,
+    pub client_certificate: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClusterTlsTrustSource {
+    #[serde(default = "default_system_roots")]
+    pub system_roots: bool,
+    pub trust_store: Option<String>,
+}
+
+impl Default for ClusterTlsTrustSource {
+    fn default() -> Self {
+        Self {
+            system_roots: default_system_roots(),
+            trust_store: None,
+        }
+    }
+}
+
+fn default_system_roots() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +437,29 @@ pub(crate) struct TlsListenerSource {
     pub sni: IndexMap<String, String>,
     #[serde(default = "default_tls_handshake_timeout")]
     pub handshake_timeout: String,
+    #[serde(default)]
+    pub client_auth: ClientAuthSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClientAuthSource {
+    #[serde(default = "default_client_auth_mode")]
+    pub mode: String,
+    pub trust_store: Option<String>,
+}
+
+impl Default for ClientAuthSource {
+    fn default() -> Self {
+        Self {
+            mode: default_client_auth_mode(),
+            trust_store: None,
+        }
+    }
+}
+
+fn default_client_auth_mode() -> String {
+    "none".to_owned()
 }
 
 fn default_tls_handshake_timeout() -> String {

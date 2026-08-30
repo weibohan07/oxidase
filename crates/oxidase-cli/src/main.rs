@@ -158,9 +158,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                 gateway.config_version,
                 gateway.listeners.len(),
                 gateway.graph.len(),
-                gateway.resources.certificates.len()
-                    + gateway.resources.clusters.len()
-                    + gateway.resources.sites.len()
+                snapshot_resource_count(&gateway)
             ));
             Ok(RunSuccess::with_diagnostics(warnings))
         }
@@ -340,15 +338,24 @@ struct PreparedSnapshot {
     warnings: Vec<Diagnostic>,
 }
 
+fn snapshot_resource_count(snapshot: &RuntimeSnapshot) -> usize {
+    snapshot.resources.certificates.len()
+        + snapshot.resources.secrets.len()
+        + snapshot.resources.trust_stores.len()
+        + snapshot.resources.clusters.len()
+        + snapshot.resources.sites.len()
+}
+
 fn prepare_snapshot(config: &Path) -> Result<PreparedSnapshot, CliFailure> {
     let mut gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
-    let warnings = std::mem::take(&mut gateway.warnings);
+    let mut warnings = std::mem::take(&mut gateway.warnings);
     let snapshot = RuntimeSnapshot::prepare(gateway).map_err(|error| {
         CliFailure {
             diagnostics: error.into_diagnostics(),
         }
         .with_prior(&warnings)
     })?;
+    warnings.extend(snapshot.preparation_warnings().iter().cloned());
     Ok(PreparedSnapshot { snapshot, warnings })
 }
 
@@ -1070,8 +1077,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        compare_expectation, explain, listener_protocol_label, prepare_snapshot,
-        watch_dependencies_with_timing,
+        CompilationManifest, compare_expectation, explain, listener_protocol_label,
+        prepare_snapshot, snapshot_resource_count, watch_dependencies_with_timing,
     };
 
     #[tokio::test]
@@ -1323,6 +1330,7 @@ listeners:
         .expect("warning fixture can be written");
 
         let prepared = prepare_snapshot(&config).expect("warning does not reject preparation");
+        assert_eq!(snapshot_resource_count(&prepared.snapshot), 1);
         assert_eq!(prepared.warnings.len(), 1);
         assert_eq!(prepared.warnings[0].severity, DiagnosticSeverity::Warning);
         assert_eq!(prepared.warnings[0].code, "resource.cluster_retry_post");
@@ -1331,6 +1339,67 @@ listeners:
             "resources.clusters.api.retry.methods[0]"
         );
         assert_eq!(prepared.snapshot.resources.clusters.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_preparation_reports_resource_warnings_without_secret_values_or_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempdir().expect("temporary directory is available");
+        let secret = directory.path().join("distinctive-admin-token.secret");
+        fs::write(&secret, b"do-not-render-this-token").expect("secret can be written");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644))
+            .expect("secret permissions can be set");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    admin-token:
+      file: distinctive-admin-token.secret
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        )
+        .expect("gateway config can be written");
+
+        let prepared = prepare_snapshot(&config).expect("warning does not reject preparation");
+        assert_eq!(prepared.warnings.len(), 1);
+        assert_eq!(prepared.warnings[0].code, "secret.file_permissions");
+        let rendered = String::from_utf8(
+            oxidase_cli::encode_json_diagnostics(
+                &oxidase_cli::DiagnosticRoot::for_config(&config),
+                prepared.warnings.clone(),
+            )
+            .expect("warnings encode"),
+        )
+        .expect("diagnostic JSON is UTF-8");
+        assert!(!rendered.contains("do-not-render-this-token"));
+        assert!(!rendered.contains("distinctive-admin-token.secret"));
+        let manifest = serde_json::to_string(&CompilationManifest {
+            format: "oxidase.snapshot-manifest/v1",
+            summary: prepared.snapshot.summary().clone(),
+        })
+        .expect("inspection manifest serializes");
+        assert!(!manifest.contains("do-not-render-this-token"));
+        assert!(!manifest.contains("distinctive-admin-token.secret"));
+        let independently_prepared =
+            prepare_snapshot(&config).expect("the same Secret-backed source prepares again");
+        let repeated_manifest = serde_json::to_string(&CompilationManifest {
+            format: "oxidase.snapshot-manifest/v1",
+            summary: independently_prepared.snapshot.summary().clone(),
+        })
+        .expect("repeated inspection manifest serializes");
+        assert_eq!(
+            manifest, repeated_manifest,
+            "opaque runtime Secret tokens must not make compile output nondeterministic"
+        );
     }
 
     #[test]

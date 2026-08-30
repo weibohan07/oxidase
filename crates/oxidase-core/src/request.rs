@@ -24,12 +24,52 @@ pub struct RequestMetadata {
     pub tls: TlsConnectionMetadata,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TlsConnectionMetadata {
     pub enabled: bool,
     pub server_name: Option<String>,
     pub alpn: Option<String>,
     pub version: Option<String>,
+    pub client: TlsClientMetadata,
+}
+
+impl std::fmt::Debug for TlsConnectionMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TlsConnectionMetadata")
+            .field("enabled", &self.enabled)
+            .field("server_name", &self.server_name)
+            .field("alpn", &self.alpn)
+            .field("version", &self.version)
+            .field("client", &self.client)
+            .finish()
+    }
+}
+
+/// Verified client-certificate facts captured at the TLS handshake boundary.
+///
+/// The subject is informational rather than a canonical identity. Callers that
+/// need a stable identity should use the leaf fingerprint or a verified SAN.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TlsClientMetadata {
+    pub verified: bool,
+    pub sha256: Option<String>,
+    pub subject: Option<String>,
+    pub dns_sans: Vec<String>,
+    pub uri_sans: Vec<String>,
+}
+
+impl std::fmt::Debug for TlsClientMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TlsClientMetadata")
+            .field("verified", &self.verified)
+            .field("has_sha256", &self.sha256.is_some())
+            .field("has_subject", &self.subject.is_some())
+            .field("dns_san_count", &self.dns_sans.len())
+            .field("uri_san_count", &self.uri_sans.len())
+            .finish()
+    }
 }
 
 impl RequestMetadata {
@@ -458,6 +498,39 @@ fn http_version_name(version: Version) -> &'static str {
 }
 
 fn tls_value(tls: &TlsConnectionMetadata) -> Value {
+    let client = Value::Map(BTreeMap::from([
+        (
+            "dns_sans".to_owned(),
+            Value::List(
+                tls.client
+                    .dns_sans
+                    .iter()
+                    .cloned()
+                    .map(Value::from)
+                    .collect(),
+            ),
+        ),
+        (
+            "sha256".to_owned(),
+            tls.client.sha256.clone().map_or(Value::Null, Value::from),
+        ),
+        (
+            "subject".to_owned(),
+            tls.client.subject.clone().map_or(Value::Null, Value::from),
+        ),
+        (
+            "uri_sans".to_owned(),
+            Value::List(
+                tls.client
+                    .uri_sans
+                    .iter()
+                    .cloned()
+                    .map(Value::from)
+                    .collect(),
+            ),
+        ),
+        ("verified".to_owned(), Value::Bool(tls.client.verified)),
+    ]));
     Value::Map(BTreeMap::from([
         ("enabled".to_owned(), Value::Bool(tls.enabled)),
         (
@@ -472,6 +545,7 @@ fn tls_value(tls: &TlsConnectionMetadata) -> Value {
             "version".to_owned(),
             tls.version.clone().map_or(Value::Null, Value::from),
         ),
+        ("client".to_owned(), client),
     ]))
 }
 
@@ -533,7 +607,9 @@ mod tests {
 
     use http::{HeaderMap, HeaderValue, Method, Version};
 
-    use super::{Bindings, RequestFrame, RequestMetadata, TlsConnectionMetadata};
+    use super::{
+        Bindings, RequestFrame, RequestMetadata, TlsClientMetadata, TlsConnectionMetadata,
+    };
     use crate::Value;
 
     #[test]
@@ -582,8 +658,18 @@ mod tests {
                 server_name: Some("api.example.test".to_owned()),
                 alpn: Some("h2".to_owned()),
                 version: Some("TLS1.3".to_owned()),
+                client: TlsClientMetadata {
+                    verified: true,
+                    sha256: Some("sha256-test-fingerprint".to_owned()),
+                    subject: Some("CN=client-secret-subject".to_owned()),
+                    dns_sans: vec!["client.example.test".to_owned()],
+                    uri_sans: vec!["spiffe://example.test/workload".to_owned()],
+                },
             },
         );
+        let debug = format!("{:?}", metadata.tls);
+        assert!(!debug.contains("client-secret-subject"));
+        assert!(!debug.contains("sha256-test-fingerprint"));
         let context = RequestFrame::new(metadata).evaluation_context();
         let request = context.root("request").expect("request root exists");
         assert_eq!(
@@ -598,6 +684,26 @@ mod tests {
         );
         assert_eq!(tls.get("alpn").and_then(Value::as_str), Some("h2"));
         assert_eq!(tls.get("version").and_then(Value::as_str), Some("TLS1.3"));
+        let client = tls.get("client").expect("TLS client namespace exists");
+        assert_eq!(client.get("verified"), Some(&Value::Bool(true)));
+        assert_eq!(
+            client.get("sha256").and_then(Value::as_str),
+            Some("sha256-test-fingerprint")
+        );
+        assert_eq!(
+            client.get("subject").and_then(Value::as_str),
+            Some("CN=client-secret-subject")
+        );
+        assert_eq!(
+            client.get("dns_sans"),
+            Some(&Value::List(vec![Value::from("client.example.test")]))
+        );
+        assert_eq!(
+            client.get("uri_sans"),
+            Some(&Value::List(vec![Value::from(
+                "spiffe://example.test/workload"
+            )]))
+        );
     }
 
     #[test]

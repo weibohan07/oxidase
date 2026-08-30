@@ -4,7 +4,8 @@
 //! [`ClusterHealthManager::activate_snapshot`] only after publishing a snapshot;
 //! failed candidates therefore cannot leak health-check tasks.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -15,11 +16,12 @@ use futures_util::future::join_all;
 use http::{Method, Request, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Empty};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use oxidase_config::{ActiveHealthSpec, ClusterProtocol};
+use oxidase_core::ContentDigest;
 use oxidase_runtime::{PreparedCluster, PreparedEndpoint, RuntimeSnapshot};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -62,6 +64,7 @@ impl ClusterHealthManager {
     /// a duplicate supervisor.
     pub(crate) fn activate_snapshot(&mut self, snapshot: &RuntimeSnapshot) -> usize {
         self.reap_finished();
+        self.client.reconcile_snapshot(snapshot);
         let mut activated = 0;
         for cluster in snapshot.resources.clusters.values() {
             if cluster.spec().health.active.is_none() || !cluster.try_activate_supervisor() {
@@ -104,6 +107,23 @@ impl Drop for ClusterHealthManager {
 }
 
 struct HealthClient {
+    default_tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    pool_registry: Mutex<HealthPoolRegistry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HealthPoolKey {
+    connect_timeout: Duration,
+    tls_digest: Option<ContentDigest>,
+}
+
+#[derive(Default)]
+struct HealthPoolRegistry {
+    active: BTreeMap<HealthPoolKey, Arc<HealthPools>>,
+    cached: BTreeMap<HealthPoolKey, Weak<HealthPools>>,
+}
+
+struct HealthPools {
     auto: HealthPool,
     http1: HealthPool,
     h2: HealthPool,
@@ -111,43 +131,82 @@ struct HealthClient {
 
 impl HealthClient {
     fn new() -> Result<Self, String> {
-        let auto = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| format!("cannot load native TLS roots for health checks: {error}"))?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let http1 = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| format!("cannot load native TLS roots for health checks: {error}"))?
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let h2 = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| format!("cannot load native TLS roots for health checks: {error}"))?
-            .https_or_http()
-            .enable_http2()
-            .build();
         Ok(Self {
-            auto: build_health_pool(auto, false),
-            http1: build_health_pool(http1, false),
-            h2: build_health_pool(h2, true),
+            default_tls_config: Arc::new(cleartext_health_connector_tls_config()?),
+            pool_registry: Mutex::new(HealthPoolRegistry::default()),
         })
     }
 
-    fn pool(&self, protocol: ClusterProtocol) -> &HealthPool {
-        match protocol {
-            ClusterProtocol::Auto => &self.auto,
-            ClusterProtocol::Http1 => &self.http1,
-            ClusterProtocol::H2 => &self.h2,
+    fn reconcile_snapshot(&self, snapshot: &RuntimeSnapshot) {
+        let active = snapshot
+            .resources
+            .clusters
+            .values()
+            .filter(|cluster| cluster.spec().health.active.is_some())
+            .map(|cluster| (Self::pool_key(cluster), Arc::clone(cluster)))
+            .collect::<BTreeMap<_, _>>();
+        let mut registry = self
+            .pool_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.active.retain(|key, _| active.contains_key(key));
+        for (key, cluster) in active {
+            if registry.active.contains_key(&key) {
+                continue;
+            }
+            let pools = registry
+                .cached
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| self.build_pools(&cluster));
+            registry.cached.insert(key, Arc::downgrade(&pools));
+            registry.active.insert(key, pools);
         }
+        let active_keys = registry.active.keys().copied().collect::<BTreeSet<_>>();
+        registry
+            .cached
+            .retain(|key, pools| active_keys.contains(key) || pools.strong_count() > 0);
+    }
+
+    fn pools(&self, cluster: &PreparedCluster) -> Arc<HealthPools> {
+        let key = Self::pool_key(cluster);
+        let mut registry = self
+            .pool_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pools) = registry.active.get(&key) {
+            return Arc::clone(pools);
+        }
+        if let Some(pools) = registry.cached.get(&key).and_then(Weak::upgrade) {
+            return pools;
+        }
+        let pools = self.build_pools(cluster);
+        registry.cached.insert(key, Arc::downgrade(&pools));
+        pools
+    }
+
+    fn pool_key(cluster: &PreparedCluster) -> HealthPoolKey {
+        HealthPoolKey {
+            connect_timeout: cluster.spec().connect_timeout,
+            tls_digest: cluster.upstream_tls().map(|tls| tls.digest()),
+        }
+    }
+
+    fn build_pools(&self, cluster: &PreparedCluster) -> Arc<HealthPools> {
+        let (tls_config, server_name) = cluster.upstream_tls().map_or_else(
+            || (Arc::clone(&self.default_tls_config), None),
+            |tls| (tls.client_config(), tls.server_name()),
+        );
+        Arc::new(HealthPools::new(
+            cluster.spec().connect_timeout,
+            tls_config.as_ref(),
+            server_name,
+        ))
     }
 
     async fn probe(
         &self,
-        protocol: ClusterProtocol,
+        cluster: &PreparedCluster,
         endpoint: &PreparedEndpoint,
         plan: &ActiveHealthSpec,
     ) -> bool {
@@ -162,7 +221,8 @@ impl HealthClient {
             return false;
         };
         tokio::time::timeout(plan.timeout, async {
-            let response = self.pool(protocol).request(request).await.ok()?;
+            let pools = self.pools(cluster);
+            let response = pools.pool(cluster.protocol()).request(request).await.ok()?;
             let status = response.status().as_u16();
             let body_complete = discard_bounded_body(response.into_body()).await;
             if !body_complete {
@@ -178,6 +238,83 @@ impl HealthClient {
         .ok()
         .flatten()
         .unwrap_or(false)
+    }
+}
+
+impl HealthPools {
+    fn new(
+        connect_timeout: Duration,
+        tls_config: &tokio_rustls::rustls::ClientConfig,
+        server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+    ) -> Self {
+        let auto = build_health_connector(
+            connect_timeout,
+            tls_config,
+            server_name.clone(),
+            ClusterProtocol::Auto,
+        );
+        let http1 = build_health_connector(
+            connect_timeout,
+            tls_config,
+            server_name.clone(),
+            ClusterProtocol::Http1,
+        );
+        let h2 = build_health_connector(
+            connect_timeout,
+            tls_config,
+            server_name,
+            ClusterProtocol::H2,
+        );
+        Self {
+            auto: build_health_pool(auto, false),
+            http1: build_health_pool(http1, false),
+            h2: build_health_pool(h2, true),
+        }
+    }
+
+    fn pool(&self, protocol: ClusterProtocol) -> &HealthPool {
+        match protocol {
+            ClusterProtocol::Auto => &self.auto,
+            ClusterProtocol::Http1 => &self.http1,
+            ClusterProtocol::H2 => &self.h2,
+        }
+    }
+}
+
+fn cleartext_health_connector_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
+    use tokio_rustls::rustls::RootCertStore;
+    use tokio_rustls::rustls::crypto::ring::default_provider;
+
+    // Used only by HTTP-only clusters. HTTPS health checks always use the
+    // same prepared trust/client-identity policy as ordinary Proxy traffic.
+    let roots = RootCertStore::empty();
+    tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("cannot enable safe health-check TLS versions: {error}"))
+        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn build_health_connector(
+    connect_timeout: Duration,
+    tls_config: &tokio_rustls::rustls::ClientConfig,
+    server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+    protocol: ClusterProtocol,
+) -> HttpsConnector<HttpConnector> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(connect_timeout));
+    let builder = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config.clone())
+        .https_or_http();
+    let builder = if let Some(server_name) = server_name {
+        builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
+    } else {
+        builder
+    };
+    match protocol {
+        ClusterProtocol::Auto => builder.enable_http1().enable_http2().wrap_connector(http),
+        ClusterProtocol::Http1 => builder.enable_http1().wrap_connector(http),
+        ClusterProtocol::H2 => builder.enable_http2().wrap_connector(http),
     }
 }
 
@@ -246,7 +383,7 @@ async fn run_cluster_supervisor(
         let probes = cluster
             .endpoints()
             .iter()
-            .map(|endpoint| client.probe(cluster.protocol(), endpoint, &plan));
+            .map(|endpoint| client.probe(&cluster, endpoint, &plan));
         let round = join_all(probes);
         let outcomes = tokio::select! {
             biased;

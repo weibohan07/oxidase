@@ -914,15 +914,19 @@ dependencies = [
  "oxidase-core",
  "oxidase-site",
  "rcgen",
+ "rustix",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
  "url",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

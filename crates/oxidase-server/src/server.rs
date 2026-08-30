@@ -20,7 +20,7 @@ use oxidase_core::{
 };
 use oxidase_runtime::{
     ClusterRuntimeStatus, Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot,
-    SnapshotStore,
+    SnapshotStore, verified_client_metadata,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -455,9 +455,12 @@ impl ReloadHandle {
                 }
             };
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
-            let warnings = std::mem::take(&mut gateway.warnings);
+            let mut warnings = std::mem::take(&mut gateway.warnings);
             match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
-                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies, warnings)),
+                Ok((snapshot, reuse)) => {
+                    warnings.extend(snapshot.preparation_warnings().iter().cloned());
+                    Ok((snapshot, reuse, attempt_dependencies, warnings))
+                }
                 Err(error) => {
                     let mut dependencies = attempt_dependencies;
                     dependencies.extend(error.candidate_dependencies.iter().cloned());
@@ -1249,6 +1252,21 @@ async fn serve_connection(
             };
             drop(tls_handshake_permit);
             let connection = tls_stream.get_ref().1;
+            let client_metadata = match verified_client_metadata(connection.peer_certificates()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    context.transport_metrics.record_tls_handshake(
+                        TlsHandshakeOutcome::Protocol,
+                        handshake_started.elapsed(),
+                    );
+                    tracing::debug!(
+                        listener = listener_name,
+                        error = %error,
+                        "verified TLS client metadata could not be represented safely"
+                    );
+                    return;
+                }
+            };
             let server_name = connection.server_name().map(str::to_owned);
             let negotiated_alpn = connection.alpn_protocol().map(<[u8]>::to_vec);
             context
@@ -1262,6 +1280,7 @@ async fn serve_connection(
                     .and_then(|protocol| std::str::from_utf8(protocol).ok())
                     .map(str::to_owned),
                 version: connection.protocol_version().map(tls_version_name),
+                client: client_metadata,
             };
             tracing::debug!(
                 listener = listener_name,
@@ -2747,6 +2766,7 @@ listeners:
                 server_name: Some("example.test".to_owned()),
                 alpn: Some("h2".to_owned()),
                 version: Some("TLS1.3".to_owned()),
+                client: oxidase_core::TlsClientMetadata::default(),
             },
             tunnel_sender: None,
             limits,
@@ -5059,6 +5079,80 @@ listeners:
             request(address, "/", "")
                 .await
                 .ends_with("warning-committed")
+        );
+
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_reports_resource_warnings_and_keeps_sensitive_watcher_dependencies() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "old", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+
+        let secret = directory.path().join("distinctive-reload-token.secret");
+        fs::write(&secret, b"do-not-render-this-reload-token").expect("secret can be written");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644))
+            .expect("secret permissions can be set");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    admin-token:
+      file: distinctive-reload-token.secret
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+      body:
+        text: committed
+"#,
+        )
+        .expect("warning candidate can be written");
+
+        let report = running
+            .reload_path(&config)
+            .await
+            .expect("warning does not reject reload");
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "secret.file_permissions");
+        let rendered = report
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("do-not-render-this-reload-token"));
+        assert!(!rendered.contains("distinctive-reload-token.secret"));
+        let canonical_secret = secret.canonicalize().expect("secret path canonicalizes");
+        assert!(
+            running
+                .reload_handle()
+                .watched_dependencies()
+                .contains(&canonical_secret)
+        );
+        assert!(
+            running
+                .reload_handle()
+                .current_snapshot()
+                .summary()
+                .dependencies
+                .iter()
+                .all(|dependency| !dependency.contains("distinctive-reload-token.secret"))
         );
 
         running.shutdown().await.expect("gateway shuts down");

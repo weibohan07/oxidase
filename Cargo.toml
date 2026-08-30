@@ -42,11 +42,13 @@ rustls = { version = "0.23.43", default-features = false, features = ["logging",
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["ring", "std"] }
+rustix = { version = "1", features = ["fs"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
+subtle = "2.6"
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -56,6 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 x509-parser = { version = "0.18.1", features = ["verify"] }
+zeroize = "1.9"
 walkdir = "2"
 
 [workspace.lints.rust]
