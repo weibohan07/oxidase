@@ -11,6 +11,10 @@ mod response;
 mod server;
 mod upgrade;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
+
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
 pub use metrics::Metrics;
 pub use server::{

@@ -1,35 +1,29 @@
 [package]
-name = "oxidase-cli"
+name = "oxidase-soak"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-
-[[bin]]
-name = "oxidase"
-path = "src/main.rs"
-
-[features]
-fuzzing = []
+publish = false
 
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
 http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 oxidase-config = { path = "../oxidase-config" }
-oxidase-core = { path = "../oxidase-core" }
 oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-server = { path = "../oxidase-server" }
-oxidase-site = { path = "../oxidase-site" }
+rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

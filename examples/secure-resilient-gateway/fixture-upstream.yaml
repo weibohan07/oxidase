@@ -1,0 +1,64 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  certificates:
+    upstream-test-only:
+      # TEST-ONLY, publicly known material. Never use these files in production.
+      cert_chain: ./certs/test-only-rsa-cert.pem
+      private_key: ./certs/test-only-rsa-key.pem
+
+services:
+  fixture:
+    type: route
+    cases:
+      - when:
+          path: /healthz
+        service:
+          type: respond
+          status: 204
+      - when:
+          path: /users
+        service:
+          type: respond
+          status: 200
+          body:
+            json:
+              fixture: secure-resilient-gateway
+              transport: h2
+    default:
+      type: respond
+      status: 404
+      body:
+        text: Not Found
+
+listeners:
+  - name: api-a
+    bind: 127.0.0.1:8444
+    protocol: https
+    tls:
+      default_certificate: upstream-test-only
+    http:
+      versions: [h2]
+      http2:
+        max_concurrent_streams: 64
+        max_header_list_size: 16KiB
+        keep_alive_interval: 30s
+        keep_alive_timeout: 10s
+    service:
+      ref: fixture
+
+  - name: api-b
+    bind: 127.0.0.1:9444
+    protocol: https
+    tls:
+      default_certificate: upstream-test-only
+    http:
+      versions: [h2]
+      http2:
+        max_concurrent_streams: 64
+        max_header_list_size: 16KiB
+        keep_alive_interval: 30s
+        keep_alive_timeout: 10s
+    service:
+      ref: fixture

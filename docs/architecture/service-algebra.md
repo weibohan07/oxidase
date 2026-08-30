@@ -90,6 +90,15 @@ cluster/endpoint concurrency capacity uses `UpstreamOverloaded`. Those two
 conditions are distinct from a selected endpoint failing to connect or violating
 the upstream protocol.
 
-Predicates in v0.2 inspect only the request head. A body-consuming Service marks the
-body irreversible; fallback after such a candidate requires a future explicit
-replay plan and is rejected in the meantime.
+Proxy remains one terminal Service even when its Cluster applies load balancing,
+health eligibility, bounded admission, or retry. Those are runtime properties of a
+prepared Resource, not extra Service outcomes or hidden fallback branches. A retry
+can occur only before the downstream response head and under the Cluster's explicit
+method/cause/body contract; it never turns into `Declined`. Exhausting eligible
+endpoints yields `Failed(UpstreamUnavailable)`, while admission exhaustion yields
+`Failed(UpstreamOverloaded)`.
+
+Predicates in v0.3 inspect only the request head. A body-consuming Service marks the
+body irreversible; Fallback after such a candidate remains rejected. Explicit
+bounded Proxy replay is scoped to retries inside that Proxy leaf and does not make
+the body globally replayable or allow Fallback to advance.

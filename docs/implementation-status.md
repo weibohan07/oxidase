@@ -4,9 +4,10 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `feat/v0.3-resilient-clusters`
-- public starting point: protocol-bridging merge `150046085e58c71d88b322d2693a4e588e1d1d78`
-- release line: `0.2.0-alpha`; production readiness is not claimed
+- active milestone branch: `hardening/v0.3-alpha`
+- public starting point: resilient-Cluster merge `f72021b`
+- release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
+  remains v1, and production readiness is not claimed
 
 ## Completed
 
@@ -191,6 +192,11 @@ Last updated: 2026-08-30
 - Phase 7 adds an opt-in, separately bound management listener with live/ready
   health and Prometheus text metrics. Outcome, status-class, latency, active request,
   and reload labels are fixed and bounded.
+- The management listener also exposes deterministic read-only
+  `GET /api/v1/clusters` status. Cluster/endpoint names, fixed policies and health
+  states, active counts, result counters, transitions, and ejection remaining are
+  visible; origins, request data, credentials, and certificate material are not.
+  Prometheus Cluster labels are limited to configured names and fixed enums.
 - Transport metrics use configured Listener names and fixed protocol/result enums
   for accepted and active HTTP/1 or HTTP/2 connections, TLS handshake
   result/duration, negotiated ALPN, active H2 streams, and graceful/forced H2
@@ -231,6 +237,11 @@ Last updated: 2026-08-30
   dispatch. Dependency-policy, security, contributing, operations, migration, and
   benchmark entrypoints are present. The superseded v0.1 implementation remains in
   Git history.
+- `examples/secure-resilient-gateway` compiles an HTTPS H2/H1 Listener, test-only
+  Certificate Resource, observed route, weighted H2 Cluster with health/retry/
+  admission policy, and Oxista Site. Its local fixture configuration provides two
+  H2-only HTTPS upstream listeners; the committed key is publicly known and clearly
+  forbidden for production use.
 
 ## Currently runnable
 
@@ -305,8 +316,8 @@ Last updated: 2026-08-30
 - The response-header timeout currently bounds connect plus upload/header latency as
   one deadline; per-phase connect/write timing is not separately observable yet.
 - The adversarial streaming fixtures cover representative disconnect and timeout
-  boundaries, but no long-duration memory/fd soak or sustained fuzz campaign is
-  claimed.
+  boundaries. Manual fuzz and soak tools are separate from ordinary CI; their
+  existence is not evidence of a long-duration reliability campaign.
 - The portable watcher polls every 500ms. An edit that preserves path, byte length,
   and filesystem modification timestamp could be missed until another dependency
   changes; triggered preparation itself uses full content fingerprints. Failed
@@ -321,42 +332,27 @@ Last updated: 2026-08-30
 
 ## Validation boundary
 
-- Rust 1.88 was installed locally; the locked MSRV workspace
-  all-target/all-feature check and locked workspace test suite passed.
-- Stable formatting and locked workspace/all-target/all-feature Clippy with warnings
-  denied passed. The current diagnostic branch has 154 passing non-ignored workspace
-  tests and four ignored manual benchmarks/soaks; loopback tests ran with the required
-  local permission. Final docs, release, MSRV, deny, and fuzz gates are rerun before
-  PR publication.
-- `cargo deny check` passed advisories, bans, licenses, and sources; one allowed
-  indirect `syn` duplicate-version warning remains.
-- All seven fuzz harnesses compile; no long fuzz campaign was run.
-- Protocol-bridging targeted validation passed seven trusted-Upgrade unit tests,
-  six trailer/gRPC/reset loopback tests, and five plain/TLS Upgrade socket tests.
-  These results cover the supported cross-protocol trailer and HTTP/1 WebSocket
-  matrix, but do not stand in for the final locked workspace or hosted gates.
-- Example `check`, three declarative tests, `explain`, and deterministic manifest
-  compilation passed.
-- Release-mode local smoke measurements on this machine: 100,000 short executions
-  through one shared 4,097-node graph in about 58ms; 100,000 cached RequestFrame
-  contexts in about 0.49ms; 50,000 typed-include renders in about 40ms; Site scan /
-  compile around 20ms / 3ms for 1,000 assets and 250ms / 39ms for 10,000 assets.
-  These are regression observations, not performance guarantees.
-- The ignored manual proxy soak harness was exercised for 20 keep-alive iterations
-  with periodic reload plus downstream cancellation and an 8 MiB Asset. This was a
-  short harness validation, not a sustained soak claim.
-- Semantic-closure PR #3 passed all four required jobs in run `32657427210`, and its
-  merged `main` push passed run `32657645424`, including Ubuntu loopback tests and
-  the stable release build. `main` branch protection was enabled and read back with
-  strict/up-to-date required checks for `MSRV 1.88`, `Stable workspace`,
-  `Dependency policy`, and `Fuzz harness compile smoke`; signed commits and admin
-  enforcement remain off.
+- Every milestone PR is required to pass the locked Rust 1.88 check/test, stable
+  fmt/Clippy/test/doc/release-build, cargo-deny, and fuzz compile jobs before normal
+  protected-main merge. Evidence is commit-specific; a green older workflow is not
+  treated as proof for the current head.
+- Loopback TLS/H2/gRPC/WebSocket/Cluster tests require permission to bind ephemeral
+  ports. Ordinary CI runs bounded integration fixtures and does not run an indefinite
+  soak or fuzz campaign.
+- Manual regression entrypoints cover TLS handshake plus H1/H2 traffic, SNI lookup,
+  weighted/least-request selection, retry admission, health transitions, shared
+  ServiceGraph execution, typed include/render, Site preparation, and RequestFrame
+  evaluation. They print observations only and are not performance guarantees; see
+  `docs/operations.md` for exact commands.
+- The secure/resilient gateway and fixture upstream configurations pass the same
+  compiler path as `serve`; live use of the publicly known test certificate requires
+  an isolated local trust/host setup and is not a deployment recipe.
 
 ## Next concrete work
 
-1. Complete the resilient-Cluster PR's locked local and hosted gates without
-   weakening streaming or retry boundaries.
-2. Add the secure/resilient example and operator documentation for the compiled
-   Cluster contract.
-3. Add sustained protocol/cluster fuzz and soak campaigns during final v0.3 alpha
-   hardening; ordinary CI should retain only bounded integration smoke coverage.
+1. Extend commit-specific fuzz/soak evidence on Linux with longer operator-run
+   memory/fd observation while keeping ordinary CI bounded.
+2. Separate upstream connect, upload, and response-head timeout observability while
+   preserving streaming and pre-head retry safety.
+3. Design explicit upstream trust roots and client identity before considering mTLS
+   or dynamic service discovery.

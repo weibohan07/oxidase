@@ -1672,4 +1672,74 @@ mod tests {
             EndpointHealthState::UnknownEligible
         );
     }
+
+    #[test]
+    #[ignore = "manual Cluster policy benchmark; run with --release --ignored --nocapture"]
+    fn cluster_policy_smoke_benchmark() {
+        let iterations = std::env::var("OXIDASE_CLUSTER_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000_000)
+            .max(1);
+        let weighted = prepared(
+            LoadBalancePolicy::WeightedRoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 5),
+                endpoint("b", "http://b.test", 3),
+                endpoint("c", "http://c.test", 2),
+            ],
+        );
+        let least = prepared(
+            LoadBalancePolicy::LeastRequests,
+            vec![
+                endpoint("a", "http://a.test", 5),
+                endpoint("b", "http://b.test", 3),
+                endpoint("c", "http://c.test", 2),
+            ],
+        );
+        let health = prepared(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        let now = Instant::now();
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(weighted.select_endpoint(now));
+        }
+        let weighted_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(least.select_endpoint(now));
+        }
+        let least_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let permit = health
+                .try_acquire_retry()
+                .expect("benchmark retry permit is available");
+            std::hint::black_box(&permit);
+            drop(permit);
+        }
+        let retry_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            health.record_active_health("a", false, now);
+            health.record_active_health("a", false, now);
+            health.record_active_health("a", true, now);
+            health.record_active_health("a", true, now);
+        }
+        let health_elapsed = started.elapsed();
+
+        println!(
+            "cluster_policy_benchmark iterations={iterations} weighted_ms={} least_requests_ms={} retry_budget_ms={} health_transition_ms={}",
+            weighted_elapsed.as_millis(),
+            least_elapsed.as_millis(),
+            retry_elapsed.as_millis(),
+            health_elapsed.as_millis(),
+        );
+    }
 }

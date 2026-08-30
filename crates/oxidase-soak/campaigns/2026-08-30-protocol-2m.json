@@ -1,0 +1,37 @@
+{
+  "schema_version": "oxidase.soak/v1",
+  "parameters": {
+    "mode": "protocol",
+    "requested_duration_ms": 120000,
+    "concurrency": 8,
+    "reload_interval_ms": 5000,
+    "payload_size": 32768,
+    "seed": 3237998081
+  },
+  "elapsed_ms": 120201,
+  "requests": 13484,
+  "successes": 13484,
+  "errors": 0,
+  "retries": 0,
+  "health_transitions": 0,
+  "body_cancellations": 418,
+  "bytes": 3756227385,
+  "reloads": 23,
+  "certificate_rotations": 23,
+  "http1_requests": 6757,
+  "http2_requests": 6727,
+  "grpc_requests": 6727,
+  "websocket_tunnels": 6757,
+  "process": {
+    "rss_kib": {
+      "baseline": null,
+      "peak": null,
+      "final_value": null
+    },
+    "open_fds": {
+      "baseline": null,
+      "peak": null,
+      "final_value": null
+    }
+  }
+}

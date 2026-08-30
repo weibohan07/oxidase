@@ -94,9 +94,19 @@ incompatible ALPN negotiation as `alpn_mismatch`; it never falls back to HTTP/1.
 Request paths, query strings, SNI names, peer IPs, Header values, and certificate
 paths are not labels.
 
-## Current protocol limits
+## Trailers and protocol bridges
 
 Request and response bodies remain streaming and are not collected merely because
-HTTP/2 is selected. This alpha does not yet expose request/response trailers, basic
-gRPC proxying, RFC 8441 extended CONNECT, HTTP/2 WebSocket, h2c, or HTTP/3. HTTP/1
-generic Upgrade/WebSocket is also deferred to the protocol-bridging phase.
+HTTP/2 is selected. Body adapters preserve DATA, trailers, end of stream, and errors.
+An H2 downstream Proxy to an explicitly H2 Cluster can therefore carry opaque gRPC
+messages and terminal `grpc-status`/`grpc-message` trailers. Oxidase does not parse
+protobuf or translate gRPC status; see [`../protocols/grpc.md`](../protocols/grpc.md).
+
+HTTP/2 rejects `Connection`, `Keep-Alive`, `Proxy-Connection`,
+`Transfer-Encoding`, and `Upgrade`. `TE` is retained only when its complete value is
+exactly `trailers`; source configuration cannot set these hop-by-hop/framing fields.
+
+HTTP/1 generic Upgrade/WebSocket is implemented only through the trusted Proxy path
+described in [`../protocols/websocket.md`](../protocols/websocket.md). RFC 8441 H2
+extended CONNECT/WebSocket, cleartext h2c, arbitrary CONNECT, gRPC-Web, and HTTP/3
+remain unsupported.

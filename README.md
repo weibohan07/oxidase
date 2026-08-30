@@ -27,7 +27,7 @@ Fallback advances only on `Declined`; HTTP 404 and 500 responses are still handl
 responses. Request overlays and route bindings are lexical, so a declined branch
 cannot leak captures or rewrites into its siblings.
 
-## Current v0.2 alpha
+## Current v0.3 alpha
 
 The runnable inbound data plane supports cleartext HTTP/1.1 plus HTTPS over TLS
 1.2/1.3 with ALPN-selected HTTP/1.1 or HTTP/2. Every current Service node runs on
@@ -47,6 +47,15 @@ terminal trailer frame. Oxidase does not parse protobuf, reinterpret gRPC status
 implement gRPC-Web. Additional socket fixtures verify HTTP/1 chunked request trailers
 crossing to H2 and declared H2 response trailers crossing to an accepting HTTP/1
 client; undeclared trailers fail the stream instead of being silently dropped.
+
+Clusters are prepared runtime Resources rather than URL lists interpreted per
+request. Named endpoints support deterministic round robin, smooth weighted round
+robin, or weighted least-requests selection. Optional active checks and passive
+ejection control eligibility; Cluster and per-endpoint semaphores bound admission
+before the body is consumed. Retry is disabled by default and is allowed only for
+explicit methods and pre-response-head causes/statuses with an empty body or an
+explicitly bounded replay buffer. Runtime health/counters survive only a compatible
+endpoint reload identity.
 
 Listener programs share one immutable `ServiceGraph`; normal requests do not clone
 the graph or collect explain traces. Every handled response passes through one
@@ -110,10 +119,14 @@ arbitrary CONNECT, cleartext h2c, gRPC-Web, client-certificate authentication/mT
 ACME, OCSP stapling, and user-selected cipher suites are not implemented. OXT
 `extends`/`block` remains unsupported.
 
-Atomic last-known-good reload is available with `serve --watch`; health and bounded
-metrics are available on an explicit separate `--admin-bind`. See
+Atomic last-known-good reload is available with `serve --watch`; health, bounded
+metrics, and read-only `/api/v1/clusters` status are available on an explicit
+separate `--admin-bind`. See
 [`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
-This release remains `0.2.0-alpha` and is not described as production-ready.
+This workspace is `0.3.0-alpha.1`; the Gateway API remains
+`oxidase.dev/v1alpha1` and Oxista remains v1. It is not described as
+production-ready or API-stable. Release changes are recorded in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Try the vertical slice
 
@@ -126,6 +139,8 @@ cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch
 cargo run -p oxidase-cli -- serve examples/basic-gateway/oxidase.yaml --watch \
   --admin-bind 127.0.0.1:7590
+cargo run -p oxidase-cli --locked -- \
+  check examples/secure-resilient-gateway/oxidase.yaml
 ```
 
 The example demonstrates:
@@ -184,6 +199,14 @@ Inbound transport configuration is documented in
 [`docs/configuration/http2.md`](docs/configuration/http2.md). An HTTPS listener
 defaults to `versions: [h2, http1]`; a cleartext listener defaults to `http1` and
 rejects `h2` rather than implying h2c support.
+
+Prepared Cluster policy is documented in
+[`docs/configuration/clusters.md`](docs/configuration/clusters.md). Supported
+protocol bridges and their framing limits are documented separately for
+[`gRPC`](docs/protocols/grpc.md) and
+[`HTTP/1 Upgrade/WebSocket`](docs/protocols/websocket.md). The
+[`secure-resilient-gateway`](examples/secure-resilient-gateway) example combines
+these plans with explicitly test-only certificate material.
 
 ## CLI
 

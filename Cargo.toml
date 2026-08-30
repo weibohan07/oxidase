@@ -8,13 +8,14 @@ members = [
     "crates/oxidase-server",
     "crates/oxidase-site",
     "crates/oxidase-source",
+    "crates/oxidase-soak",
     "crates/oxidase-testkit",
 ]
 default-members = ["crates/oxidase-cli"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/weibohan07/oxidase"

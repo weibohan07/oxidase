@@ -14,15 +14,17 @@ The workspace is intentionally layered:
 - `oxidase-source`: the shared strict YAML subset plus `SourceDocument<T>` original
   text and field-path span indexes.
 - `oxidase-config`: strict source models, import/reference resolution, diagnostics,
-  Certificate/Listener transport plans, and lowering.
+  Certificate/Listener transport plans, immutable Cluster policies, and lowering.
 - `oxidase-site`: the single-scan `SiteSourceIndex`, typed lexical OXT compiler, and
   immutable site resources.
 - `oxidase-runtime`: transactional request frames, Service execution, prepared
-  Certificate/TLS plans, resources, snapshots, and publication. Private signing
-  material remains opaque and never enters Service IR.
+  Certificate/TLS and Cluster plans, bounded endpoint state, resources, snapshots,
+  and publication. Private signing material remains opaque and never enters Service
+  IR.
 - `oxidase-server`: the selected HTTP data plane, production Observe/body telemetry,
   listener socket/transport lifecycle, rustls handshakes, ALPN-selected HTTP/1.1 or
-  HTTP/2 connection drivers, and the streaming proxy adapter.
+  HTTP/2 connection drivers, active Cluster supervisors, the streaming proxy/body
+  adapter, protocol-aware trailer handling, and trusted HTTP/1 Upgrade tunnels.
 - `oxidase-cli`: `check`, `explain`, `compile`, `test`, and `serve` commands plus the
   final human/JSON diagnostic rendering boundary.
 - `oxidase-testkit`: reusable fixtures for integration and protocol tests.
@@ -42,3 +44,17 @@ Inbound TLS and Hyper remain confined to runtime/server layers. `oxidase-core`
 contains only protocol-neutral request metadata (`http_version` plus safe TLS
 connection facts), so Service Algebra, Oxista, expressions, and patterns do not
 depend on rustls or Hyper types.
+
+Cluster preparation and activation are separate. A candidate snapshot builds or
+reuses `PreparedCluster` endpoint state without starting permanent work. Publication
+activates active-health supervisors; weak ownership and old snapshot lifetimes stop
+them after removal. Compatible reload reuse requires the Cluster Resource ID,
+endpoint name, canonical URL, and upstream protocol to match. Selection, health,
+passive ejection, admission, and retry state remain owned by that Resource instead
+of a global registry.
+
+The data plane preserves Hyper frames through timeout, telemetry, Proxy, and
+protocol adapters. H2 trailers therefore remain trailers for transparent gRPC.
+HTTP/1 Upgrade is a private capability produced only by the validated Proxy path;
+ordinary Service responses still pass through the same protocol-aware finalizer and
+cannot opt into hop-by-hop framing.

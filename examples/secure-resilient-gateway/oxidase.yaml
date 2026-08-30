@@ -1,0 +1,124 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  certificates:
+    public:
+      # TEST-ONLY, publicly known material. Never use these files in production.
+      cert_chain: ./certs/test-only-rsa-cert.pem
+      private_key: ./certs/test-only-rsa-key.pem
+
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: api-a
+          url: https://rsa.example.test:8444
+          weight: 2
+        - name: api-b
+          url: https://rsa.example.test:9444
+          weight: 1
+      load_balance:
+        policy: weighted_round_robin
+      health:
+        active:
+          path: /healthz
+          interval: 5s
+          timeout: 1s
+          healthy_statuses: ["200-299"]
+          healthy_threshold: 2
+          unhealthy_threshold: 3
+        passive:
+          consecutive_failures: 3
+          eject_for: 30s
+      retry:
+        max_attempts: 2
+        methods: [GET, HEAD]
+        retry_on:
+          - connect_failure
+          - response_header_timeout
+          - refused_stream
+        statuses: [502, 503, 504]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 32
+      limits:
+        max_in_flight: 1024
+        max_in_flight_per_endpoint: 256
+        queue_timeout: 0ms
+      connect_timeout: 5s
+      response_timeout: 30s
+
+  sites:
+    web:
+      root: ./site
+      manifest: site.oxsite
+
+services:
+  public:
+    type: observe
+    name: public-gateway
+    service:
+      type: route
+      cases:
+        - when:
+            path: /api/<rest:path>
+          service:
+            type: transform
+            request:
+              path: "/{{ bindings.rest }}"
+            service:
+              type: proxy
+              cluster: api
+      default:
+        type: site
+        site: web
+
+listeners:
+  - name: public-https
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+      sni:
+        rsa.example.test: public
+      handshake_timeout: 5s
+    http:
+      versions: [h2, http1]
+      http1:
+        header_read_timeout: 30s
+      http2:
+        max_concurrent_streams: 256
+        max_header_list_size: 64KiB
+        keep_alive_interval: 30s
+        keep_alive_timeout: 10s
+    service:
+      ref: public
+
+tests:
+  - name: secure api route selects resilient cluster policy
+    listener: public-https
+    request:
+      method: GET
+      scheme: https
+      host: rsa.example.test
+      path: /api/users?active=true
+    expect:
+      service: public
+      cluster: api
+      cluster_protocol: h2
+      load_balance: weighted_round_robin
+      rewritten_path: /users
+
+  - name: secure site asset
+    listener: public-https
+    request:
+      method: GET
+      scheme: https
+      host: rsa.example.test
+      path: /
+    expect:
+      service: public
+      site: web
+      status: 200
