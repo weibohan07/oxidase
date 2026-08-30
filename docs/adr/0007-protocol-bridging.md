@@ -72,9 +72,11 @@ Oxidase does not parse protobuf or gRPC message frames, does not translate
 
 ### Trailer bridging contract
 
-HTTP/2 to HTTP/2 forwards validated DATA and trailers in both directions.
-HTTP/1 chunked request trailers may be forwarded to H2 after protocol-aware Header
-sanitation.
+HTTP/2 to HTTP/2 forwards validated DATA and trailers in both directions. A real
+TLS/H2 gateway fixture verifies request and response trailer frames across the
+Proxy. HTTP/1 chunked request trailers may be forwarded to H2 after
+protocol-aware Header sanitation, but that cross-version direction is not yet
+black-box qualified in this milestone branch.
 
 For H2 response trailers sent to an HTTP/1 client, Hyper requires trailer names in
 the initial response `Trailer` declaration and the downstream request must have
@@ -109,6 +111,13 @@ connection lifecycle. A reload that retains the Listener does not cut an active
 tunnel. Listener retirement lets it continue during the drain window; expiry aborts
 the connection and tunnel.
 
+This is a generic byte tunnel after the HTTP/1 handshake. Oxidase does not parse or
+rewrite WebSocket frames. The validator, matching upstream 101 response, partial
+byte accounting, first-EOF cancellation, and bidirectional copy have focused unit
+tests. Plain/TLS WebSocket handshakes and reload/drain behavior do not yet have a
+complete socket-level integration test, so this ADR does not claim that final
+WebSocket qualification has been completed.
+
 ### Errors and observation
 
 A failure before a downstream response head maps through the existing safe Proxy
@@ -119,6 +128,29 @@ telemetry; it cannot be rewritten into an HTTP status.
 Metric labels remain bounded: configured Listener/Cluster names plus fixed protocol,
 direction, and termination enums. Paths, SNI, peer addresses, Upgrade protocol
 values, gRPC messages, and Header contents are never labels.
+
+Tunnel telemetry is listener-scoped and exports `oxidase_tunnels_started_total`,
+`oxidase_active_tunnels`, directional `oxidase_tunnel_bytes_total`, and
+`oxidase_tunnel_terminations_total`. Termination values are the fixed set
+`downstream_closed`, `upstream_closed`, `error`, and `cancelled`. The active-tunnel
+guard records `cancelled` if its owning connection task is aborted before an
+explicit finish, including drain expiry.
+
+## Qualification at adoption
+
+The committed black-box protocol fixture currently proves:
+
+- TLS/H2 downstream to H2 upstream request DATA plus request trailers;
+- H2 upstream response DATA plus response trailers to TLS/H2 downstream;
+- opaque multi-message `application/grpc` DATA forwarding with `grpc-status` and
+  `grpc-message` left in the terminal trailer frame.
+
+The fixture does not parse protobuf, and it does not establish support for
+gRPC-Web. Focused unit tests prove frame preservation through timeout and body
+instrumentation adapters, HTTP/1/H2 Header sanitation, trailer validation, trusted
+Upgrade validation, and the in-memory bidirectional tunnel. HTTP/1-to-H2 and
+H2-to-HTTP/1 trailer socket fixtures plus end-to-end WebSocket/TLS/reload/drain
+coverage remain acceptance work rather than implied success.
 
 ## Consequences
 

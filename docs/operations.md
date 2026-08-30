@@ -93,7 +93,12 @@ before Hyper. It owns wire framing and enforces these rules:
   Oxista source, including an outer response Transform.
 
 Hyper remains responsible for final HTTP/1 or HTTP/2 transport framing after this
-normalization. Upgrades and trailers are not implemented.
+normalization. The runtime sanitizer is wire-protocol aware: HTTP/1 removes
+Connection-nominated and standard hop-by-hop fields; HTTP/2 additionally rejects
+the prohibited connection fields and retains `TE` only when its value is exactly
+`trailers`. Ordinary configuration still cannot opt out of these rules. Only Proxy
+can attach validated response-trailer metadata or the private trusted capability
+needed to finalize an HTTP/1 `101 Switching Protocols` response.
 
 ## TLS and HTTP versions
 
@@ -114,6 +119,43 @@ Connection-derived request metadata is read-only:
 Forwarded/X-Forwarded scheme metadata is constructed from the accepted connection,
 not from client-supplied forwarding Headers. Raw SNI and peer addresses may appear
 as controlled tracing fields but never as metric labels.
+
+## Protocol bridging
+
+A Cluster's upstream protocol is `auto`, `http1`, or `h2`. `auto` uses HTTPS ALPN
+and cleartext HTTP/1; `http1` forces HTTP/1.1; `h2` requires H2 over TLS and uses H2
+prior knowledge for a cleartext upstream. The server owns one reusable pool for
+each policy. A transparent gRPC route therefore uses an H2 downstream and a Proxy
+whose Cluster is explicitly `protocol: h2`; Oxidase forwards DATA and terminal
+trailers without parsing protobuf, changing gRPC message frames, or translating
+`grpc-status` into the HTTP status.
+
+The current black-box TLS/H2 fixture verifies downstream request trailers, upstream
+response trailers, multiple opaque gRPC messages, and `grpc-status`/`grpc-message`
+trailers. gRPC-Web is not implemented. Cross-version trailer forwarding has stricter
+HTTP/1 rules: a downstream HTTP/1 client must advertise `TE: trailers`, and response
+trailer names must have appeared in the initial trusted `Trailer` declaration.
+Unsafe or undeclared trailers terminate the streaming body with a protocol error;
+they are not silently dropped and cannot become a synthetic 502 after the response
+head. HTTP/1-to-H2 and H2-to-HTTP/1 trailer directions still need socket-level
+qualification before this alpha claims those combinations.
+
+HTTP/1 Proxy owns a private Upgrade capability extracted by the connection driver.
+Both the downstream request and upstream 101 response must contain one valid,
+matching Upgrade protocol and `Connection: upgrade`; user Respond/OXR/Transform
+output cannot construct this capability. The upstream attempt is forced through
+the HTTP/1 pool. Once both Hyper upgrade futures resolve, the connection owner
+copies bytes bidirectionally without application buffering and keeps the request's
+snapshot alive. A retained Listener leaves the tunnel running across reload;
+retirement permits it to run until the normal drain deadline, after which the
+connection task is aborted.
+
+This is generic Upgrade transport and does not inspect WebSocket frames. Focused
+unit tests cover validation, matching 101 responses, partial byte accounting,
+bidirectional copy, and first-EOF cancellation. Complete plain/TLS WebSocket and
+reload/drain socket tests remain pending, so WebSocket is not yet described as a
+fully qualified alpha protocol. HTTP/2 extended CONNECT, arbitrary CONNECT tunnels,
+and WebTransport are rejected.
 
 ## Asset request order
 
@@ -177,6 +219,18 @@ shutdown. Result and protocol values are closed enums; SNI values, certificate
 paths, client IPs, URLs, and Headers are not labels. Each Listener permits at most
 128 simultaneous TLS handshakes; excess accepts fail immediately with the fixed
 `overloaded` result.
+
+Trusted HTTP/1 tunnels add only listener-scoped bounded series:
+
+- `oxidase_tunnels_started_total` and `oxidase_active_tunnels`;
+- `oxidase_tunnel_bytes_total{direction}`, where direction is one of
+  `downstream_to_upstream` or `upstream_to_downstream`;
+- `oxidase_tunnel_terminations_total{reason}`, where reason is one of
+  `downstream_closed`, `upstream_closed`, `error`, or `cancelled`.
+
+Dropping an unfinished tunnel guard records `cancelled`, so a drain-time abort does
+not leak the active gauge. Upgrade protocol values and WebSocket application data
+are never labels.
 
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service
