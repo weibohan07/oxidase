@@ -828,6 +828,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_certificate_pem() {
+        let directory = tempdir().expect("temporary directory is available");
+        let generated = identity(&["default.example.test"]);
+        let source = certificate_spec(
+            directory.path(),
+            "malformed",
+            "-----BEGIN CERTIFICATE-----\nnot-base64!\n-----END CERTIFICATE-----\n",
+            &generated.private_key_pem,
+        );
+
+        let failure = PreparedCertificate::prepare(&source)
+            .expect_err("malformed certificate PEM must fail preparation");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificatePem
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_pem");
+    }
+
+    #[test]
+    fn rejects_certificate_and_key_directories() {
+        let directory = tempdir().expect("temporary directory is available");
+        let generated = identity(&["default.example.test"]);
+        let mut certificate_directory = certificate_spec(
+            directory.path(),
+            "certificate-directory",
+            &generated.certificate_pem,
+            &generated.private_key_pem,
+        );
+        certificate_directory.cert_chain = directory.path().to_path_buf();
+        let failure = PreparedCertificate::prepare(&certificate_directory)
+            .expect_err("a certificate directory must fail preparation");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateNotFile
+        );
+
+        let mut key_directory = certificate_spec(
+            directory.path(),
+            "key-directory",
+            &generated.certificate_pem,
+            &generated.private_key_pem,
+        );
+        key_directory.private_key = directory.path().to_path_buf();
+        let failure = PreparedCertificate::prepare(&key_directory)
+            .expect_err("a private-key directory must fail preparation");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::PrivateKeyNotFile
+        );
+    }
+
+    #[test]
     fn rejects_multiple_private_keys_without_exposing_them() {
         let directory = tempdir().expect("temporary directory is available");
         let generated = identity(&["default.example.test"]);
