@@ -1,25 +1,109 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use oxidase_config::{
-    CertificateSpec, CompiledListener, HttpListenerSpec, HttpVersion, ListenerLimits,
-    ListenerProtocol, SniPattern, TlsListenerSpec,
+    CertificateSpec, ClientAuthMode, CompiledListener, HttpListenerSpec, HttpVersion,
+    ListenerLimits, ListenerProtocol, SniPattern, TlsListenerSpec,
 };
 use oxidase_core::{
     ContentDigest, ContentDigestBuilder, Diagnostic, ListenerId, ResourceId, ServiceId, SourceSpan,
+    TlsClientMetadata,
 };
 use rustls::crypto::ring::default_provider;
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{Error as RustlsError, InconsistentKeys, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
+
+use crate::regular_file::{RegularFileOpenError, open_regular_file};
+use crate::trust::PreparedTrustStore;
+
+const MAX_CLIENT_IDENTITY_SAN_COUNT: usize = 64;
+const MAX_CLIENT_IDENTITY_TEXT_BYTES: usize = 4 * 1024;
+
+/// Converts only rustls-verified client certificates into bounded core
+/// metadata. `None` is the anonymous result for optional/no client auth.
+pub fn verified_client_metadata(
+    certificates: Option<&[CertificateDer<'_>]>,
+) -> Result<TlsClientMetadata, TlsClientMetadataError> {
+    let Some(leaf) = certificates.and_then(|certificates| certificates.first()) else {
+        return Ok(TlsClientMetadata::default());
+    };
+    let (remaining, certificate) = parse_x509_certificate(leaf.as_ref())
+        .map_err(|_| TlsClientMetadataError("verified client leaf is not valid X.509"))?;
+    if !remaining.is_empty() {
+        return Err(TlsClientMetadataError(
+            "verified client leaf has trailing data",
+        ));
+    }
+    let subject = certificate.subject().to_string();
+    if subject.len() > MAX_CLIENT_IDENTITY_TEXT_BYTES {
+        return Err(TlsClientMetadataError(
+            "verified client subject exceeds the metadata bound",
+        ));
+    }
+    let mut dns_sans = Vec::new();
+    let mut uri_sans = Vec::new();
+    if let Some(names) = certificate
+        .subject_alternative_name()
+        .map_err(|_| TlsClientMetadataError("verified client SAN extension is invalid"))?
+    {
+        for name in &names.value.general_names {
+            match name {
+                GeneralName::DNSName(name) => {
+                    dns_sans.push(name.to_ascii_lowercase());
+                }
+                GeneralName::URI(uri) => uri_sans.push((*uri).to_owned()),
+                _ => {}
+            }
+            if dns_sans.len().saturating_add(uri_sans.len()) > MAX_CLIENT_IDENTITY_SAN_COUNT {
+                return Err(TlsClientMetadataError(
+                    "verified client SAN count exceeds the metadata bound",
+                ));
+            }
+        }
+    }
+    let san_bytes = dns_sans
+        .iter()
+        .chain(&uri_sans)
+        .map(String::len)
+        .sum::<usize>();
+    if san_bytes > MAX_CLIENT_IDENTITY_TEXT_BYTES {
+        return Err(TlsClientMetadataError(
+            "verified client SAN text exceeds the metadata bound",
+        ));
+    }
+    dns_sans.sort();
+    dns_sans.dedup();
+    uri_sans.sort();
+    uri_sans.dedup();
+    Ok(TlsClientMetadata {
+        verified: true,
+        sha256: Some(format!("sha256:{}", ContentDigest::of_bytes(leaf.as_ref()))),
+        subject: Some(subject),
+        dns_sans,
+        uri_sans,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsClientMetadataError(&'static str);
+
+impl fmt::Display for TlsClientMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TlsClientMetadataError {}
 
 /// One validated certificate chain and signing key prepared before publication.
 ///
@@ -151,7 +235,7 @@ impl PreparedCertificate {
         self.certified_key.cert.len()
     }
 
-    fn certified_key(&self) -> Arc<CertifiedKey> {
+    pub(crate) fn certified_key(&self) -> Arc<CertifiedKey> {
         Arc::clone(&self.certified_key)
     }
 
@@ -366,12 +450,13 @@ impl PreparedListenerPlan {
     pub(crate) fn prepare(
         source: &CompiledListener,
         certificates: &BTreeMap<ResourceId, Arc<PreparedCertificate>>,
+        trust_stores: &BTreeMap<ResourceId, Arc<PreparedTrustStore>>,
     ) -> Result<Self, TlsListenerPreparationFailure> {
         let tls = match &source.tls {
             Some(tls) => {
                 let resolver = Arc::new(PreparedCertificateResolver::prepare(tls, certificates)?);
                 let provider = Arc::new(default_provider());
-                let mut server_config = ServerConfig::builder_with_provider(provider)
+                let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
                     .with_safe_default_protocol_versions()
                     .map_err(|error| {
                         TlsListenerPreparationFailure::new(
@@ -380,9 +465,51 @@ impl PreparedListenerPlan {
                             format!("cannot enable the safe TLS 1.2/1.3 defaults: {error}"),
                             tls.source.clone(),
                         )
-                    })?
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver.clone());
+                    })?;
+                let builder = match tls.client_auth.mode {
+                    ClientAuthMode::None => builder.with_no_client_auth(),
+                    ClientAuthMode::Optional | ClientAuthMode::Required => {
+                        let trust_id = tls.client_auth.trust_store.as_ref().ok_or_else(|| {
+                            TlsListenerPreparationFailure::new(
+                                TlsListenerPreparationErrorKind::TrustStoreUnavailable,
+                                "tls.client_auth_trust_unavailable",
+                                "compiled TLS client authentication has no trust-store reference",
+                                tls.client_auth.source.clone(),
+                            )
+                        })?;
+                        let trust = trust_stores.get(trust_id).ok_or_else(|| {
+                            TlsListenerPreparationFailure::new(
+                                TlsListenerPreparationErrorKind::TrustStoreUnavailable,
+                                "tls.client_auth_trust_unavailable",
+                                format!("prepared trust store `{trust_id}` is unavailable"),
+                                tls.client_auth
+                                    .trust_store_source
+                                    .clone()
+                                    .unwrap_or_else(|| tls.client_auth.source.clone()),
+                            )
+                        })?;
+                        let verifier = WebPkiClientVerifier::builder_with_provider(
+                            trust.roots(),
+                            Arc::clone(&provider),
+                        );
+                        let verifier = if tls.client_auth.mode == ClientAuthMode::Optional {
+                            verifier.allow_unauthenticated()
+                        } else {
+                            verifier
+                        }
+                        .build()
+                        .map_err(|error| {
+                            TlsListenerPreparationFailure::new(
+                                TlsListenerPreparationErrorKind::ClientAuthVerifier,
+                                "tls.client_auth_verifier",
+                                format!("cannot build TLS client-certificate verifier: {error}"),
+                                tls.client_auth.source.clone(),
+                            )
+                        })?;
+                        builder.with_client_cert_verifier(verifier)
+                    }
+                };
+                let mut server_config = builder.with_cert_resolver(resolver.clone());
                 server_config.alpn_protocols = source
                     .http
                     .versions
@@ -497,6 +624,31 @@ impl PreparedListenerPlan {
                         "tls_sni_certificate",
                         certificates[&rule.certificate].digest,
                     );
+            }
+            digest.field_bytes(
+                "tls_client_auth_mode",
+                match tls_source.client_auth.mode {
+                    ClientAuthMode::None => b"none".as_slice(),
+                    ClientAuthMode::Optional => b"optional".as_slice(),
+                    ClientAuthMode::Required => b"required".as_slice(),
+                },
+            );
+            if let Some(trust_store) = &tls_source.client_auth.trust_store {
+                let prepared = trust_stores.get(trust_store).ok_or_else(|| {
+                    TlsListenerPreparationFailure::new(
+                        TlsListenerPreparationErrorKind::TrustStoreUnavailable,
+                        "tls.client_auth_trust_unavailable",
+                        format!("prepared trust store `{trust_store}` is unavailable"),
+                        tls_source
+                            .client_auth
+                            .trust_store_source
+                            .clone()
+                            .unwrap_or_else(|| tls_source.client_auth.source.clone()),
+                    )
+                })?;
+                digest
+                    .field_bytes("tls_client_auth_trust_id", trust_store.as_str().as_bytes())
+                    .field_digest("tls_client_auth_trust_digest", prepared.digest());
             }
         }
 
@@ -739,6 +891,8 @@ fn validate_certificate_chain(
 pub enum TlsListenerPreparationErrorKind {
     CertificateUnavailable,
     SniCertificateName,
+    TrustStoreUnavailable,
+    ClientAuthVerifier,
     ServerConfig,
 }
 
@@ -747,6 +901,8 @@ impl fmt::Display for TlsListenerPreparationErrorKind {
         formatter.write_str(match self {
             Self::CertificateUnavailable => "listener certificate is unavailable",
             Self::SniCertificateName => "certificate does not cover its SNI rule",
+            Self::TrustStoreUnavailable => "listener client-auth trust store is unavailable",
+            Self::ClientAuthVerifier => "listener client-auth verifier is invalid",
             Self::ServerConfig => "TLS server configuration is invalid",
         })
     }
@@ -823,53 +979,10 @@ fn read_regular_file(
     source: &SourceSpan,
     kind: CertificateFileKind,
 ) -> Result<Vec<u8>, CertificatePreparationFailure> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        let missing = error.kind() == std::io::ErrorKind::NotFound;
-        let (kind, code, message) = match (kind, missing) {
-            (CertificateFileKind::Chain, true) => (
-                CertificatePreparationErrorKind::CertificateMissing,
-                "tls.certificate_missing",
-                "certificate chain file does not exist".to_owned(),
-            ),
-            (CertificateFileKind::Chain, false) => (
-                CertificatePreparationErrorKind::CertificateRead,
-                "tls.certificate_read",
-                format!("cannot inspect certificate chain file: {error}"),
-            ),
-            (CertificateFileKind::PrivateKey, true) => (
-                CertificatePreparationErrorKind::PrivateKeyMissingFile,
-                "tls.private_key_missing_file",
-                "private key file does not exist".to_owned(),
-            ),
-            (CertificateFileKind::PrivateKey, false) => (
-                CertificatePreparationErrorKind::PrivateKeyRead,
-                "tls.private_key_read",
-                format!("cannot inspect private key file: {error}"),
-            ),
-        };
-        CertificatePreparationFailure::new(kind, code, message, source.clone())
-    })?;
-    if !metadata.is_file() {
-        let (kind, code, message) = match kind {
-            CertificateFileKind::Chain => (
-                CertificatePreparationErrorKind::CertificateNotFile,
-                "tls.certificate_not_file",
-                "certificate chain path must name a regular file",
-            ),
-            CertificateFileKind::PrivateKey => (
-                CertificatePreparationErrorKind::PrivateKeyNotFile,
-                "tls.private_key_not_file",
-                "private key path must name a regular file",
-            ),
-        };
-        return Err(CertificatePreparationFailure::new(
-            kind,
-            code,
-            message,
-            source.clone(),
-        ));
-    }
-    fs::read(path).map_err(|error| {
+    let (mut file, _) =
+        open_regular_file(path).map_err(|error| certificate_open_failure(source, kind, error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
         let (kind, code, message) = match kind {
             CertificateFileKind::Chain => (
                 CertificatePreparationErrorKind::CertificateRead,
@@ -883,7 +996,58 @@ fn read_regular_file(
             ),
         };
         CertificatePreparationFailure::new(kind, code, message, source.clone())
-    })
+    })?;
+    Ok(bytes)
+}
+
+fn certificate_open_failure(
+    source: &SourceSpan,
+    kind: CertificateFileKind,
+    error: RegularFileOpenError,
+) -> CertificatePreparationFailure {
+    match error {
+        RegularFileOpenError::Inspect(error) | RegularFileOpenError::Open(error) => {
+            let missing = error.kind() == std::io::ErrorKind::NotFound;
+            let (kind, code, message) = match (kind, missing) {
+                (CertificateFileKind::Chain, true) => (
+                    CertificatePreparationErrorKind::CertificateMissing,
+                    "tls.certificate_missing",
+                    "certificate chain file does not exist".to_owned(),
+                ),
+                (CertificateFileKind::Chain, false) => (
+                    CertificatePreparationErrorKind::CertificateRead,
+                    "tls.certificate_read",
+                    format!("cannot safely open certificate chain file: {error}"),
+                ),
+                (CertificateFileKind::PrivateKey, true) => (
+                    CertificatePreparationErrorKind::PrivateKeyMissingFile,
+                    "tls.private_key_missing_file",
+                    "private key file does not exist".to_owned(),
+                ),
+                (CertificateFileKind::PrivateKey, false) => (
+                    CertificatePreparationErrorKind::PrivateKeyRead,
+                    "tls.private_key_read",
+                    format!("cannot safely open private key file: {error}"),
+                ),
+            };
+            CertificatePreparationFailure::new(kind, code, message, source.clone())
+        }
+        RegularFileOpenError::NotRegular | RegularFileOpenError::ChangedType => {
+            let (kind, code, message) = match kind {
+                CertificateFileKind::Chain => (
+                    CertificatePreparationErrorKind::CertificateNotFile,
+                    "tls.certificate_not_file",
+                    "certificate chain path must name a stable regular file",
+                ),
+                CertificateFileKind::PrivateKey => (
+                    CertificatePreparationErrorKind::PrivateKeyNotFile,
+                    "tls.private_key_not_file",
+                    "private key path must name a stable regular file",
+                ),
+            };
+            CertificatePreparationFailure::new(kind, code, message, source.clone())
+        }
+    }
 }
 
 fn certified_key_error(
@@ -945,18 +1109,47 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use oxidase_config::{CertificateSpec, SniCertificateSpec, SniPattern, TlsListenerSpec};
+    use oxidase_config::{
+        CertificateSpec, ClientAuthMode, ClientAuthSpec, SniCertificateSpec, SniPattern,
+        TlsListenerSpec,
+    };
     use oxidase_core::{ResourceId, SourceSpan};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedKey as GeneratedCertificate,
         DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, date_time_ymd,
         generate_simple_self_signed,
     };
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
     use tempfile::tempdir;
 
     use super::{
         CertificatePreparationErrorKind, PreparedCertificate, PreparedCertificateResolver,
+        verified_client_metadata,
     };
+
+    #[test]
+    fn verified_client_certificates_become_bounded_rustls_free_metadata() {
+        let identity = identity(&["CLIENT.Example.Test", "client.example.test"]);
+        let certificates = CertificateDer::pem_slice_iter(identity.certificate_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("test-only client certificate PEM is valid");
+        let metadata = verified_client_metadata(Some(&certificates))
+            .expect("verified test certificate metadata is valid");
+        assert!(metadata.verified);
+        assert_eq!(metadata.dns_sans, ["client.example.test"]);
+        assert!(
+            metadata
+                .sha256
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+        );
+        assert!(metadata.subject.is_some());
+        assert_eq!(
+            verified_client_metadata(None).expect("anonymous TLS metadata is valid"),
+            oxidase_core::TlsClientMetadata::default()
+        );
+    }
 
     struct TestIdentity {
         certificate_pem: String,
@@ -1099,6 +1292,16 @@ mod tests {
                 "resources.certificates.{name}.private_key"
             )),
             source: SourceSpan::synthetic(format!("resources.certificates.{name}")),
+        }
+    }
+
+    fn no_client_auth() -> ClientAuthSpec {
+        ClientAuthSpec {
+            mode: ClientAuthMode::None,
+            trust_store: None,
+            mode_source: SourceSpan::synthetic("listeners[0].tls.client_auth.mode"),
+            trust_store_source: None,
+            source: SourceSpan::synthetic("listeners[0].tls.client_auth"),
         }
     }
 
@@ -1456,6 +1659,7 @@ mod tests {
                 },
             ],
             handshake_timeout: Duration::from_secs(5),
+            client_auth: no_client_auth(),
             source: SourceSpan::synthetic("listeners[0].tls"),
         };
         let resolver = PreparedCertificateResolver::prepare(&source, &certificates)
@@ -1516,6 +1720,7 @@ mod tests {
                 certificate_source: SourceSpan::synthetic("listeners[0].tls.sni.api.example.test"),
             }],
             handshake_timeout: Duration::from_secs(5),
+            client_auth: no_client_auth(),
             source: SourceSpan::synthetic("listeners[0].tls"),
         };
 
@@ -1577,6 +1782,7 @@ mod tests {
                 },
             ],
             handshake_timeout: Duration::from_secs(5),
+            client_auth: no_client_auth(),
             source: SourceSpan::synthetic("listeners[0].tls"),
         };
         let resolver = PreparedCertificateResolver::prepare(&source, &certificates)

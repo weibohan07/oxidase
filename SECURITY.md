@@ -72,8 +72,16 @@ validation.
 
 ## Explicitly unsupported security claims
 
-Oxidase does not currently provide mTLS, bearer-token administration, ACME, OCSP
-stapling, a WAF, arbitrary CONNECT, HTTP/3, h2c ingress, H2 WebSocket, gRPC-Web,
-dynamic service discovery, or a distributed control plane. It has not completed a
-long-duration Linux resource qualification. Do not infer these properties from the
-presence of related TLS, Proxy, Cluster, or soak code.
+Oxidase currently provides Trust-Store-backed inbound `none`/`optional`/`required`
+client-certificate verification and upstream TLS with system/custom roots, a fixed
+verification identity, and an optional client Certificate Resource. Only bounded,
+rustls-verified client metadata reaches the request model. mTLS does not assign an
+application role or authorize a request, and upstream certificate verification
+cannot be disabled.
+
+Oxidase does not currently provide CRL/OCSP revocation, certificate pinning, a
+SPIFFE policy engine, automatic certificate-to-role mapping, bearer-token
+administration, ACME, a WAF, arbitrary CONNECT, HTTP/3, h2c ingress, H2 WebSocket,
+gRPC-Web, dynamic service discovery, or a distributed control plane. It has not
+completed a long-duration Linux resource qualification. Do not infer these
+properties from the presence of related TLS, Proxy, Cluster, or soak code.

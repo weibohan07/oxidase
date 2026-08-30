@@ -15,8 +15,8 @@ Oxidase 是一个使用 Rust 编写的声明式 HTTP Service 程序编译器与�
   包装型（`Transform`、`Observe`、`Timeout`、`RequestBodyLimit`、
   `ConcurrencyLimit`、`RateLimit`、`Recover`）与组合型（`Route`、`Fallback`、
   `Reenter`）节点。
-- **Resource Registry**：持有已验证的 Certificate、可复用 SiteSnapshot、Cluster 等
-  共享状态；Resource 不是 Service。
+- **Resource Registry**：持有已验证的 Secret、Trust Store、Certificate、可复用
+  SiteSnapshot 与 Prepared Cluster 等共享状态；Resource 不是 Service。
 - **Router DSL**：可选的源码语法，在执行前降解为普通 Service IR；运行时没有
   特权 Router。
 - **Oxista**：把 `.oxsite`、`.oxr`、`.oxt` 编译为不可变 Site 索引；请求期不解析
@@ -50,7 +50,10 @@ endpoint 支持确定性 round robin、平滑 weighted round robin 与加权 lea
 可选主动健康检查与被动摘除决定 endpoint 是否 eligible；Cluster 与 endpoint 两级
 semaphore 会在读取 request body 前执行有界 admission。Retry 默认关闭，只有显式
 method、response head 前的 cause/status，以及空 body 或显式有界 replay buffer 同时
-满足时才会发生。健康状态与计数只在 reload endpoint identity 兼容时复用。
+满足时才会发生。健康状态与计数只在 reload endpoint identity 兼容时复用。HTTPS
+Cluster 可使用系统 roots、自定义 Trust Store 或两者并集，固定精确 DNS/IP 验证身份，
+并以已准备的 Certificate Resource 作为上游 client identity。TLS policy 属于 Proxy
+和 health-check pool 的兼容身份；无法关闭证书验证。
 
 入站治理同时覆盖 transport 与 Service 边界。Listener limits 限制全局连接数、真实
 peer IP 的连接数、空闲读写进度、Header 字节数/数量，以及每条 HTTP/1 connection 的
@@ -93,12 +96,16 @@ Gateway 与 Oxista semantic diagnostic 会保留精确 byte/行列、secondary l
 envelope，stdout 不混入人类输出。RequestFrame 的 Header/query/bindings/request
 namespace 采用 frame-local lazy cache，同一未修改 frame 只构造一次。
 
-Certificate 作为 Resource 在发布前完成 PEM/X.509、唯一受支持私钥、证书与私钥
-匹配、SNI 与证书兼容性以及 Listener setting 验证。SNI 先精确匹配，再匹配仅一个
-label 的最左侧 wildcard，最后使用 default certificate。保留的 Listener socket 会在
-每次新连接时读取当前不可变 TLS/HTTP plan，因此合法证书轮换可在不重新 bind 的情况
-下原子生效；既有连接继续使用旧 TLS 状态。每个 HTTP/2 stream 在请求开始时固定当前
-snapshot，Listener retire 时先 graceful shutdown/GOAWAY，再受 drain deadline 约束。
+Secret 是有界、仅文件型的 Resource，格式化输出始终 redact，并在最后 owner drop 时
+尽力 zeroize；它不是通用 expression/template value。严格的 certificate-only Trust
+Store Resource 为入站 client authentication 与上游私有 PKI 提供 roots。Certificate
+作为 Resource 在发布前完成 PEM/X.509、唯一受支持私钥、证书与私钥匹配、SNI 与证书
+兼容性以及 Listener setting 验证。HTTPS Listener 支持 `none`、`optional`、`required`
+client authentication，并只在 `request.tls.client` 暴露经过 rustls 验证且有界的 leaf
+metadata。保留的 Listener socket 会在每次新连接时读取当前不可变 TLS/HTTP plan，
+因此合法证书或 Trust Store 轮换可在不重新 bind 的情况下原子生效；既有连接继续使用
+旧 TLS 状态。每个 HTTP/2 stream 在请求开始时固定当前 snapshot，Listener retire 时先
+graceful shutdown/GOAWAY，再受 drain deadline 约束。
 
 HTTP/1 Proxy 已有 server-local trusted Upgrade 路径：普通 Respond/OXR/Transform
 无法伪造它的 101 响应，验证后的 tunnel 由 connection 持有并执行双向流式复制与
@@ -106,8 +113,9 @@ HTTP/1 Proxy 已有 server-local trusted Upgrade 路径：普通 Respond/OXR/Tra
 聚焦测试。Socket fixture 已覆盖明文/TLS HTTP/1 handshake、双向 WebSocket-style
 bytes、任一侧关闭、固定旧 snapshot 的 reload、新 Listener、drain timeout、trusted
 capability 隔离与有界指标。Oxidase 透明转发 WebSocket 流量，不解析其 frame。HTTP/2
-extended CONNECT、任意 CONNECT、明文 h2c、gRPC-Web、客户端证书认证/mTLS、ACME、
-OCSP stapling 与用户自定义 cipher suite 均未实现；OXT `extends/block` 同样不支持。
+extended CONNECT、任意 CONNECT、明文 h2c、gRPC-Web、ACME、OCSP/CRL 吊销检查、
+证书到角色的自动映射与用户自定义 cipher suite 均未实现；OXT `extends/block` 同样
+不支持。
 
 使用 `serve --watch` 可以启用保留 last-known-good 的原子 reload；通过独立、显式的
 `--admin-bind` 可启用健康检查、有界指标与只读 `/api/v1/clusters` 状态。准确边界见
@@ -184,6 +192,12 @@ sequence 以及 literal/folded block scalar。Import/reference cycle 会被检�
 [`docs/configuration/http2.md`](docs/configuration/http2.md)。HTTPS Listener 默认
 `versions: [h2, http1]`；明文 Listener 默认 `http1`，若配置 `h2` 会明确拒绝，而
 不会暗示支持 h2c。
+
+文件型 Secret 处理见
+[`docs/configuration/secrets.md`](docs/configuration/secrets.md)。自定义 Trust Store、
+入站 mTLS、已验证 request metadata 与上游 TLS/mTLS policy 见
+[`docs/configuration/mtls.md`](docs/configuration/mtls.md)。mTLS 只认证证书链，不会
+自动授权请求；配置中不存在 `dangerous_skip_verify`。
 
 Listener 入站限制与保护 wrapper 的契约记录在
 [`ADR 0009`](docs/adr/0009-ingress-resource-governance.md)。有限默认值为：总连接

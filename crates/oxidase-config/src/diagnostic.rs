@@ -3,10 +3,23 @@ use std::path::PathBuf;
 
 pub use oxidase_core::Diagnostic;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompileError {
     pub diagnostics: Vec<Diagnostic>,
     pub discovered_dependencies: Vec<PathBuf>,
+}
+
+impl fmt::Debug for CompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompileError")
+            .field("diagnostics", &self.diagnostics)
+            .field(
+                "discovered_dependency_count",
+                &self.discovered_dependencies.len(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompileError {

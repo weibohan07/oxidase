@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,26 +26,50 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
-    ActiveHealthSource, BodySource, CertificateSource, ClusterEndpointSource, ClusterSource,
-    ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource, Http1SettingsSource,
-    Http2SettingsSource, HttpListenerSource, HttpVersionSource, InlineServiceSource,
-    ListenerLimitsSource, ListenerProtocolSource, ListenerSource, PassiveHealthSource,
-    PredicateSource, RateLimitKeySource, RedirectQuerySource, RequestTransformSource,
-    ResourcesSource, ResponseTransformSource, RetryRequestBodySource, RetrySource, ServiceSource,
-    SiteSource, StatusRangeSource, TlsListenerSource,
+    ActiveHealthSource, BodySource, CertificateSource, ClientAuthSource, ClusterEndpointSource,
+    ClusterSource, ClusterTlsSource, ConfigTestSource, ErrorClassSource, GatewaySource,
+    HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource, HttpVersionSource,
+    InlineServiceSource, ListenerLimitsSource, ListenerProtocolSource, ListenerSource,
+    PassiveHealthSource, PredicateSource, RateLimitKeySource, RedirectQuerySource,
+    RequestTransformSource, ResourcesSource, ResponseTransformSource, RetryRequestBodySource,
+    RetrySource, SecretSource, ServiceSource, SiteSource, StatusRangeSource, TlsListenerSource,
+    TrustStoreSource,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompiledGateway {
     pub source: PathBuf,
     pub config_version: ConfigVersion,
+    /// Complete filesystem dependency set used by preparation and reload.
     pub dependencies: Vec<PathBuf>,
+    /// Inspection-safe dependency set with secret and private-key paths removed.
+    pub summary_dependencies: Vec<PathBuf>,
     pub graph: Arc<ServiceGraph>,
     pub resources: CompiledResources,
     pub listeners: Vec<CompiledListener>,
     pub tests: Vec<ConfigTestSource>,
     /// Non-fatal structured diagnostics produced while compiling this source.
     pub warnings: Vec<Diagnostic>,
+}
+
+impl fmt::Debug for CompiledGateway {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledGateway")
+            .field("source", &self.source)
+            .field("config_version", &self.config_version)
+            .field("dependency_count", &self.dependencies.len())
+            .field("service_node_count", &self.graph.len())
+            .field("certificate_count", &self.resources.certificates.len())
+            .field("secret_count", &self.resources.secrets.len())
+            .field("trust_store_count", &self.resources.trust_stores.len())
+            .field("cluster_count", &self.resources.clusters.len())
+            .field("site_count", &self.resources.sites.len())
+            .field("listener_count", &self.listeners.len())
+            .field("test_count", &self.tests.len())
+            .field("warning_count", &self.warnings.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompiledGateway {
@@ -62,7 +87,7 @@ impl CompiledGateway {
             config_version: self.config_version.to_string(),
             source: self.source.display().to_string(),
             dependencies: self
-                .dependencies
+                .summary_dependencies
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
@@ -110,6 +135,8 @@ impl CompiledGateway {
 #[derive(Debug, Clone, Default)]
 pub struct CompiledResources {
     pub certificates: BTreeMap<ResourceId, CertificateSpec>,
+    pub secrets: BTreeMap<ResourceId, SecretSpec>,
+    pub trust_stores: BTreeMap<ResourceId, TrustStoreSpec>,
     pub clusters: BTreeMap<ResourceId, ClusterSpec>,
     pub sites: BTreeMap<ResourceId, SiteSpec>,
 }
@@ -119,13 +146,62 @@ pub struct CompiledResources {
 /// Certificate and private-key bytes are deliberately not part of the
 /// compiled configuration. The server preparation boundary reads and validates
 /// them without making secret material inspectable through this IR.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CertificateSpec {
     pub id: ResourceId,
     pub cert_chain: PathBuf,
     pub private_key: PathBuf,
     pub cert_chain_source: SourceSpan,
     pub private_key_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+impl fmt::Debug for CertificateSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CertificateSpec")
+            .field("id", &self.id)
+            .field("cert_chain", &self.cert_chain)
+            .field("private_key", &"<redacted path>")
+            .field("cert_chain_source", &self.cert_chain_source)
+            .field("private_key_source", &self.private_key_source)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// A file-backed secret reference. Secret bytes are deliberately absent from
+/// compiler IR and from every serializable inspection structure.
+#[derive(Clone)]
+pub struct SecretSpec {
+    pub id: ResourceId,
+    pub file: PathBuf,
+    pub max_bytes: u64,
+    pub file_source: SourceSpan,
+    pub max_bytes_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+impl fmt::Debug for SecretSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretSpec")
+            .field("id", &self.id)
+            .field("file", &"<redacted path>")
+            .field("max_bytes", &self.max_bytes)
+            .field("file_source", &self.file_source)
+            .field("max_bytes_source", &self.max_bytes_source)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// One strict PEM trust-anchor bundle prepared at runtime.
+#[derive(Debug, Clone)]
+pub struct TrustStoreSpec {
+    pub id: ResourceId,
+    pub ca_bundle: PathBuf,
+    pub ca_bundle_source: SourceSpan,
     pub source: SourceSpan,
 }
 
@@ -138,9 +214,30 @@ pub struct ClusterSpec {
     pub health: ClusterHealthSpec,
     pub retry: RetrySpec,
     pub limits: ClusterLimits,
+    pub tls: Option<ClusterTlsSpec>,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
     pub protocol_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+/// Rustls-free upstream TLS policy compiled for one Cluster.
+#[derive(Debug, Clone)]
+pub struct ClusterTlsSpec {
+    pub server_name: Option<String>,
+    pub trust: ClusterTlsTrustSpec,
+    pub client_certificate: Option<ResourceId>,
+    pub server_name_source: Option<SourceSpan>,
+    pub client_certificate_source: Option<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterTlsTrustSpec {
+    pub system_roots: bool,
+    pub trust_store: Option<ResourceId>,
+    pub system_roots_source: SourceSpan,
+    pub trust_store_source: Option<SourceSpan>,
     pub source: SourceSpan,
 }
 
@@ -341,7 +438,26 @@ pub struct TlsListenerSpec {
     pub default_certificate_source: SourceSpan,
     pub sni: Vec<SniCertificateSpec>,
     pub handshake_timeout: Duration,
+    pub client_auth: ClientAuthSpec,
     pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientAuthSpec {
+    pub mode: ClientAuthMode,
+    pub trust_store: Option<ResourceId>,
+    pub mode_source: SourceSpan,
+    pub trust_store_source: Option<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    #[default]
+    None,
+    Optional,
+    Required,
 }
 
 impl TlsListenerSpec {
@@ -492,6 +608,7 @@ impl Compiler {
         let result = (|| {
             validate_document_identity(&merged)?;
             let (resources, warnings) = compile_resources(&merged)?;
+            let summary_dependencies = summary_dependencies(&merged);
 
             let mut builder = ProgramBuilder::new(&merged, &resources);
             let listeners = builder.compile_listeners()?;
@@ -513,6 +630,7 @@ impl Compiler {
                 source: path,
                 config_version: ConfigVersion::new(format!("v2-sha256-{}", merged.hash)),
                 dependencies: merged.dependencies,
+                summary_dependencies,
                 graph,
                 resources,
                 listeners,
@@ -812,6 +930,26 @@ impl Loader {
                     .extend(candidate_dependencies(&resolved));
             }
         }
+        for located in merged.secrets.values() {
+            let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+            let resolved = resolve_declared_path(directory, &located.value.file);
+            merged
+                .dependencies
+                .extend(candidate_dependencies(&resolved));
+            merged
+                .dependency_candidates
+                .extend(candidate_dependencies(&resolved));
+        }
+        for located in merged.trust_stores.values() {
+            let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+            let resolved = resolve_declared_path(directory, &located.value.ca_bundle);
+            merged
+                .dependencies
+                .extend(candidate_dependencies(&resolved));
+            merged
+                .dependency_candidates
+                .extend(candidate_dependencies(&resolved));
+        }
         merged.dependencies.sort();
         merged.dependencies.dedup();
         merged.dependency_candidates.sort();
@@ -828,6 +966,30 @@ fn resolve_declared_path(directory: &Path, declared: &Path) -> PathBuf {
     }
 }
 
+fn summary_dependencies(merged: &MergedSource) -> Vec<PathBuf> {
+    let mut sensitive = BTreeSet::new();
+    for located in merged.secrets.values() {
+        let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+        sensitive.extend(candidate_dependencies(&resolve_declared_path(
+            directory,
+            &located.value.file,
+        )));
+    }
+    for located in merged.certificates.values() {
+        let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+        sensitive.extend(candidate_dependencies(&resolve_declared_path(
+            directory,
+            &located.value.private_key,
+        )));
+    }
+    merged
+        .dependencies
+        .iter()
+        .filter(|path| !sensitive.contains(*path))
+        .cloned()
+        .collect()
+}
+
 #[derive(Default)]
 struct MergedSource {
     root: PathBuf,
@@ -839,6 +1001,8 @@ struct MergedSource {
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
     certificates: BTreeMap<String, Located<CertificateSource>>,
+    secrets: BTreeMap<String, Located<SecretSource>>,
+    trust_stores: BTreeMap<String, Located<TrustStoreSource>>,
     clusters: BTreeMap<String, Located<ClusterSource>>,
     sites: BTreeMap<String, Located<SiteSource>>,
     services: BTreeMap<String, Located<ServiceSource>>,
@@ -892,6 +1056,36 @@ fn merge_resources(
             },
             &mut merged.merge_errors,
             "certificate resource",
+        );
+    }
+    for (name, secret) in resources.secrets {
+        let field_path = field_path_child("resources.secrets", &name);
+        insert_located(
+            &mut merged.secrets,
+            name.clone(),
+            Located {
+                value: secret,
+                file: file.to_path_buf(),
+                field_path,
+                spans: spans.clone(),
+            },
+            &mut merged.merge_errors,
+            "secret resource",
+        );
+    }
+    for (name, trust_store) in resources.trust_stores {
+        let field_path = field_path_child("resources.trust_stores", &name);
+        insert_located(
+            &mut merged.trust_stores,
+            name.clone(),
+            Located {
+                value: trust_store,
+                file: file.to_path_buf(),
+                field_path,
+                spans: spans.clone(),
+            },
+            &mut merged.merge_errors,
+            "trust-store resource",
         );
     }
     for (name, cluster) in resources.clusters {
@@ -1038,6 +1232,68 @@ fn compile_resources(
             },
         );
     }
+    for (name, located) in &merged.secrets {
+        if name.trim().is_empty() {
+            return Err(semantic_error_at(
+                "resource.secret_name",
+                "secret resource name cannot be empty",
+                located.span(),
+            ));
+        }
+        let file_path = format!("{}.file", located.field_path);
+        let max_bytes_path = format!("{}.max_bytes", located.field_path);
+        if located.value.file.as_os_str().is_empty() {
+            return Err(semantic_error_at(
+                "resource.secret_path",
+                "secret file path cannot be empty",
+                located.span_at(&file_path),
+            ));
+        }
+        let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+        let id = ResourceId::new(format!("secret:{name}"));
+        resources.secrets.insert(
+            id.clone(),
+            SecretSpec {
+                id,
+                file: resolve_declared_path(directory, &located.value.file),
+                max_bytes: parse_byte_size(
+                    &located.value.max_bytes,
+                    &located.span_at(&max_bytes_path),
+                )?,
+                file_source: located.span_at(&file_path),
+                max_bytes_source: located.span_at(&max_bytes_path),
+                source: located.span(),
+            },
+        );
+    }
+    for (name, located) in &merged.trust_stores {
+        if name.trim().is_empty() {
+            return Err(semantic_error_at(
+                "resource.trust_store_name",
+                "trust-store resource name cannot be empty",
+                located.span(),
+            ));
+        }
+        let ca_bundle_path = format!("{}.ca_bundle", located.field_path);
+        if located.value.ca_bundle.as_os_str().is_empty() {
+            return Err(semantic_error_at(
+                "resource.trust_store_path",
+                "CA bundle path cannot be empty",
+                located.span_at(&ca_bundle_path),
+            ));
+        }
+        let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+        let id = ResourceId::new(format!("trust_store:{name}"));
+        resources.trust_stores.insert(
+            id.clone(),
+            TrustStoreSpec {
+                id,
+                ca_bundle: resolve_declared_path(directory, &located.value.ca_bundle),
+                ca_bundle_source: located.span_at(&ca_bundle_path),
+                source: located.span(),
+            },
+        );
+    }
     for (name, located) in &merged.clusters {
         let protocol_path = format!("{}.protocol", located.field_path);
         let protocol_source = located.span_at(&protocol_path);
@@ -1073,6 +1329,12 @@ fn compile_resources(
         let health = compile_cluster_health(located)?;
         let retry = compile_retry(located, &mut warnings)?;
         let limits = compile_cluster_limits(located)?;
+        let tls = located
+            .value
+            .tls
+            .as_ref()
+            .map(|source| compile_cluster_tls(source, located, &resources, &endpoints))
+            .transpose()?;
         let id = ResourceId::new(format!("cluster:{name}"));
         resources.clusters.insert(
             id.clone(),
@@ -1084,6 +1346,7 @@ fn compile_resources(
                 health,
                 retry,
                 limits,
+                tls,
                 connect_timeout: parse_duration(
                     &located.value.connect_timeout,
                     &located.span_at(&format!("{}.connect_timeout", located.field_path)),
@@ -1243,6 +1506,83 @@ fn compile_tls_listener(
             &source.handshake_timeout,
             &context.span(&format!("{field_path}.handshake_timeout")),
         )?,
+        client_auth: compile_client_auth(
+            &source.client_auth,
+            resources,
+            context,
+            &format!("{field_path}.client_auth"),
+        )?,
+        source: context.span(field_path),
+    })
+}
+
+fn compile_client_auth(
+    source: &ClientAuthSource,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<ClientAuthSpec, CompileError> {
+    let mode_path = format!("{field_path}.mode");
+    let trust_store_path = format!("{field_path}.trust_store");
+    let mode = match source.mode.as_str() {
+        "none" => ClientAuthMode::None,
+        "optional" => ClientAuthMode::Optional,
+        "required" => ClientAuthMode::Required,
+        mode => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "listener.client_auth_mode",
+                    format!("unsupported TLS client-auth mode `{mode}`"),
+                    context.span(&mode_path),
+                )
+                .with_help("use `none`, `optional`, or `required`"),
+            ));
+        }
+    };
+    match (mode, source.trust_store.as_deref()) {
+        (ClientAuthMode::None, Some(_)) => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "listener.client_auth_trust_forbidden",
+                    "client_auth.trust_store is forbidden when mode is `none`",
+                    context.span(&trust_store_path),
+                )
+                .with_help("remove `trust_store`, or use mode `optional` or `required`"),
+            ));
+        }
+        (ClientAuthMode::Optional | ClientAuthMode::Required, None) => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "listener.client_auth_trust_required",
+                    format!("client-auth mode `{}` requires a trust_store", source.mode),
+                    context.span(field_path),
+                )
+                .with_help("reference a resource defined under `resources.trust_stores`"),
+            ));
+        }
+        _ => {}
+    }
+    let trust_store = source
+        .trust_store
+        .as_deref()
+        .map(|name| {
+            trust_store_reference(
+                name,
+                resources,
+                context,
+                &trust_store_path,
+                "listener.trust_store_reference",
+            )
+        })
+        .transpose()?;
+    Ok(ClientAuthSpec {
+        mode,
+        trust_store,
+        mode_source: context.span(&mode_path),
+        trust_store_source: source
+            .trust_store
+            .as_ref()
+            .map(|_| context.span(&trust_store_path)),
         source: context.span(field_path),
     })
 }
@@ -1265,6 +1605,29 @@ fn certificate_reference(
         )
         .map_diagnostics(|diagnostic| {
             diagnostic.with_help("define it under `resources.certificates`")
+        }))
+    }
+}
+
+fn trust_store_reference(
+    name: &str,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+    diagnostic_code: &'static str,
+) -> Result<ResourceId, CompileError> {
+    let id = ResourceId::new(format!("trust_store:{name}"));
+    if resources.trust_stores.contains_key(&id) {
+        Ok(id)
+    } else {
+        Err(diagnostic_at(
+            diagnostic_code,
+            format!("trust-store resource `{name}` does not exist"),
+            context,
+            field_path,
+        )
+        .map_diagnostics(|diagnostic| {
+            diagnostic.with_help("define it under `resources.trust_stores`")
         }))
     }
 }
@@ -2490,6 +2853,162 @@ fn parse_cluster_protocol(
             .with_help("use `auto`, `http1`, or `h2`"),
         )),
     }
+}
+
+fn compile_cluster_tls(
+    source: &ClusterTlsSource,
+    located: &Located<ClusterSource>,
+    resources: &CompiledResources,
+    endpoints: &[ClusterEndpointSpec],
+) -> Result<ClusterTlsSpec, CompileError> {
+    let field_path = format!("{}.tls", located.field_path);
+    if !endpoints
+        .iter()
+        .any(|endpoint| endpoint.url.scheme() == "https")
+    {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_tls_inert",
+                "cluster TLS policy has no effect because every endpoint uses `http`",
+                located.span_at(&field_path),
+            )
+            .with_help("remove `tls`, or configure at least one `https` endpoint"),
+        ));
+    }
+
+    let context = SourceContext {
+        file: &located.file,
+        spans: Some(located.spans.as_ref()),
+    };
+    let server_name_path = format!("{field_path}.server_name");
+    let trust_path = format!("{field_path}.trust");
+    let system_roots_path = format!("{trust_path}.system_roots");
+    let trust_store_path = format!("{trust_path}.trust_store");
+    let client_certificate_path = format!("{field_path}.client_certificate");
+
+    let server_name = source
+        .server_name
+        .as_deref()
+        .map(|name| {
+            normalize_upstream_server_name(name).map_err(|message| {
+                CompileError::one(
+                    Diagnostic::new(
+                        "resource.cluster_tls_server_name",
+                        message,
+                        located.span_at(&server_name_path),
+                    )
+                    .with_help("use an ASCII DNS name or an unbracketed IPv4/IPv6 address"),
+                )
+            })
+        })
+        .transpose()?;
+
+    if !source.trust.system_roots && source.trust.trust_store.is_none() {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_tls_trust_empty",
+                "upstream TLS must trust system roots, a trust_store, or both",
+                located.span_at(&trust_path),
+            )
+            .with_help("set `system_roots: true` or reference a custom trust_store"),
+        ));
+    }
+    let trust_store = source
+        .trust
+        .trust_store
+        .as_deref()
+        .map(|name| {
+            trust_store_reference(
+                name,
+                resources,
+                context,
+                &trust_store_path,
+                "resource.cluster_trust_store_reference",
+            )
+        })
+        .transpose()?;
+    let client_certificate = source
+        .client_certificate
+        .as_deref()
+        .map(|name| {
+            let id = ResourceId::new(format!("certificate:{name}"));
+            if resources.certificates.contains_key(&id) {
+                Ok(id)
+            } else {
+                Err(diagnostic_at(
+                    "resource.cluster_client_certificate_reference",
+                    format!("certificate resource `{name}` does not exist"),
+                    context,
+                    &client_certificate_path,
+                )
+                .map_diagnostics(|diagnostic| {
+                    diagnostic.with_help("define it under `resources.certificates`")
+                }))
+            }
+        })
+        .transpose()?;
+
+    Ok(ClusterTlsSpec {
+        server_name,
+        trust: ClusterTlsTrustSpec {
+            system_roots: source.trust.system_roots,
+            trust_store,
+            system_roots_source: located.span_at(&system_roots_path),
+            trust_store_source: source
+                .trust
+                .trust_store
+                .as_ref()
+                .map(|_| located.span_at(&trust_store_path)),
+            source: located.span_at(&trust_path),
+        },
+        client_certificate,
+        server_name_source: source
+            .server_name
+            .as_ref()
+            .map(|_| located.span_at(&server_name_path)),
+        client_certificate_source: source
+            .client_certificate
+            .as_ref()
+            .map(|_| located.span_at(&client_certificate_path)),
+        source: located.span_at(&field_path),
+    })
+}
+
+fn normalize_upstream_server_name(source: &str) -> Result<String, String> {
+    if source.is_empty() || !source.is_ascii() || source.contains('*') {
+        return Err(format!(
+            "invalid upstream TLS server name `{source}`; wildcards and non-ASCII names are not supported"
+        ));
+    }
+    if let Ok(address) = source.parse::<std::net::IpAddr>() {
+        return Ok(address.to_string());
+    }
+    let normalized = source.to_ascii_lowercase();
+    if normalized.len() > 253 || normalized.ends_with('.') {
+        return Err(format!("invalid upstream TLS server name `{source}`"));
+    }
+    for label in normalized.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("invalid upstream TLS server name `{source}`"));
+        }
+    }
+    if normalized
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!(
+            "upstream TLS server name `{source}` must not have an all-numeric final DNS label"
+        ));
+    }
+    Ok(normalized)
 }
 
 fn compile_cluster_endpoints(
@@ -5298,5 +5817,435 @@ listeners:
         assert_eq!(diagnostic.labels[0].span.line, 5);
         assert!(diagnostic.primary.file.ends_with("b.yaml"));
         assert!(diagnostic.labels[0].span.file.ends_with("a.yaml"));
+    }
+
+    #[test]
+    fn compiles_secret_trust_and_mutual_tls_policies_with_exact_spans() {
+        let (directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    admin-token:
+      file: secrets/admin-token
+      max_bytes: 8KiB
+  trust_stores:
+    internal-ca:
+      ca_bundle: pki/internal-ca.pem
+  certificates:
+    gateway:
+      cert_chain: pki/gateway.pem
+      private_key: pki/gateway-key.pem
+    upstream-client:
+      cert_chain: pki/client.pem
+      private_key: pki/client-key.pem
+  clusters:
+    api:
+      endpoints:
+        - https://127.0.0.1:8443
+      tls:
+        server_name: API.Internal.Example
+        trust:
+          system_roots: false
+          trust_store: internal-ca
+        client_certificate: upstream-client
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: gateway
+      client_auth:
+        mode: required
+        trust_store: internal-ca
+    service:
+      type: proxy
+      cluster: api
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("mutual TLS source compiles");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("temporary directory canonicalizes");
+        let secret = gateway
+            .resources
+            .secrets
+            .get(&oxidase_core::ResourceId::new("secret:admin-token"))
+            .expect("secret exists");
+        assert_eq!(secret.file, canonical_directory.join("secrets/admin-token"));
+        assert_eq!(secret.max_bytes, 8 * 1_024);
+        assert_eq!(
+            secret.file_source.field_path,
+            "resources.secrets[\"admin-token\"].file"
+        );
+        assert_eq!(
+            secret.max_bytes_source.field_path,
+            "resources.secrets[\"admin-token\"].max_bytes"
+        );
+        assert!(gateway.dependencies.contains(&secret.file));
+        assert!(!gateway.summary_dependencies.contains(&secret.file));
+
+        let trust = gateway
+            .resources
+            .trust_stores
+            .get(&oxidase_core::ResourceId::new("trust_store:internal-ca"))
+            .expect("trust store exists");
+        assert_eq!(
+            trust.ca_bundle,
+            canonical_directory.join("pki/internal-ca.pem")
+        );
+        assert_eq!(
+            trust.ca_bundle_source.field_path,
+            "resources.trust_stores[\"internal-ca\"].ca_bundle"
+        );
+        assert!(gateway.dependencies.contains(&trust.ca_bundle));
+        assert!(gateway.summary_dependencies.contains(&trust.ca_bundle));
+        let private_key = canonical_directory.join("pki/gateway-key.pem");
+        assert!(gateway.dependencies.contains(&private_key));
+        assert!(!gateway.summary_dependencies.contains(&private_key));
+        let summary = serde_json::to_string(&gateway.summary()).expect("summary serializes");
+        assert!(!summary.contains("secrets/admin-token"));
+        assert!(!summary.contains("gateway-key.pem"));
+        let resources_debug = format!("{:?}", gateway.resources);
+        assert!(resources_debug.contains("<redacted path>"));
+        assert!(!resources_debug.contains("secrets/admin-token"));
+        assert!(!resources_debug.contains("gateway-key.pem"));
+        let gateway_debug = format!("{gateway:?}");
+        assert!(!gateway_debug.contains("secrets/admin-token"));
+        assert!(!gateway_debug.contains("gateway-key.pem"));
+
+        let tls = gateway
+            .resources
+            .clusters
+            .get(&oxidase_core::ResourceId::new("cluster:api"))
+            .and_then(|cluster| cluster.tls.as_ref())
+            .expect("cluster TLS exists");
+        assert_eq!(tls.server_name.as_deref(), Some("api.internal.example"));
+        assert!(!tls.trust.system_roots);
+        assert_eq!(
+            tls.trust.trust_store.as_ref().map(|id| id.as_str()),
+            Some("trust_store:internal-ca")
+        );
+        assert_eq!(
+            tls.client_certificate.as_ref().map(|id| id.as_str()),
+            Some("certificate:upstream-client")
+        );
+        assert_eq!(
+            tls.server_name_source
+                .as_ref()
+                .expect("server-name span")
+                .field_path,
+            "resources.clusters.api.tls.server_name"
+        );
+        assert_eq!(
+            tls.trust
+                .trust_store_source
+                .as_ref()
+                .expect("trust-store span")
+                .field_path,
+            "resources.clusters.api.tls.trust.trust_store"
+        );
+        assert_eq!(
+            tls.client_certificate_source
+                .as_ref()
+                .expect("client-certificate span")
+                .field_path,
+            "resources.clusters.api.tls.client_certificate"
+        );
+
+        let client_auth = &gateway.listeners[0]
+            .tls
+            .as_ref()
+            .expect("listener TLS exists")
+            .client_auth;
+        assert_eq!(client_auth.mode, super::ClientAuthMode::Required);
+        assert_eq!(
+            client_auth.trust_store.as_ref().map(|id| id.as_str()),
+            Some("trust_store:internal-ca")
+        );
+        assert_eq!(
+            client_auth.mode_source.field_path,
+            "listeners[0].tls.client_auth.mode"
+        );
+        assert_eq!(
+            client_auth
+                .trust_store_source
+                .as_ref()
+                .expect("client-auth trust span")
+                .field_path,
+            "listeners[0].tls.client_auth.trust_store"
+        );
+    }
+
+    #[test]
+    fn preserves_secret_and_client_auth_defaults() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    token:
+      file: token.txt
+  certificates:
+    gateway:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: gateway
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("defaults compile");
+        assert_eq!(
+            gateway
+                .resources
+                .secrets
+                .get(&oxidase_core::ResourceId::new("secret:token"))
+                .expect("secret exists")
+                .max_bytes,
+            64 * 1_024
+        );
+        let auth = &gateway.listeners[0]
+            .tls
+            .as_ref()
+            .expect("TLS exists")
+            .client_auth;
+        assert_eq!(auth.mode, super::ClientAuthMode::None);
+        assert!(auth.trust_store.is_none());
+    }
+
+    #[test]
+    fn validates_listener_client_auth_contract_at_the_declared_field() {
+        let cases = [
+            (
+                "mode: sometimes",
+                "listener.client_auth_mode",
+                "listeners[0].tls.client_auth.mode",
+            ),
+            (
+                "mode: none\n        trust_store: internal-ca",
+                "listener.client_auth_trust_forbidden",
+                "listeners[0].tls.client_auth.trust_store",
+            ),
+            (
+                "mode: required",
+                "listener.client_auth_trust_required",
+                "listeners[0].tls.client_auth",
+            ),
+            (
+                "mode: optional\n        trust_store: missing",
+                "listener.trust_store_reference",
+                "listeners[0].tls.client_auth.trust_store",
+            ),
+        ];
+        for (client_auth, code, field_path) in cases {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  trust_stores:
+    internal-ca:
+      ca_bundle: ca.pem
+  certificates:
+    gateway:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: gateway
+      client_auth:
+        {client_auth}
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("client-auth source must fail");
+            assert_eq!(error.diagnostics[0].code, code, "source: {client_auth}");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path, field_path,
+                "source: {client_auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_cluster_tls_policy_and_references() {
+        let cases = [
+            (
+                "http://127.0.0.1:8080",
+                "server_name: api.internal.example".to_owned(),
+                "resource.cluster_tls_inert",
+                "resources.clusters.api.tls",
+            ),
+            (
+                "https://127.0.0.1:8443",
+                "trust:\n          system_roots: false".to_owned(),
+                "resource.cluster_tls_trust_empty",
+                "resources.clusters.api.tls.trust",
+            ),
+            (
+                "https://127.0.0.1:8443",
+                "server_name: \"bad name\"".to_owned(),
+                "resource.cluster_tls_server_name",
+                "resources.clusters.api.tls.server_name",
+            ),
+            (
+                "https://127.0.0.1:8443",
+                "trust:\n          trust_store: missing".to_owned(),
+                "resource.cluster_trust_store_reference",
+                "resources.clusters.api.tls.trust.trust_store",
+            ),
+            (
+                "https://127.0.0.1:8443",
+                "client_certificate: missing".to_owned(),
+                "resource.cluster_client_certificate_reference",
+                "resources.clusters.api.tls.client_certificate",
+            ),
+        ];
+        for (endpoint, tls, code, field_path) in cases {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints: [{endpoint}]
+      tls:
+        {tls}
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("cluster TLS source must fail");
+            assert_eq!(error.diagnostics[0].code, code, "TLS: {tls}");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path, field_path,
+                "TLS: {tls}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_resource_paths_and_zero_secret_limit() {
+        let cases = [
+            (
+                "secrets:\n    value:\n      file: \"\"",
+                "resource.secret_path",
+                "resources.secrets.value.file",
+            ),
+            (
+                "secrets:\n    value:\n      file: value\n      max_bytes: 0B",
+                "config.byte_size",
+                "resources.secrets.value.max_bytes",
+            ),
+            (
+                "trust_stores:\n    roots:\n      ca_bundle: \"\"",
+                "resource.trust_store_path",
+                "resources.trust_stores.roots.ca_bundle",
+            ),
+        ];
+        for (resources, code, field_path) in cases {
+            let (_directory, path) = write_config(&format!(
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  {resources}\nlisteners:\n  - name: public\n    bind: 127.0.0.1:8080\n    service:\n      type: respond\n"
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid resource must fail");
+            assert_eq!(error.diagnostics[0].code, code, "resource: {resources}");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path, field_path,
+                "resource: {resources}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_and_trust_dependencies_survive_semantic_failure() {
+        let directory = tempdir().expect("temporary directory is available");
+        let root = directory.path().join("oxidase.yaml");
+        fs::write(
+            &root,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    gateway:
+      cert_chain: missing/public.pem
+      private_key: missing/distinctive-private-key.pem
+  secrets:
+    token:
+      file: missing/token
+  trust_stores:
+    roots:
+      ca_bundle: missing/ca.pem
+listeners:
+  - name: public
+    bind: not-an-address
+    service:
+      type: respond
+"#,
+        )
+        .expect("config can be written");
+        let error = Compiler::compile_path(root).expect_err("listener bind must fail");
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("temporary directory canonicalizes");
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical.join("missing/token"))
+        );
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical.join("missing/ca.pem"))
+        );
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical.join("missing"))
+        );
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical.join("missing/distinctive-private-key.pem"))
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("missing/token"));
+        assert!(!debug.contains("distinctive-private-key.pem"));
+    }
+
+    #[test]
+    fn strict_yaml_rejects_unknown_nested_trust_fields() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  trust_stores:
+    roots:
+      ca_bundle: ca.pem
+      accepted_but_inert: true
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("unknown field must fail");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+        assert!(error.diagnostics[0].message.contains("accepted_but_inert"));
     }
 }

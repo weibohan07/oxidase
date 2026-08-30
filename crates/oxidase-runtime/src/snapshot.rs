@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,19 +14,28 @@ use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnaps
 
 use crate::cluster::PreparedCluster;
 use crate::governance::GovernanceRegistry;
+use crate::secret::{PreparedSecret, SecretPreparationErrorKind, SecretPreparationFailure};
 use crate::tls::{
     CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
     PreparedListenerPlan, TlsListenerPreparationErrorKind, TlsListenerPreparationFailure,
 };
+use crate::trust::{
+    PreparedTrustStore, TrustStorePreparationErrorKind, TrustStorePreparationFailure,
+};
+use crate::upstream_tls::{
+    PreparedUpstreamTls, UpstreamTlsPreparationErrorKind, UpstreamTlsPreparationFailure,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
+    pub secrets: BTreeMap<ResourceId, Arc<PreparedSecret>>,
+    pub trust_stores: BTreeMap<ResourceId, Arc<PreparedTrustStore>>,
     pub certificates: BTreeMap<ResourceId, Arc<PreparedCertificate>>,
     pub clusters: BTreeMap<ResourceId, Arc<PreparedCluster>>,
     pub sites: BTreeMap<ResourceId, Arc<SiteSnapshot>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeSnapshot {
     pub config_version: ConfigVersion,
     pub dependencies: Vec<std::path::PathBuf>,
@@ -36,10 +45,31 @@ pub struct RuntimeSnapshot {
     pub listeners: Vec<CompiledListener>,
     pub prepared_listeners: Vec<PreparedListenerPlan>,
     pub tests: Vec<ConfigTestSource>,
+    preparation_warnings: Vec<Diagnostic>,
     summary: GatewaySummary,
+    secret_fingerprints: BTreeMap<ResourceId, ContentDigest>,
+    trust_store_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     certificate_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     site_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     cluster_fingerprints: BTreeMap<ResourceId, ContentDigest>,
+}
+
+impl fmt::Debug for RuntimeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeSnapshot")
+            .field("config_version", &self.config_version)
+            .field("service_nodes", &self.graph.len())
+            .field("secret_count", &self.resources.secrets.len())
+            .field("trust_store_count", &self.resources.trust_stores.len())
+            .field("certificate_count", &self.resources.certificates.len())
+            .field("cluster_count", &self.resources.clusters.len())
+            .field("site_count", &self.resources.sites.len())
+            .field("listener_count", &self.listeners.len())
+            .field("test_count", &self.tests.len())
+            .field("warning_count", &self.preparation_warnings.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuntimeSnapshot {
@@ -62,6 +92,20 @@ impl RuntimeSnapshot {
         reuse.concurrency_limiters = governance_reuse.concurrency;
         reuse.rate_limiters = governance_reuse.rate_limits;
         let mut dependencies = gateway.dependencies.clone();
+        let mut preparation_warnings = Vec::new();
+        let mut sensitive_dependencies = gateway
+            .resources
+            .secrets
+            .values()
+            .flat_map(|source| dependency_path_forms(&source.file))
+            .collect::<BTreeSet<_>>();
+        sensitive_dependencies.extend(
+            gateway
+                .resources
+                .certificates
+                .values()
+                .flat_map(|source| dependency_path_forms(&source.private_key)),
+        );
         for (id, source) in &gateway.resources.sites {
             let index = SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
                 preparation_error_from_site(id, &source.source, &dependencies, failure)
@@ -106,6 +150,53 @@ impl RuntimeSnapshot {
             site_fingerprints.insert(id.clone(), fingerprint);
             sites.insert(id.clone(), snapshot);
         }
+        let mut secrets = BTreeMap::new();
+        let mut secret_fingerprints = BTreeMap::new();
+        for (id, source) in &gateway.resources.secrets {
+            // Always read and validate the candidate before reuse. A missing,
+            // oversized, or unreadable rotation must retain last-known-good.
+            let candidate = PreparedSecret::prepare(source).map_err(|failure| {
+                preparation_error_from_secret(id, &dependencies, &source.file, failure)
+            })?;
+            preparation_warnings.extend(candidate.warnings);
+            let fingerprint = candidate.secret.fingerprint();
+            let secret = previous
+                .filter(|previous| previous.secret_fingerprints.get(id) == Some(&fingerprint))
+                .and_then(|previous| previous.resources.secrets.get(id).cloned());
+            let secret = if let Some(secret) = secret {
+                reuse.secrets += 1;
+                secret
+            } else {
+                Arc::new(candidate.secret)
+            };
+            if let Ok(canonical) = source.file.canonicalize() {
+                dependencies.push(canonical);
+            }
+            secret_fingerprints.insert(id.clone(), fingerprint);
+            secrets.insert(id.clone(), secret);
+        }
+        let mut trust_stores = BTreeMap::new();
+        let mut trust_store_fingerprints = BTreeMap::new();
+        for (id, source) in &gateway.resources.trust_stores {
+            let candidate = PreparedTrustStore::prepare(source).map_err(|failure| {
+                preparation_error_from_trust_store(id, &dependencies, &source.ca_bundle, failure)
+            })?;
+            let fingerprint = candidate.digest();
+            let trust_store = previous
+                .filter(|previous| previous.trust_store_fingerprints.get(id) == Some(&fingerprint))
+                .and_then(|previous| previous.resources.trust_stores.get(id).cloned());
+            let trust_store = if let Some(trust_store) = trust_store {
+                reuse.trust_stores += 1;
+                trust_store
+            } else {
+                Arc::new(candidate)
+            };
+            if let Ok(canonical) = source.ca_bundle.canonicalize() {
+                dependencies.push(canonical);
+            }
+            trust_store_fingerprints.insert(id.clone(), fingerprint);
+            trust_stores.insert(id.clone(), trust_store);
+        }
         let mut certificates = BTreeMap::new();
         let mut certificate_fingerprints = BTreeMap::new();
         for (id, source) in &gateway.resources.certificates {
@@ -136,7 +227,17 @@ impl RuntimeSnapshot {
         let mut clusters = BTreeMap::new();
         let mut cluster_fingerprints = BTreeMap::new();
         for (id, source) in gateway.resources.clusters {
-            let fingerprint = cluster_fingerprint(&source);
+            let upstream_tls = PreparedUpstreamTls::prepare(&source, &trust_stores, &certificates)
+                .map_err(|failure| {
+                    preparation_error_from_upstream_tls(&id, &dependencies, failure)
+                })?
+                .map(Arc::new);
+            let mut fingerprint_builder = ContentDigestBuilder::new("oxidase/prepared-cluster/v1");
+            fingerprint_builder.field_digest("cluster_spec", cluster_fingerprint(&source));
+            if let Some(tls) = &upstream_tls {
+                fingerprint_builder.field_digest("upstream_tls", tls.digest());
+            }
+            let fingerprint = fingerprint_builder.finish();
             let previous_cluster =
                 previous.and_then(|previous| previous.resources.clusters.get(&id));
             let unchanged = previous
@@ -147,8 +248,11 @@ impl RuntimeSnapshot {
                 reuse.cluster_endpoints += cluster.endpoints().len();
                 cluster
             } else {
-                let (cluster, reused_endpoints) =
-                    PreparedCluster::prepare(source, previous_cluster.map(Arc::as_ref));
+                let (cluster, reused_endpoints) = PreparedCluster::prepare_with_tls(
+                    source,
+                    upstream_tls,
+                    previous_cluster.map(Arc::as_ref),
+                );
                 reuse.cluster_endpoints += reused_endpoints;
                 Arc::new(cluster)
             };
@@ -159,33 +263,61 @@ impl RuntimeSnapshot {
             .listeners
             .iter()
             .map(|listener| {
-                PreparedListenerPlan::prepare(listener, &certificates).map_err(|failure| {
-                    preparation_error_from_tls_listener(listener, &dependencies, failure)
-                })
+                PreparedListenerPlan::prepare(listener, &certificates, &trust_stores).map_err(
+                    |failure| preparation_error_from_tls_listener(listener, &dependencies, failure),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         normalize_dependencies(&mut dependencies);
-        let mut version_hash = ContentDigestBuilder::new("oxidase/runtime-snapshot/v1");
-        version_hash.field_bytes("gateway", gateway.config_version.as_str().as_bytes());
+        // Inspection output must remain reproducible without turning a
+        // low-entropy Secret into an offline oracle. Build one deterministic
+        // public identity from source plus non-secret prepared resources, then
+        // derive the live activation identity by adding opaque per-Secret
+        // version tokens below.
+        let mut public_version_hash =
+            ContentDigestBuilder::new("oxidase/runtime-snapshot-public/v1");
+        public_version_hash.field_bytes("gateway", gateway.config_version.as_str().as_bytes());
+        for (id, fingerprint) in &trust_store_fingerprints {
+            public_version_hash
+                .field_bytes("trust_store_id", id.as_str().as_bytes())
+                .field_digest("trust_store_digest", *fingerprint);
+        }
         for (id, fingerprint) in &certificate_fingerprints {
-            version_hash
+            public_version_hash
                 .field_bytes("certificate_id", id.as_str().as_bytes())
                 .field_digest("certificate_digest", *fingerprint);
         }
         for (id, fingerprint) in &site_fingerprints {
-            version_hash
+            public_version_hash
                 .field_bytes("site_id", id.as_str().as_bytes())
                 .field_digest("site_digest", *fingerprint);
         }
         for (id, fingerprint) in &cluster_fingerprints {
-            version_hash
+            public_version_hash
                 .field_bytes("cluster_id", id.as_str().as_bytes())
                 .field_digest("cluster_digest", *fingerprint);
         }
+        let public_config_version =
+            ConfigVersion::new(format!("v2-sha256-{}", public_version_hash.finish()));
+        summary.config_version = public_config_version.to_string();
+
+        let mut version_hash = ContentDigestBuilder::new("oxidase/runtime-snapshot-activation/v1");
+        version_hash.field_bytes(
+            "public_config_version",
+            public_config_version.as_str().as_bytes(),
+        );
+        for (id, secret) in &secrets {
+            version_hash
+                .field_bytes("secret_id", id.as_str().as_bytes())
+                // The raw deterministic fingerprint is deliberately excluded:
+                // a random token makes a rotated Secret visible to live reload
+                // while remaining stable only for reuse of the same prepared Arc.
+                .field_digest("secret_version_token", secret.version_token());
+        }
         let config_version = ConfigVersion::new(format!("v2-sha256-{}", version_hash.finish()));
-        summary.config_version = config_version.to_string();
         summary.dependencies = dependencies
             .iter()
+            .filter(|path| !sensitive_dependencies.contains(*path))
             .map(|path| path.display().to_string())
             .collect();
         Ok((
@@ -195,6 +327,8 @@ impl RuntimeSnapshot {
                 graph: gateway.graph,
                 governance,
                 resources: ResourceRegistry {
+                    secrets,
+                    trust_stores,
                     certificates,
                     clusters,
                     sites,
@@ -202,7 +336,10 @@ impl RuntimeSnapshot {
                 listeners: gateway.listeners,
                 prepared_listeners,
                 tests: gateway.tests,
+                preparation_warnings,
                 summary,
+                secret_fingerprints,
+                trust_store_fingerprints,
                 certificate_fingerprints,
                 site_fingerprints,
                 cluster_fingerprints,
@@ -214,6 +351,12 @@ impl RuntimeSnapshot {
     #[must_use]
     pub fn summary(&self) -> &GatewaySummary {
         &self.summary
+    }
+
+    /// Non-fatal warnings discovered while preparing file-backed resources.
+    #[must_use]
+    pub fn preparation_warnings(&self) -> &[Diagnostic] {
+        &self.preparation_warnings
     }
 
     #[must_use]
@@ -234,6 +377,8 @@ impl RuntimeSnapshot {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceReuse {
+    pub secrets: usize,
+    pub trust_stores: usize,
     pub certificates: usize,
     pub sites: usize,
     pub clusters: usize,
@@ -245,7 +390,6 @@ pub struct ResourceReuse {
     pub rate_limiters: usize,
 }
 
-#[derive(Debug)]
 pub struct PreparationError {
     pub resource: ResourceId,
     pub kind: PreparationErrorKind,
@@ -253,12 +397,79 @@ pub struct PreparationError {
     pub candidate_dependencies: Vec<std::path::PathBuf>,
 }
 
+impl fmt::Debug for PreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparationError")
+            .field("resource", &self.resource)
+            .field("kind", &self.kind)
+            .field("diagnostics", &self.diagnostics)
+            .field(
+                "candidate_dependency_count",
+                &self.candidate_dependencies.len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub enum PreparationErrorKind {
+    Secret(SecretPreparationErrorKind),
+    TrustStore(TrustStorePreparationErrorKind),
     Certificate(CertificatePreparationErrorKind),
     Fingerprint(String),
     Site(Box<SiteCompileError>),
     TlsListener(TlsListenerPreparationErrorKind),
+    UpstreamTls(UpstreamTlsPreparationErrorKind),
+}
+
+fn preparation_error_from_secret(
+    resource: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+    declared_path: &std::path::Path,
+    failure: SecretPreparationFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    candidate_dependencies.extend(dependency_path_forms(declared_path));
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::Secret(failure.kind),
+        diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
+}
+
+fn preparation_error_from_trust_store(
+    resource: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+    declared_path: &std::path::Path,
+    failure: TrustStorePreparationFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    candidate_dependencies.extend(dependency_path_forms(declared_path));
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::TrustStore(failure.kind),
+        diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
+}
+
+fn preparation_error_from_upstream_tls(
+    resource: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+    failure: UpstreamTlsPreparationFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::UpstreamTls(failure.kind),
+        diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
 }
 
 fn preparation_error_from_certificate(
@@ -339,6 +550,19 @@ impl PreparationError {
 fn normalize_dependencies(dependencies: &mut Vec<std::path::PathBuf>) {
     dependencies.sort();
     dependencies.dedup();
+}
+
+fn dependency_path_forms(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        paths.push(parent.to_path_buf());
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        paths.push(canonical);
+    }
+    paths
 }
 
 fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
@@ -479,10 +703,13 @@ impl std::error::Error for PreparationError {}
 impl fmt::Display for PreparationErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Secret(error) => error.fmt(formatter),
+            Self::TrustStore(error) => error.fmt(formatter),
             Self::Certificate(error) => error.fmt(formatter),
             Self::Fingerprint(message) => formatter.write_str(message),
             Self::Site(error) => error.fmt(formatter),
             Self::TlsListener(error) => error.fmt(formatter),
+            Self::UpstreamTls(error) => error.fmt(formatter),
         }
     }
 }
@@ -568,6 +795,38 @@ listeners:
         config
     }
 
+    fn write_secret_trust_gateway(directory: &std::path::Path) -> std::path::PathBuf {
+        fs::write(directory.join("token.txt"), b"first-secret")
+            .expect("test-only secret can be written");
+        let GeneratedCertificate { cert, .. } =
+            generate_simple_self_signed(vec!["root.example.test".to_owned()])
+                .expect("test-only trust anchor can be generated");
+        fs::write(directory.join("ca.pem"), cert.pem())
+            .expect("test-only CA bundle can be written");
+        let config = directory.join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    token:
+      file: token.txt
+      max_bytes: 64B
+  trust_stores:
+    internal:
+      ca_bundle: ca.pem
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        )
+        .expect("Secret/Trust gateway can be written");
+        config
+    }
+
     #[test]
     fn cluster_digest_is_stable_and_preserves_endpoint_preference_order() {
         let cluster = |protocol, endpoints: &[&str]| ClusterSpec {
@@ -607,6 +866,7 @@ listeners:
                 queue_timeout: Duration::ZERO,
                 source: SourceSpan::synthetic("clusters.api.limits"),
             },
+            tls: None,
             connect_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_secs(2),
             protocol_source: SourceSpan::synthetic("clusters.api.protocol"),
@@ -1036,5 +1296,191 @@ listeners:
                     .expect("candidate private key canonicalizes")
             )
         );
+    }
+
+    #[test]
+    fn secret_and_trust_resources_reuse_by_validated_content() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = write_secret_trust_gateway(directory.path());
+        let first = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("first source compiles"),
+        )
+        .expect("first snapshot prepares");
+        let secret_id = ResourceId::new("secret:token");
+        let trust_id = ResourceId::new("trust_store:internal");
+        assert!(first.resources.secrets[&secret_id].constant_time_eq(b"first-secret"));
+        assert_eq!(
+            first.resources.trust_stores[&trust_id].certificate_count(),
+            1
+        );
+
+        let (same, reuse) = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("unchanged source compiles"),
+            Some(&first),
+        )
+        .expect("unchanged snapshot prepares");
+        assert_eq!(reuse.secrets, 1);
+        assert_eq!(reuse.trust_stores, 1);
+        assert_eq!(first.config_version, same.config_version);
+        assert!(Arc::ptr_eq(
+            &first.resources.secrets[&secret_id],
+            &same.resources.secrets[&secret_id]
+        ));
+        assert!(Arc::ptr_eq(
+            &first.resources.trust_stores[&trust_id],
+            &same.resources.trust_stores[&trust_id]
+        ));
+
+        fs::write(directory.path().join("token.txt"), b"next-secret!")
+            .expect("rotated secret can be written");
+        let (rotated, reuse) = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("rotated source compiles"),
+            Some(&same),
+        )
+        .expect("rotated snapshot prepares");
+        assert_eq!(reuse.secrets, 0);
+        assert_eq!(reuse.trust_stores, 1);
+        assert_ne!(same.config_version, rotated.config_version);
+        assert_eq!(
+            same.summary().config_version,
+            rotated.summary().config_version,
+            "inspection identity must not expose or vary with Secret contents"
+        );
+        assert!(rotated.resources.secrets[&secret_id].constant_time_eq(b"next-secret!"));
+        assert!(!Arc::ptr_eq(
+            &same.resources.secrets[&secret_id],
+            &rotated.resources.secrets[&secret_id]
+        ));
+    }
+
+    #[test]
+    fn independent_secret_preparation_separates_public_and_activation_versions() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = write_secret_trust_gateway(directory.path());
+        let first = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("first source compiles"),
+        )
+        .expect("first snapshot prepares");
+        let independent = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("second source compiles"),
+        )
+        .expect("independent snapshot prepares");
+
+        assert_ne!(first.config_version, independent.config_version);
+        assert_eq!(
+            first.summary().config_version,
+            independent.summary().config_version,
+            "deterministic inspection identity excludes opaque activation tokens"
+        );
+        let secret_id = ResourceId::new("secret:token");
+        assert_eq!(
+            first.resources.secrets[&secret_id].fingerprint(),
+            independent.resources.secrets[&secret_id].fingerprint()
+        );
+        assert_ne!(
+            first.resources.secrets[&secret_id].version_token(),
+            independent.resources.secrets[&secret_id].version_token()
+        );
+    }
+
+    #[test]
+    fn failed_trust_rotation_retains_candidate_dependencies_and_old_resources() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = write_secret_trust_gateway(directory.path());
+        let first = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("first source compiles"),
+        )
+        .expect("first snapshot prepares");
+        let GeneratedCertificate { signing_key, .. } =
+            generate_simple_self_signed(vec!["not-a-ca.example.test".to_owned()])
+                .expect("test-only key can be generated");
+        fs::write(directory.path().join("ca.pem"), signing_key.serialize_pem())
+            .expect("invalid CA candidate can be written");
+
+        let error = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("candidate source compiles"),
+            Some(&first),
+        )
+        .expect_err("non-certificate trust material must fail");
+        assert_eq!(error.diagnostics()[0].code, "trust_store.pem_item");
+        assert!(
+            error.candidate_dependencies.contains(
+                &directory
+                    .path()
+                    .join("ca.pem")
+                    .canonicalize()
+                    .expect("candidate CA path canonicalizes")
+            )
+        );
+        assert!(
+            first.resources.secrets[&ResourceId::new("secret:token")]
+                .constant_time_eq(b"first-secret")
+        );
+    }
+
+    #[test]
+    fn snapshot_debug_and_summary_hide_secret_and_private_key_paths() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = write_secret_trust_gateway(directory.path());
+        let snapshot =
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("source compiles"))
+                .expect("snapshot prepares");
+        let secret_path = directory
+            .path()
+            .join("token.txt")
+            .canonicalize()
+            .expect("secret path canonicalizes");
+
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("first-secret"));
+        assert!(!debug.contains("token.txt"));
+        assert!(snapshot.dependencies.contains(&secret_path));
+        assert!(
+            snapshot
+                .summary()
+                .dependencies
+                .iter()
+                .all(|dependency| !dependency.contains("token.txt"))
+        );
+
+        write_test_identity(directory.path(), &["default.example.test"]);
+        let tls_config = write_tls_gateway(directory.path());
+        let tls_snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&tls_config).expect("TLS source compiles"),
+        )
+        .expect("TLS snapshot prepares");
+        let private_key_path = directory
+            .path()
+            .join("key.pem")
+            .canonicalize()
+            .expect("private key path canonicalizes");
+        assert!(tls_snapshot.dependencies.contains(&private_key_path));
+        assert!(
+            tls_snapshot
+                .summary()
+                .dependencies
+                .iter()
+                .all(|dependency| !dependency.contains("key.pem"))
+        );
+        assert!(!format!("{tls_snapshot:?}").contains("key.pem"));
+
+        fs::write(directory.path().join("key.pem"), "not private-key PEM")
+            .expect("invalid private key can be written");
+        let error = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&tls_config).expect("invalid-key source still compiles"),
+        )
+        .expect_err("invalid private-key material must fail preparation");
+        let diagnostics_rendered = error
+            .diagnostics()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error_debug = format!("{error:?}");
+        for sensitive in ["not private-key PEM", "key.pem"] {
+            assert!(!diagnostics_rendered.contains(sensitive));
+            assert!(!error_debug.contains(sensitive));
+        }
+        assert!(error.candidate_dependencies.contains(&private_key_path));
     }
 }

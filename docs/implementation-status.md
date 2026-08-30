@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `hardening/v0.4-security-conformance`
-- public starting point: v0.3 merge `05aedd1`
+- active milestone branch: `feat/v0.4-trust-mtls`
+- public starting point: v0.4 ingress-governance merge `afb20de`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -89,6 +89,21 @@ Last updated: 2026-08-30
   No private material enters Debug, diagnostics, manifests, logs, or metrics.
   Certificate/key paths remain reload dependencies. Reuse identity is the public
   chain digest; a candidate key is still parsed and matched before reuse.
+- File-backed Secret Resources are bounded (64 KiB by default), require a regular
+  file, preserve exact bytes, and stay out of compiler IR and inspection-safe
+  summaries. Debug/Display/Serialize output is redacted; equal-length comparisons
+  avoid data-dependent early exit. The shared allocation is zeroized on final drop,
+  with explicit OS/cache/allocator limitations, and permissive Unix modes warn.
+  Live runtime ConfigVersion uses an opaque per-prepared-resource token rather than
+  exposing the deterministic Secret fingerprint. The deterministic compile/
+  inspection identity excludes both Secret contents and those random activation
+  tokens, so repeated manifests remain byte-stable and intentionally cannot
+  distinguish Secret rotations.
+- Trust Store Resources strictly accept a non-empty, certificate-only ASCII PEM
+  bundle, normalize duplicate/order-equivalent DER, and provide a content-stable
+  root set to inbound and upstream TLS. Secret, Trust Store, certificate, and key
+  files all participate in candidate dependency watching; invalid rotation remains
+  last-known-good.
 - HTTPS listeners use rustls with safe TLS 1.2/1.3 defaults and an explicit ring
   crypto provider. Exact ASCII SNI names take precedence over one-label left-most
   wildcards and then the default certificate; SNI rules are checked against leaf
@@ -96,6 +111,12 @@ Last updated: 2026-08-30
   advertises only enabled `h2`/`http/1.1` protocols. Each Listener also has a fixed
   128-handshake non-waiting concurrency gate; overload closes the new socket instead
   of queueing an unbounded task.
+- HTTPS Listener client authentication supports `none`, `optional`, and `required`.
+  Optional mode admits anonymous clients but rejects an invalid presented chain;
+  required mode requires a chain verified by the configured Trust Store. Only
+  verified, bounded leaf SHA-256/subject/DNS-SAN/URI-SAN metadata enters the request
+  expression namespace. The subject is informational, and identity values are not
+  metrics labels or automatic authorization roles.
 - The inbound connection driver supports cleartext HTTP/1.1 and ALPN-selected HTTPS
   HTTP/1.1 or HTTP/2. HTTP/2 applies bounded concurrent-stream/header-list settings
   plus configured keepalive, and each request/stream pins the current snapshot at
@@ -165,6 +186,11 @@ Last updated: 2026-08-30
   server owns one long-lived pool for each policy: `auto` uses HTTPS ALPN and
   cleartext HTTP/1, `http1` forces HTTP/1.1, and `h2` requires TLS H2 or uses
   cleartext H2 prior knowledge. Protocol changes participate in Cluster identity.
+- HTTPS Clusters support system roots, a custom Trust Store, or their union; an
+  exact DNS/IP verification name; and an existing Certificate Resource as the
+  upstream client identity. Proxy and active-health pools include the complete TLS
+  policy digest, so trust, client-certificate, or verification-name changes cannot
+  reuse incompatible connections. There is no certificate-verification bypass.
 - Cluster resources prepare into immutable plans plus reload-compatible endpoint
   runtime state. Round robin, smooth weighted round robin, and weighted
   least-requests select only eligible endpoints; bounded Cluster/endpoint admission
@@ -340,13 +366,16 @@ Last updated: 2026-08-30
   are runnable on the existing HTTP/1.1 and HTTP/2 data plane. Request-body and
   admission rejection occur before child execution when determinable; post-head
   streaming failure cancels the stream rather than fabricating a replacement status.
+- An HTTPS Listener can require or optionally request a client certificate from a
+  configured Trust Store on HTTP/1.1 or HTTP/2. Verified client identity is visible
+  to the existing expression/template namespace. HTTPS Cluster traffic and active
+  checks can use custom roots and an upstream client Certificate Resource.
 
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a self-contained executable snapshot artifact.
-- Cleartext h2c, client-certificate authentication/mTLS, ACME, OCSP stapling,
-  user-configurable TLS cipher suites, HTTP/3, HTTP/2 extended CONNECT, arbitrary
-  CONNECT tunneling, and WebTransport.
+- Cleartext h2c, ACME, OCSP stapling, user-configurable TLS cipher suites, HTTP/3,
+  HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
 - Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
 
@@ -384,10 +413,13 @@ Last updated: 2026-08-30
   dropped. Wire fixtures cover H1-to-H2 request trailers and declared/rejected
   H2-to-H1 request and response cases. HTTP/1 Upgrade is Proxy-only and
   capability-gated; H2 extended CONNECT remains rejected.
-- TLS uses rustls defaults for TLS 1.2/1.3. Client certificates/mTLS, ACME, OCSP
-  stapling, custom cipher-suite policy, and automatic certificate issuance are not
-  implemented. SNI wildcards match exactly one left-most DNS label and must appear
-  literally in the selected leaf certificate subjectAltName.
+- TLS uses rustls defaults for TLS 1.2/1.3. Inbound mTLS verifies against one custom
+  Trust Store; upstream TLS can combine native and one custom Trust Store and can
+  present one Certificate Resource. There is no CRL/OCSP revocation, certificate
+  pinning, SPIFFE policy engine, automatic role mapping, ACME, custom cipher-suite
+  policy, or automatic certificate issuance. SNI wildcards match exactly one
+  left-most DNS label and must appear literally in the selected leaf certificate
+  subjectAltName.
 - Cluster endpoints are static configuration: dynamic DNS/service discovery,
   cross-process health consensus, hedging, and arbitrary retry scripting are not
   implemented. Retry never occurs after a downstream response head and request-body
@@ -448,5 +480,5 @@ Last updated: 2026-08-30
    memory/fd observation while keeping ordinary CI bounded.
 2. Separate upstream connect, upload, and response-head timeout observability while
    preserving streaming and pre-head retry safety.
-3. Design explicit upstream trust roots and client identity before considering mTLS
-   or dynamic service discovery.
+3. Build the portable Bundle and authenticated control-plane layers without making
+   Secret bytes general expression or serialization values.

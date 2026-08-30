@@ -1089,6 +1089,7 @@ mod tests {
         ClusterAdmissionError, ExecutionObserver, RuntimeSnapshot, ServiceObservationContext,
         ServiceObservationOutcome, ServiceObservationResult,
     };
+    use rcgen::generate_simple_self_signed;
     use tempfile::tempdir;
 
     use super::{
@@ -1108,6 +1109,59 @@ mod tests {
         assert!(output.contains("outcome=\"handled\""));
         assert!(output.contains("class=\"2xx\""));
         assert!(!output.contains("http://"));
+    }
+
+    #[test]
+    fn snapshot_metrics_never_export_secret_material_or_sensitive_paths() {
+        let directory = tempdir().expect("temporary directory is available");
+        let generated = generate_simple_self_signed(vec!["metrics.example.test".to_owned()])
+            .expect("test-only identity can be generated");
+        fs::write(directory.path().join("public.pem"), generated.cert.pem())
+            .expect("test-only certificate can be written");
+        fs::write(
+            directory.path().join("distinctive-private-key.pem"),
+            generated.signing_key.serialize_pem(),
+        )
+        .expect("test-only private key can be written");
+        fs::write(
+            directory.path().join("distinctive-secret-token"),
+            b"do-not-export-this-secret",
+        )
+        .expect("test-only secret can be written");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: public.pem
+      private_key: distinctive-private-key.pem
+  secrets:
+    token:
+      file: distinctive-secret-token
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        )
+        .expect("fixture config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("fixture config compiles"),
+        )
+        .expect("fixture snapshot prepares");
+
+        let output = Metrics::default().render_prometheus_for(&snapshot);
+        for sensitive in [
+            "do-not-export-this-secret",
+            "distinctive-secret-token",
+            "distinctive-private-key.pem",
+        ] {
+            assert!(!output.contains(sensitive));
+        }
     }
 
     #[test]
