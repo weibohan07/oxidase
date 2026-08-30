@@ -56,10 +56,14 @@ old snapshots keep their PreparedCluster alive until the last pinned request is
 released, then cancellation and weak ownership let every health task stop without
 an Arc cycle.
 
-When only load-balancing, health, retry, or concurrency policy changes, compatible
-endpoint state is reused under the identity above and the new policy takes effect.
-A URL or upstream-protocol change creates a new endpoint state and does not reuse
-an incompatible connection/state identity.
+When only load-balancing, retry, or concurrency policy changes, compatible endpoint
+state is reused under the identity above and the new policy takes effect. A health
+policy change creates a new health generation so the old and new active-health
+supervisors cannot write the same state under different thresholds or probe rules;
+the endpoint admission counter is still shared so pinned old requests remain subject
+to the new snapshot's per-endpoint capacity accounting. A URL or upstream-protocol
+change creates a new endpoint and admission state and does not reuse an incompatible
+connection/state identity.
 
 ### Load balancing
 

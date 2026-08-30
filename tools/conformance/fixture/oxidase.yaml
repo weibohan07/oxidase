@@ -1,0 +1,59 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  certificates:
+    conformance:
+      # TEST-ONLY, publicly known material. Never use it in production.
+      cert_chain: ../../../examples/secure-resilient-gateway/certs/test-only-rsa-cert.pem
+      private_key: ../../../examples/secure-resilient-gateway/certs/test-only-rsa-key.pem
+  clusters:
+    smuggling-backend:
+      endpoints:
+        - http://127.0.0.1:19080
+      connect_timeout: 1s
+      response_timeout: 5s
+    websocket-echo:
+      protocol: http1
+      endpoints:
+        - http://127.0.0.1:19001
+      connect_timeout: 1s
+      response_timeout: 5s
+
+services:
+  h2-response:
+    type: respond
+    status: 200
+    body:
+      text: oxidase-conformance
+  smuggling-proxy:
+    type: proxy
+    cluster: smuggling-backend
+  websocket-proxy:
+    type: proxy
+    cluster: websocket-echo
+
+listeners:
+  - name: smuggling-http1
+    bind: 127.0.0.1:18080
+    protocol: http
+    http:
+      versions: [http1]
+    service:
+      ref: smuggling-proxy
+  - name: websocket-http1
+    bind: 127.0.0.1:18081
+    protocol: http
+    http:
+      versions: [http1]
+    service:
+      ref: websocket-proxy
+  - name: secure-h2
+    bind: 127.0.0.1:18443
+    protocol: https
+    tls:
+      default_certificate: conformance
+    http:
+      versions: [h2, http1]
+    service:
+      ref: h2-response
