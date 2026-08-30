@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,9 +25,18 @@ pub(crate) struct GatewaySource {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResourcesSource {
     #[serde(default)]
+    pub certificates: BTreeMap<String, CertificateSource>,
+    #[serde(default)]
     pub clusters: BTreeMap<String, ClusterSource>,
     #[serde(default)]
     pub sites: BTreeMap<String, SiteSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CertificateSource {
+    pub cert_chain: PathBuf,
+    pub private_key: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +78,9 @@ pub(crate) struct ListenerSource {
     pub bind: String,
     #[serde(default)]
     pub protocol: ListenerProtocolSource,
+    pub tls: Option<TlsListenerSource>,
+    #[serde(default)]
+    pub http: HttpListenerSource,
     pub service: ServiceSource,
 }
 
@@ -76,6 +89,95 @@ pub(crate) struct ListenerSource {
 pub(crate) enum ListenerProtocolSource {
     #[default]
     Http,
+    Https,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TlsListenerSource {
+    pub default_certificate: String,
+    #[serde(default)]
+    pub sni: IndexMap<String, String>,
+    #[serde(default = "default_tls_handshake_timeout")]
+    pub handshake_timeout: String,
+}
+
+fn default_tls_handshake_timeout() -> String {
+    "5s".to_owned()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HttpListenerSource {
+    pub versions: Option<Vec<HttpVersionSource>>,
+    pub http1: Option<Http1SettingsSource>,
+    pub http2: Option<Http2SettingsSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HttpVersionSource {
+    Http1,
+    H2,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Http1SettingsSource {
+    #[serde(default = "default_header_read_timeout")]
+    pub header_read_timeout: String,
+}
+
+impl Default for Http1SettingsSource {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: default_header_read_timeout(),
+        }
+    }
+}
+
+fn default_header_read_timeout() -> String {
+    "30s".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Http2SettingsSource {
+    #[serde(default = "default_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+    #[serde(default = "default_max_header_list_size")]
+    pub max_header_list_size: String,
+    #[serde(default = "default_http2_keep_alive_interval")]
+    pub keep_alive_interval: String,
+    #[serde(default = "default_http2_keep_alive_timeout")]
+    pub keep_alive_timeout: String,
+}
+
+impl Default for Http2SettingsSource {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: default_max_concurrent_streams(),
+            max_header_list_size: default_max_header_list_size(),
+            keep_alive_interval: default_http2_keep_alive_interval(),
+            keep_alive_timeout: default_http2_keep_alive_timeout(),
+        }
+    }
+}
+
+fn default_max_concurrent_streams() -> u32 {
+    256
+}
+
+fn default_max_header_list_size() -> String {
+    "64KiB".to_owned()
+}
+
+fn default_http2_keep_alive_interval() -> String {
+    "30s".to_owned()
+}
+
+fn default_http2_keep_alive_timeout() -> String {
+    "10s".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
