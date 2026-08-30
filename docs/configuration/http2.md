@@ -79,13 +79,17 @@ Remaining connection and stream tasks are aborted only after that deadline.
 `request.http_version` is `"1.1"` or `"2"`. TLS requests also expose the negotiated
 ALPN (`"http/1.1"` or `"h2"`) through `request.tls.alpn`.
 
-The management metrics endpoint exports bounded series for:
+The management metrics endpoint exports bounded series keyed by the statically
+configured `listener` name and fixed result/protocol enums for:
 
 - accepted and active connections with `protocol="http1|h2"`;
 - TLS handshake result and duration;
 - ALPN result from a fixed `http1|h2|none|other` set;
 - active HTTP/2 streams;
 - graceful or forced HTTP/2 shutdown.
+
+An H2-only Listener classifies a client that omits ALPN as `alpn_required` and an
+incompatible ALPN negotiation as `alpn_mismatch`; it never falls back to HTTP/1.1.
 
 Request paths, query strings, SNI names, peer IPs, Header values, and certificate
 paths are not labels.
@@ -96,4 +100,3 @@ Request and response bodies remain streaming and are not collected merely becaus
 HTTP/2 is selected. This alpha does not yet expose request/response trailers, basic
 gRPC proxying, RFC 8441 extended CONNECT, HTTP/2 WebSocket, h2c, or HTTP/3. HTTP/1
 generic Upgrade/WebSocket is also deferred to the protocol-bridging phase.
-

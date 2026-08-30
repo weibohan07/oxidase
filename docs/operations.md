@@ -170,11 +170,13 @@ byte totals, body lifetime buckets, and a fixed termination reason of `completed
 `error`, `cancelled`, or `timeout`. Dropping a client response does not cause body
 collection; it drops the upstream/file stream and releases the active-request guard.
 
-Transport telemetry adds fixed-label series for accepted/active connections by
-`protocol="http1|h2"`, TLS handshake result and duration, negotiated ALPN, active
-HTTP/2 streams, and graceful/forced HTTP/2 shutdown. Result and protocol values are
-closed enums; SNI values, certificate paths, client IPs, URLs, and Headers are not
-labels.
+Transport telemetry adds series keyed by configured Listener name and fixed enums
+for accepted/active connections by `protocol="http1|h2"`, TLS handshake result and
+duration, negotiated ALPN, active HTTP/2 streams, and graceful/forced HTTP/2
+shutdown. Result and protocol values are closed enums; SNI values, certificate
+paths, client IPs, URLs, and Headers are not labels. Each Listener permits at most
+128 simultaneous TLS handshakes; excess accepts fail immediately with the fixed
+`overloaded` result.
 
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service

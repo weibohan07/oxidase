@@ -64,6 +64,12 @@ listeners:
 timeout is `5s`. A timed-out or invalid handshake closes that connection without
 publishing request data or changing the active snapshot.
 
+Each Listener also has a fixed internal limit of 128 concurrent TLS handshakes.
+Oxidase acquires that permit immediately after accept; when all permits are occupied,
+the new socket is closed instead of creating an unbounded queue of handshake tasks.
+The rejection is reported as the fixed `overloaded` transport result. This limit is
+not user-configurable in the current alpha.
+
 Oxidase uses rustls safe TLS 1.2/1.3 defaults with the pure-Rust-facing ring provider.
 Cipher suites and protocol versions are not user configurable in this alpha.
 
@@ -113,4 +119,3 @@ trusted from client-supplied forwarding Headers.
 This alpha does not implement client-certificate authentication/mTLS, ACME, OCSP
 stapling, TLS 1.0/1.1, user-configurable cipher suites, QUIC/HTTP/3, or automatic
 certificate issuance. Do not configure publicly known test keys for a real service.
-

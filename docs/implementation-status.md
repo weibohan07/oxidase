@@ -90,7 +90,9 @@ Last updated: 2026-08-30
   crypto provider. Exact ASCII SNI names take precedence over one-label left-most
   wildcards and then the default certificate; SNI rules are checked against leaf
   subjectAltName during preparation. Handshakes have a configured timeout and ALPN
-  advertises only enabled `h2`/`http/1.1` protocols.
+  advertises only enabled `h2`/`http/1.1` protocols. Each Listener also has a fixed
+  128-handshake non-waiting concurrency gate; overload closes the new socket instead
+  of queueing an unbounded task.
 - The inbound connection driver supports cleartext HTTP/1.1 and ALPN-selected HTTPS
   HTTP/1.1 or HTTP/2. HTTP/2 applies bounded concurrent-stream/header-list settings
   plus configured keepalive, and each request/stream pins the current snapshot at
@@ -157,10 +159,11 @@ Last updated: 2026-08-30
 - Phase 7 adds an opt-in, separately bound management listener with live/ready
   health and Prometheus text metrics. Outcome, status-class, latency, active request,
   and reload labels are fixed and bounded.
-- Transport metrics use fixed protocol/result enums for accepted and active HTTP/1
-  or HTTP/2 connections, TLS handshake result/duration, negotiated ALPN, active H2
-  streams, and graceful/forced H2 shutdown. Raw SNI, peer IP, paths, certificate
-  paths, and request data are not metric labels.
+- Transport metrics use configured Listener names and fixed protocol/result enums
+  for accepted and active HTTP/1 or HTTP/2 connections, TLS handshake
+  result/duration, negotiated ALPN, active H2 streams, and graceful/forced H2
+  shutdown. Raw SNI, peer IP, paths, certificate paths, and request data are not
+  metric labels.
 - Data-plane HTTP/1 mode and the management HTTP/1 listener use Hyper's timer-backed
   30-second request-header timeout. Real socket tests cover a stalled header, progress within
   the deadline, upstream mid-body truncation, paced versus stalled response bodies,

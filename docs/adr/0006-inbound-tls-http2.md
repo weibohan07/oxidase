@@ -100,6 +100,11 @@ HTTP/1 retains the timer-backed header-read timeout and existing graceful shutdo
 HTTP/2 uses Hyper's Tokio executor/timer and explicit maximum concurrent streams,
 maximum header-list size, keepalive interval, and keepalive timeout.
 
+Each Listener owns a fixed 128-permit TLS-handshake gate. The accept path uses a
+non-waiting permit acquisition, so an overloaded Listener closes the newly accepted
+socket and records a fixed result instead of accumulating an unbounded task queue.
+An H2-only Listener fails closed when ALPN is absent or incompatible.
+
 On listener retirement or process shutdown, acceptance stops first. Every HTTP/1
 connection receives graceful shutdown; every HTTP/2 connection sends GOAWAY through
 Hyper's graceful-shutdown API and stops accepting new streams. Accepted requests may
@@ -112,10 +117,10 @@ Protocol-neutral request metadata exposes `request.http_version` and a read-only
 Forwarded/X-Forwarded-Proto continues to derive scheme from this trusted connection
 metadata, never from an incoming Header.
 
-Transport metrics use fixed protocol/result enums; existing Observe metrics use only
-configured Observe names and fixed result enums. SNI, certificate paths, client
-addresses, and request data are not labels. SNI may appear as a controlled tracing
-field.
+Transport metrics use configured Listener names plus fixed protocol/result enums;
+existing Observe metrics use only configured Observe names and fixed result enums.
+SNI, certificate paths, client addresses, and request data are not labels. SNI may
+appear as a controlled tracing field.
 
 ## Rejected alternatives
 
