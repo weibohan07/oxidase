@@ -913,6 +913,7 @@ dependencies = [
  "oxidase-config",
  "oxidase-core",
  "oxidase-site",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
