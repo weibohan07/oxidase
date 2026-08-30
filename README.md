@@ -13,8 +13,9 @@ runtime snapshot. Each listener binds network traffic to any root Service.
 
 - **Listener** owns transport metadata and points to a root Service.
 - **Service Program** composes terminal (`Respond`, `Redirect`, `Site`, `Proxy`),
-  wrapper (`Transform`, `Observe`, `Timeout`, `Recover`), and composition (`Route`,
-  `Fallback`, `Reenter`) nodes.
+  wrapper (`Transform`, `Observe`, `Timeout`, `RequestBodyLimit`,
+  `ConcurrencyLimit`, `RateLimit`, `Recover`), and composition (`Route`, `Fallback`,
+  `Reenter`) nodes.
 - **Resource Registry** owns reusable state such as validated Certificate material,
   compiled Site snapshots, and Cluster definitions. Resources are not Services.
 - **Router DSL** is optional source syntax lowered to ordinary Service IR before
@@ -56,6 +57,15 @@ before the body is consumed. Retry is disabled by default and is allowed only fo
 explicit methods and pre-response-head causes/statuses with an empty body or an
 explicitly bounded replay buffer. Runtime health/counters survive only a compatible
 endpoint reload identity.
+
+Inbound governance is explicit at both transport and Service boundaries. Listener
+limits bound total and per-kernel-peer connections, idle progress, Header bytes and
+count, and requests per HTTP/1 connection or accepted HTTP/2 streams. The wrapper
+Services `request_body_limit`, `concurrency_limit`, and `rate_limit` respectively
+enforce a streaming byte ceiling, cancellation-safe admission held through the
+response body or trusted tunnel, and a bounded monotonic token bucket keyed only by
+the actual peer IP or a named lexical binding. No forwarded Header is trusted as a
+client identity, and runtime keys never become metric labels.
 
 Listener programs share one immutable `ServiceGraph`; normal requests do not clone
 the graph or collect explain traces. Every handled response passes through one
@@ -199,6 +209,13 @@ Inbound transport configuration is documented in
 [`docs/configuration/http2.md`](docs/configuration/http2.md). An HTTPS listener
 defaults to `versions: [h2, http1]`; a cleartext listener defaults to `http1` and
 rejects `h2` rather than implying h2c support.
+
+Listener ingress limits and protection wrappers are defined in
+[`ADR 0009`](docs/adr/0009-ingress-resource-governance.md). Defaults remain finite:
+10,000 total connections, 100 connections per peer IP, a 2-minute connection-idle
+deadline, 30-second request/response body-idle deadlines, 64 KiB and 100 decoded
+Headers, and 1,000 requests/streams per connection. These are alpha defaults rather
+than capacity recommendations; deployments must select limits for their workload.
 
 Prepared Cluster policy is documented in
 [`docs/configuration/clusters.md`](docs/configuration/clusters.md). Supported

@@ -102,12 +102,30 @@ Last updated: 2026-08-30
   request start rather than pinning one Service snapshot for the entire connection.
   Request expressions expose connection-derived HTTP version and TLS enabled/SNI/
   ALPN/version metadata.
-- HTTP/1 ingress has conservative hard defaults of 100 decoded fields, 64 KiB
-  decoded head storage, and an 8 KiB request target in addition to its header-read
-  timeout. Duplicate/empty/missing Host, unsupported authority-form/CONNECT, and
-  ambiguous targets fail before Service execution. Absolute-form and H2 authority
-  replace any conflicting Host so expressions, forwarding metadata, and upstream
-  Host observe one canonical value.
+- HTTP/1 ingress defaults to 100 decoded fields and 64 KiB decoded head storage;
+  these are now configurable Listener limits. An 8 KiB request target remains a
+  conservative fixed bound in addition to the HTTP/1 header-read timeout.
+  Duplicate/empty/missing Host, unsupported authority-form/CONNECT, and ambiguous
+  targets fail before Service execution. Absolute-form and H2 authority replace any
+  conflicting Host so expressions, forwarding metadata, and upstream Host observe
+  one canonical value.
+- Every Listener now compiles a finite ingress policy. Defaults are 10,000 active
+  connections, 100 connections per normalized kernel peer IP, 2 minutes without
+  wire progress, 30-second request- and response-body idle deadlines, 64 KiB/100
+  decoded Headers, and 1,000 accepted requests or streams per connection. HTTP/1
+  applies the request budget to sequential/keep-alive requests; HTTP/2 applies it to
+  streams and retires the connection with GOAWAY after the last admitted stream.
+  Total/per-IP accounting is RAII-owned by the retained socket and includes TLS
+  handshakes and trusted Upgrade lifetimes. The peer map is capacity-bounded, evicts
+  idle identities, normalizes IPv4-mapped IPv6, and never trusts forwarding Headers.
+- Listener request/response body idle deadlines are progress deadlines, not total
+  transfer durations. Request DATA is wrapped without collection; downstream body
+  frame stalls and socket write stalls are classified as timeouts. Header count and
+  decoded-size limits apply to both HTTP versions, with HTTP/2 also retaining its
+  protocol-specific header-list ceiling.
+- Bodyless/HEAD requests do not allocate the request-body timeout adapter. HTTP/1
+  reserves independent bounded parser allowance for the request target and framing
+  before applying the configured decoded Header budget.
 - A retained listener socket loads the published transport plan for each accept.
   Certificate, Service, protocol, and HTTP-setting changes therefore affect new
   connections without rebinding, while existing TLS connections retain their old
@@ -170,6 +188,26 @@ Last updated: 2026-08-30
   policy, health/retry/limit summary, and an explicit runtime-dependent endpoint
   selection note. Declarative tests can assert the Cluster resource, protocol, and
   load-balancing policy without pretending to predict live endpoint state.
+- Three protection wrappers compile into the ordinary Service graph.
+  `RequestBodyLimit` rejects a known oversized Content-Length before its child,
+  otherwise counts streamed DATA (not trailers) and composes nested limits by their
+  minimum. `ConcurrencyLimit` acquires before body consumption and retains its RAII
+  permit through a handled response body or trusted Upgrade tunnel. `RateLimit`
+  uses a monotonic token bucket keyed only by the actual peer IP or a Boolean,
+  integer, or string lexical binding of at most 256 bytes. Missing/invalid bindings
+  and a full non-evictable key map fail closed with 429.
+- Peer and rate-key expiry use ordered bounded indexes rather than scanning the full
+  configured capacity for each rotating rejected identity. Completed data-plane and
+  admin connection tasks are reaped between accepts; the current admin listener has
+  a fixed 256-live-connection safety cap pending its source-level control plane.
+- Concurrency queues are bounded to `max_in_flight`; `queue_timeout: 0ms` is
+  fail-fast. Concurrency state reuses the compiler-owned Service identity across
+  compatible reloads so old active work remains counted while a new limit governs
+  admission. Rate state reuses only when key source, rate, burst, `max_keys`, and
+  `idle_ttl` all match. A changed rate policy starts a new bounded generation.
+- Observe, Listener transport, and governance metric registries have finite
+  reload-churn caps. Existing governance series update without allocating new label
+  keys, and runtime peer/binding values never enter a series identity.
 - Proxy body adapters preserve DATA, trailer, end-of-stream, and error frames.
   HTTP/2 retains only the exact `TE: trailers` value and rejects connection-specific
   fields; HTTP/1 continues to remove Connection-nominated and hop-by-hop fields. A
@@ -298,6 +336,10 @@ Last updated: 2026-08-30
 - A Proxy backed by a prepared Cluster applies configured load balancing, health
   eligibility, bounded admission, and safe pre-head retry while preserving the
   same streaming H1/H2 pools and request-pinned snapshot semantics.
+- Listener connection/peer/header/request limits and the three protection wrappers
+  are runnable on the existing HTTP/1.1 and HTTP/2 data plane. Request-body and
+  admission rejection occur before child execution when determinable; post-head
+  streaming failure cancels the stream rather than fabricating a replacement status.
 
 ## Not implemented
 
@@ -368,9 +410,15 @@ Last updated: 2026-08-30
   redirects require a future explicit allow policy.
 - The admin listener is CLI-configured rather than part of the gateway source and is
   not dynamically rebound during config reload.
-- HTTP/1 field/head/target limits and the TLS handshake concurrency gate are safe
-  fixed defaults in this hardening PR; per-Listener and per-IP configurable ingress
-  governance is not implemented until the dedicated v0.4 ingress PR.
+- Ingress governance is local to one Oxidase process. There is no trusted-proxy
+  client-identity policy, distributed rate-limit store, cross-process connection
+  budget, or arbitrary Header-derived limiter key. The actual kernel peer address is
+  the only network identity; lexical binding keys are scalar and limited to 256
+  bytes.
+- A streamed request-body limit can return 413 only before a downstream response
+  head is committed. If an upstream response has already begun, exceeding the limit
+  cancels the body/upstream path and records a body error; HTTP does not permit
+  replacing that already-sent head with a synthetic 413.
 
 ## Validation boundary
 

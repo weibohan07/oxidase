@@ -8,9 +8,10 @@ result is exactly one of:
 - `Failed(error)`: the Service was applicable but could not complete.
 
 Terminal Services are `Respond`, `Redirect`, `Site`, and `Proxy`. Wrapper Services
-are `Transform`, `Observe`, `Timeout`, and `Recover`. Composition Services are
-`Route`, `Fallback`, and the explicitly budgeted `Reenter` operation. Router is a
-source-level convenience lowered into these nodes, never a privileged executor.
+are `Transform`, `Observe`, `Timeout`, `RequestBodyLimit`, `ConcurrencyLimit`,
+`RateLimit`, and `Recover`. Composition Services are `Route`, `Fallback`, and the
+explicitly budgeted `Reenter` operation. Router is a source-level convenience
+lowered into these nodes, never a privileged executor.
 
 The compiled node table is one immutable `ServiceGraph` shared by every listener
 program view through `Arc`. A request copies only its entry ID and shared graph
@@ -62,6 +63,32 @@ not claim to measure delivery of a streaming body. Timeout cancellation closes t
 scope through an RAII guard. The server independently wraps the final `GatewayBody`
 to count emitted bytes and classify completion, body error, idle timeout, or client
 cancellation without collecting the stream.
+
+The three ingress-governance wrappers preserve the same outcome algebra:
+
+- `RequestBodyLimit` carries an immutable lexical byte ceiling to its descendant;
+  nested wrappers take the minimum. A known oversized Content-Length produces a
+  handled 413 before the child. A body-consuming leaf enforces unknown-length bodies
+  as DATA frames flow. The limit is not committed into `RequestFrame`, so a Declined
+  or Failed branch cannot expose it to a Fallback sibling. A post-response-head
+  overflow terminates the stream instead of fabricating a new response.
+- `ConcurrencyLimit` acquires before child execution and body consumption. Saturated,
+  full-queue, or queue-timeout admission produces its configured handled rejection;
+  it never becomes `Declined`. For `Handled`, the permit becomes part of the
+  server-local response-body or trusted-tunnel plan and remains held through the
+  streaming lifecycle. Every other outcome releases on scope exit.
+- `RateLimit` evaluates a prepared bounded token bucket before child execution. Its
+  only keys are the normalized transport peer IP or a named lexical scalar binding.
+  Rejection is a handled 429 with bounded `Retry-After`; missing/invalid keys and
+  exhausted key-map capacity fail closed rather than creating a global/unbounded
+  identity map. Actual keys are neither Service identity nor metric labels.
+
+Concurrency and rate state live in the snapshot's governance registry, separate from
+the immutable node graph. Concurrency state reuses its compiler-owned Service
+identity across compatible reloads so active old-snapshot bodies/tunnels remain
+counted. Rate state additionally requires an identical key/rate/burst/capacity/idle
+policy. Listener connection admission has a different lifetime and belongs to the
+retained socket; it is not another Service outcome or hidden graph node.
 
 After the root returns `Handled`, a single protocol finalizer removes hop-by-hop and
 untrusted framing metadata, derives safe lengths, and enforces body rules for HEAD,
