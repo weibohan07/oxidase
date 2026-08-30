@@ -167,20 +167,40 @@ impl ProxyClient {
         })
     }
 
-    fn pools(&self, connect_timeout: Duration) -> Result<Arc<ProxyPools>, String> {
+    pub(crate) fn reconcile_snapshot(&self, snapshot: &RuntimeSnapshot) {
+        let active = snapshot
+            .resources
+            .clusters
+            .values()
+            .map(|cluster| cluster.spec().connect_timeout)
+            .filter(|timeout| *timeout != Duration::from_secs(5))
+            .collect::<BTreeSet<_>>();
+        let mut cache = self
+            .pools_by_connect_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|timeout, _| active.contains(timeout));
+        for timeout in active {
+            cache
+                .entry(timeout)
+                .or_insert_with(|| Arc::new(ProxyPools::new(timeout, &self.tls_config)));
+        }
+    }
+
+    fn pools(&self, connect_timeout: Duration) -> Arc<ProxyPools> {
         if connect_timeout == Duration::from_secs(5) {
-            return Ok(Arc::clone(&self.default_pools));
+            return Arc::clone(&self.default_pools);
         }
         let mut cache = self
             .pools_by_connect_timeout
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pools) = cache.get(&connect_timeout) {
-            return Ok(Arc::clone(pools));
+            return Arc::clone(pools);
         }
         let pools = Arc::new(ProxyPools::new(connect_timeout, &self.tls_config));
         cache.insert(connect_timeout, Arc::clone(&pools));
-        Ok(pools)
+        pools
     }
 }
 
@@ -246,18 +266,13 @@ impl ProxyClient {
         }
         let mut permit = match cluster.acquire().await {
             Ok(permit) => permit,
-            Err(error) => return admission_failure(&cluster, error),
-        };
-        let configured_pool = ProxyPoolKind::for_cluster(cluster.protocol());
-        let pools = match self.pools(cluster.spec().connect_timeout) {
-            Ok(pools) => pools,
             Err(error) => {
-                return ServiceOutcome::Failed(ServiceError::new(
-                    ErrorClass::InvalidState,
-                    format!("cannot initialize upstream connection pools: {error}"),
-                ));
+                cluster.record_admission_failure(error);
+                return admission_failure(&cluster, error);
             }
         };
+        let configured_pool = ProxyPoolKind::for_cluster(cluster.protocol());
+        let pools = self.pools(cluster.spec().connect_timeout);
         let Some(payload) = body.take() else {
             return ServiceOutcome::Failed(ServiceError::new(
                 ErrorClass::BodyUnavailable,
@@ -360,20 +375,23 @@ impl ProxyClient {
                     cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
                     let detail =
                         format!("upstream request to `{}` failed: {error}", endpoint.name());
-                    if attempt < max_attempts
-                        && retry_allows_failure(retry, failure)
-                        && let Some(storm_permit) = cluster.try_acquire_retry()
-                    {
-                        tried.insert(endpoint.name().to_owned());
-                        drop(permit);
-                        match cluster.acquire_excluding(&tried).await {
-                            Ok(next) => {
-                                permit = next;
-                                retry_permit = Some(storm_permit);
-                                continue;
+                    if retry_allows_failure(retry, failure) {
+                        if attempt < max_attempts
+                            && let Some(storm_permit) = cluster.try_acquire_retry()
+                        {
+                            tried.insert(endpoint.name().to_owned());
+                            drop(permit);
+                            match cluster.acquire_excluding(&tried).await {
+                                Ok(next) => {
+                                    permit = next;
+                                    retry_permit = Some(storm_permit);
+                                    cluster.record_retry_attempt();
+                                    continue;
+                                }
+                                Err(_) => drop(storm_permit),
                             }
-                            Err(_) => drop(storm_permit),
                         }
+                        cluster.record_retry_exhausted();
                     }
                     return ServiceOutcome::Failed(ServiceError::new(
                         failure.error_class(),
@@ -387,20 +405,23 @@ impl ProxyClient {
                         "upstream `{}` did not produce response headers in {timeout:?}",
                         endpoint.name()
                     );
-                    if attempt < max_attempts
-                        && retry_allows_failure(retry, failure)
-                        && let Some(storm_permit) = cluster.try_acquire_retry()
-                    {
-                        tried.insert(endpoint.name().to_owned());
-                        drop(permit);
-                        match cluster.acquire_excluding(&tried).await {
-                            Ok(next) => {
-                                permit = next;
-                                retry_permit = Some(storm_permit);
-                                continue;
+                    if retry_allows_failure(retry, failure) {
+                        if attempt < max_attempts
+                            && let Some(storm_permit) = cluster.try_acquire_retry()
+                        {
+                            tried.insert(endpoint.name().to_owned());
+                            drop(permit);
+                            match cluster.acquire_excluding(&tried).await {
+                                Ok(next) => {
+                                    permit = next;
+                                    retry_permit = Some(storm_permit);
+                                    cluster.record_retry_attempt();
+                                    continue;
+                                }
+                                Err(_) => drop(storm_permit),
                             }
-                            Err(_) => drop(storm_permit),
                         }
+                        cluster.record_retry_exhausted();
                     }
                     return ServiceOutcome::Failed(ServiceError::new(
                         failure.error_class(),
@@ -409,19 +430,27 @@ impl ProxyClient {
                 }
             };
 
-            if attempt < max_attempts
-                && retry_allows_status(retry, response.status())
-                && let Some(storm_permit) = cluster.try_acquire_retry()
-            {
-                let previous_endpoint = endpoint.name().to_owned();
-                tried.insert(previous_endpoint.clone());
-                if cluster.retarget_excluding(&mut permit, &tried).await {
-                    cluster.record_passive_failure(&previous_endpoint, std::time::Instant::now());
-                    drop(response);
-                    retry_permit = Some(storm_permit);
-                    continue;
+            if retry_allows_status(retry, response.status()) {
+                if attempt < max_attempts
+                    && let Some(storm_permit) = cluster.try_acquire_retry()
+                {
+                    let previous_endpoint = endpoint.name().to_owned();
+                    tried.insert(previous_endpoint.clone());
+                    if cluster.retarget_excluding(&mut permit, &tried).await {
+                        if response.status().is_server_error() {
+                            cluster.record_passive_failure(
+                                &previous_endpoint,
+                                std::time::Instant::now(),
+                            );
+                        }
+                        drop(response);
+                        retry_permit = Some(storm_permit);
+                        cluster.record_retry_attempt();
+                        continue;
+                    }
+                    drop(storm_permit);
                 }
-                drop(storm_permit);
+                cluster.record_retry_exhausted();
             }
 
             if let Some(pending_upgrade) = pending_upgrade.take() {
