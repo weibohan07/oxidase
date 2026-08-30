@@ -55,6 +55,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+x509-parser = { version = "0.18.1", features = ["verify"] }
 walkdir = "2"
 
 [workspace.lints.rust]

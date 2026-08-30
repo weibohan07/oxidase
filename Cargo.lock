@@ -922,6 +922,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "x509-parser",
 ]
 
 [[package]]
