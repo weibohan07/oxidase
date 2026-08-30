@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use oxidase_config::{Compiler, ExplainRequestSource, TestExpectationSource};
+use oxidase_config::{
+    Compiler, ExplainRequestSource, HttpVersion, ListenerProtocol, TestExpectationSource,
+};
 use oxidase_core::{
     ContentDigest, ContentDigestBuilder, Diagnostic, RequestFrame, RequestMetadata, ResourceId,
     ResponseHead, ServiceOutcome, SourceSpan,
@@ -130,7 +133,9 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                 gateway.config_version,
                 gateway.listeners.len(),
                 gateway.graph.len(),
-                gateway.resources.clusters.len() + gateway.resources.sites.len()
+                gateway.resources.certificates.len()
+                    + gateway.resources.clusters.len()
+                    + gateway.resources.sites.len()
             ));
             Ok(RunSuccess::default())
         }
@@ -194,6 +199,16 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
             admin_bind,
         } => {
             let gateway = prepare_snapshot(&config)?;
+            let listener_protocols = gateway
+                .listeners
+                .iter()
+                .map(|listener| {
+                    (
+                        listener.name.clone(),
+                        listener_protocol_label(listener.protocol, &listener.http.versions),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             let _ = tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_env_filter(
@@ -211,7 +226,10 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     .map_err(server_failure)?;
             }
             for (name, address) in server.local_addresses() {
-                reporter.human_stdout(format!("listener {name} accepting HTTP/1.1 on {address}"));
+                let protocol = listener_protocols
+                    .get(&name)
+                    .expect("bound listeners originate from the prepared snapshot");
+                reporter.human_stdout(format!("listener {name} accepting {protocol} on {address}"));
             }
             if let Some(address) = server.admin_address() {
                 reporter.human_stdout(format!("admin listener accepting HTTP/1.1 on {address}"));
@@ -246,6 +264,23 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
             }
             running.shutdown().await.map_err(server_failure)?;
             Ok(RunSuccess::default())
+        }
+    }
+}
+
+fn listener_protocol_label(protocol: ListenerProtocol, versions: &[HttpVersion]) -> String {
+    match protocol {
+        ListenerProtocol::Http => "HTTP/1.1".to_owned(),
+        ListenerProtocol::Https => {
+            let alpn = versions
+                .iter()
+                .map(|version| match version {
+                    HttpVersion::Http1 => "http/1.1",
+                    HttpVersion::H2 => "h2",
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("HTTPS (ALPN: {alpn})")
         }
     }
 }
@@ -722,6 +757,7 @@ async fn watch_dependencies_with_timing(
                         tracing::info!(
                             previous_version = report.previous_version,
                             current_version = report.current_version,
+                            reused_certificates = report.reused_certificates,
                             reused_sites = report.reused_sites,
                             reused_clusters = report.reused_clusters,
                             "configuration reload committed"
@@ -788,13 +824,32 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use oxidase_config::Compiler;
+    use oxidase_config::{Compiler, HttpVersion, ListenerProtocol};
     use oxidase_core::{RespondBody, ServiceKind};
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::watch_dependencies_with_timing;
+    use super::{listener_protocol_label, watch_dependencies_with_timing};
+
+    #[test]
+    fn listener_protocol_labels_describe_cleartext_and_tls_alpn() {
+        assert_eq!(
+            listener_protocol_label(ListenerProtocol::Http, &[HttpVersion::Http1]),
+            "HTTP/1.1"
+        );
+        assert_eq!(
+            listener_protocol_label(
+                ListenerProtocol::Https,
+                &[HttpVersion::H2, HttpVersion::Http1]
+            ),
+            "HTTPS (ALPN: h2, http/1.1)"
+        );
+        assert_eq!(
+            listener_protocol_label(ListenerProtocol::Https, &[HttpVersion::H2]),
+            "HTTPS (ALPN: h2)"
+        );
+    }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(2), async {
