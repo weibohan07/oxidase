@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use oxidase_core::ErrorClass;
 use oxidase_runtime::{
-    ExecutionObserver, ServiceObservationContext, ServiceObservationOutcome,
-    ServiceObservationResult,
+    EndpointHealthState, ExecutionObserver, RuntimeSnapshot, ServiceObservationContext,
+    ServiceObservationOutcome, ServiceObservationResult,
 };
 
 const LATENCY_BOUNDS_MS: [u64; 9] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
@@ -299,6 +299,113 @@ impl Metrics {
             }
         }
         output
+    }
+
+    /// Renders process metrics together with bounded runtime Cluster series
+    /// from one pinned snapshot.
+    ///
+    /// Cluster and endpoint names come exclusively from compiled configuration;
+    /// protocol, policy, and health labels are fixed enums. Request URLs,
+    /// headers, client addresses, and error strings never become labels.
+    #[must_use]
+    pub fn render_prometheus_for(&self, snapshot: &RuntimeSnapshot) -> String {
+        let mut output = self.render_prometheus();
+        let now = Instant::now();
+        for cluster in snapshot.resources.clusters.values() {
+            let status = cluster.status(now);
+            let cluster_name = escape_label(&status.cluster);
+            output.push_str(&format!(
+                "oxidase_cluster_info{{cluster=\"{cluster_name}\",policy=\"{}\",protocol=\"{}\"}} 1\n",
+                status.policy, status.protocol
+            ));
+            output.push_str(&format!(
+                "oxidase_cluster_active_requests{{cluster=\"{cluster_name}\"}} {}\n",
+                status.active_requests
+            ));
+            output.push_str(&format!(
+                "oxidase_cluster_active_retries{{cluster=\"{cluster_name}\"}} {}\n",
+                status.active_retries
+            ));
+            output.push_str(&format!(
+                "oxidase_cluster_retry_attempts_total{{cluster=\"{cluster_name}\"}} {}\n",
+                status.retry_attempts
+            ));
+            output.push_str(&format!(
+                "oxidase_cluster_retry_exhausted_total{{cluster=\"{cluster_name}\"}} {}\n",
+                status.retry_exhausted
+            ));
+            for (reason, value) in [
+                ("overloaded", status.overload_rejections),
+                ("unavailable", status.unavailable_rejections),
+            ] {
+                output.push_str(&format!(
+                    "oxidase_cluster_admission_rejections_total{{cluster=\"{cluster_name}\",reason=\"{reason}\"}} {value}\n"
+                ));
+            }
+
+            let mut endpoints = status.endpoints;
+            endpoints.sort_by(|left, right| left.name.cmp(&right.name));
+            for endpoint in endpoints {
+                let endpoint_name = escape_label(&endpoint.name);
+                let labels = format!("cluster=\"{cluster_name}\",endpoint=\"{endpoint_name}\"");
+                output.push_str(&format!(
+                    "oxidase_cluster_endpoint_selections_total{{{labels}}} {}\n",
+                    endpoint.runtime.selections
+                ));
+                output.push_str(&format!(
+                    "oxidase_cluster_endpoint_active_requests{{{labels}}} {}\n",
+                    endpoint.runtime.active_requests
+                ));
+                output.push_str(&format!(
+                    "oxidase_cluster_endpoint_successes_total{{{labels}}} {}\n",
+                    endpoint.runtime.successes
+                ));
+                output.push_str(&format!(
+                    "oxidase_cluster_endpoint_failures_total{{{labels}}} {}\n",
+                    endpoint.runtime.failures
+                ));
+                for (result, value) in [
+                    ("success", endpoint.runtime.active_health_successes),
+                    ("failure", endpoint.runtime.active_health_failures),
+                ] {
+                    output.push_str(&format!(
+                        "oxidase_cluster_health_checks_total{{{labels},result=\"{result}\"}} {value}\n"
+                    ));
+                }
+                output.push_str(&format!(
+                    "oxidase_cluster_passive_ejections_total{{{labels}}} {}\n",
+                    endpoint.runtime.passive_ejections
+                ));
+                output.push_str(&format!(
+                    "oxidase_cluster_health_transitions_total{{{labels}}} {}\n",
+                    endpoint.runtime.health_transitions
+                ));
+                for health in CLUSTER_HEALTH_STATES {
+                    let value = u8::from(endpoint.runtime.health == health);
+                    output.push_str(&format!(
+                        "oxidase_cluster_endpoint_health{{{labels},state=\"{}\"}} {value}\n",
+                        cluster_health_name(health)
+                    ));
+                }
+            }
+        }
+        output
+    }
+}
+
+const CLUSTER_HEALTH_STATES: [EndpointHealthState; 4] = [
+    EndpointHealthState::UnknownEligible,
+    EndpointHealthState::Healthy,
+    EndpointHealthState::Unhealthy,
+    EndpointHealthState::PassivelyEjected,
+];
+
+const fn cluster_health_name(health: EndpointHealthState) -> &'static str {
+    match health {
+        EndpointHealthState::UnknownEligible => "unknown_eligible",
+        EndpointHealthState::Healthy => "healthy",
+        EndpointHealthState::Unhealthy => "unhealthy",
+        EndpointHealthState::PassivelyEjected => "passively_ejected",
     }
 }
 
@@ -874,15 +981,18 @@ fn push_counter(output: &mut String, name: &str, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use http::StatusCode;
+    use oxidase_config::Compiler;
     use oxidase_core::{ErrorClass, ServiceId};
     use oxidase_runtime::{
-        ExecutionObserver, ServiceObservationContext, ServiceObservationOutcome,
-        ServiceObservationResult,
+        ClusterAdmissionError, ExecutionObserver, RuntimeSnapshot, ServiceObservationContext,
+        ServiceObservationOutcome, ServiceObservationResult,
     };
+    use tempfile::tempdir;
 
     use super::{
         ConnectionProtocol, H2Shutdown, Metrics, ProductionObserver, TlsAlpn, TlsHandshakeOutcome,
@@ -901,6 +1011,113 @@ mod tests {
         assert!(output.contains("outcome=\"handled\""));
         assert!(output.contains("class=\"2xx\""));
         assert!(!output.contains("http://"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_cluster_metrics_export_all_bounded_runtime_counters() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: api-a
+          url: http://127.0.0.1:43123
+          weight: 1
+      load_balance:
+        policy: least_requests
+      health:
+        active:
+          path: /healthz
+          interval: 1s
+          timeout: 100ms
+          healthy_statuses: ["200-299"]
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+        passive:
+          consecutive_failures: 1
+          eject_for: 30s
+services:
+  root:
+    type: respond
+    body:
+      text: ok
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("fixture config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("fixture config compiles"),
+        )
+        .expect("fixture snapshot prepares");
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("fixture cluster exists");
+        let request = cluster.acquire().await.expect("request can be admitted");
+        let retry = cluster
+            .try_acquire_retry()
+            .expect("retry budget has capacity");
+        cluster.record_retry_attempt();
+        cluster.record_retry_exhausted();
+        cluster.record_admission_failure(ClusterAdmissionError::Overloaded);
+        cluster.record_admission_failure(ClusterAdmissionError::Unavailable);
+        let now = Instant::now();
+        cluster.record_active_health("api-a", false, now);
+        cluster.record_passive_failure("api-a", now);
+        cluster.record_active_health("api-a", true, now);
+        cluster.record_passive_success("api-a");
+
+        let output = Metrics::default().render_prometheus_for(&snapshot);
+        assert!(output.contains(
+            "oxidase_cluster_info{cluster=\"api\",policy=\"least_requests\",protocol=\"h2\"} 1"
+        ));
+        assert!(output.contains("oxidase_cluster_active_requests{cluster=\"api\"} 1"));
+        assert!(output.contains("oxidase_cluster_active_retries{cluster=\"api\"} 1"));
+        assert!(output.contains("oxidase_cluster_retry_attempts_total{cluster=\"api\"} 1"));
+        assert!(output.contains("oxidase_cluster_retry_exhausted_total{cluster=\"api\"} 1"));
+        for reason in ["overloaded", "unavailable"] {
+            assert!(output.contains(&format!(
+                "oxidase_cluster_admission_rejections_total{{cluster=\"api\",reason=\"{reason}\"}} 1"
+            )));
+        }
+        let labels = "cluster=\"api\",endpoint=\"api-a\"";
+        for metric in [
+            "oxidase_cluster_endpoint_selections_total",
+            "oxidase_cluster_endpoint_active_requests",
+            "oxidase_cluster_endpoint_successes_total",
+            "oxidase_cluster_endpoint_failures_total",
+            "oxidase_cluster_passive_ejections_total",
+        ] {
+            assert!(
+                output.contains(&format!("{metric}{{{labels}}} 1")),
+                "{output}"
+            );
+        }
+        for result in ["success", "failure"] {
+            assert!(output.contains(&format!(
+                "oxidase_cluster_health_checks_total{{{labels},result=\"{result}\"}} 1"
+            )));
+        }
+        assert!(output.contains(&format!(
+            "oxidase_cluster_endpoint_health{{{labels},state=\"healthy\"}} 1"
+        )));
+        assert!(!output.contains("127.0.0.1"));
+        assert!(!output.contains("/healthz"));
+
+        drop(retry);
+        drop(request);
     }
 
     #[test]

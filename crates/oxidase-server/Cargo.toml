@@ -22,6 +22,8 @@ oxidase-config = { path = "../oxidase-config" }
 oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-site = { path = "../oxidase-site" }
 rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

@@ -19,8 +19,10 @@ use oxidase_core::{
     Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan, TlsConnectionMetadata,
 };
 use oxidase_runtime::{
-    Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot, SnapshotStore,
+    ClusterRuntimeStatus, Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot,
+    SnapshotStore,
 };
+use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -897,9 +899,10 @@ async fn handle_admin_request(
         "/metrics" => admin_response(
             StatusCode::OK,
             "text/plain; version=0.0.4; charset=utf-8",
-            Bytes::from(metrics.render_prometheus()),
+            Bytes::from(metrics.render_prometheus_for(&store.pin())),
             &method,
         ),
+        "/api/v1/clusters" => cluster_admin_response(&store.pin(), &method),
         _ => admin_response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -908,6 +911,41 @@ async fn handle_admin_request(
         ),
     };
     Ok(response)
+}
+
+#[derive(Serialize)]
+struct ClusterAdminResponse {
+    clusters: Vec<ClusterRuntimeStatus>,
+}
+
+fn cluster_admin_response(snapshot: &RuntimeSnapshot, method: &Method) -> Response<GatewayBody> {
+    let now = std::time::Instant::now();
+    let mut clusters = snapshot
+        .resources
+        .clusters
+        .values()
+        .map(|cluster| cluster.status(now))
+        .collect::<Vec<_>>();
+    clusters.sort_by(|left, right| left.cluster.cmp(&right.cluster));
+    for cluster in &mut clusters {
+        cluster
+            .endpoints
+            .sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    match serde_json::to_vec(&ClusterAdminResponse { clusters }) {
+        Ok(body) => admin_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":\"serialization_failed\"}\n"),
+            method,
+        ),
+    }
 }
 
 fn admin_response(
@@ -2445,6 +2483,130 @@ listeners:
             metrics.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 3"),
             "{metrics}"
         );
+        running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn admin_clusters_are_deterministic_snapshot_scoped_and_omit_origins() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    zeta:
+      endpoints:
+        - name: zeta-a
+          url: http://127.0.0.1:43125
+    alpha:
+      protocol: h2
+      endpoints:
+        - name: alpha-b
+          url: http://127.0.0.1:43124
+        - name: alpha-a
+          url: http://127.0.0.1:43123
+      load_balance:
+        policy: least_requests
+services:
+  root:
+    type: respond
+    body:
+      text: ok
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("fixture config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("fixture config compiles"),
+        )
+        .expect("fixture snapshot prepares");
+        let server = GatewayServer::bind(snapshot)
+            .await
+            .expect("server binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("valid admin bind"))
+            .await
+            .expect("admin server binds");
+        let running = server.spawn();
+        let admin = running.admin_address().expect("admin address is available");
+
+        let first = request(admin, "/api/v1/clusters", "").await;
+        let second = request(admin, "/api/v1/clusters", "").await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(
+            first
+                .to_ascii_lowercase()
+                .contains("content-type: application/json; charset=utf-8"),
+            "{first}"
+        );
+        let first_body = first
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("admin response has a body");
+        let second_body = second
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("second admin response has a body");
+        assert_eq!(first_body, second_body);
+        assert!(!first_body.contains("127.0.0.1"));
+        assert!(!first_body.contains("url"));
+
+        let document: serde_json::Value =
+            serde_json::from_str(first_body).expect("admin body is valid JSON");
+        let clusters = document["clusters"]
+            .as_array()
+            .expect("clusters is an array");
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0]["cluster"], "alpha");
+        assert_eq!(clusters[0]["policy"], "least_requests");
+        assert_eq!(clusters[0]["protocol"], "h2");
+        assert_eq!(clusters[0]["endpoints"][0]["name"], "alpha-a");
+        assert_eq!(clusters[0]["endpoints"][1]["name"], "alpha-b");
+        assert_eq!(clusters[1]["cluster"], "zeta");
+        for field in [
+            "active_requests",
+            "active_retries",
+            "retry_attempts",
+            "retry_exhausted",
+            "overload_rejections",
+            "unavailable_rejections",
+        ] {
+            assert_eq!(clusters[0][field], 0, "missing or nonzero field {field}");
+        }
+        for field in [
+            "health",
+            "active_requests",
+            "selections",
+            "successes",
+            "failures",
+            "active_health_successes",
+            "active_health_failures",
+            "passive_ejections",
+            "health_transitions",
+            "last_transition_unix_ms",
+            "ejection_remaining_ms",
+        ] {
+            assert!(
+                clusters[0]["endpoints"][0].get(field).is_some(),
+                "missing endpoint field {field}"
+            );
+        }
+
+        let metrics = request(admin, "/metrics", "").await;
+        let alpha = metrics
+            .find("oxidase_cluster_info{cluster=\"alpha\"")
+            .expect("alpha metrics are rendered");
+        let zeta = metrics
+            .find("oxidase_cluster_info{cluster=\"zeta\"")
+            .expect("zeta metrics are rendered");
+        assert!(alpha < zeta);
+        assert!(!metrics.contains("127.0.0.1"));
+
         running.shutdown().await.expect("server shuts down cleanly");
     }
 
