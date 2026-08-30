@@ -16,6 +16,7 @@ use tokio::time::{Instant, Sleep};
 
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
 use crate::protocol::TrailerGuard;
+use crate::upgrade::TunnelPlan;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -26,10 +27,12 @@ pub enum GatewayBodyPlan {
     Stream {
         body: GatewayBody,
         known_length: Option<u64>,
+        trailer_guard: Option<TrailerGuard>,
     },
     Head {
         representation_length: Option<u64>,
     },
+    TrustedUpgrade(TunnelPlan),
 }
 
 impl std::fmt::Debug for GatewayBodyPlan {
@@ -40,9 +43,14 @@ impl std::fmt::Debug for GatewayBodyPlan {
                 .debug_struct("Bytes")
                 .field("length", &bytes.len())
                 .finish(),
-            Self::Stream { known_length, .. } => formatter
+            Self::Stream {
+                known_length,
+                trailer_guard,
+                ..
+            } => formatter
                 .debug_struct("Stream")
                 .field("known_length", known_length)
+                .field("has_trailer_guard", &trailer_guard.is_some())
                 .finish(),
             Self::Head {
                 representation_length,
@@ -50,6 +58,9 @@ impl std::fmt::Debug for GatewayBodyPlan {
                 .debug_struct("Head")
                 .field("representation_length", representation_length)
                 .finish(),
+            Self::TrustedUpgrade(plan) => {
+                formatter.debug_tuple("TrustedUpgrade").field(plan).finish()
+            }
         }
     }
 }
@@ -63,6 +74,7 @@ impl GatewayBodyPlan {
             Self::Head {
                 representation_length,
             } => *representation_length,
+            Self::TrustedUpgrade(_) => None,
         }
     }
 
@@ -75,6 +87,7 @@ impl GatewayBodyPlan {
             Self::Bytes(bytes) => full_body(bytes),
             Self::Stream { body, .. } => body,
             Self::Head { .. } => empty_body(),
+            Self::TrustedUpgrade(_) => empty_body(),
         }
     }
 }

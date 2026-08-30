@@ -6,6 +6,7 @@ use oxidase_core::{ResponseHead, is_hop_by_hop_header};
 
 use crate::body::{GatewayBody, GatewayBodyPlan, ProtocolBody};
 use crate::protocol::{TrailerGuard, WireProtocol};
+use crate::upgrade::TunnelPlan;
 
 /// Protocol facts needed at the final response framing boundary.
 ///
@@ -38,6 +39,17 @@ pub(crate) struct ResponseFinalizer<'a> {
     context: ResponseFinalizationContext,
 }
 
+pub(crate) struct FinalizedResponse {
+    pub(crate) response: Response<GatewayBody>,
+    pub(crate) tunnel: Option<TunnelPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseFinalizationError {
+    TrustedUpgradeRequiresHttp1,
+    TrustedUpgradeRequiresSwitchingProtocols,
+}
+
 impl<'a> ResponseFinalizer<'a> {
     pub(crate) const fn new(method: &'a Method) -> Self {
         Self {
@@ -63,11 +75,17 @@ impl<'a> ResponseFinalizer<'a> {
         // `Trailer` remains forbidden to source configuration. A declaration
         // reaching this boundary is trusted Proxy metadata, but it still must
         // parse and pass the protocol safety policy before being preserved.
-        let trailer_guard = TrailerGuard::from_response_headers(
-            self.context.wire_protocol,
-            self.context.accepts_http1_trailers,
-            &response.headers,
-        );
+        let trailer_guard = match &response.body {
+            GatewayBodyPlan::Stream {
+                trailer_guard: Some(trailer_guard),
+                ..
+            } => trailer_guard.clone(),
+            _ => TrailerGuard::from_response_headers(
+                self.context.wire_protocol,
+                self.context.accepts_http1_trailers,
+                &response.headers,
+            ),
+        };
         remove_hop_by_hop(&mut response.headers);
 
         // Framing metadata is derived only from the selected, trusted body plan.
@@ -109,6 +127,43 @@ impl<'a> ResponseFinalizer<'a> {
         *output.status_mut() = response.status;
         *output.headers_mut() = response.headers;
         output
+    }
+
+    pub(crate) fn finalize_handled(
+        self,
+        mut response: ResponseHead<GatewayBodyPlan>,
+    ) -> Result<FinalizedResponse, ResponseFinalizationError> {
+        let body = std::mem::replace(&mut response.body, GatewayBodyPlan::Empty);
+        let GatewayBodyPlan::TrustedUpgrade(tunnel) = body else {
+            response.body = body;
+            return Ok(FinalizedResponse {
+                response: self.finalize(response),
+                tunnel: None,
+            });
+        };
+        if self.context.wire_protocol != WireProtocol::Http1 {
+            return Err(ResponseFinalizationError::TrustedUpgradeRequiresHttp1);
+        }
+        if response.status != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(ResponseFinalizationError::TrustedUpgradeRequiresSwitchingProtocols);
+        }
+
+        remove_hop_by_hop(&mut response.headers);
+        response.headers.remove(header::CONTENT_LENGTH);
+        response.headers.remove(header::TRANSFER_ENCODING);
+        response
+            .headers
+            .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        response
+            .headers
+            .insert(header::UPGRADE, tunnel.protocol_header_value());
+        let mut output = Response::new(GatewayBodyPlan::Empty.into_body(true));
+        *output.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+        *output.headers_mut() = response.headers;
+        Ok(FinalizedResponse {
+            response: output,
+            tunnel: Some(tunnel),
+        })
     }
 }
 
@@ -157,6 +212,7 @@ mod tests {
             body: GatewayBodyPlan::Stream {
                 body: StreamBody::new(stream::iter(frames)).boxed_unsync(),
                 known_length: Some(7),
+                trailer_guard: None,
             },
         }
     }

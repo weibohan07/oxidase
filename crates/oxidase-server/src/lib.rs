@@ -11,6 +11,7 @@ mod metrics;
 mod protocol;
 mod response;
 mod server;
+mod upgrade;
 
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
 pub use metrics::Metrics;

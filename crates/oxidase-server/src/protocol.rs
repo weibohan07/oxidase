@@ -117,7 +117,7 @@ impl std::error::Error for TrailerValidationError {}
 
 /// Runtime policy applied to every trailer frame sent downstream.
 #[derive(Clone, Debug)]
-pub(crate) struct TrailerGuard {
+pub struct TrailerGuard {
     protocol: WireProtocol,
     accepts_http1_trailers: bool,
     declaration: Option<TrailerDeclaration>,

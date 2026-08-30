@@ -25,7 +25,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
-use crate::protocol::{WireProtocol, sanitize_runtime_headers};
+use crate::protocol::{
+    TrailerGuard, WireProtocol, http1_accepts_trailers, sanitize_runtime_headers,
+};
+use crate::upgrade::GatewayRequestPayload;
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
@@ -116,8 +119,8 @@ impl ProxyClient {
         &self,
         cluster: &ResourceId,
         request: &RequestFrame,
-        body: &mut Option<Incoming>,
-        snapshot: &RuntimeSnapshot,
+        body: &mut Option<GatewayRequestPayload>,
+        snapshot: &Arc<RuntimeSnapshot>,
     ) -> ServiceOutcome<GatewayBodyPlan> {
         let Some(cluster_spec) = snapshot.resources.clusters.get(cluster) else {
             return ServiceOutcome::Failed(ServiceError::new(
@@ -125,18 +128,26 @@ impl ProxyClient {
                 format!("prepared cluster `{cluster}` is missing"),
             ));
         };
-        let pool_kind = ProxyPoolKind::for_cluster(cluster_spec.protocol);
+        let configured_pool = ProxyPoolKind::for_cluster(cluster_spec.protocol);
         let sequence = self.endpoint_sequence.fetch_add(1, Ordering::Relaxed);
         let endpoint = &cluster_spec.endpoints[sequence as usize % cluster_spec.endpoints.len()];
         let uri = match upstream_uri(endpoint, request.path_and_query()) {
             Ok(uri) => uri,
             Err(error) => return ServiceOutcome::Failed(error),
         };
-        let Some(body) = body.take() else {
+        let Some(payload) = body.take() else {
             return ServiceOutcome::Failed(ServiceError::new(
                 ErrorClass::BodyUnavailable,
                 "Proxy request body is unavailable",
             ));
+        };
+        let (body, pending_upgrade) = payload.into_parts();
+        // Upgrade is an HTTP/1 connection capability even when the Cluster's
+        // ordinary traffic policy is auto or H2.
+        let pool_kind = if pending_upgrade.is_some() {
+            ProxyPoolKind::Http1
+        } else {
+            configured_pool
         };
         let mut upstream = Request::new(body);
         *upstream.method_mut() = request.method().clone();
@@ -150,13 +161,21 @@ impl ProxyClient {
                 "request contains invalid connection-specific metadata",
             ));
         }
+        if let Some(upgrade) = &pending_upgrade {
+            upstream
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            upstream
+                .headers_mut()
+                .insert(header::UPGRADE, upgrade.protocol_header_value());
+        }
         apply_forwarding_headers(upstream.headers_mut(), request, endpoint);
 
         let timeout = cluster_spec
             .connect_timeout
             .checked_add(cluster_spec.response_timeout)
             .unwrap_or(cluster_spec.response_timeout);
-        let response =
+        let mut response =
             match tokio::time::timeout(timeout, self.pool(pool_kind).request(upstream)).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
@@ -179,6 +198,49 @@ impl ProxyClient {
                     ));
                 }
             };
+        if let Some(pending_upgrade) = pending_upgrade {
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                let upstream_upgrade = hyper::upgrade::on(&mut response);
+                let plan = match pending_upgrade
+                    .bind(snapshot.clone())
+                    .accept(&response, upstream_upgrade)
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        return ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::UpstreamProtocol,
+                            format!("upstream Upgrade handshake is invalid: {error}"),
+                        ));
+                    }
+                };
+                let (mut parts, _body) = response.into_parts();
+                if sanitize_runtime_headers(&mut parts.headers, WireProtocol::Http1).is_err() {
+                    return ServiceOutcome::Failed(ServiceError::new(
+                        ErrorClass::UpstreamProtocol,
+                        "upstream Upgrade response has invalid connection metadata",
+                    ));
+                }
+                return ServiceOutcome::Handled(ResponseHead {
+                    status: StatusCode::SWITCHING_PROTOCOLS,
+                    headers: parts.headers,
+                    body: GatewayBodyPlan::TrustedUpgrade(plan),
+                });
+            }
+        } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return ServiceOutcome::Failed(ServiceError::new(
+                ErrorClass::UpstreamProtocol,
+                "upstream returned an unsolicited 101 response",
+            ));
+        }
+
+        let downstream_protocol = response_wire_protocol(request.original().http_version);
+        let accepts_http1_trailers = downstream_protocol == WireProtocol::Http1
+            && http1_accepts_trailers(&request.original().headers);
+        let trailer_guard = TrailerGuard::from_response_headers(
+            downstream_protocol,
+            accepts_http1_trailers,
+            response.headers(),
+        );
         let (mut parts, body) = response.into_parts();
         if sanitize_runtime_headers(&mut parts.headers, response_wire_protocol(parts.version))
             .is_err()
@@ -197,6 +259,7 @@ impl ProxyClient {
             GatewayBodyPlan::Stream {
                 body: timeout_incoming_body(body, cluster_spec.response_timeout),
                 known_length: None,
+                trailer_guard: Some(trailer_guard),
             }
         };
         ServiceOutcome::Handled(ResponseHead {
@@ -225,7 +288,7 @@ fn response_wire_protocol(version: Version) -> WireProtocol {
     }
 }
 
-impl LeafExecutor<Incoming, GatewayBodyPlan> for HyperLeaves {
+impl LeafExecutor<GatewayRequestPayload, GatewayBodyPlan> for HyperLeaves {
     fn body_from_bytes(&self, bytes: Bytes) -> GatewayBodyPlan {
         if bytes.is_empty() {
             GatewayBodyPlan::Empty
@@ -271,7 +334,7 @@ impl LeafExecutor<Incoming, GatewayBodyPlan> for HyperLeaves {
         &'a self,
         cluster: &'a ResourceId,
         request: &'a RequestFrame,
-        body: &'a mut Option<Incoming>,
+        body: &'a mut Option<GatewayRequestPayload>,
     ) -> BoxLeafFuture<'a, GatewayBodyPlan> {
         Box::pin(self.proxy.execute(cluster, request, body, &self.snapshot))
     }
@@ -486,6 +549,7 @@ async fn stream_asset(
     Ok(GatewayBodyPlan::Stream {
         body: StreamBody::new(stream).boxed_unsync(),
         known_length: Some(response_length),
+        trailer_guard: None,
     })
 }
 
