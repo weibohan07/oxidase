@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, StatusCode};
+use http::{HeaderName, HeaderValue, Method, StatusCode, uri::PathAndQuery};
 use oxidase_core::{
     CompiledMetadata, CompiledPattern, CompiledTemplate, ConfigVersion, ContentDigest,
     ContentDigestBuilder, DiagnosticReference, ErrorClass, Expression, HeaderPredicate,
@@ -25,11 +25,13 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
-    BodySource, CertificateSource, ClusterSource, ConfigTestSource, ErrorClassSource,
-    GatewaySource, HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource,
-    HttpVersionSource, InlineServiceSource, ListenerProtocolSource, ListenerSource,
-    PredicateSource, RedirectQuerySource, RequestTransformSource, ResourcesSource,
-    ResponseTransformSource, ServiceSource, SiteSource, TlsListenerSource,
+    ActiveHealthSource, BodySource, CertificateSource, ClusterEndpointSource, ClusterSource,
+    ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource, Http1SettingsSource,
+    Http2SettingsSource, HttpListenerSource, HttpVersionSource, InlineServiceSource,
+    ListenerProtocolSource, ListenerSource, PassiveHealthSource, PredicateSource,
+    RedirectQuerySource, RequestTransformSource, ResourcesSource, ResponseTransformSource,
+    RetryRequestBodySource, RetrySource, ServiceSource, SiteSource, StatusRangeSource,
+    TlsListenerSource,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,8 @@ pub struct CompiledGateway {
     pub resources: CompiledResources,
     pub listeners: Vec<CompiledListener>,
     pub tests: Vec<ConfigTestSource>,
+    /// Non-fatal structured diagnostics produced while compiling this source.
+    pub warnings: Vec<Diagnostic>,
 }
 
 impl CompiledGateway {
@@ -80,6 +84,11 @@ impl CompiledGateway {
                 .map(|cluster| ClusterSummary {
                     id: cluster.id.to_string(),
                     protocol: cluster.protocol,
+                    load_balance: cluster.load_balance,
+                    endpoint_count: cluster.endpoints.len(),
+                    active_health: cluster.health.active.is_some(),
+                    passive_health: cluster.health.passive.is_some(),
+                    retry_max_attempts: cluster.retry.max_attempts,
                 })
                 .collect(),
             certificates: self
@@ -124,10 +133,137 @@ pub struct CertificateSpec {
 pub struct ClusterSpec {
     pub id: ResourceId,
     pub protocol: ClusterProtocol,
-    pub endpoints: Vec<Url>,
+    pub endpoints: Vec<ClusterEndpointSpec>,
+    pub load_balance: LoadBalancePolicy,
+    pub health: ClusterHealthSpec,
+    pub retry: RetrySpec,
+    pub limits: ClusterLimits,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
     pub protocol_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterEndpointSpec {
+    pub name: String,
+    pub url: Url,
+    pub weight: u16,
+    pub name_source: SourceSpan,
+    pub url_source: SourceSpan,
+    pub weight_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancePolicy {
+    #[default]
+    RoundRobin,
+    WeightedRoundRobin,
+    LeastRequests,
+}
+
+impl LoadBalancePolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::WeightedRoundRobin => "weighted_round_robin",
+            Self::LeastRequests => "least_requests",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClusterHealthSpec {
+    pub active: Option<ActiveHealthSpec>,
+    pub passive: Option<PassiveHealthSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveHealthSpec {
+    pub path: String,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub healthy_statuses: Vec<StatusRange>,
+    pub healthy_threshold: u32,
+    pub unhealthy_threshold: u32,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct PassiveHealthSpec {
+    pub consecutive_failures: u32,
+    pub eject_for: Duration,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StatusRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl StatusRange {
+    #[must_use]
+    pub const fn contains(self, status: u16) -> bool {
+        self.start <= status && status <= self.end
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrySpec {
+    pub max_attempts: u32,
+    pub methods: Vec<Method>,
+    pub retry_on: Vec<RetryCause>,
+    pub statuses: Vec<StatusRange>,
+    pub request_body: RetryRequestBodySpec,
+    pub max_concurrent_retries: u32,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryCause {
+    ConnectFailure,
+    ResponseHeaderTimeout,
+    RefusedStream,
+    Reset,
+}
+
+impl RetryCause {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectFailure => "connect_failure",
+            Self::ResponseHeaderTimeout => "response_header_timeout",
+            Self::RefusedStream => "refused_stream",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryRequestBodySpec {
+    pub mode: RetryBodyMode,
+    pub max_bytes: u64,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryBodyMode {
+    #[default]
+    None,
+    Buffer,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterLimits {
+    pub max_in_flight: u32,
+    pub max_in_flight_per_endpoint: u32,
+    pub queue_timeout: Duration,
     pub source: SourceSpan,
 }
 
@@ -305,6 +441,11 @@ pub struct GatewaySummary {
 pub struct ClusterSummary {
     pub id: String,
     pub protocol: ClusterProtocol,
+    pub load_balance: LoadBalancePolicy,
+    pub endpoint_count: usize,
+    pub active_health: bool,
+    pub passive_health: bool,
+    pub retry_max_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,7 +477,7 @@ impl Compiler {
         discovered_dependencies.dedup();
         let result = (|| {
             validate_document_identity(&merged)?;
-            let resources = compile_resources(&merged)?;
+            let (resources, warnings) = compile_resources(&merged)?;
 
             let mut builder = ProgramBuilder::new(&merged, &resources);
             let listeners = builder.compile_listeners()?;
@@ -366,6 +507,7 @@ impl Compiler {
                     .into_iter()
                     .map(|located| located.value)
                     .collect(),
+                warnings,
             })
         })();
         result.map_err(|error: CompileError| {
@@ -839,8 +981,11 @@ fn validate_document_identity(merged: &MergedSource) -> Result<(), CompileError>
     }
 }
 
-fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, CompileError> {
+fn compile_resources(
+    merged: &MergedSource,
+) -> Result<(CompiledResources, Vec<Diagnostic>), CompileError> {
     let mut resources = CompiledResources::default();
+    let mut warnings = Vec::new();
     for (name, located) in &merged.certificates {
         if name.trim().is_empty() {
             return Err(semantic_error_at(
@@ -890,34 +1035,30 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 located.span_at(&format!("{}.endpoints", located.field_path)),
             ));
         }
-        let mut endpoints = Vec::new();
-        for (index, endpoint) in located.value.endpoints.iter().enumerate() {
-            let endpoint_span =
-                located.span_at(&format!("{}.endpoints[{index}]", located.field_path));
-            let url = Url::parse(endpoint).map_err(|error| {
-                semantic_error_at(
-                    "resource.endpoint",
-                    format!("invalid endpoint `{endpoint}`: {error}"),
-                    endpoint_span.clone(),
-                )
-            })?;
-            if !matches!(url.scheme(), "http" | "https")
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(semantic_error_at(
-                    "resource.endpoint",
+        let endpoints = compile_cluster_endpoints(located)?;
+        let load_balance_path = format!("{}.load_balance.policy", located.field_path);
+        let load_balance = parse_load_balance_policy(
+            &located.value.load_balance.policy,
+            &located.span_at(&load_balance_path),
+        )?;
+        if load_balance == LoadBalancePolicy::RoundRobin
+            && let Some(endpoint) = endpoints.iter().find(|endpoint| endpoint.weight != 1)
+        {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "resource.cluster_round_robin_weight",
                     format!(
-                        "endpoint `{endpoint}` must be an http(s) origin/path without credentials, query, or fragment"
+                        "round_robin requires endpoint `{}` to have weight 1",
+                        endpoint.name
                     ),
-                    endpoint_span,
-                ));
-            }
-            endpoints.push(url);
+                    endpoint.weight_source.clone(),
+                )
+                .with_help("use `weighted_round_robin`, or set every endpoint weight to 1"),
+            ));
         }
+        let health = compile_cluster_health(located)?;
+        let retry = compile_retry(located, &mut warnings)?;
+        let limits = compile_cluster_limits(located)?;
         let id = ResourceId::new(format!("cluster:{name}"));
         resources.clusters.insert(
             id.clone(),
@@ -925,6 +1066,10 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                 id,
                 protocol,
                 endpoints,
+                load_balance,
+                health,
+                retry,
+                limits,
                 connect_timeout: parse_duration(
                     &located.value.connect_timeout,
                     &located.span_at(&format!("{}.connect_timeout", located.field_path)),
@@ -979,7 +1124,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
             },
         );
     }
-    Ok(resources)
+    Ok((resources, warnings))
 }
 
 fn compile_listener_transport(
@@ -2044,6 +2189,8 @@ fn error_class(source: ErrorClassSource) -> ErrorClass {
         ErrorClassSource::Timeout => ErrorClass::Timeout,
         ErrorClassSource::UpstreamConnect => ErrorClass::UpstreamConnect,
         ErrorClassSource::UpstreamProtocol => ErrorClass::UpstreamProtocol,
+        ErrorClassSource::UpstreamUnavailable => ErrorClass::UpstreamUnavailable,
+        ErrorClassSource::UpstreamOverloaded => ErrorClass::UpstreamOverloaded,
         ErrorClassSource::SiteIo => ErrorClass::SiteIo,
         ErrorClassSource::TemplateLimit => ErrorClass::TemplateLimit,
         ErrorClassSource::BodyUnavailable => ErrorClass::BodyUnavailable,
@@ -2053,6 +2200,21 @@ fn error_class(source: ErrorClassSource) -> ErrorClass {
 }
 
 fn parse_duration(source: &str, source_span: &SourceSpan) -> Result<Duration, CompileError> {
+    parse_duration_with_zero_policy(source, source_span, false)
+}
+
+fn parse_nonnegative_duration(
+    source: &str,
+    source_span: &SourceSpan,
+) -> Result<Duration, CompileError> {
+    parse_duration_with_zero_policy(source, source_span, true)
+}
+
+fn parse_duration_with_zero_policy(
+    source: &str,
+    source_span: &SourceSpan,
+    allow_zero: bool,
+) -> Result<Duration, CompileError> {
     let (number, multiplier) = if let Some(number) = source.strip_suffix("ms") {
         (number, 1u64)
     } else if let Some(number) = source.strip_suffix('s') {
@@ -2083,7 +2245,7 @@ fn parse_duration(source: &str, source_span: &SourceSpan) -> Result<Duration, Co
             source_span.clone(),
         ))
     })?;
-    if millis == 0 {
+    if millis == 0 && !allow_zero {
         return Err(CompileError::one(Diagnostic::new(
             "config.duration",
             "duration must be greater than zero",
@@ -2110,6 +2272,494 @@ fn parse_cluster_protocol(
             .with_help("use `auto`, `http1`, or `h2`"),
         )),
     }
+}
+
+fn compile_cluster_endpoints(
+    located: &Located<ClusterSource>,
+) -> Result<Vec<ClusterEndpointSpec>, CompileError> {
+    let mut endpoints = Vec::with_capacity(located.value.endpoints.len());
+    let mut names = BTreeMap::<String, SourceSpan>::new();
+    for (index, endpoint) in located.value.endpoints.iter().enumerate() {
+        let base_path = format!("{}.endpoints[{index}]", located.field_path);
+        let base_span = located.span_at(&base_path);
+        let (name, url_source, weight, name_span, url_span, weight_span) = match endpoint {
+            ClusterEndpointSource::Shorthand(url) => (
+                format!("endpoint-{index}"),
+                url.as_str(),
+                1_u64,
+                base_span.clone(),
+                base_span.clone(),
+                base_span.clone(),
+            ),
+            ClusterEndpointSource::Structured(endpoint) => (
+                endpoint.name.clone(),
+                endpoint.url.as_str(),
+                endpoint.weight,
+                located.span_at(&format!("{base_path}.name")),
+                located.span_at(&format!("{base_path}.url")),
+                located.span_at(&format!("{base_path}.weight")),
+            ),
+        };
+        validate_endpoint_name(&name, &name_span)?;
+        if let Some(first) = names.insert(name.clone(), name_span.clone()) {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "resource.endpoint_duplicate",
+                    format!("duplicate endpoint name `{name}`"),
+                    name_span,
+                )
+                .with_label("first endpoint with this name", first.clone())
+                .with_related("first endpoint definition", first),
+            ));
+        }
+        let weight = u16::try_from(weight)
+            .ok()
+            .filter(|weight| (1..=1_000).contains(weight))
+            .ok_or_else(|| {
+                CompileError::one(
+                    Diagnostic::new(
+                        "resource.endpoint_weight",
+                        format!("endpoint `{name}` weight must be in 1..=1000"),
+                        weight_span.clone(),
+                    )
+                    .with_help("choose an integer weight from 1 through 1000"),
+                )
+            })?;
+        let url = parse_endpoint_url(url_source, &url_span)?;
+        endpoints.push(ClusterEndpointSpec {
+            name,
+            url,
+            weight,
+            name_source: name_span,
+            url_source: url_span,
+            weight_source: weight_span,
+            source: base_span,
+        });
+    }
+    Ok(endpoints)
+}
+
+fn validate_endpoint_name(name: &str, source: &SourceSpan) -> Result<(), CompileError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.endpoint_name",
+                format!("invalid endpoint name `{name}`"),
+                source.clone(),
+            )
+            .with_help("use 1 to 128 ASCII letters, digits, dots, underscores, or hyphens"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_endpoint_url(source: &str, source_span: &SourceSpan) -> Result<Url, CompileError> {
+    let url = Url::parse(source).map_err(|error| {
+        semantic_error_at(
+            "resource.endpoint",
+            format!("invalid endpoint `{source}`: {error}"),
+            source_span.clone(),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(semantic_error_at(
+            "resource.endpoint",
+            format!(
+                "endpoint `{source}` must be an http(s) origin/path without credentials, query, or fragment"
+            ),
+            source_span.clone(),
+        ));
+    }
+    Ok(url)
+}
+
+fn parse_load_balance_policy(
+    source: &str,
+    source_span: &SourceSpan,
+) -> Result<LoadBalancePolicy, CompileError> {
+    match source {
+        "round_robin" => Ok(LoadBalancePolicy::RoundRobin),
+        "weighted_round_robin" => Ok(LoadBalancePolicy::WeightedRoundRobin),
+        "least_requests" => Ok(LoadBalancePolicy::LeastRequests),
+        _ => Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_load_balance",
+                format!("unsupported load-balancing policy `{source}`"),
+                source_span.clone(),
+            )
+            .with_help("use `round_robin`, `weighted_round_robin`, or `least_requests`"),
+        )),
+    }
+}
+
+fn compile_cluster_health(
+    located: &Located<ClusterSource>,
+) -> Result<ClusterHealthSpec, CompileError> {
+    let health_path = format!("{}.health", located.field_path);
+    let active = located
+        .value
+        .health
+        .active
+        .as_ref()
+        .map(|source| compile_active_health(source, located, &format!("{health_path}.active")))
+        .transpose()?;
+    let passive = located
+        .value
+        .health
+        .passive
+        .as_ref()
+        .map(|source| compile_passive_health(source, located, &format!("{health_path}.passive")))
+        .transpose()?;
+    Ok(ClusterHealthSpec { active, passive })
+}
+
+fn compile_active_health(
+    source: &ActiveHealthSource,
+    located: &Located<ClusterSource>,
+    field_path: &str,
+) -> Result<ActiveHealthSpec, CompileError> {
+    let path_span = located.span_at(&format!("{field_path}.path"));
+    if !source.path.starts_with('/')
+        || source.path.starts_with("//")
+        || PathAndQuery::from_str(&source.path).is_err()
+    {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_health_path",
+                format!(
+                    "health-check path `{}` is not valid origin-form",
+                    source.path
+                ),
+                path_span,
+            )
+            .with_help("use an absolute path such as `/healthz`, optionally with a query"),
+        ));
+    }
+    if source.healthy_statuses.is_empty() {
+        return Err(semantic_error_at(
+            "resource.cluster_health_status",
+            "active health checks require at least one healthy status range",
+            located.span_at(&format!("{field_path}.healthy_statuses")),
+        ));
+    }
+    let healthy_statuses = compile_status_ranges(
+        &source.healthy_statuses,
+        located,
+        &format!("{field_path}.healthy_statuses"),
+        "resource.cluster_health_status",
+    )?;
+    validate_positive(
+        source.healthy_threshold,
+        "resource.cluster_health_threshold",
+        "healthy_threshold",
+        located.span_at(&format!("{field_path}.healthy_threshold")),
+    )?;
+    validate_positive(
+        source.unhealthy_threshold,
+        "resource.cluster_health_threshold",
+        "unhealthy_threshold",
+        located.span_at(&format!("{field_path}.unhealthy_threshold")),
+    )?;
+    Ok(ActiveHealthSpec {
+        path: source.path.clone(),
+        interval: parse_duration(
+            &source.interval,
+            &located.span_at(&format!("{field_path}.interval")),
+        )?,
+        timeout: parse_duration(
+            &source.timeout,
+            &located.span_at(&format!("{field_path}.timeout")),
+        )?,
+        healthy_statuses,
+        healthy_threshold: source.healthy_threshold,
+        unhealthy_threshold: source.unhealthy_threshold,
+        source: located.span_at(field_path),
+    })
+}
+
+fn compile_passive_health(
+    source: &PassiveHealthSource,
+    located: &Located<ClusterSource>,
+    field_path: &str,
+) -> Result<PassiveHealthSpec, CompileError> {
+    validate_positive(
+        source.consecutive_failures,
+        "resource.cluster_passive_threshold",
+        "consecutive_failures",
+        located.span_at(&format!("{field_path}.consecutive_failures")),
+    )?;
+    Ok(PassiveHealthSpec {
+        consecutive_failures: source.consecutive_failures,
+        eject_for: parse_duration(
+            &source.eject_for,
+            &located.span_at(&format!("{field_path}.eject_for")),
+        )?,
+        source: located.span_at(field_path),
+    })
+}
+
+fn compile_retry(
+    located: &Located<ClusterSource>,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<RetrySpec, CompileError> {
+    let source: &RetrySource = &located.value.retry;
+    let field_path = format!("{}.retry", located.field_path);
+    validate_positive(
+        source.max_attempts,
+        "resource.cluster_retry_attempts",
+        "max_attempts",
+        located.span_at(&format!("{field_path}.max_attempts")),
+    )?;
+    validate_positive(
+        source.max_concurrent_retries,
+        "resource.cluster_retry_concurrency",
+        "max_concurrent_retries",
+        located.span_at(&format!("{field_path}.max_concurrent_retries")),
+    )?;
+
+    let mut methods = Vec::with_capacity(source.methods.len());
+    let mut method_names = BTreeSet::new();
+    for (index, method) in source.methods.iter().enumerate() {
+        let method_span = located.span_at(&format!("{field_path}.methods[{index}]"));
+        let parsed = Method::from_bytes(method.as_bytes()).map_err(|error| {
+            CompileError::one(Diagnostic::new(
+                "resource.cluster_retry_method",
+                format!("invalid retry method `{method}`: {error}"),
+                method_span.clone(),
+            ))
+        })?;
+        if !method_names.insert(parsed.as_str().to_owned()) {
+            return Err(semantic_error_at(
+                "resource.cluster_retry_method",
+                format!("duplicate retry method `{method}`"),
+                method_span,
+            ));
+        }
+        if parsed == Method::POST {
+            warnings.push(
+                Diagnostic::warning(
+                    "resource.cluster_retry_post",
+                    "retrying POST requires the operator to guarantee request idempotency",
+                    method_span,
+                )
+                .with_help("remove POST unless the upstream operation is safe to repeat"),
+            );
+        }
+        methods.push(parsed);
+    }
+
+    let mut retry_on = Vec::with_capacity(source.retry_on.len());
+    let mut causes = BTreeSet::new();
+    for (index, cause) in source.retry_on.iter().enumerate() {
+        let cause_span = located.span_at(&format!("{field_path}.retry_on[{index}]"));
+        let cause = parse_retry_cause(cause, &cause_span)?;
+        if !causes.insert(cause) {
+            return Err(semantic_error_at(
+                "resource.cluster_retry_cause",
+                format!("duplicate retry cause `{}`", cause.as_str()),
+                cause_span,
+            ));
+        }
+        retry_on.push(cause);
+    }
+    let statuses = compile_status_ranges(
+        &source.statuses,
+        located,
+        &format!("{field_path}.statuses"),
+        "resource.cluster_retry_status",
+    )?;
+    if source.max_attempts > 1 && methods.is_empty() {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_retry_methods",
+                "retry max_attempts greater than 1 requires at least one explicit method",
+                located.span_at(&format!("{field_path}.methods")),
+            )
+            .with_help("list only methods whose upstream operations are safe to repeat"),
+        ));
+    }
+    if source.max_attempts > 1 && retry_on.is_empty() && statuses.is_empty() {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_retry_trigger",
+                "retry max_attempts greater than 1 requires a retry_on cause or status",
+                located.span_at(field_path.as_str()),
+            )
+            .with_help("configure explicit pre-response-head failures or response statuses"),
+        ));
+    }
+    Ok(RetrySpec {
+        max_attempts: source.max_attempts,
+        methods,
+        retry_on,
+        statuses,
+        request_body: compile_retry_body(&source.request_body, located, &field_path)?,
+        max_concurrent_retries: source.max_concurrent_retries,
+        source: located.span_at(&field_path),
+    })
+}
+
+fn parse_retry_cause(source: &str, source_span: &SourceSpan) -> Result<RetryCause, CompileError> {
+    match source {
+        "connect_failure" => Ok(RetryCause::ConnectFailure),
+        "response_header_timeout" => Ok(RetryCause::ResponseHeaderTimeout),
+        "refused_stream" => Ok(RetryCause::RefusedStream),
+        "reset" => Ok(RetryCause::Reset),
+        _ => Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_retry_cause",
+                format!("unsupported retry cause `{source}`"),
+                source_span.clone(),
+            )
+            .with_help(
+                "use `connect_failure`, `response_header_timeout`, `refused_stream`, or `reset`",
+            ),
+        )),
+    }
+}
+
+fn compile_retry_body(
+    source: &RetryRequestBodySource,
+    located: &Located<ClusterSource>,
+    retry_path: &str,
+) -> Result<RetryRequestBodySpec, CompileError> {
+    let field_path = format!("{retry_path}.request_body");
+    let mode_span = located.span_at(&format!("{field_path}.mode"));
+    let mode = match source.mode.as_str() {
+        "none" => RetryBodyMode::None,
+        "buffer" => RetryBodyMode::Buffer,
+        _ => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "resource.cluster_retry_body_mode",
+                    format!("unsupported retry request-body mode `{}`", source.mode),
+                    mode_span,
+                )
+                .with_help("use `none` or `buffer`"),
+            ));
+        }
+    };
+    Ok(RetryRequestBodySpec {
+        mode,
+        max_bytes: parse_byte_size(
+            &source.max_bytes,
+            &located.span_at(&format!("{field_path}.max_bytes")),
+        )?,
+        source: located.span_at(&field_path),
+    })
+}
+
+fn compile_cluster_limits(located: &Located<ClusterSource>) -> Result<ClusterLimits, CompileError> {
+    let source = &located.value.limits;
+    let field_path = format!("{}.limits", located.field_path);
+    validate_positive(
+        source.max_in_flight,
+        "resource.cluster_limit",
+        "max_in_flight",
+        located.span_at(&format!("{field_path}.max_in_flight")),
+    )?;
+    validate_positive(
+        source.max_in_flight_per_endpoint,
+        "resource.cluster_limit",
+        "max_in_flight_per_endpoint",
+        located.span_at(&format!("{field_path}.max_in_flight_per_endpoint")),
+    )?;
+    Ok(ClusterLimits {
+        max_in_flight: source.max_in_flight,
+        max_in_flight_per_endpoint: source.max_in_flight_per_endpoint,
+        queue_timeout: parse_nonnegative_duration(
+            &source.queue_timeout,
+            &located.span_at(&format!("{field_path}.queue_timeout")),
+        )?,
+        source: located.span_at(&field_path),
+    })
+}
+
+fn compile_status_ranges(
+    sources: &[StatusRangeSource],
+    located: &Located<ClusterSource>,
+    field_path: &str,
+    code: &'static str,
+) -> Result<Vec<StatusRange>, CompileError> {
+    let mut ranges = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        ranges.push(parse_status_range(
+            source,
+            code,
+            &located.span_at(&format!("{field_path}[{index}]")),
+        )?);
+    }
+    Ok(ranges)
+}
+
+fn parse_status_range(
+    source: &StatusRangeSource,
+    code: &'static str,
+    source_span: &SourceSpan,
+) -> Result<StatusRange, CompileError> {
+    let source = match source {
+        StatusRangeSource::Code(code) => code.to_string(),
+        StatusRangeSource::Text(source) => source.clone(),
+    };
+    let (start, end) = source
+        .split_once('-')
+        .map_or((source.as_str(), source.as_str()), |(start, end)| {
+            (start, end)
+        });
+    let parse = |value: &str| {
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|value| StatusCode::from_u16(*value).is_ok())
+    };
+    let Some(start) = parse(start) else {
+        return Err(invalid_status_range(code, &source, source_span));
+    };
+    let Some(end) = parse(end) else {
+        return Err(invalid_status_range(code, &source, source_span));
+    };
+    if start > end {
+        return Err(invalid_status_range(code, &source, source_span));
+    }
+    Ok(StatusRange { start, end })
+}
+
+fn invalid_status_range(code: &'static str, source: &str, span: &SourceSpan) -> CompileError {
+    CompileError::one(
+        Diagnostic::new(
+            code,
+            format!("invalid HTTP status or closed range `{source}`"),
+            span.clone(),
+        )
+        .with_help("use a status such as `503` or an inclusive range such as `200-299`"),
+    )
+}
+
+fn validate_positive(
+    value: u32,
+    code: &'static str,
+    name: &str,
+    source: SourceSpan,
+) -> Result<(), CompileError> {
+    if value == 0 {
+        return Err(semantic_error_at(
+            code,
+            format!("{name} must be greater than zero"),
+            source,
+        ));
+    }
+    Ok(())
 }
 
 fn parse_byte_size(source: &str, source_span: &SourceSpan) -> Result<u64, CompileError> {
@@ -2320,7 +2970,7 @@ mod tests {
 
     use http::StatusCode;
     use oxidase_core::{
-        HeaderTransforms, RespondBody, ServiceId, ServiceKind, ServiceNode, SourceSpan,
+        ErrorClass, HeaderTransforms, RespondBody, ServiceId, ServiceKind, ServiceNode, SourceSpan,
     };
     use tempfile::tempdir;
 
@@ -2397,6 +3047,58 @@ listeners:
     }
 
     #[test]
+    fn recover_compiles_cluster_availability_error_classes() {
+        let (_directory, path) = write_config(
+            r#"
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: recover
+    service:
+      type: respond
+      body:
+        text: primary
+    handlers:
+      - classes: [upstream_unavailable, upstream_overloaded]
+        service:
+          type: respond
+          body:
+            text: recovered
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("Recover classes compile");
+        let program = gateway
+            .program_for("public")
+            .expect("listener program exists");
+        let ServiceKind::Recover { handlers, .. } = &program
+            .graph
+            .get(&program.entry)
+            .expect("Recover entry exists")
+            .kind
+        else {
+            panic!("listener entry must be Recover");
+        };
+
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            handlers[0].classes,
+            [
+                ErrorClass::UpstreamUnavailable,
+                ErrorClass::UpstreamOverloaded,
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
     fn cluster_protocol_defaults_to_auto_for_legacy_endpoint_shorthand() {
         let (_directory, path) = write_config(
             r#"api_version: oxidase.dev/v1alpha1
@@ -2421,7 +3123,9 @@ listeners:
             .get(&oxidase_core::ResourceId::new("cluster:api"))
             .expect("cluster is compiled");
         assert_eq!(cluster.protocol, super::ClusterProtocol::Auto);
-        assert_eq!(cluster.endpoints[0].as_str(), "http://127.0.0.1:3000/");
+        assert_eq!(cluster.endpoints[0].name, "endpoint-0");
+        assert_eq!(cluster.endpoints[0].weight, 1);
+        assert_eq!(cluster.endpoints[0].url.as_str(), "http://127.0.0.1:3000/");
         assert_eq!(gateway.summary().clusters.len(), 1);
         assert_eq!(
             gateway.summary().clusters[0].protocol,
@@ -2518,6 +3222,292 @@ resources:
                 .to_string()
                 .contains("unknown field `upstream_protocol`")
         );
+    }
+
+    #[test]
+    fn compiles_structured_resilient_cluster_policy_and_post_warning() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: api-a
+          url: https://127.0.0.1:8443/base
+          weight: 2
+        - name: api-b
+          url: https://127.0.0.1:9443
+          weight: 1
+      load_balance:
+        policy: weighted_round_robin
+      health:
+        active:
+          path: /healthz?ready=1
+          interval: 5s
+          timeout: 1s
+          healthy_statuses: ["200-299", 304]
+          healthy_threshold: 2
+          unhealthy_threshold: 3
+        passive:
+          consecutive_failures: 4
+          eject_for: 30s
+      retry:
+        max_attempts: 3
+        methods: [GET, POST]
+        retry_on: [connect_failure, response_header_timeout, refused_stream, reset]
+        statuses: [502, "503-504"]
+        request_body:
+          mode: buffer
+          max_bytes: 64KiB
+        max_concurrent_retries: 16
+      limits:
+        max_in_flight: 512
+        max_in_flight_per_endpoint: 128
+        queue_timeout: 0ms
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("resilient cluster compiles");
+        let cluster = &gateway.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")];
+        assert_eq!(cluster.endpoints.len(), 2);
+        assert_eq!(cluster.endpoints[0].name, "api-a");
+        assert_eq!(cluster.endpoints[0].weight, 2);
+        assert_eq!(
+            cluster.load_balance,
+            super::LoadBalancePolicy::WeightedRoundRobin
+        );
+        let active = cluster.health.active.as_ref().expect("active health plan");
+        assert_eq!(active.path, "/healthz?ready=1");
+        assert!(active.healthy_statuses[0].contains(250));
+        assert!(active.healthy_statuses[1].contains(304));
+        assert_eq!(
+            cluster
+                .health
+                .passive
+                .as_ref()
+                .expect("passive health plan")
+                .consecutive_failures,
+            4
+        );
+        assert_eq!(cluster.retry.max_attempts, 3);
+        assert_eq!(
+            cluster.retry.methods,
+            [http::Method::GET, http::Method::POST]
+        );
+        assert_eq!(cluster.retry.retry_on.len(), 4);
+        assert_eq!(
+            cluster.retry.request_body.mode,
+            super::RetryBodyMode::Buffer
+        );
+        assert_eq!(cluster.retry.request_body.max_bytes, 65_536);
+        assert_eq!(cluster.limits.max_in_flight, 512);
+        assert_eq!(cluster.limits.queue_timeout, std::time::Duration::ZERO);
+        assert_eq!(gateway.warnings.len(), 1);
+        assert_eq!(gateway.warnings[0].code, "resource.cluster_retry_post");
+        assert_eq!(
+            gateway.warnings[0].primary.field_path,
+            "resources.clusters.api.retry.methods[1]"
+        );
+        let summary = &gateway.summary().clusters[0];
+        assert_eq!(
+            summary.load_balance,
+            super::LoadBalancePolicy::WeightedRoundRobin
+        );
+        assert_eq!(summary.endpoint_count, 2);
+        assert!(summary.active_health);
+        assert!(summary.passive_health);
+        assert_eq!(summary.retry_max_attempts, 3);
+    }
+
+    #[test]
+    fn rejects_duplicate_endpoint_names_with_both_definition_spans() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: duplicate
+          url: https://one.example
+        - name: duplicate
+          url: https://two.example
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let error = Compiler::compile_path(path).expect_err("duplicate endpoint must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "resource.endpoint_duplicate");
+        assert_eq!(
+            diagnostic.primary.field_path,
+            "resources.clusters.api.endpoints[1].name"
+        );
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(
+            diagnostic.labels[0].span.field_path,
+            "resources.clusters.api.endpoints[0].name"
+        );
+    }
+
+    #[test]
+    fn validates_endpoint_weight_and_round_robin_weight_semantics() {
+        for (weight, expected_code) in [
+            ("0", "resource.endpoint_weight"),
+            ("1001", "resource.endpoint_weight"),
+            ("2", "resource.cluster_round_robin_weight"),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: api-a
+          url: https://one.example
+          weight: {weight}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid weight policy fails");
+            assert_eq!(error.diagnostics[0].code, expected_code);
+            assert_eq!(
+                error.diagnostics[0].primary.field_path,
+                "resources.clusters.api.endpoints[0].weight"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_health_path_status_range_and_threshold_spans() {
+        for (fragment, code, field_path) in [
+            (
+                "path: https://example.test/health",
+                "resource.cluster_health_path",
+                "resources.clusters.api.health.active.path",
+            ),
+            (
+                "healthy_statuses: [\"299-200\"]",
+                "resource.cluster_health_status",
+                "resources.clusters.api.health.active.healthy_statuses[0]",
+            ),
+            (
+                "healthy_threshold: 0",
+                "resource.cluster_health_threshold",
+                "resources.clusters.api.health.active.healthy_threshold",
+            ),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints: [https://one.example]
+      health:
+        active:
+          {fragment}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid health policy fails");
+            assert_eq!(error.diagnostics[0].code, code);
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unknown_retry_policy_at_exact_fields() {
+        for (retry, code, field_path) in [
+            (
+                "max_attempts: 0",
+                "resource.cluster_retry_attempts",
+                "resources.clusters.api.retry.max_attempts",
+            ),
+            (
+                "max_attempts: 2\n        methods: [GET]\n        retry_on: [socket_magic]",
+                "resource.cluster_retry_cause",
+                "resources.clusters.api.retry.retry_on[0]",
+            ),
+            (
+                "max_attempts: 2\n        retry_on: [connect_failure]",
+                "resource.cluster_retry_methods",
+                "resources.clusters.api.retry.methods",
+            ),
+            (
+                "request_body:\n          mode: unlimited\n          max_bytes: 1KiB",
+                "resource.cluster_retry_body_mode",
+                "resources.clusters.api.retry.request_body.mode",
+            ),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints: [https://one.example]
+      retry:
+        {retry}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid retry policy fails");
+            assert_eq!(error.diagnostics[0].code, code);
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+        }
+    }
+
+    #[test]
+    fn rejects_zero_concurrency_limits_but_accepts_zero_queue_timeout() {
+        for field in ["max_in_flight", "max_in_flight_per_endpoint"] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints: [https://one.example]
+      limits:
+        {field}: 0
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("zero limit fails");
+            assert_eq!(error.diagnostics[0].code, "resource.cluster_limit");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path,
+                format!("resources.clusters.api.limits.{field}")
+            );
+        }
     }
 
     #[test]
