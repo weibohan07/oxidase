@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Request, StatusCode};
@@ -575,4 +575,83 @@ async fn rotates_certificate_and_service_atomically_without_rebinding_the_socket
         .shutdown()
         .await
         .expect("gateway shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual transport benchmark; run with --release --ignored --nocapture"]
+async fn tls_http1_http2_smoke_benchmark() {
+    let request_iterations = std::env::var("OXIDASE_TRANSPORT_BENCH_REQUESTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000)
+        .max(1);
+    let handshake_iterations = std::env::var("OXIDASE_TRANSPORT_BENCH_HANDSHAKES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .max(1);
+    let identity = identity(&["benchmark.example.test"]);
+    let gateway = start_gateway(&identity, "benchmark", "h2, http1").await;
+    let h1_config = client_config(&[&identity], &[b"http/1.1"]);
+    let h2_config = client_config(&[&identity], &[b"h2"]);
+
+    let started = Instant::now();
+    for _ in 0..handshake_iterations {
+        let stream = connect_tls(
+            gateway.address,
+            "benchmark.example.test",
+            Arc::clone(&h1_config),
+        )
+        .await;
+        std::hint::black_box(stream.get_ref().1.alpn_protocol());
+    }
+    let tls_elapsed = started.elapsed();
+
+    let mut h1 = http1_client(
+        gateway.address,
+        "benchmark.example.test",
+        Arc::clone(&h1_config),
+    )
+    .await;
+    let started = Instant::now();
+    for _ in 0..request_iterations {
+        std::hint::black_box(send_http1(&mut h1.sender, "benchmark.example.test").await);
+    }
+    let h1_elapsed = started.elapsed();
+
+    let h2 = http2_client(
+        gateway.address,
+        "benchmark.example.test",
+        Arc::clone(&h2_config),
+    )
+    .await;
+    let started = Instant::now();
+    let mut completed = 0;
+    while completed < request_iterations {
+        let batch = (request_iterations - completed).min(32);
+        let mut requests = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            let mut sender = h2.sender.clone();
+            requests.push(tokio::spawn(async move {
+                send_http2(&mut sender, "benchmark.example.test").await
+            }));
+        }
+        for request in requests {
+            std::hint::black_box(request.await.expect("benchmark H2 request joins"));
+        }
+        completed += batch;
+    }
+    let h2_elapsed = started.elapsed();
+
+    println!(
+        "transport_benchmark tls_handshakes={handshake_iterations} tls_ms={} h1_requests={request_iterations} h1_ms={} h2_requests={request_iterations} h2_ms={}",
+        tls_elapsed.as_millis(),
+        h1_elapsed.as_millis(),
+        h2_elapsed.as_millis(),
+    );
+    gateway
+        .running
+        .shutdown()
+        .await
+        .expect("benchmark gateway shuts down");
 }

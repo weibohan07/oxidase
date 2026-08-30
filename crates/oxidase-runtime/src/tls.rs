@@ -756,7 +756,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use oxidase_config::{CertificateSpec, SniCertificateSpec, SniPattern, TlsListenerSpec};
     use oxidase_core::{ResourceId, SourceSpan};
@@ -1084,5 +1084,78 @@ mod tests {
         let failure = PreparedCertificateResolver::prepare(&source, &certificates)
             .expect_err("an incompatible certificate SAN must fail preparation");
         assert_eq!(failure.diagnostic.code, "tls.sni_certificate_name");
+    }
+
+    #[test]
+    #[ignore = "manual SNI resolver benchmark; run with --release --ignored --nocapture"]
+    fn sni_resolver_smoke_benchmark() {
+        let iterations = std::env::var("OXIDASE_SNI_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000_000)
+            .max(1);
+        let directory = tempdir().expect("temporary directory is available");
+        let inputs = [
+            ("default", identity(&["default.example.test"])),
+            ("api", identity(&["api.example.test"])),
+            ("internal", identity(&["*.internal.example.test"])),
+        ];
+        let mut certificates = BTreeMap::new();
+        for (name, generated) in &inputs {
+            let source = certificate_spec(
+                directory.path(),
+                name,
+                &generated.certificate_pem,
+                &generated.private_key_pem,
+            );
+            certificates.insert(
+                source.id.clone(),
+                Arc::new(
+                    PreparedCertificate::prepare(&source).expect("benchmark certificate prepares"),
+                ),
+            );
+        }
+        let source = TlsListenerSpec {
+            default_certificate: ResourceId::new("certificate:default"),
+            default_certificate_source: SourceSpan::synthetic(
+                "listeners[0].tls.default_certificate",
+            ),
+            sni: vec![
+                SniCertificateSpec {
+                    pattern: SniPattern::Exact("api.example.test".to_owned()),
+                    certificate: ResourceId::new("certificate:api"),
+                    source: SourceSpan::synthetic("listeners[0].tls.sni.api.example.test"),
+                    certificate_source: SourceSpan::synthetic(
+                        "listeners[0].tls.sni.api.example.test",
+                    ),
+                },
+                SniCertificateSpec {
+                    pattern: SniPattern::Wildcard("internal.example.test".to_owned()),
+                    certificate: ResourceId::new("certificate:internal"),
+                    source: SourceSpan::synthetic("listeners[0].tls.sni[*.internal.example.test]"),
+                    certificate_source: SourceSpan::synthetic(
+                        "listeners[0].tls.sni[*.internal.example.test]",
+                    ),
+                },
+            ],
+            handshake_timeout: Duration::from_secs(5),
+            source: SourceSpan::synthetic("listeners[0].tls"),
+        };
+        let resolver = PreparedCertificateResolver::prepare(&source, &certificates)
+            .expect("benchmark SNI resolver prepares");
+        let names = [
+            Some("api.example.test"),
+            Some("node.internal.example.test"),
+            Some("unknown.example.test"),
+            None,
+        ];
+        let started = Instant::now();
+        for index in 0..iterations {
+            std::hint::black_box(resolver.resolve_prepared(names[index % names.len()]));
+        }
+        println!(
+            "sni_resolver_benchmark iterations={iterations} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
 }
