@@ -36,6 +36,14 @@ If-Range 与单 Range。Range 只作用于 GET：有效单 bytes Range 在 ident
 使用 identity；HEAD、未知/错误 unit、multiple Range，以及 identity 被排除的请求都
 回到正常的完整表示协商路径。
 
+Cluster 可选择 `auto`、强制 `http1` 或强制 `h2` 的上游连接池。从 H2 downstream 到
+显式 H2 Cluster，Proxy 会保留 DATA 与 trailer frame。当前 TLS/H2 集成 fixture 已验证
+请求/响应 trailers 与透明的多消息 `application/grpc`，包括终止 trailer frame 中的
+`grpc-status` 和 `grpc-message`。Oxidase 不解析 protobuf、不重新解释 gRPC status，
+也不实现 gRPC-Web。额外 socket fixture 已验证 HTTP/1 chunked request trailer 转发到
+H2，以及声明过的 H2 response trailer 转发给接受 trailer 的 HTTP/1 client；未声明的
+trailer 会使 stream 失败，而不会被静默丢弃。
+
 所有 Listener program 共享一张不可变 `ServiceGraph`；普通请求既不复制整图，也
 不收集 explain trace。所有已处理响应统一经过 framing finalizer，Gateway/Oxista
 源码不能控制 hop-by-hop 或 framing Header。HEAD、1xx、204、205、304 的 body 规则
@@ -76,8 +84,15 @@ label 的最左侧 wildcard，最后使用 default certificate。保留的 Liste
 下原子生效；既有连接继续使用旧 TLS 状态。每个 HTTP/2 stream 在请求开始时固定当前
 snapshot，Listener retire 时先 graceful shutdown/GOAWAY，再受 drain deadline 约束。
 
-明文 h2c、客户端证书认证/mTLS、ACME、OCSP stapling、用户自定义 cipher suite、
-HTTP/2 WebSocket、Upgrade/trailers 与 gRPC 尚未实现；OXT `extends/block` 也仍不支持。
+HTTP/1 Proxy 已有 server-local trusted Upgrade 路径：普通 Respond/OXR/Transform
+无法伪造它的 101 响应，验证后的 tunnel 由 connection 持有并执行双向流式复制与
+有界指标。其 parser、上游 101 匹配、部分字节计数和内存内 copy/cancellation 已有
+聚焦测试。Socket fixture 已覆盖明文/TLS HTTP/1 handshake、双向 WebSocket-style
+bytes、任一侧关闭、固定旧 snapshot 的 reload、新 Listener、drain timeout、trusted
+capability 隔离与有界指标。Oxidase 透明转发 WebSocket 流量，不解析其 frame。HTTP/2
+extended CONNECT、任意 CONNECT、明文 h2c、gRPC-Web、客户端证书认证/mTLS、ACME、
+OCSP stapling 与用户自定义 cipher suite 均未实现；OXT `extends/block` 同样不支持。
+
 使用 `serve --watch` 可以启用保留 last-known-good 的原子 reload；通过独立、显式的
 `--admin-bind` 可启用健康检查与有界指标。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
@@ -173,6 +188,9 @@ oxidase test <config>
 OXT/OXR/asset、缺失声明路径、template root、预压缩候选及父目录也会保留在 watcher
 依赖集中。Retired HTTP/1 connection 会收到 graceful shutdown，HTTP/2 connection
 会收到 GOAWAY：空闲连接及时关闭，活跃请求/stream 继续在其固定快照上 drain。
+trusted HTTP/1 tunnel 同样固定原 snapshot 并由 connection task 持有；Listener 保留时
+继续运行，retire 时使用同一 drain window，超时后才强制取消。这一生命周期已实现，
+且 reload/new-Listener/drain-timeout 行为已有 socket fixture 覆盖。
 
 ## 开发
 

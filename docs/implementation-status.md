@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `feat/v0.3-inbound-tls-h2`
-- public starting point: diagnostics merge `4a9123f582f2ac76dc3ecf3ab24b071d64ffc067`
+- active milestone branch: `feat/v0.3-protocol-bridging`
+- public starting point: inbound TLS/H2 merge `c96943ece30c701d1bb89066b8cba30e4d273ba2`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -134,6 +134,23 @@ Last updated: 2026-08-30
   target-Host and sanitized connection-derived Forwarded/X-Forwarded policy,
   preserves raw path/query representation, enforces response-header and body-idle
   timeouts, and returns classified Failed outcomes.
+- Cluster source compiles `auto`, `http1`, or `h2` upstream protocol policy. The
+  server owns one long-lived pool for each policy: `auto` uses HTTPS ALPN and
+  cleartext HTTP/1, `http1` forces HTTP/1.1, and `h2` requires TLS H2 or uses
+  cleartext H2 prior knowledge. Protocol changes participate in Cluster identity.
+- Proxy body adapters preserve DATA, trailer, end-of-stream, and error frames.
+  HTTP/2 retains only the exact `TE: trailers` value and rejects connection-specific
+  fields; HTTP/1 continues to remove Connection-nominated and hop-by-hop fields. A
+  TLS/H2 black-box fixture proves request/response trailers and opaque multi-message
+  gRPC forwarding, including terminal `grpc-status` and `grpc-message` trailers.
+- HTTP/1 ingress and Proxy now carry a server-local trusted Upgrade capability.
+  Validation requires a single protocol and matching upstream 101; non-Proxy
+  Services and user Header policy cannot construct it. Focused tests cover malformed
+  handshakes, H2/CONNECT rejection, protocol matching, partial-byte accounting,
+  bidirectional copy, and first-EOF cancellation. Socket tests cover plain/TLS H1,
+  both byte directions and close origins, reload with a pinned old tunnel and a new
+  Listener, drain-time abort, non-Proxy 101 isolation, unsupported H2/h2c/CONNECT
+  rejection, and bounded tunnel metrics.
 - A real fixture-upstream test covers POST streaming, query preservation, forwarding
   headers, response header sanitization, connection-pool reuse, and timeout mapping.
 - Phase 6 reload compiles and prepares a complete candidate against the current
@@ -162,8 +179,10 @@ Last updated: 2026-08-30
 - Transport metrics use configured Listener names and fixed protocol/result enums
   for accepted and active HTTP/1 or HTTP/2 connections, TLS handshake
   result/duration, negotiated ALPN, active H2 streams, and graceful/forced H2
-  shutdown. Raw SNI, peer IP, paths, certificate paths, and request data are not
-  metric labels.
+  shutdown. Trusted tunnels add started/active counts, two fixed byte directions,
+  and fixed downstream-closed/upstream-closed/error/cancelled terminations. Dropping
+  an unfinished tunnel records cancellation. Raw SNI, peer IP, paths, Upgrade
+  protocols, certificate paths, and request data are not metric labels.
 - Data-plane HTTP/1 mode and the management HTTP/1 listener use Hyper's timer-backed
   30-second request-header timeout. Real socket tests cover a stalled header, progress within
   the deadline, upstream mid-body truncation, paced versus stalled response bodies,
@@ -205,13 +224,20 @@ Last updated: 2026-08-30
   and tested. The integration suite includes real listener/upstream/watcher/TLS/H2
   tests that require permission to bind loopback ports; manual smoke benchmarks
   remain ignored by the ordinary test suite.
+- An H2 Proxy with an explicitly H2 Cluster can transparently forward request and
+  response trailers plus opaque gRPC DATA. The integration fixture verifies terminal
+  gRPC status/message trailers without a gRPC-specific Service or protobuf parser.
+- An HTTP/1 Proxy can transparently pass a validated generic Upgrade, including
+  WebSocket traffic, over cleartext or TLS. Socket fixtures cover both byte/close
+  directions, snapshot pinning across reload, new-Listener publication, bounded
+  retirement drain, trusted-capability isolation, and tunnel telemetry.
 
 ## Not implemented
 
-- WebSocket/upgrades, trailers/gRPC, OXT inheritance, and a self-contained executable
-  snapshot artifact.
+- gRPC-Web, OXT inheritance, and a self-contained executable snapshot artifact.
 - Cleartext h2c, client-certificate authentication/mTLS, ACME, OCSP stapling,
-  user-configurable TLS cipher suites, HTTP/3, and HTTP/2 extended CONNECT.
+  user-configurable TLS cipher suites, HTTP/3, HTTP/2 extended CONNECT, arbitrary
+  CONNECT tunneling, and WebTransport.
 - Cluster health checks/retries, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
 
@@ -240,7 +266,14 @@ Last updated: 2026-08-30
   unknown units, malformed syntax, and multipart ranges are deliberately ignored.
 - Cleartext listeners support HTTP/1.1 only; configuring `h2` is rejected because
   h2c is not implemented. HTTPS listeners support HTTP/1.1 and HTTP/2 through ALPN,
-  but upgrades, trailers, gRPC, and a new `100-continue` policy remain unimplemented.
+  and H2-to-H2 Proxy paths preserve validated trailers. Basic transparent gRPC
+  forwards opaque DATA and terminal trailers only; protobuf inspection, gRPC-Web,
+  and a new `100-continue` policy remain unimplemented.
+- H2-to-HTTP/1 response trailers require both downstream `TE: trailers` and an
+  initial trusted `Trailer` declaration; an unsafe or undeclared late field ends the
+  body with a protocol error rather than being dropped. Wire fixtures cover both
+  H1-to-H2 request trailers and declared/rejected H2-to-H1 response cases. HTTP/1
+  Upgrade is Proxy-only and capability-gated; H2 extended CONNECT remains rejected.
 - TLS uses rustls defaults for TLS 1.2/1.3. Client certificates/mTLS, ACME, OCSP
   stapling, custom cipher-suite policy, and automatic certificate issuance are not
   implemented. SNI wildcards match exactly one left-most DNS label and must appear
@@ -277,6 +310,10 @@ Last updated: 2026-08-30
 - `cargo deny check` passed advisories, bans, licenses, and sources; one allowed
   indirect `syn` duplicate-version warning remains.
 - All seven fuzz harnesses compile; no long fuzz campaign was run.
+- Protocol-bridging targeted validation passed seven trusted-Upgrade unit tests,
+  six trailer/gRPC/reset loopback tests, and five plain/TLS Upgrade socket tests.
+  These results cover the supported cross-protocol trailer and HTTP/1 WebSocket
+  matrix, but do not stand in for the final locked workspace or hosted gates.
 - Example `check`, three declarative tests, `explain`, and deterministic manifest
   compilation passed.
 - Release-mode local smoke measurements on this machine: 100,000 short executions
@@ -296,8 +333,9 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Preserve DATA/trailer frames across every body adapter and add protocol-aware
-   HTTP/1 versus HTTP/2 Header sanitization.
-2. Add transparent H2 gRPC forwarding with request/response trailers.
-3. Add capability-gated HTTP/1 WebSocket Upgrade without weakening ordinary response
-   finalization.
+1. Complete the protocol-bridging PR's locked local and hosted gates without
+   weakening the tested framing boundaries.
+2. Build PreparedCluster health, balancing, concurrency, and safe retry semantics on
+   the now-qualified H1/H2 pools.
+3. Add sustained protocol/cluster fuzz and soak campaigns during final v0.3 alpha
+   hardening; ordinary CI should retain only bounded integration smoke coverage.

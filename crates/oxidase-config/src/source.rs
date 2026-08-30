@@ -42,11 +42,17 @@ pub(crate) struct CertificateSource {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterSource {
+    #[serde(default = "default_cluster_protocol")]
+    pub protocol: String,
     pub endpoints: Vec<String>,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: String,
     #[serde(default = "default_response_timeout")]
     pub response_timeout: String,
+}
+
+fn default_cluster_protocol() -> String {
+    "auto".to_owned()
 }
 
 fn default_connect_timeout() -> String {

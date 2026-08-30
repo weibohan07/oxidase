@@ -320,7 +320,8 @@ fn normalize_dependencies(dependencies: &mut Vec<std::path::PathBuf>) {
 }
 
 fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
-    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v1");
+    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v2");
+    hash.field_bytes("protocol", source.protocol.as_str().as_bytes());
     hash.field_u64("endpoint_count", source.endpoints.len() as u64);
     for endpoint in &source.endpoints {
         hash.field_bytes("endpoint", endpoint.as_str().as_bytes());
@@ -401,7 +402,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use oxidase_config::{ClusterSpec, Compiler};
+    use oxidase_config::{ClusterProtocol, ClusterSpec, Compiler};
     use oxidase_core::{ResourceId, SourceSpan};
     use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
     use tempfile::tempdir;
@@ -452,21 +453,37 @@ listeners:
 
     #[test]
     fn cluster_digest_is_stable_and_preserves_endpoint_preference_order() {
-        let cluster = |endpoints: &[&str]| ClusterSpec {
+        let cluster = |protocol, endpoints: &[&str]| ClusterSpec {
             id: ResourceId::new("cluster:api"),
+            protocol,
             endpoints: endpoints
                 .iter()
                 .map(|endpoint| Url::parse(endpoint).expect("fixture endpoint is valid"))
                 .collect(),
             connect_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_secs(2),
+            protocol_source: SourceSpan::synthetic("clusters.api.protocol"),
             source: SourceSpan::synthetic("clusters.api"),
         };
-        let first = cluster(&["http://127.0.0.1:3000", "https://example.test/"]);
-        let same = cluster(&["http://127.0.0.1:3000", "https://example.test/"]);
-        let reordered = cluster(&["https://example.test/", "http://127.0.0.1:3000"]);
+        let first = cluster(
+            ClusterProtocol::Auto,
+            &["http://127.0.0.1:3000", "https://example.test/"],
+        );
+        let same = cluster(
+            ClusterProtocol::Auto,
+            &["http://127.0.0.1:3000", "https://example.test/"],
+        );
+        let reordered = cluster(
+            ClusterProtocol::Auto,
+            &["https://example.test/", "http://127.0.0.1:3000"],
+        );
+        let forced_h2 = cluster(
+            ClusterProtocol::H2,
+            &["http://127.0.0.1:3000", "https://example.test/"],
+        );
         assert_eq!(cluster_fingerprint(&first), cluster_fingerprint(&same));
         assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&reordered));
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&forced_h2));
     }
 
     #[test]
@@ -534,6 +551,42 @@ listeners:
         assert!(!Arc::ptr_eq(
             &second.resources.sites[&site_id],
             &third.resources.sites[&site_id]
+        ));
+
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - http://127.0.0.1:3000
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("cluster protocol can be updated");
+        let (fourth, reuse) = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("protocol update compiles"),
+            Some(&third),
+        )
+        .expect("protocol update prepares");
+        assert_eq!(reuse.clusters, 0);
+        assert!(!Arc::ptr_eq(
+            &third.resources.clusters[&cluster_id],
+            &fourth.resources.clusters[&cluster_id]
         ));
     }
 

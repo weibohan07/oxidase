@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -33,9 +33,16 @@ use crate::connection::TrackedExecutor;
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
     ConnectionProtocol, H2Shutdown, ListenerTransportMetrics, Metrics, ProductionObserver, TlsAlpn,
-    TlsHandshakeOutcome,
+    TlsHandshakeOutcome, TunnelTermination as TunnelMetricTermination,
 };
-use crate::response::ResponseFinalizer;
+use crate::protocol::{WireProtocol, http1_accepts_trailers};
+use crate::response::{
+    FinalizedResponse, ResponseFinalizationContext, ResponseFinalizationError, ResponseFinalizer,
+};
+use crate::upgrade::{
+    GatewayRequestPayload, TunnelPlan, TunnelTermination as TunnelIoTermination,
+    validate_upgrade_request,
+};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -971,6 +978,7 @@ async fn run_listener(
                     transport_metrics: transport_metrics.clone(),
                     scheme: "http",
                     tls: TlsConnectionMetadata::default(),
+                    tunnel_sender: None,
                 };
                 connections.spawn(async move {
                     serve_connection(
@@ -1242,6 +1250,7 @@ struct GatewayConnectionContext {
     transport_metrics: ListenerTransportMetrics,
     scheme: &'static str,
     tls: TlsConnectionMetadata,
+    tunnel_sender: Option<mpsc::Sender<TunnelPlan>>,
 }
 
 async fn serve_http1_connection<Io>(
@@ -1255,10 +1264,13 @@ async fn serve_http1_connection<Io>(
     let _active_connection = context
         .transport_metrics
         .connection_accepted(ConnectionProtocol::Http1);
-    let service_context = context.clone();
+    let (tunnel_sender, mut tunnel_receiver) = mpsc::channel(1);
+    let mut service_context = context.clone();
+    service_context.tunnel_sender = Some(tunnel_sender);
     let service = service_fn(move |request| handle_request(request, service_context.clone()));
-    let connection =
-        http1_builder(settings.header_read_timeout).serve_connection(TokioIo::new(io), service);
+    let connection = http1_builder(settings.header_read_timeout)
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades();
     tokio::pin!(connection);
     let result = tokio::select! {
         result = &mut connection => result,
@@ -1269,6 +1281,41 @@ async fn serve_http1_connection<Io>(
     };
     if let Err(error) = result {
         tracing::debug!(error = %error, "HTTP/1 connection ended with an error");
+    }
+    if let Ok(tunnel) = tunnel_receiver.try_recv() {
+        let observation = context.transport_metrics.tunnel_started();
+        match tunnel.run().await {
+            Ok(report) => {
+                observation.finish(
+                    report.downstream_to_upstream_bytes,
+                    report.upstream_to_downstream_bytes,
+                    match report.termination {
+                        TunnelIoTermination::DownstreamClosed => {
+                            TunnelMetricTermination::DownstreamClosed
+                        }
+                        TunnelIoTermination::UpstreamClosed => {
+                            TunnelMetricTermination::UpstreamClosed
+                        }
+                        TunnelIoTermination::DownstreamReadError(_)
+                        | TunnelIoTermination::DownstreamWriteError(_)
+                        | TunnelIoTermination::UpstreamReadError(_)
+                        | TunnelIoTermination::UpstreamWriteError(_) => {
+                            TunnelMetricTermination::Error
+                        }
+                    },
+                );
+                tracing::debug!(
+                    downstream_to_upstream_bytes = report.downstream_to_upstream_bytes,
+                    upstream_to_downstream_bytes = report.upstream_to_downstream_bytes,
+                    termination = ?report.termination,
+                    "HTTP/1 upgrade tunnel finished"
+                );
+            }
+            Err(error) => {
+                observation.finish(0, 0, TunnelMetricTermination::Error);
+                tracing::debug!(error = %error, "HTTP/1 upgrade tunnel could not be established");
+            }
+        }
     }
 }
 
@@ -1360,7 +1407,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 }
 
 async fn handle_request(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     context: GatewayConnectionContext,
 ) -> Result<Response<GatewayBody>, Infallible> {
     let GatewayConnectionContext {
@@ -1372,6 +1419,7 @@ async fn handle_request(
         transport_metrics: _,
         scheme,
         tls,
+        tunnel_sender,
     } = context;
     let active_request = metrics.request_started();
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1404,8 +1452,26 @@ async fn handle_request(
         ));
     };
 
+    let request_method = request.method().clone();
+    let wire_protocol = wire_protocol(request.version());
+    let accepts_http1_trailers =
+        wire_protocol == WireProtocol::Http1 && http1_accepts_trailers(request.headers());
+    let pending_upgrade = match validate_upgrade_request(&request) {
+        Ok(Some(candidate)) => Some(candidate.pending(hyper::upgrade::on(&mut request))),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(request_id, error = %error, "HTTP Upgrade request is invalid");
+            metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
+            let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
+            return Ok(instrument_response_body_with_snapshot(
+                response,
+                metrics,
+                active_request,
+                Some(snapshot),
+            ));
+        }
+    };
     let (parts, body) = request.into_parts();
-    let request_method = parts.method.clone();
     let authority = parts
         .headers
         .get(header::HOST)
@@ -1443,22 +1509,46 @@ async fn handle_request(
     let leaves = HyperLeaves::new(snapshot.clone(), proxy);
     let observer = ProductionObserver::new(&metrics, &config_version, &listener_name, request_id);
     let report = Executor::new(&program, &leaves)
-        .execute_observed(RequestFrame::new(metadata), Some(body), &observer)
+        .execute_observed(
+            RequestFrame::new(metadata),
+            Some(GatewayRequestPayload::new(body, pending_upgrade)),
+            &observer,
+        )
         .await;
 
-    let (outcome, status, response) = match report.outcome {
-        ServiceOutcome::Handled(response) => {
-            let status = response.status;
-            (
-                "handled",
-                status,
-                response_from_head(response, &request_method),
-            )
-        }
+    let (outcome, status, response, tunnel) = match report.outcome {
+        ServiceOutcome::Handled(response) => match response_from_head(
+            response,
+            &request_method,
+            ResponseFinalizationContext::new(wire_protocol, accepts_http1_trailers),
+        ) {
+            Ok(FinalizedResponse { response, tunnel }) => {
+                let status = response.status();
+                ("handled", status, response, tunnel)
+            }
+            Err(error) => {
+                tracing::error!(
+                    request_id,
+                    error = ?error,
+                    "trusted response finalization failed"
+                );
+                (
+                    "failed",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    safe_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                        &request_method,
+                    ),
+                    None,
+                )
+            }
+        },
         ServiceOutcome::Declined => (
             "declined",
             StatusCode::NOT_FOUND,
             safe_response(StatusCode::NOT_FOUND, "Not Found", &request_method),
+            None,
         ),
         ServiceOutcome::Failed(error) => {
             tracing::error!(
@@ -1477,8 +1567,31 @@ async fn handle_request(
                     safe_error_body(error.public_status),
                     &request_method,
                 ),
+                None,
             )
         }
+    };
+    let (outcome, status, response) = if let Some(tunnel) = tunnel {
+        match tunnel_sender.and_then(|sender| sender.try_send(tunnel).ok()) {
+            Some(()) => (outcome, status, response),
+            None => {
+                tracing::error!(
+                    request_id,
+                    "trusted Upgrade tunnel has no live HTTP/1 connection owner"
+                );
+                (
+                    "failed",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    safe_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                        &request_method,
+                    ),
+                )
+            }
+        }
+    } else {
+        (outcome, status, response)
     };
     tracing::info!(
         request_id,
@@ -1501,8 +1614,17 @@ async fn handle_request(
 fn response_from_head(
     response: oxidase_core::ResponseHead<GatewayBodyPlan>,
     method: &Method,
-) -> Response<GatewayBody> {
-    ResponseFinalizer::new(method).finalize(response)
+    context: ResponseFinalizationContext,
+) -> Result<FinalizedResponse, ResponseFinalizationError> {
+    ResponseFinalizer::with_context(method, context).finalize_handled(response)
+}
+
+fn wire_protocol(version: Version) -> WireProtocol {
+    if version == Version::HTTP_2 {
+        WireProtocol::Http2
+    } else {
+        WireProtocol::Http1
+    }
 }
 
 fn safe_error_body(status: StatusCode) -> &'static str {
@@ -2176,6 +2298,7 @@ listeners:
                 alpn: Some("h2".to_owned()),
                 version: Some("TLS1.3".to_owned()),
             },
+            tunnel_sender: None,
         }
     }
 
