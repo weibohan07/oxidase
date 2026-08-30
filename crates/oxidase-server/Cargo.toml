@@ -22,11 +22,13 @@ oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-site = { path = "../oxidase-site" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true
 
 [lints]

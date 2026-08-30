@@ -2,6 +2,7 @@
 
 mod executor;
 mod snapshot;
+mod tls;
 
 pub use executor::{
     BoxLeafFuture, ExecutionObserver, ExecutionReport, ExecutionTrace, Executor,
@@ -12,6 +13,10 @@ pub use executor::{
 pub use snapshot::{
     PreparationError, PreparationErrorKind, ResourceRegistry, ResourceReuse, RuntimeSnapshot,
     SnapshotStore,
+};
+pub use tls::{
+    CertificatePreparationErrorKind, PreparedCertificate, PreparedCertificateResolver,
+    PreparedListenerPlan, PreparedTlsListener, TlsListenerPreparationErrorKind,
 };
 
 pub const RUNTIME_FORMAT_VERSION: u32 = 1;

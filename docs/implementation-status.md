@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `feat/v0.3-diagnostics`
-- public starting point: runtime-semantics merge `69d1d538bea493be46fc0dc867ca69016da50a4b`
+- active milestone branch: `feat/v0.3-inbound-tls-h2`
+- public starting point: diagnostics merge `4a9123f582f2ac76dc3ecf3ab24b071d64ffc067`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -80,6 +80,31 @@ Last updated: 2026-08-30
 - Phase 4 Tokio + Hyper HTTP/1.1 data plane with prepare-all listener binding,
   arbitrary root Service execution, connection-derived peer/scheme metadata, safe
   root outcome mapping, structured tracing fields, and bounded graceful drain.
+- Certificate resources are prepared before publication with strict PEM/X.509
+  parsing, exactly one PKCS#8/PKCS#1/SEC1 private key, positive key/leaf consistency
+  validation, and no private material in Debug, diagnostics, manifests, logs, or
+  metrics. Certificate and key paths remain reload dependencies. Reuse identity is
+  the public certificate chain digest; a candidate private key is nevertheless
+  parsed and matched on every preparation before old signing state can be reused.
+- HTTPS listeners use rustls with safe TLS 1.2/1.3 defaults and an explicit ring
+  crypto provider. Exact ASCII SNI names take precedence over one-label left-most
+  wildcards and then the default certificate; SNI rules are checked against leaf
+  subjectAltName during preparation. Handshakes have a configured timeout and ALPN
+  advertises only enabled `h2`/`http/1.1` protocols. Each Listener also has a fixed
+  128-handshake non-waiting concurrency gate; overload closes the new socket instead
+  of queueing an unbounded task.
+- The inbound connection driver supports cleartext HTTP/1.1 and ALPN-selected HTTPS
+  HTTP/1.1 or HTTP/2. HTTP/2 applies bounded concurrent-stream/header-list settings
+  plus configured keepalive, and each request/stream pins the current snapshot at
+  request start rather than pinning one Service snapshot for the entire connection.
+  Request expressions expose connection-derived HTTP version and TLS enabled/SNI/
+  ALPN/version metadata.
+- A retained listener socket loads the published transport plan for each accept.
+  Certificate, Service, protocol, and HTTP-setting changes therefore affect new
+  connections without rebinding, while existing TLS connections retain their old
+  rustls state. Invalid certificate/SNI candidates never publish and last-known-good
+  remains active. Retired HTTP/1 connections receive graceful shutdown; HTTP/2
+  connections receive graceful shutdown/GOAWAY and are aborted only at drain expiry.
 - Site bytes and assets are adapted to HTTP without default collection. Identity,
   Brotli, and gzip representations own independent length/ETag/mtime metadata.
   Quality negotiation, validator precedence, representation-aware 304, If-Range,
@@ -124,17 +149,23 @@ Last updated: 2026-08-30
   missing templates, scanned assets, template roots, backing/precompressed
   candidates, and their parent directories remain watched and can recover without
   another Gateway edit.
-- Retired HTTP/1 connections receive Hyper graceful shutdown. Idle keep-alive closes
-  promptly, active requests finish on their pinned snapshot, and the drain timeout
-  is the only point at which remaining tasks are aborted.
+- Retired HTTP/1 and HTTP/2 connections receive Hyper graceful shutdown. Idle
+  keep-alive closes promptly, HTTP/2 stops admitting new streams, active requests
+  finish on their pinned snapshot, and the drain timeout is the only point at which
+  remaining tasks are aborted.
 - Integration tests prove invalid and bind-conflicting reload rollback, listener
   retain/add/remove behavior, old long-running requests crossing a commit, and new
   requests immediately observing the new version.
 - Phase 7 adds an opt-in, separately bound management listener with live/ready
   health and Prometheus text metrics. Outcome, status-class, latency, active request,
   and reload labels are fixed and bounded.
-- Both data-plane and management HTTP/1 listeners use Hyper's timer-backed 30-second
-  request-header timeout. Real socket tests cover a stalled header, progress within
+- Transport metrics use configured Listener names and fixed protocol/result enums
+  for accepted and active HTTP/1 or HTTP/2 connections, TLS handshake
+  result/duration, negotiated ALPN, active H2 streams, and graceful/forced H2
+  shutdown. Raw SNI, peer IP, paths, certificate paths, and request data are not
+  metric labels.
+- Data-plane HTTP/1 mode and the management HTTP/1 listener use Hyper's timer-backed
+  30-second request-header timeout. Real socket tests cover a stalled header, progress within
   the deadline, upstream mid-body truncation, paced versus stalled response bodies,
   client download cancellation, client upload cancellation, active-request cleanup,
   and post-failure pool reuse.
@@ -169,18 +200,20 @@ Last updated: 2026-08-30
 
 ## Currently runnable
 
-- A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, reloaded, observed, and tested. More than 150
-  workspace tests pass, including real listener/upstream/watcher tests that require
-  permission to bind loopback ports; manual smoke benchmarks remain ignored by the
-  ordinary test suite.
+- A v1alpha1 config and Oxista site can be fully prepared, served over cleartext
+  HTTP/1.1 or TLS HTTP/1.1/HTTP/2, executed in memory, explained, reloaded, observed,
+  and tested. The integration suite includes real listener/upstream/watcher/TLS/H2
+  tests that require permission to bind loopback ports; manual smoke benchmarks
+  remain ignored by the ordinary test suite.
 
 ## Not implemented
 
-- Inbound TLS/HTTP2, WebSocket/upgrades, trailers/gRPC, OXT inheritance, and a
-  self-contained executable snapshot artifact.
-- Cluster health checks/retries, WASM/plugins, ACME, Web UI, Kubernetes integration,
-  HTTP/3, and a general-purpose cache server.
+- WebSocket/upgrades, trailers/gRPC, OXT inheritance, and a self-contained executable
+  snapshot artifact.
+- Cleartext h2c, client-certificate authentication/mTLS, ACME, OCSP stapling,
+  user-configurable TLS cipher suites, HTTP/3, and HTTP/2 extended CONNECT.
+- Cluster health checks/retries, WASM/plugins, Web UI, Kubernetes integration, and a
+  general-purpose cache server.
 
 ## Known limitations
 
@@ -202,11 +235,16 @@ Last updated: 2026-08-30
   rejected until the Value model can represent audited provenance.
 - Symlinked files are checked against the canonical root, but their alias path is not
   indexed in this release; directory symlinks are rejected rather than traversed.
-- Asset negotiation is HTTP/1.1 only and is not a general content-negotiation
-  framework. Range is implemented only for GET and only for one bytes range;
+- Asset negotiation is not a general content-negotiation framework. Range is
+  implemented only for GET and only for one bytes range;
   unknown units, malformed syntax, and multipart ranges are deliberately ignored.
-- Listener serving supports HTTP/1.1 only. TLS, HTTP/2, upgrades, trailers, gRPC,
-  and `100-continue` policy remain unimplemented.
+- Cleartext listeners support HTTP/1.1 only; configuring `h2` is rejected because
+  h2c is not implemented. HTTPS listeners support HTTP/1.1 and HTTP/2 through ALPN,
+  but upgrades, trailers, gRPC, and a new `100-continue` policy remain unimplemented.
+- TLS uses rustls defaults for TLS 1.2/1.3. Client certificates/mTLS, ACME, OCSP
+  stapling, custom cipher-suite policy, and automatic certificate issuance are not
+  implemented. SNI wildcards match exactly one left-most DNS label and must appear
+  literally in the selected leaf certificate subjectAltName.
 - Cluster health checks, retry policy, stable per-cluster health state, and
   configurable Forwarded trust policy are not implemented. The current secure
   default always replaces incoming forwarding metadata.
@@ -258,7 +296,8 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Add the inbound TLS Certificate resource, SNI resolver, and atomic rotation.
-2. Add ALPN-selected HTTP/1.1 and HTTP/2 connection drivers with per-stream snapshot
-   pinning and GOAWAY drain.
-3. Preserve DATA/trailer frames before adding gRPC and trusted HTTP/1 Upgrade paths.
+1. Preserve DATA/trailer frames across every body adapter and add protocol-aware
+   HTTP/1 versus HTTP/2 Header sanitization.
+2. Add transparent H2 gRPC forwarding with request/response trailers.
+3. Add capability-gated HTTP/1 WebSocket Upgrade without weakening ordinary response
+   finalization.

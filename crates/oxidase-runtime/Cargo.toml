@@ -14,9 +14,13 @@ oxidase-config = { path = "../oxidase-config" }
 oxidase-core = { path = "../oxidase-core" }
 oxidase-site = { path = "../oxidase-site" }
 serde_json.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true
 url.workspace = true
 

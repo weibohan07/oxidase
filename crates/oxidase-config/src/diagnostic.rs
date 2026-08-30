@@ -28,6 +28,11 @@ impl CompileError {
         self.discovered_dependencies.dedup();
         self
     }
+
+    pub(crate) fn map_diagnostics(mut self, map: impl FnMut(Diagnostic) -> Diagnostic) -> Self {
+        self.diagnostics = self.diagnostics.into_iter().map(map).collect();
+        self
+    }
 }
 
 impl fmt::Display for CompileError {

@@ -12,8 +12,14 @@ use oxidase_core::{
 };
 use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
+use crate::tls::{
+    CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
+    PreparedListenerPlan, TlsListenerPreparationErrorKind, TlsListenerPreparationFailure,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
+    pub certificates: BTreeMap<ResourceId, Arc<PreparedCertificate>>,
     pub clusters: BTreeMap<ResourceId, Arc<ClusterSpec>>,
     pub sites: BTreeMap<ResourceId, Arc<SiteSnapshot>>,
 }
@@ -25,8 +31,10 @@ pub struct RuntimeSnapshot {
     pub graph: Arc<ServiceGraph>,
     pub resources: ResourceRegistry,
     pub listeners: Vec<CompiledListener>,
+    pub prepared_listeners: Vec<PreparedListenerPlan>,
     pub tests: Vec<ConfigTestSource>,
     summary: GatewaySummary,
+    certificate_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     site_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     cluster_fingerprints: BTreeMap<ResourceId, ContentDigest>,
 }
@@ -89,6 +97,33 @@ impl RuntimeSnapshot {
             site_fingerprints.insert(id.clone(), fingerprint);
             sites.insert(id.clone(), snapshot);
         }
+        let mut certificates = BTreeMap::new();
+        let mut certificate_fingerprints = BTreeMap::new();
+        for (id, source) in &gateway.resources.certificates {
+            // Even when the public chain digest is unchanged, parse and validate
+            // the candidate private key before deciding to reuse the old opaque
+            // signing state. An invalid key-only rotation must never commit.
+            let candidate = PreparedCertificate::prepare(source).map_err(|failure| {
+                preparation_error_from_certificate(id, &dependencies, failure)
+            })?;
+            let fingerprint = candidate.digest;
+            let certificate = previous
+                .filter(|previous| previous.certificate_fingerprints.get(id) == Some(&fingerprint))
+                .and_then(|previous| previous.resources.certificates.get(id).cloned());
+            let certificate = if let Some(certificate) = certificate {
+                reuse.certificates += 1;
+                certificate
+            } else {
+                Arc::new(candidate)
+            };
+            for path in [&source.cert_chain, &source.private_key] {
+                if let Ok(canonical) = path.canonicalize() {
+                    dependencies.push(canonical);
+                }
+            }
+            certificate_fingerprints.insert(id.clone(), fingerprint);
+            certificates.insert(id.clone(), certificate);
+        }
         let mut clusters = BTreeMap::new();
         let mut cluster_fingerprints = BTreeMap::new();
         for (id, source) in gateway.resources.clusters {
@@ -105,9 +140,23 @@ impl RuntimeSnapshot {
             cluster_fingerprints.insert(id.clone(), fingerprint);
             clusters.insert(id, cluster);
         }
+        let prepared_listeners = gateway
+            .listeners
+            .iter()
+            .map(|listener| {
+                PreparedListenerPlan::prepare(listener, &certificates).map_err(|failure| {
+                    preparation_error_from_tls_listener(listener, &dependencies, failure)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         normalize_dependencies(&mut dependencies);
         let mut version_hash = ContentDigestBuilder::new("oxidase/runtime-snapshot/v1");
         version_hash.field_bytes("gateway", gateway.config_version.as_str().as_bytes());
+        for (id, fingerprint) in &certificate_fingerprints {
+            version_hash
+                .field_bytes("certificate_id", id.as_str().as_bytes())
+                .field_digest("certificate_digest", *fingerprint);
+        }
         for (id, fingerprint) in &site_fingerprints {
             version_hash
                 .field_bytes("site_id", id.as_str().as_bytes())
@@ -129,10 +178,16 @@ impl RuntimeSnapshot {
                 config_version,
                 dependencies,
                 graph: gateway.graph,
-                resources: ResourceRegistry { clusters, sites },
+                resources: ResourceRegistry {
+                    certificates,
+                    clusters,
+                    sites,
+                },
                 listeners: gateway.listeners,
+                prepared_listeners,
                 tests: gateway.tests,
                 summary,
+                certificate_fingerprints,
                 site_fingerprints,
                 cluster_fingerprints,
             },
@@ -152,10 +207,18 @@ impl RuntimeSnapshot {
             .find(|candidate| candidate.id.as_str() == listener || candidate.name == listener)
             .map(|listener| ServiceProgram::new(listener.service.clone(), Arc::clone(&self.graph)))
     }
+
+    #[must_use]
+    pub fn prepared_listener_for(&self, listener: &str) -> Option<&PreparedListenerPlan> {
+        self.prepared_listeners
+            .iter()
+            .find(|candidate| candidate.id.as_str() == listener || candidate.name == listener)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceReuse {
+    pub certificates: usize,
     pub sites: usize,
     pub clusters: usize,
 }
@@ -170,8 +233,40 @@ pub struct PreparationError {
 
 #[derive(Debug)]
 pub enum PreparationErrorKind {
+    Certificate(CertificatePreparationErrorKind),
     Fingerprint(String),
     Site(Box<SiteCompileError>),
+    TlsListener(TlsListenerPreparationErrorKind),
+}
+
+fn preparation_error_from_certificate(
+    resource: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+    failure: CertificatePreparationFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::Certificate(failure.kind),
+        diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
+}
+
+fn preparation_error_from_tls_listener(
+    listener: &CompiledListener,
+    existing_dependencies: &[std::path::PathBuf],
+    failure: TlsListenerPreparationFailure,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: ResourceId::new(format!("listener:{}", listener.name)),
+        kind: PreparationErrorKind::TlsListener(failure.kind),
+        diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
 }
 
 fn preparation_error_from_site(
@@ -269,8 +364,10 @@ impl std::error::Error for PreparationError {}
 impl fmt::Display for PreparationErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Certificate(error) => error.fmt(formatter),
             Self::Fingerprint(message) => formatter.write_str(message),
             Self::Site(error) => error.fmt(formatter),
+            Self::TlsListener(error) => error.fmt(formatter),
         }
     }
 }
@@ -306,10 +403,52 @@ mod tests {
 
     use oxidase_config::{ClusterSpec, Compiler};
     use oxidase_core::{ResourceId, SourceSpan};
+    use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
     use tempfile::tempdir;
     use url::Url;
 
     use super::{RuntimeSnapshot, cluster_fingerprint};
+
+    fn write_test_identity(directory: &std::path::Path, names: &[&str]) {
+        let GeneratedCertificate { cert, signing_key } = generate_simple_self_signed(
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("test-only certificate can be generated");
+        fs::write(directory.join("cert.pem"), cert.pem())
+            .expect("test-only certificate can be written");
+        fs::write(directory.join("key.pem"), signing_key.serialize_pem())
+            .expect("test-only private key can be written");
+    }
+
+    fn write_tls_gateway(directory: &std::path::Path) -> std::path::PathBuf {
+        let config = directory.join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: [h2, http1]
+    service:
+      type: respond
+"#,
+        )
+        .expect("TLS gateway can be written");
+        config
+    }
 
     #[test]
     fn cluster_digest_is_stable_and_preserves_endpoint_preference_order() {
@@ -590,6 +729,100 @@ listeners:
                 .reference_chain
                 .iter()
                 .all(|reference| reference.span.is_some())
+        );
+    }
+
+    #[test]
+    fn certificate_dependencies_reuse_and_config_version_follow_public_chain() {
+        let directory = tempdir().expect("temporary directory is available");
+        write_test_identity(directory.path(), &["default.example.test"]);
+        let config = write_tls_gateway(directory.path());
+
+        let first = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("first TLS gateway compiles"),
+        )
+        .expect("first TLS snapshot prepares");
+        let certificate_id = ResourceId::new("certificate:public");
+        let certificate_path = directory
+            .path()
+            .join("cert.pem")
+            .canonicalize()
+            .expect("certificate canonicalizes");
+        let private_key_path = directory
+            .path()
+            .join("key.pem")
+            .canonicalize()
+            .expect("private key canonicalizes");
+        assert!(first.dependencies.contains(&certificate_path));
+        assert!(first.dependencies.contains(&private_key_path));
+        assert_eq!(
+            first.prepared_listeners[0]
+                .tls
+                .as_ref()
+                .expect("listener has TLS")
+                .server_config
+                .alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        let (unchanged, reuse) = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("unchanged TLS gateway compiles"),
+            Some(&first),
+        )
+        .expect("unchanged TLS snapshot prepares");
+        assert_eq!(reuse.certificates, 1);
+        assert_eq!(first.config_version, unchanged.config_version);
+        assert!(Arc::ptr_eq(
+            &first.resources.certificates[&certificate_id],
+            &unchanged.resources.certificates[&certificate_id]
+        ));
+
+        write_test_identity(directory.path(), &["rotated.example.test"]);
+        let (rotated, reuse) = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("rotated TLS gateway compiles"),
+            Some(&unchanged),
+        )
+        .expect("rotated TLS snapshot prepares");
+        assert_eq!(reuse.certificates, 0);
+        assert_ne!(unchanged.config_version, rotated.config_version);
+        assert!(!Arc::ptr_eq(
+            &unchanged.resources.certificates[&certificate_id],
+            &rotated.resources.certificates[&certificate_id]
+        ));
+    }
+
+    #[test]
+    fn invalid_key_only_rotation_is_validated_before_certificate_reuse() {
+        let directory = tempdir().expect("temporary directory is available");
+        write_test_identity(directory.path(), &["default.example.test"]);
+        let config = write_tls_gateway(directory.path());
+        let first = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("first TLS gateway compiles"),
+        )
+        .expect("first TLS snapshot prepares");
+
+        let GeneratedCertificate { signing_key, .. } =
+            generate_simple_self_signed(vec!["other.example.test".to_owned()])
+                .expect("different test-only key can be generated");
+        fs::write(
+            directory.path().join("key.pem"),
+            signing_key.serialize_pem(),
+        )
+        .expect("mismatched key can be written");
+        let error = RuntimeSnapshot::prepare_reusing(
+            Compiler::compile_path(&config).expect("key-rotated gateway compiles"),
+            Some(&first),
+        )
+        .expect_err("a mismatched key must fail rather than reuse the old signing state");
+        assert_eq!(error.diagnostics()[0].code, "tls.key_mismatch");
+        assert!(
+            error.candidate_dependencies.contains(
+                &directory
+                    .path()
+                    .join("key.pem")
+                    .canonicalize()
+                    .expect("candidate private key canonicalizes")
+            )
         );
     }
 }

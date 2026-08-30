@@ -25,10 +25,11 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
-    BodySource, ClusterSource, ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource,
-    InlineServiceSource, ListenerProtocolSource, ListenerSource, PredicateSource,
-    RedirectQuerySource, RequestTransformSource, ResourcesSource, ResponseTransformSource,
-    ServiceSource, SiteSource,
+    BodySource, CertificateSource, ClusterSource, ConfigTestSource, ErrorClassSource,
+    GatewaySource, HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource,
+    HttpVersionSource, InlineServiceSource, ListenerProtocolSource, ListenerSource,
+    PredicateSource, RedirectQuerySource, RequestTransformSource, ResourcesSource,
+    ResponseTransformSource, ServiceSource, SiteSource, TlsListenerSource,
 };
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,7 @@ impl CompiledGateway {
                 .map(|listener| ListenerSummary {
                     name: listener.name.clone(),
                     bind: listener.bind.to_string(),
+                    protocol: listener.protocol,
                     service: listener.service.to_string(),
                 })
                 .collect(),
@@ -74,6 +76,12 @@ impl CompiledGateway {
             clusters: self
                 .resources
                 .clusters
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+            certificates: self
+                .resources
+                .certificates
                 .keys()
                 .map(ToString::to_string)
                 .collect(),
@@ -89,8 +97,24 @@ impl CompiledGateway {
 
 #[derive(Debug, Clone, Default)]
 pub struct CompiledResources {
+    pub certificates: BTreeMap<ResourceId, CertificateSpec>,
     pub clusters: BTreeMap<ResourceId, ClusterSpec>,
     pub sites: BTreeMap<ResourceId, SiteSpec>,
+}
+
+/// Paths and source locations for one inbound TLS certificate resource.
+///
+/// Certificate and private-key bytes are deliberately not part of the
+/// compiled configuration. The server preparation boundary reads and validates
+/// them without making secret material inspectable through this IR.
+#[derive(Debug, Clone)]
+pub struct CertificateSpec {
+    pub id: ResourceId,
+    pub cert_chain: PathBuf,
+    pub private_key: PathBuf,
+    pub cert_chain_source: SourceSpan,
+    pub private_key_source: SourceSpan,
+    pub source: SourceSpan,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +141,121 @@ pub struct CompiledListener {
     pub id: ListenerId,
     pub name: String,
     pub bind: SocketAddr,
+    pub protocol: ListenerProtocol,
+    pub tls: Option<TlsListenerSpec>,
+    pub http: HttpListenerSpec,
     pub service: ServiceId,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerProtocol {
+    Http,
+    Https,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsListenerSpec {
+    pub default_certificate: ResourceId,
+    pub default_certificate_source: SourceSpan,
+    pub sni: Vec<SniCertificateSpec>,
+    pub handshake_timeout: Duration,
+    pub source: SourceSpan,
+}
+
+impl TlsListenerSpec {
+    /// Resolves an already-validated server name using exact-before-wildcard
+    /// precedence and falls back to the configured default certificate.
+    #[must_use]
+    pub fn select_certificate(&self, server_name: Option<&str>) -> &ResourceId {
+        let Some(server_name) = server_name else {
+            return &self.default_certificate;
+        };
+        if let Some(rule) = self.sni.iter().find(|rule| {
+            matches!(rule.pattern, SniPattern::Exact(_)) && rule.pattern.matches(server_name)
+        }) {
+            return &rule.certificate;
+        }
+        self.sni
+            .iter()
+            .filter(|rule| {
+                matches!(rule.pattern, SniPattern::Wildcard(_)) && rule.pattern.matches(server_name)
+            })
+            .max_by_key(|rule| match &rule.pattern {
+                SniPattern::Wildcard(suffix) => suffix.len(),
+                SniPattern::Exact(_) => 0,
+            })
+            .map_or(&self.default_certificate, |rule| &rule.certificate)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SniCertificateSpec {
+    pub pattern: SniPattern,
+    pub certificate: ResourceId,
+    /// Span of the configured SNI mapping key.
+    pub source: SourceSpan,
+    /// Span of the certificate-resource reference value.
+    pub certificate_source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SniPattern {
+    Exact(String),
+    /// A single-label wildcard suffix, stored without the leading `*.`.
+    Wildcard(String),
+}
+
+impl SniPattern {
+    #[must_use]
+    pub fn matches(&self, server_name: &str) -> bool {
+        let server_name = server_name.to_ascii_lowercase();
+        match self {
+            Self::Exact(expected) => server_name == *expected,
+            Self::Wildcard(suffix) => server_name
+                .strip_suffix(suffix)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+        }
+    }
+
+    #[must_use]
+    pub fn normalized_rule(&self) -> String {
+        match self {
+            Self::Exact(name) => name.clone(),
+            Self::Wildcard(suffix) => format!("*.{suffix}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpListenerSpec {
+    pub versions: Vec<HttpVersion>,
+    pub http1: Option<Http1Settings>,
+    pub http2: Option<Http2Settings>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpVersion {
+    Http1,
+    H2,
+}
+
+#[derive(Debug, Clone)]
+pub struct Http1Settings {
+    pub header_read_timeout: Duration,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct Http2Settings {
+    pub max_concurrent_streams: u32,
+    pub max_header_list_size: u32,
+    pub keep_alive_interval: Duration,
+    pub keep_alive_timeout: Duration,
     pub source: SourceSpan,
 }
 
@@ -128,6 +266,7 @@ pub struct GatewaySummary {
     pub dependencies: Vec<String>,
     pub listeners: Vec<ListenerSummary>,
     pub services: Vec<String>,
+    pub certificates: Vec<String>,
     pub clusters: Vec<String>,
     pub sites: Vec<String>,
 }
@@ -136,6 +275,7 @@ pub struct GatewaySummary {
 pub struct ListenerSummary {
     pub name: String,
     pub bind: String,
+    pub protocol: ListenerProtocol,
     pub service: String,
 }
 
@@ -154,6 +294,10 @@ impl Compiler {
         }
         let discovered_dependencies = loader.discovered_dependencies();
         let merged = loader.finish(path.clone());
+        let mut discovered_dependencies = discovered_dependencies;
+        discovered_dependencies.extend(merged.dependency_candidates.iter().cloned());
+        discovered_dependencies.sort();
+        discovered_dependencies.dedup();
         let result = (|| {
             validate_document_identity(&merged)?;
             let resources = compile_resources(&merged)?;
@@ -271,6 +415,13 @@ impl SourceContext<'_> {
         self.spans.map_or_else(
             || span(self.file, field_path),
             |spans| indexed_span(self.file, field_path, spans),
+        )
+    }
+
+    fn key_span(self, field_path: &str) -> SourceSpan {
+        self.spans.map_or_else(
+            || span(self.file, field_path),
+            |spans| indexed_key_span(self.file, field_path, spans),
         )
     }
 }
@@ -457,7 +608,31 @@ impl Loader {
                         }),
                 );
         }
+        for located in merged.certificates.values() {
+            let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+            for declared in [&located.value.cert_chain, &located.value.private_key] {
+                let resolved = resolve_declared_path(directory, declared);
+                merged
+                    .dependencies
+                    .extend(candidate_dependencies(&resolved));
+                merged
+                    .dependency_candidates
+                    .extend(candidate_dependencies(&resolved));
+            }
+        }
+        merged.dependencies.sort();
+        merged.dependencies.dedup();
+        merged.dependency_candidates.sort();
+        merged.dependency_candidates.dedup();
         merged
+    }
+}
+
+fn resolve_declared_path(directory: &Path, declared: &Path) -> PathBuf {
+    if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        directory.join(declared)
     }
 }
 
@@ -465,11 +640,13 @@ impl Loader {
 struct MergedSource {
     root: PathBuf,
     dependencies: Vec<PathBuf>,
+    dependency_candidates: Vec<PathBuf>,
     source_files: BTreeMap<PathBuf, SourceFileId>,
     span_indexes: BTreeMap<PathBuf, Arc<FieldSpanIndex>>,
     hash: ContentDigest,
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
+    certificates: BTreeMap<String, Located<CertificateSource>>,
     clusters: BTreeMap<String, Located<ClusterSource>>,
     sites: BTreeMap<String, Located<SiteSource>>,
     services: BTreeMap<String, Located<ServiceSource>>,
@@ -510,6 +687,21 @@ fn merge_resources(
     file: &Path,
     spans: Arc<FieldSpanIndex>,
 ) {
+    for (name, certificate) in resources.certificates {
+        let field_path = field_path_child("resources.certificates", &name);
+        insert_located(
+            &mut merged.certificates,
+            name.clone(),
+            Located {
+                value: certificate,
+                file: file.to_path_buf(),
+                field_path,
+                spans: spans.clone(),
+            },
+            &mut merged.merge_errors,
+            "certificate resource",
+        );
+    }
     for (name, cluster) in resources.clusters {
         insert_located(
             &mut merged.clusters,
@@ -613,6 +805,44 @@ fn validate_document_identity(merged: &MergedSource) -> Result<(), CompileError>
 
 fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, CompileError> {
     let mut resources = CompiledResources::default();
+    for (name, located) in &merged.certificates {
+        if name.trim().is_empty() {
+            return Err(semantic_error_at(
+                "resource.certificate_name",
+                "certificate resource name cannot be empty",
+                located.span(),
+            ));
+        }
+        let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+        let cert_chain_path = format!("{}.cert_chain", located.field_path);
+        let private_key_path = format!("{}.private_key", located.field_path);
+        if located.value.cert_chain.as_os_str().is_empty() {
+            return Err(semantic_error_at(
+                "resource.certificate_path",
+                "certificate chain path cannot be empty",
+                located.span_at(&cert_chain_path),
+            ));
+        }
+        if located.value.private_key.as_os_str().is_empty() {
+            return Err(semantic_error_at(
+                "resource.certificate_path",
+                "private key path cannot be empty",
+                located.span_at(&private_key_path),
+            ));
+        }
+        let id = ResourceId::new(format!("certificate:{name}"));
+        resources.certificates.insert(
+            id.clone(),
+            CertificateSpec {
+                id,
+                cert_chain: resolve_declared_path(directory, &located.value.cert_chain),
+                private_key: resolve_declared_path(directory, &located.value.private_key),
+                cert_chain_source: located.span_at(&cert_chain_path),
+                private_key_source: located.span_at(&private_key_path),
+                source: located.span(),
+            },
+        );
+    }
     for (name, located) in &merged.clusters {
         if located.value.endpoints.is_empty() {
             return Err(semantic_error_at(
@@ -711,6 +941,358 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
     Ok(resources)
 }
 
+fn compile_listener_transport(
+    source: &ListenerSource,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<(ListenerProtocol, Option<TlsListenerSpec>, HttpListenerSpec), CompileError> {
+    let protocol = match source.protocol {
+        ListenerProtocolSource::Http => ListenerProtocol::Http,
+        ListenerProtocolSource::Https => ListenerProtocol::Https,
+    };
+    let tls_path = format!("{field_path}.tls");
+    let tls = match (protocol, source.tls.as_ref()) {
+        (ListenerProtocol::Http, Some(_)) => {
+            return Err(diagnostic_at(
+                "listener.tls_forbidden",
+                "`tls` is only valid when listener protocol is `https`",
+                context,
+                &tls_path,
+            ));
+        }
+        (ListenerProtocol::Http, None) => None,
+        (ListenerProtocol::Https, None) => {
+            return Err(diagnostic_at(
+                "listener.tls_required",
+                "HTTPS listeners require a `tls` configuration",
+                context,
+                &format!("{field_path}.protocol"),
+            )
+            .map_diagnostics(|diagnostic| {
+                diagnostic.with_help("set `tls.default_certificate` to a certificate resource")
+            }));
+        }
+        (ListenerProtocol::Https, Some(tls)) => {
+            Some(compile_tls_listener(tls, resources, context, &tls_path)?)
+        }
+    };
+    let http = compile_http_listener(
+        &source.http,
+        protocol,
+        context,
+        &format!("{field_path}.http"),
+    )?;
+    Ok((protocol, tls, http))
+}
+
+fn compile_tls_listener(
+    source: &TlsListenerSource,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<TlsListenerSpec, CompileError> {
+    let default_path = format!("{field_path}.default_certificate");
+    let default_certificate = certificate_reference(
+        &source.default_certificate,
+        resources,
+        context,
+        &default_path,
+    )?;
+    let sni_path = format!("{field_path}.sni");
+    let mut normalized = BTreeMap::<SniPattern, SourceSpan>::new();
+    let mut sni = Vec::with_capacity(source.sni.len());
+    for (rule, certificate) in &source.sni {
+        let rule_path = field_path_child(&sni_path, rule);
+        let rule_span = context.key_span(&rule_path);
+        let pattern = parse_sni_pattern(rule).map_err(|message| {
+            CompileError::one(
+                Diagnostic::new("listener.sni", message, rule_span.clone()).with_help(
+                    "use an ASCII DNS name or one left-most wildcard such as `*.example.com`",
+                ),
+            )
+        })?;
+        if let Some(previous) = normalized.get(&pattern) {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "listener.sni_duplicate",
+                    format!(
+                        "duplicate normalized SNI rule `{}`",
+                        pattern.normalized_rule()
+                    ),
+                    rule_span.clone(),
+                )
+                .with_label("first rule", previous.clone())
+                .with_related("first rule", previous.clone()),
+            ));
+        }
+        normalized.insert(pattern.clone(), rule_span.clone());
+        sni.push(SniCertificateSpec {
+            pattern,
+            certificate: certificate_reference(certificate, resources, context, &rule_path)?,
+            source: rule_span,
+            certificate_source: context.span(&rule_path),
+        });
+    }
+    sni.sort_by(|left, right| left.pattern.cmp(&right.pattern));
+    Ok(TlsListenerSpec {
+        default_certificate,
+        default_certificate_source: context.span(&default_path),
+        sni,
+        handshake_timeout: parse_duration(
+            &source.handshake_timeout,
+            &context.span(&format!("{field_path}.handshake_timeout")),
+        )?,
+        source: context.span(field_path),
+    })
+}
+
+fn certificate_reference(
+    name: &str,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<ResourceId, CompileError> {
+    let id = ResourceId::new(format!("certificate:{name}"));
+    if resources.certificates.contains_key(&id) {
+        Ok(id)
+    } else {
+        Err(diagnostic_at(
+            "listener.certificate_reference",
+            format!("certificate resource `{name}` does not exist"),
+            context,
+            field_path,
+        )
+        .map_diagnostics(|diagnostic| {
+            diagnostic.with_help("define it under `resources.certificates`")
+        }))
+    }
+}
+
+fn compile_http_listener(
+    source: &HttpListenerSource,
+    protocol: ListenerProtocol,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<HttpListenerSpec, CompileError> {
+    let versions = source.versions.clone().unwrap_or_else(|| match protocol {
+        ListenerProtocol::Http => vec![HttpVersionSource::Http1],
+        ListenerProtocol::Https => vec![HttpVersionSource::H2, HttpVersionSource::Http1],
+    });
+    if versions.is_empty() {
+        return Err(diagnostic_at(
+            "listener.http_versions",
+            "at least one HTTP version must be enabled",
+            context,
+            &format!("{field_path}.versions"),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut compiled_versions = Vec::with_capacity(versions.len());
+    for (index, version) in versions.into_iter().enumerate() {
+        let version = match version {
+            HttpVersionSource::Http1 => HttpVersion::Http1,
+            HttpVersionSource::H2 => HttpVersion::H2,
+        };
+        if protocol == ListenerProtocol::Http && version == HttpVersion::H2 {
+            return Err(diagnostic_at(
+                "listener.h2c_unsupported",
+                "cleartext HTTP/2 (h2c) is not supported",
+                context,
+                &format!("{field_path}.versions[{index}]"),
+            )
+            .map_diagnostics(|diagnostic| {
+                diagnostic.with_help("use `protocol: https` for HTTP/2 or enable only `http1`")
+            }));
+        }
+        if !seen.insert(version) {
+            return Err(diagnostic_at(
+                "listener.http_version_duplicate",
+                format!(
+                    "HTTP version `{}` is configured more than once",
+                    http_version_name(version)
+                ),
+                context,
+                &format!("{field_path}.versions[{index}]"),
+            ));
+        }
+        compiled_versions.push(version);
+    }
+    let http1 = compile_http1_settings(source.http1.as_ref(), &seen, context, field_path)?;
+    let http2 = compile_http2_settings(source.http2.as_ref(), &seen, context, field_path)?;
+    Ok(HttpListenerSpec {
+        versions: compiled_versions,
+        http1,
+        http2,
+        source: context.span(field_path),
+    })
+}
+
+fn compile_http1_settings(
+    source: Option<&Http1SettingsSource>,
+    versions: &BTreeSet<HttpVersion>,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<Option<Http1Settings>, CompileError> {
+    let enabled = versions.contains(&HttpVersion::Http1);
+    if !enabled {
+        if source.is_some() {
+            return Err(diagnostic_at(
+                "listener.http1_settings_disabled",
+                "`http1` settings require HTTP/1 to be enabled in `versions`",
+                context,
+                &format!("{field_path}.http1"),
+            ));
+        }
+        return Ok(None);
+    }
+    let default;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            default = Http1SettingsSource::default();
+            &default
+        }
+    };
+    Ok(Some(Http1Settings {
+        header_read_timeout: parse_duration(
+            &source.header_read_timeout,
+            &context.span(&format!("{field_path}.http1.header_read_timeout")),
+        )?,
+        source: context.span(&format!("{field_path}.http1")),
+    }))
+}
+
+fn compile_http2_settings(
+    source: Option<&Http2SettingsSource>,
+    versions: &BTreeSet<HttpVersion>,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<Option<Http2Settings>, CompileError> {
+    let enabled = versions.contains(&HttpVersion::H2);
+    if !enabled {
+        if source.is_some() {
+            return Err(diagnostic_at(
+                "listener.http2_settings_disabled",
+                "`http2` settings require `h2` to be enabled in `versions`",
+                context,
+                &format!("{field_path}.http2"),
+            ));
+        }
+        return Ok(None);
+    }
+    let default;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            default = Http2SettingsSource::default();
+            &default
+        }
+    };
+    if source.max_concurrent_streams == 0 {
+        return Err(diagnostic_at(
+            "listener.http2_max_concurrent_streams",
+            "HTTP/2 max_concurrent_streams must be greater than zero",
+            context,
+            &format!("{field_path}.http2.max_concurrent_streams"),
+        ));
+    }
+    let max_header_list_size = parse_byte_size(
+        &source.max_header_list_size,
+        &context.span(&format!("{field_path}.http2.max_header_list_size")),
+    )?;
+    let max_header_list_size = u32::try_from(max_header_list_size).map_err(|_| {
+        semantic_error_at(
+            "config.byte_size",
+            "HTTP/2 max_header_list_size exceeds the supported 32-bit range",
+            context.span(&format!("{field_path}.http2.max_header_list_size")),
+        )
+    })?;
+    Ok(Some(Http2Settings {
+        max_concurrent_streams: source.max_concurrent_streams,
+        max_header_list_size,
+        keep_alive_interval: parse_duration(
+            &source.keep_alive_interval,
+            &context.span(&format!("{field_path}.http2.keep_alive_interval")),
+        )?,
+        keep_alive_timeout: parse_duration(
+            &source.keep_alive_timeout,
+            &context.span(&format!("{field_path}.http2.keep_alive_timeout")),
+        )?,
+        source: context.span(&format!("{field_path}.http2")),
+    }))
+}
+
+fn http_version_name(version: HttpVersion) -> &'static str {
+    match version {
+        HttpVersion::Http1 => "http1",
+        HttpVersion::H2 => "h2",
+    }
+}
+
+fn parse_sni_pattern(source: &str) -> Result<SniPattern, String> {
+    if !source.is_ascii() {
+        return Err(format!(
+            "SNI rule `{source}` must contain only ASCII DNS characters"
+        ));
+    }
+    let normalized = source.to_ascii_lowercase();
+    if let Some(suffix) = normalized.strip_prefix("*.") {
+        if suffix.contains('*') {
+            return Err(format!(
+                "SNI wildcard `{source}` may contain only one wildcard"
+            ));
+        }
+        validate_dns_name(suffix, true).map(|()| SniPattern::Wildcard(suffix.to_owned()))
+    } else {
+        if normalized.contains('*') {
+            return Err(format!(
+                "SNI wildcard in `{source}` must be the complete left-most label"
+            ));
+        }
+        validate_dns_name(&normalized, false).map(|()| SniPattern::Exact(normalized))
+    }
+}
+
+fn validate_dns_name(name: &str, wildcard_suffix: bool) -> Result<(), String> {
+    let max_length = if wildcard_suffix { 251 } else { 253 };
+    if name.is_empty() || name.len() > max_length || name.ends_with('.') {
+        return Err(format!("invalid SNI DNS name `{name}`"));
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        let kind = if wildcard_suffix {
+            "wildcard suffix"
+        } else {
+            "name"
+        };
+        return Err(format!(
+            "SNI {kind} `{name}` must be a DNS name, not an IP address"
+        ));
+    }
+    for label in name.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("invalid SNI DNS name `{name}`"));
+        }
+    }
+    if name
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!(
+            "SNI DNS name `{name}` must not have an all-numeric final label"
+        ));
+    }
+    Ok(())
+}
+
 struct ProgramBuilder<'a> {
     source: &'a MergedSource,
     resources: &'a CompiledResources,
@@ -754,10 +1336,13 @@ impl<'a> ProgramBuilder<'a> {
                     located.span_at(&format!("{}.bind", located.field_path)),
                 )
             })?;
-            match located.value.protocol {
-                ListenerProtocolSource::Http => {}
-            }
             let context = self.source.context(&located.file);
+            let (protocol, tls, http) = compile_listener_transport(
+                &located.value,
+                self.resources,
+                context,
+                &located.field_path,
+            )?;
             let service = self.compile_service(
                 &located.value.service,
                 context,
@@ -767,6 +1352,9 @@ impl<'a> ProgramBuilder<'a> {
                 id: ListenerId::new(format!("listener:{}", located.value.name)),
                 name: located.value.name.clone(),
                 bind,
+                protocol,
+                tls,
+                http,
                 service,
                 source: located.span(),
             });
@@ -1464,6 +2052,49 @@ fn parse_duration(source: &str, source_span: &SourceSpan) -> Result<Duration, Co
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_byte_size(source: &str, source_span: &SourceSpan) -> Result<u64, CompileError> {
+    let (number, multiplier) = if let Some(number) = source.strip_suffix("KiB") {
+        (number, 1_024u64)
+    } else if let Some(number) = source.strip_suffix("MiB") {
+        (number, 1_024u64 * 1_024)
+    } else if let Some(number) = source.strip_suffix("GiB") {
+        (number, 1_024u64 * 1_024 * 1_024)
+    } else if let Some(number) = source.strip_suffix('B') {
+        (number, 1u64)
+    } else {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "config.byte_size",
+                format!("invalid byte size `{source}`"),
+                source_span.clone(),
+            )
+            .with_help("use an integer followed by `B`, `KiB`, `MiB`, or `GiB`"),
+        ));
+    };
+    let number = number.parse::<u64>().map_err(|_| {
+        CompileError::one(Diagnostic::new(
+            "config.byte_size",
+            format!("invalid byte size `{source}`"),
+            source_span.clone(),
+        ))
+    })?;
+    let bytes = number.checked_mul(multiplier).ok_or_else(|| {
+        CompileError::one(Diagnostic::new(
+            "config.byte_size",
+            format!("byte size `{source}` is too large"),
+            source_span.clone(),
+        ))
+    })?;
+    if bytes == 0 {
+        return Err(CompileError::one(Diagnostic::new(
+            "config.byte_size",
+            "byte size must be greater than zero",
+            source_span.clone(),
+        )));
+    }
+    Ok(bytes)
+}
+
 fn yaml_value(source: &serde_yaml_ng::Value) -> Result<Value, String> {
     match source {
         serde_yaml_ng::Value::Null => Ok(Value::Null),
@@ -1534,6 +2165,23 @@ fn indexed_span(path: &Path, field_path: &str, spans: &FieldSpanIndex) -> Source
         return span(path, field_path);
     };
     let source = &source.value;
+    SourceSpan {
+        file: path.to_path_buf(),
+        start_byte: source.start_byte,
+        end_byte: source.end_byte,
+        line: source.start_line,
+        column: source.start_column,
+        end_line: source.end_line,
+        end_column: source.end_column,
+        field_path: field_path.to_owned(),
+    }
+}
+
+fn indexed_key_span(path: &Path, field_path: &str, spans: &FieldSpanIndex) -> SourceSpan {
+    let Some(source) = spans.nearest(field_path) else {
+        return span(path, field_path);
+    };
+    let source = &source.key;
     SourceSpan {
         file: path.to_path_buf(),
         start_byte: source.start_byte,
@@ -2325,5 +2973,641 @@ listeners:
         assert!(spans[1].file.ends_with("a.yaml"));
         assert!(spans.iter().all(|span| span.field_path == "imports[0]"));
         assert_eq!(diagnostic.primary, *spans[1]);
+    }
+
+    #[test]
+    fn legacy_http_listener_defaults_to_http1() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("legacy listener compiles");
+        let listener = &gateway.listeners[0];
+        assert_eq!(listener.protocol, super::ListenerProtocol::Http);
+        assert!(listener.tls.is_none());
+        assert_eq!(listener.http.versions, vec![super::HttpVersion::Http1]);
+        assert_eq!(
+            listener
+                .http
+                .http1
+                .as_ref()
+                .expect("HTTP/1 settings exist")
+                .header_read_timeout,
+            std::time::Duration::from_secs(30)
+        );
+        assert!(listener.http.http2.is_none());
+    }
+
+    #[test]
+    fn https_defaults_to_h2_then_http1_and_resolves_certificate_paths() {
+        let directory = tempdir().expect("temporary directory is available");
+        fs::create_dir_all(directory.path().join("config/certs"))
+            .expect("certificate directory can be created");
+        let cert = directory.path().join("config/certs/public.pem");
+        let key = directory.path().join("config/certs/public-key.pem");
+        fs::write(&cert, "test certificate bytes").expect("certificate can be written");
+        fs::write(&key, "TEST-ONLY PRIVATE KEY CONTENT").expect("private key can be written");
+        write_file(
+            directory.path(),
+            "config/resources.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: certs/public.pem
+      private_key: certs/public-key.pem
+"#,
+        );
+        write_file(
+            directory.path(),
+            "oxidase.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [config/resources.yaml]
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+    service:
+      type: respond
+"#,
+        );
+
+        let gateway = Compiler::compile_path(directory.path().join("oxidase.yaml"))
+            .expect("HTTPS listener compiles");
+        let listener = &gateway.listeners[0];
+        assert_eq!(listener.protocol, super::ListenerProtocol::Https);
+        assert_eq!(
+            listener.http.versions,
+            vec![super::HttpVersion::H2, super::HttpVersion::Http1]
+        );
+        assert!(listener.http.http1.is_some());
+        let http2 = listener.http.http2.as_ref().expect("HTTP/2 settings exist");
+        assert_eq!(http2.max_concurrent_streams, 256);
+        assert_eq!(http2.max_header_list_size, 64 * 1024);
+        assert_eq!(
+            http2.keep_alive_interval,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(http2.keep_alive_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(
+            listener
+                .tls
+                .as_ref()
+                .expect("TLS settings exist")
+                .handshake_timeout,
+            std::time::Duration::from_secs(5)
+        );
+
+        let certificate = gateway
+            .resources
+            .certificates
+            .get(&oxidase_core::ResourceId::new("certificate:public"))
+            .expect("certificate exists");
+        assert_eq!(
+            certificate.cert_chain,
+            cert.canonicalize().expect("cert canonicalizes")
+        );
+        assert_eq!(
+            certificate.private_key,
+            key.canonicalize().expect("key canonicalizes")
+        );
+        assert!(gateway.dependencies.contains(&certificate.cert_chain));
+        assert!(gateway.dependencies.contains(&certificate.private_key));
+
+        let summary = serde_json::to_string(&gateway.summary()).expect("summary serializes");
+        assert!(summary.contains("certificate:public"));
+        assert!(!summary.contains("TEST-ONLY PRIVATE KEY CONTENT"));
+    }
+
+    #[test]
+    fn compiles_normalized_exact_and_single_label_wildcard_sni_rules() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    default:
+      cert_chain: default.pem
+      private_key: default-key.pem
+    api:
+      cert_chain: api.pem
+      private_key: api-key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: default
+      sni:
+        API.Example.COM: api
+        "*.internal.example.com": api
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("SNI rules compile");
+        let tls = gateway.listeners[0]
+            .tls
+            .as_ref()
+            .expect("TLS settings exist");
+        let sni = &tls.sni;
+        assert_eq!(sni.len(), 2);
+        assert!(sni.iter().any(|rule| {
+            rule.pattern == super::SniPattern::Exact("api.example.com".to_owned())
+                && rule.pattern.matches("API.EXAMPLE.COM")
+        }));
+        let wildcard = sni
+            .iter()
+            .find(|rule| matches!(rule.pattern, super::SniPattern::Wildcard(_)))
+            .expect("wildcard exists");
+        assert!(wildcard.pattern.matches("one.internal.example.com"));
+        assert!(!wildcard.pattern.matches("a.b.internal.example.com"));
+        assert!(!wildcard.pattern.matches("internal.example.com"));
+        assert_eq!(
+            tls.select_certificate(Some("api.example.com")).as_str(),
+            "certificate:api"
+        );
+        assert_eq!(
+            tls.select_certificate(Some("one.internal.example.com"))
+                .as_str(),
+            "certificate:api"
+        );
+        assert_eq!(
+            tls.select_certificate(Some("unknown.example.com")).as_str(),
+            "certificate:default"
+        );
+        assert_eq!(tls.select_certificate(None).as_str(), "certificate:default");
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_sni_rules_with_both_spans() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+      sni:
+        API.Example.COM: public
+        api.example.com: public
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("duplicate SNI must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "listener.sni_duplicate");
+        assert_eq!(diagnostic.primary.line, 16);
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].span.line, 15);
+    }
+
+    #[test]
+    fn rejects_invalid_sni_rule_forms() {
+        for rule in [
+            "",
+            "127.0.0.1",
+            "*.127.0.0.1",
+            "foo.*.example.com",
+            "*.*.example.com",
+            "foo..example.com",
+            "foo_example.com",
+            "example.123",
+            "*.example.com.",
+            "雪.example.com",
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+      sni:
+        "{rule}": public
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid SNI must fail");
+            assert_eq!(error.diagnostics[0].code, "listener.sni", "rule: {rule}");
+            assert_eq!(error.diagnostics[0].primary.line, 15, "rule: {rule}");
+        }
+    }
+
+    #[test]
+    fn enforces_protocol_tls_and_http_version_boundaries() {
+        let cases = [
+            (
+                r#"protocol: http
+    tls:
+      default_certificate: public"#,
+                "listener.tls_forbidden",
+                "listeners[0].tls",
+            ),
+            (
+                "protocol: https",
+                "listener.tls_required",
+                "listeners[0].protocol",
+            ),
+            (
+                r#"protocol: http
+    http:
+      versions: [http1, h2]"#,
+                "listener.h2c_unsupported",
+                "listeners[0].http.versions[1]",
+            ),
+            (
+                r#"protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: []"#,
+                "listener.http_versions",
+                "listeners[0].http.versions",
+            ),
+            (
+                r#"protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: [h2, h2]"#,
+                "listener.http_version_duplicate",
+                "listeners[0].http.versions[1]",
+            ),
+            (
+                r#"protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: [h2]
+      http1:
+        header_read_timeout: 1s"#,
+                "listener.http1_settings_disabled",
+                "listeners[0].http.http1",
+            ),
+            (
+                r#"protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: [http1]
+      http2:
+        max_concurrent_streams: 1"#,
+                "listener.http2_settings_disabled",
+                "listeners[0].http.http2",
+            ),
+        ];
+        for (listener_fields, code, field_path) in cases {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: public
+    bind: 127.0.0.1:8443
+    {listener_fields}
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid transport must fail");
+            assert_eq!(error.diagnostics[0].code, code);
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+            assert!(
+                error.diagnostics[0].primary.end_byte > error.diagnostics[0].primary.start_byte
+            );
+        }
+    }
+
+    #[test]
+    fn validates_certificate_references_with_exact_spans() {
+        for (tls, line, field_path) in [
+            (
+                "default_certificate: missing",
+                13,
+                "listeners[0].tls.default_certificate",
+            ),
+            (
+                "default_certificate: public\n      sni:\n        api.example.com: missing",
+                15,
+                "listeners[0].tls.sni[\"api.example.com\"]",
+            ),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      {tls}
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("unknown certificate must fail");
+            let diagnostic = &error.diagnostics[0];
+            assert_eq!(diagnostic.code, "listener.certificate_reference");
+            assert_eq!(diagnostic.primary.line, line);
+            assert_eq!(diagnostic.primary.field_path, field_path);
+        }
+    }
+
+    #[test]
+    fn validates_http_timeouts_stream_limits_and_header_sizes() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+      handshake_timeout: 2500ms
+    http:
+      versions: [h2, http1]
+      http1:
+        header_read_timeout: 45s
+      http2:
+        max_concurrent_streams: 128
+        max_header_list_size: 1MiB
+        keep_alive_interval: 1m
+        keep_alive_timeout: 7s
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("custom transport settings compile");
+        let listener = &gateway.listeners[0];
+        assert_eq!(
+            listener.tls.as_ref().expect("TLS exists").handshake_timeout,
+            std::time::Duration::from_millis(2500)
+        );
+        assert_eq!(
+            listener
+                .http
+                .http1
+                .as_ref()
+                .expect("HTTP/1 exists")
+                .header_read_timeout,
+            std::time::Duration::from_secs(45)
+        );
+        let http2 = listener.http.http2.as_ref().expect("HTTP/2 exists");
+        assert_eq!(http2.max_concurrent_streams, 128);
+        assert_eq!(http2.max_header_list_size, 1024 * 1024);
+        assert_eq!(
+            http2.keep_alive_interval,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(http2.keep_alive_timeout, std::time::Duration::from_secs(7));
+
+        for (field, value, code) in [
+            (
+                "max_concurrent_streams",
+                "0",
+                "listener.http2_max_concurrent_streams",
+            ),
+            ("max_header_list_size", "0B", "config.byte_size"),
+            ("max_header_list_size", "64KB", "config.byte_size"),
+            ("keep_alive_interval", "0s", "config.duration"),
+            ("keep_alive_timeout", "forever", "config.duration"),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+    http:
+      versions: [h2]
+      http2:
+        {field}: {value}
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid setting must fail");
+            assert_eq!(error.diagnostics[0].code, code, "field: {field}");
+            assert!(
+                error.diagnostics[0].primary.field_path.ends_with(field),
+                "field: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_certificate_paths_at_the_declared_field() {
+        for (field, field_path) in [
+            ("cert_chain", "resources.certificates.public.cert_chain"),
+            ("private_key", "resources.certificates.public.private_key"),
+        ] {
+            let cert_chain = if field == "cert_chain" {
+                "\"\""
+            } else {
+                "cert.pem"
+            };
+            let private_key = if field == "private_key" {
+                "\"\""
+            } else {
+                "key.pem"
+            };
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: {cert_chain}
+      private_key: {private_key}
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("empty path must fail");
+            assert_eq!(error.diagnostics[0].code, "resource.certificate_path");
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+            assert_eq!(
+                error.diagnostics[0].primary.line,
+                6 + usize::from(field == "private_key")
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_dependencies_survive_later_semantic_failure() {
+        let directory = tempdir().expect("temporary directory is available");
+        let root = directory.path().join("oxidase.yaml");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("temporary directory canonicalizes");
+        let cert = canonical_directory.join("missing/cert.pem");
+        let key = canonical_directory.join("missing/key.pem");
+        fs::write(
+            &root,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: missing/cert.pem
+      private_key: missing/key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: unknown
+    service:
+      type: respond
+"#,
+        )
+        .expect("config can be written");
+        let error = Compiler::compile_path(root).expect_err("unknown reference must fail");
+        assert!(error.discovered_dependencies.contains(&cert));
+        assert!(error.discovered_dependencies.contains(&key));
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&canonical_directory.join("missing"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certificate_dependency_preserves_declared_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory is available");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("temporary directory canonicalizes");
+        fs::write(canonical_directory.join("cert-v1.pem"), "certificate")
+            .expect("certificate can be written");
+        fs::write(canonical_directory.join("key.pem"), "key").expect("key can be written");
+        symlink("cert-v1.pem", canonical_directory.join("cert.pem"))
+            .expect("certificate symlink can be created");
+        fs::write(
+            canonical_directory.join("oxidase.yaml"),
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: key.pem
+listeners:
+  - name: secure
+    bind: 127.0.0.1:8443
+    protocol: https
+    tls:
+      default_certificate: public
+    service:
+      type: respond
+"#,
+        )
+        .expect("config can be written");
+        let gateway = Compiler::compile_path(canonical_directory.join("oxidase.yaml"))
+            .expect("config compiles");
+        let certificate = gateway
+            .resources
+            .certificates
+            .get(&oxidase_core::ResourceId::new("certificate:public"))
+            .expect("certificate exists");
+        let declared = canonical_directory.join("cert.pem");
+        assert_eq!(certificate.cert_chain, declared);
+        assert_ne!(
+            certificate.cert_chain,
+            canonical_directory.join("cert-v1.pem")
+        );
+        assert!(gateway.dependencies.contains(&declared));
+        assert!(gateway.dependencies.contains(&canonical_directory));
+    }
+
+    #[test]
+    fn duplicate_imported_certificate_definitions_report_both_spans() {
+        let directory = tempdir().expect("temporary directory is available");
+        for name in ["a.yaml", "b.yaml"] {
+            fs::write(
+                directory.path().join(name),
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  certificates:\n    duplicate:\n      cert_chain: cert.pem\n      private_key: key.pem\n",
+            )
+            .expect("import can be written");
+        }
+        let root = directory.path().join("oxidase.yaml");
+        fs::write(
+            &root,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nimports: [a.yaml, b.yaml]\nlisteners:\n  - name: public\n    bind: 127.0.0.1:8080\n    service:\n      type: respond\n",
+        )
+        .expect("root config can be written");
+        let error = Compiler::compile_path(root).expect_err("duplicate certificate must fail");
+        let diagnostic = error
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "config.duplicate_definition")
+            .expect("duplicate diagnostic exists");
+        assert!(diagnostic.message.contains("certificate resource"));
+        assert_eq!(diagnostic.primary.line, 5);
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].span.line, 5);
+        assert!(diagnostic.primary.file.ends_with("b.yaml"));
+        assert!(diagnostic.labels[0].span.file.ends_with("a.yaml"));
     }
 }

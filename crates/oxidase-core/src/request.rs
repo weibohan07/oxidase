@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use http::uri::{Authority, PathAndQuery, Scheme};
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
 use percent_encoding::percent_decode_str;
 use thiserror::Error;
 
@@ -20,6 +20,16 @@ pub struct RequestMetadata {
     pub path_and_query: PathAndQuery,
     pub headers: HeaderMap,
     pub peer_address: Option<SocketAddr>,
+    pub http_version: Version,
+    pub tls: TlsConnectionMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsConnectionMetadata {
+    pub enabled: bool,
+    pub server_name: Option<String>,
+    pub alpn: Option<String>,
+    pub version: Option<String>,
 }
 
 impl RequestMetadata {
@@ -37,7 +47,20 @@ impl RequestMetadata {
             path_and_query: parse_transform_path_and_query(path_and_query.as_ref())?,
             headers,
             peer_address: None,
+            http_version: Version::HTTP_11,
+            tls: TlsConnectionMetadata::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_connection_metadata(
+        mut self,
+        http_version: Version,
+        tls: TlsConnectionMetadata,
+    ) -> Self {
+        self.http_version = http_version;
+        self.tls = tls;
+        self
     }
 }
 
@@ -373,6 +396,10 @@ impl RequestFrame {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut request = BTreeMap::new();
             request.insert("method".to_owned(), Value::from(self.method().as_str()));
+            request.insert(
+                "http_version".to_owned(),
+                Value::from(http_version_name(self.original.http_version)),
+            );
             request.insert("scheme".to_owned(), Value::from(self.scheme()));
             request.insert("authority".to_owned(), Value::from(self.authority()));
             request.insert("host".to_owned(), Value::from(self.host()));
@@ -392,6 +419,7 @@ impl RequestFrame {
                     Value::from(peer_address.to_string()),
                 );
             }
+            request.insert("tls".to_owned(), tls_value(&self.original.tls));
 
             Value::Map(request)
         })
@@ -416,6 +444,35 @@ impl RequestFrame {
             Value::Map(self.bindings.visible_values())
         })
     }
+}
+
+fn http_version_name(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "unknown",
+    }
+}
+
+fn tls_value(tls: &TlsConnectionMetadata) -> Value {
+    Value::Map(BTreeMap::from([
+        ("enabled".to_owned(), Value::Bool(tls.enabled)),
+        (
+            "server_name".to_owned(),
+            tls.server_name.clone().map_or(Value::Null, Value::from),
+        ),
+        (
+            "alpn".to_owned(),
+            tls.alpn.clone().map_or(Value::Null, Value::from),
+        ),
+        (
+            "version".to_owned(),
+            tls.version.clone().map_or(Value::Null, Value::from),
+        ),
+    ]))
 }
 
 fn headers_value(headers: &HeaderMap) -> Value {
@@ -474,9 +531,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use http::{HeaderMap, HeaderValue, Method};
+    use http::{HeaderMap, HeaderValue, Method, Version};
 
-    use super::{Bindings, RequestFrame, RequestMetadata};
+    use super::{Bindings, RequestFrame, RequestMetadata, TlsConnectionMetadata};
     use crate::Value;
 
     #[test]
@@ -506,6 +563,41 @@ mod tests {
         assert_eq!(frame.path_and_query(), "/search?b=two%20words&a=1&a=2");
         assert_eq!(frame.authority(), "[::1]:7589");
         assert_eq!(frame.host(), "[::1]");
+    }
+
+    #[test]
+    fn exposes_protocol_and_tls_connection_metadata_as_read_only_request_roots() {
+        let metadata = RequestMetadata::try_new(
+            Method::GET,
+            "https",
+            "api.example.test",
+            "/",
+            HeaderMap::new(),
+        )
+        .expect("request metadata is valid")
+        .with_connection_metadata(
+            Version::HTTP_2,
+            TlsConnectionMetadata {
+                enabled: true,
+                server_name: Some("api.example.test".to_owned()),
+                alpn: Some("h2".to_owned()),
+                version: Some("TLS1.3".to_owned()),
+            },
+        );
+        let context = RequestFrame::new(metadata).evaluation_context();
+        let request = context.root("request").expect("request root exists");
+        assert_eq!(
+            request.get("http_version").and_then(Value::as_str),
+            Some("2")
+        );
+        let tls = request.get("tls").expect("TLS namespace exists");
+        assert_eq!(tls.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(
+            tls.get("server_name").and_then(Value::as_str),
+            Some("api.example.test")
+        );
+        assert_eq!(tls.get("alpn").and_then(Value::as_str), Some("h2"));
+        assert_eq!(tls.get("version").and_then(Value::as_str), Some("TLS1.3"));
     }
 
     #[test]
