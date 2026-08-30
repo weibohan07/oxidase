@@ -14,7 +14,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use oxidase_runtime::RuntimeSnapshot;
+use oxidase_runtime::{ClusterRequestPermit, PreparedCluster, RuntimeSnapshot};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -163,6 +163,7 @@ impl TrustedUpgrade {
             downstream: self.downstream,
             upstream,
             snapshot: self.snapshot,
+            cluster_lease: None,
         })
     }
 }
@@ -183,11 +184,26 @@ pub struct TunnelPlan {
     downstream: OnUpgrade,
     upstream: OnUpgrade,
     snapshot: Arc<RuntimeSnapshot>,
+    cluster_lease: Option<TunnelClusterLease>,
 }
 
 impl TunnelPlan {
     pub(crate) fn protocol_header_value(&self) -> HeaderValue {
         self.token.header_value.clone()
+    }
+
+    pub(crate) fn retain_cluster_permit(
+        mut self,
+        cluster: Arc<PreparedCluster>,
+        permit: ClusterRequestPermit,
+    ) -> Self {
+        let endpoint = permit.endpoint().name().into();
+        self.cluster_lease = Some(TunnelClusterLease {
+            cluster,
+            endpoint,
+            _permit: permit,
+        });
+        self
     }
 
     /// Waits for both Hyper state machines to yield their upgraded transports,
@@ -201,16 +217,49 @@ impl TunnelPlan {
             downstream,
             upstream,
             snapshot: _snapshot,
+            cluster_lease,
         } = self;
-        let (downstream, upstream) = tokio::try_join!(
+        let upgrades = tokio::try_join!(
             async {
                 downstream
                     .await
                     .map_err(TunnelEstablishmentError::Downstream)
             },
             async { upstream.await.map_err(TunnelEstablishmentError::Upstream) }
-        )?;
-        Ok(run_tunnel_io(TokioIo::new(downstream), TokioIo::new(upstream)).await)
+        );
+        let (downstream, upstream) = match upgrades {
+            Ok(upgrades) => upgrades,
+            Err(error) => {
+                if matches!(&error, TunnelEstablishmentError::Upstream(_))
+                    && let Some(lease) = &cluster_lease
+                {
+                    lease.record_failure();
+                }
+                return Err(error);
+            }
+        };
+        let report = run_tunnel_io(TokioIo::new(downstream), TokioIo::new(upstream)).await;
+        if matches!(
+            report.termination,
+            TunnelTermination::UpstreamReadError(_) | TunnelTermination::UpstreamWriteError(_)
+        ) && let Some(lease) = &cluster_lease
+        {
+            lease.record_failure();
+        }
+        Ok(report)
+    }
+}
+
+struct TunnelClusterLease {
+    cluster: Arc<PreparedCluster>,
+    endpoint: Box<str>,
+    _permit: ClusterRequestPermit,
+}
+
+impl TunnelClusterLease {
+    fn record_failure(&self) {
+        self.cluster
+            .record_passive_failure(&self.endpoint, std::time::Instant::now());
     }
 }
 

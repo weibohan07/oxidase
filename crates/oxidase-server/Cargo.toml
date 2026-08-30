@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
+h2.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
@@ -20,6 +21,9 @@ oxidase-core = { path = "../oxidase-core" }
 oxidase-config = { path = "../oxidase-config" }
 oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-site = { path = "../oxidase-site" }
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

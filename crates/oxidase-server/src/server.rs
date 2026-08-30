@@ -19,8 +19,10 @@ use oxidase_core::{
     Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan, TlsConnectionMetadata,
 };
 use oxidase_runtime::{
-    Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot, SnapshotStore,
+    ClusterRuntimeStatus, Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot,
+    SnapshotStore,
 };
+use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,6 +31,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body_with_snapshot};
+use crate::cluster_health::ClusterHealthManager;
 use crate::connection::TrackedExecutor;
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
@@ -60,6 +63,7 @@ fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
 pub struct GatewayServer {
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    health: ClusterHealthManager,
     metrics: Arc<Metrics>,
     listeners: Vec<BoundListener>,
     admin: Option<BoundAdmin>,
@@ -139,9 +143,13 @@ impl GatewayServer {
                 local_address,
             });
         }
+        let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
+        proxy.reconcile_snapshot(&snapshot);
+        let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
         Ok(Self {
             store: Arc::new(SnapshotStore::new(snapshot)),
-            proxy: Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?),
+            proxy,
+            health,
             metrics: Arc::new(Metrics::default()),
             listeners,
             admin: None,
@@ -230,6 +238,7 @@ impl GatewayServer {
     }
 
     async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Result<(), ServerError> {
+        self.health.activate_snapshot(&self.store.pin());
         let (completion_sender, mut completions) = mpsc::unbounded_channel();
         let mut listeners = BTreeMap::new();
         let mut generation = 1u64;
@@ -267,6 +276,7 @@ impl GatewayServer {
                                 store: &self.store,
                                 proxy: &self.proxy,
                                 metrics: &self.metrics,
+                                health: &mut self.health,
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
                             };
@@ -282,12 +292,14 @@ impl GatewayServer {
                         Some(Control::Shutdown { response }) => {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
+                            self.health.shutdown().await;
                             let _ = response.send(());
                             return Ok(());
                         }
                         None => {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
+                            self.health.shutdown().await;
                             return Ok(());
                         }
                     }
@@ -401,7 +413,7 @@ impl ReloadHandle {
             if let Some(delay) = preparation_delay {
                 std::thread::sleep(delay);
             }
-            let gateway = match oxidase_config::Compiler::compile_path(path) {
+            let mut gateway = match oxidase_config::Compiler::compile_path(path) {
                 Ok(gateway) => gateway,
                 Err(error) => {
                     let dependencies = error.discovered_dependencies;
@@ -412,15 +424,18 @@ impl ReloadHandle {
                 }
             };
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
+            let warnings = std::mem::take(&mut gateway.warnings);
             match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
-                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies)),
+                Ok((snapshot, reuse)) => Ok((snapshot, reuse, attempt_dependencies, warnings)),
                 Err(error) => {
                     let mut dependencies = attempt_dependencies;
                     dependencies.extend(error.candidate_dependencies.iter().cloned());
                     dependencies.sort();
                     dependencies.dedup();
+                    let mut diagnostics = warnings;
+                    diagnostics.extend(error.into_diagnostics());
                     Err((
-                        ServerError::Reload(ReloadError::new(error.into_diagnostics())),
+                        ServerError::Reload(ReloadError::new(diagnostics)),
                         dependencies,
                     ))
                 }
@@ -428,7 +443,7 @@ impl ReloadHandle {
         })
         .await
         .map_err(|error| ServerError::Task(format!("reload compiler worker failed: {error}")))?;
-        let (snapshot, reuse, attempt_dependencies) = match prepared {
+        let (snapshot, reuse, attempt_dependencies, warnings) = match prepared {
             Ok(prepared) => prepared,
             Err((error, dependencies)) => {
                 self.record_attempt_dependencies(dependencies);
@@ -446,7 +461,8 @@ impl ReloadHandle {
             })
             .await
             .map_err(|_| ServerError::ControlClosed)?;
-        let report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        let mut report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        report.warnings = warnings;
         self.record_published_dependencies(published_dependencies);
         Ok(report)
     }
@@ -557,11 +573,14 @@ pub struct ReloadReport {
     pub current_version: String,
     pub reused_sites: usize,
     pub reused_clusters: usize,
+    pub reused_cluster_endpoints: usize,
     pub reused_certificates: usize,
     pub listeners_added: Vec<String>,
     pub listeners_removed: Vec<String>,
     pub listeners_retained: Vec<String>,
     pub local_addresses: Vec<(String, SocketAddr)>,
+    /// Non-fatal diagnostics emitted while compiling this committed candidate.
+    pub warnings: Vec<Diagnostic>,
 }
 
 fn start_listener(
@@ -676,6 +695,12 @@ async fn apply_reload(
     let previous_version = environment.store.pin().config_version.to_string();
     let current_version = snapshot.config_version.to_string();
     environment.store.publish(snapshot);
+    environment
+        .proxy
+        .reconcile_snapshot(&environment.store.pin());
+    environment
+        .health
+        .activate_snapshot(&environment.store.pin());
 
     let listeners_added = prepared
         .iter()
@@ -706,6 +731,7 @@ async fn apply_reload(
         current_version,
         reused_sites: reuse.sites,
         reused_clusters: reuse.clusters,
+        reused_cluster_endpoints: reuse.cluster_endpoints,
         reused_certificates: reuse.certificates,
         listeners_added,
         listeners_removed: to_stop,
@@ -714,6 +740,7 @@ async fn apply_reload(
             .iter()
             .map(|(name, listener)| (name.clone(), listener.local_address))
             .collect(),
+        warnings: Vec::new(),
     })
 }
 
@@ -721,6 +748,7 @@ struct ReloadEnvironment<'a> {
     store: &'a Arc<SnapshotStore>,
     proxy: &'a Arc<ProxyClient>,
     metrics: &'a Arc<Metrics>,
+    health: &'a mut ClusterHealthManager,
     drain_timeout: Duration,
     completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
 }
@@ -875,9 +903,10 @@ async fn handle_admin_request(
         "/metrics" => admin_response(
             StatusCode::OK,
             "text/plain; version=0.0.4; charset=utf-8",
-            Bytes::from(metrics.render_prometheus()),
+            Bytes::from(metrics.render_prometheus_for(&store.pin())),
             &method,
         ),
+        "/api/v1/clusters" => cluster_admin_response(&store.pin(), &method),
         _ => admin_response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -886,6 +915,41 @@ async fn handle_admin_request(
         ),
     };
     Ok(response)
+}
+
+#[derive(Serialize)]
+struct ClusterAdminResponse {
+    clusters: Vec<ClusterRuntimeStatus>,
+}
+
+fn cluster_admin_response(snapshot: &RuntimeSnapshot, method: &Method) -> Response<GatewayBody> {
+    let now = std::time::Instant::now();
+    let mut clusters = snapshot
+        .resources
+        .clusters
+        .values()
+        .map(|cluster| cluster.status(now))
+        .collect::<Vec<_>>();
+    clusters.sort_by(|left, right| left.cluster.cmp(&right.cluster));
+    for cluster in &mut clusters {
+        cluster
+            .endpoints
+            .sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    match serde_json::to_vec(&ClusterAdminResponse { clusters }) {
+        Ok(body) => admin_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":\"serialization_failed\"}\n"),
+            method,
+        ),
+    }
 }
 
 fn admin_response(
@@ -1632,6 +1696,8 @@ fn safe_error_body(status: StatusCode) -> &'static str {
         "Gateway Timeout"
     } else if status == StatusCode::BAD_GATEWAY {
         "Bad Gateway"
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        "Service Unavailable"
     } else {
         "Internal Server Error"
     }
@@ -1791,7 +1857,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http::{HeaderName, HeaderValue, Request, Response, Version, header};
+    use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
     use http_body_util::{BodyExt, Empty, Full};
     use hyper::client::conn::http2 as client_http2;
     use hyper::server::conn::http1;
@@ -1808,8 +1874,8 @@ mod tests {
     use super::{
         AlpnSelectionError, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayConnectionContext,
         GatewayServer, H2DrainObservation, NegotiatedHttpProtocol, ProxyClient, ServerError,
-        http1_builder, reserve_tls_handshake, select_https_protocol, serve_http2_connection,
-        tls_accept_error_outcome,
+        http1_builder, reserve_tls_handshake, safe_error_body, select_https_protocol,
+        serve_http2_connection, tls_accept_error_outcome,
     };
     use crate::metrics::{Metrics, TlsHandshakeOutcome};
 
@@ -1827,6 +1893,23 @@ mod tests {
         assert_eq!(diagnostics[0].code, "server.listener_bind");
         assert_eq!(diagnostics[0].primary.field_path, "listeners[0].bind");
         assert!(diagnostics[0].message.contains("public"));
+    }
+
+    #[test]
+    fn root_error_bodies_are_safe_and_status_specific() {
+        assert_eq!(safe_error_body(StatusCode::BAD_GATEWAY), "Bad Gateway");
+        assert_eq!(
+            safe_error_body(StatusCode::SERVICE_UNAVAILABLE),
+            "Service Unavailable"
+        );
+        assert_eq!(
+            safe_error_body(StatusCode::GATEWAY_TIMEOUT),
+            "Gateway Timeout"
+        );
+        assert_eq!(
+            safe_error_body(StatusCode::INTERNAL_SERVER_ERROR),
+            "Internal Server Error"
+        );
     }
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
@@ -2404,6 +2487,130 @@ listeners:
             metrics.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 3"),
             "{metrics}"
         );
+        running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn admin_clusters_are_deterministic_snapshot_scoped_and_omit_origins() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    zeta:
+      endpoints:
+        - name: zeta-a
+          url: http://127.0.0.1:43125
+    alpha:
+      protocol: h2
+      endpoints:
+        - name: alpha-b
+          url: http://127.0.0.1:43124
+        - name: alpha-a
+          url: http://127.0.0.1:43123
+      load_balance:
+        policy: least_requests
+services:
+  root:
+    type: respond
+    body:
+      text: ok
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("fixture config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("fixture config compiles"),
+        )
+        .expect("fixture snapshot prepares");
+        let server = GatewayServer::bind(snapshot)
+            .await
+            .expect("server binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("valid admin bind"))
+            .await
+            .expect("admin server binds");
+        let running = server.spawn();
+        let admin = running.admin_address().expect("admin address is available");
+
+        let first = request(admin, "/api/v1/clusters", "").await;
+        let second = request(admin, "/api/v1/clusters", "").await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(
+            first
+                .to_ascii_lowercase()
+                .contains("content-type: application/json; charset=utf-8"),
+            "{first}"
+        );
+        let first_body = first
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("admin response has a body");
+        let second_body = second
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("second admin response has a body");
+        assert_eq!(first_body, second_body);
+        assert!(!first_body.contains("127.0.0.1"));
+        assert!(!first_body.contains("url"));
+
+        let document: serde_json::Value =
+            serde_json::from_str(first_body).expect("admin body is valid JSON");
+        let clusters = document["clusters"]
+            .as_array()
+            .expect("clusters is an array");
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0]["cluster"], "alpha");
+        assert_eq!(clusters[0]["policy"], "least_requests");
+        assert_eq!(clusters[0]["protocol"], "h2");
+        assert_eq!(clusters[0]["endpoints"][0]["name"], "alpha-a");
+        assert_eq!(clusters[0]["endpoints"][1]["name"], "alpha-b");
+        assert_eq!(clusters[1]["cluster"], "zeta");
+        for field in [
+            "active_requests",
+            "active_retries",
+            "retry_attempts",
+            "retry_exhausted",
+            "overload_rejections",
+            "unavailable_rejections",
+        ] {
+            assert_eq!(clusters[0][field], 0, "missing or nonzero field {field}");
+        }
+        for field in [
+            "health",
+            "active_requests",
+            "selections",
+            "successes",
+            "failures",
+            "active_health_successes",
+            "active_health_failures",
+            "passive_ejections",
+            "health_transitions",
+            "last_transition_unix_ms",
+            "ejection_remaining_ms",
+        ] {
+            assert!(
+                clusters[0]["endpoints"][0].get(field).is_some(),
+                "missing endpoint field {field}"
+            );
+        }
+
+        let metrics = request(admin, "/metrics", "").await;
+        let alpha = metrics
+            .find("oxidase_cluster_info{cluster=\"alpha\"")
+            .expect("alpha metrics are rendered");
+        let zeta = metrics
+            .find("oxidase_cluster_info{cluster=\"zeta\"")
+            .expect("zeta metrics are rendered");
+        assert!(alpha < zeta);
+        assert!(!metrics.contains("127.0.0.1"));
+
         running.shutdown().await.expect("server shuts down cleanly");
     }
 
@@ -4091,6 +4298,68 @@ listeners:
             .expect("removed listener drains");
         assert_eq!(removed.listeners_removed, vec!["extra"]);
         assert!(request(address, "/", "").await.ends_with("four"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn successful_reload_reports_non_fatal_compiler_warnings() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "old", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("initial config compiles"),
+        )
+        .expect("initial snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+      retry:
+        max_attempts: 2
+        methods: [POST]
+        retry_on: [connect_failure]
+services:
+  root:
+    type: respond
+    body:
+      text: warning-committed
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("warning candidate can be written");
+
+        let report = running
+            .reload_path(&config)
+            .await
+            .expect("warning does not reject reload");
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "resource.cluster_retry_post");
+        assert_eq!(
+            report.warnings[0].primary.field_path,
+            "resources.clusters.api.retry.methods[0]"
+        );
+        assert!(
+            request(address, "/", "")
+                .await
+                .ends_with("warning-committed")
+        );
+
         running.shutdown().await.expect("gateway shuts down");
     }
 

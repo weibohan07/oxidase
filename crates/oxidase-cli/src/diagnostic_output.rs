@@ -267,7 +267,7 @@ fn encoded_path(root: &DiagnosticRoot, path: &Path) -> EncodedPath {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use oxidase_core::{Diagnostic, SourceSpan};
+    use oxidase_core::{Diagnostic, DiagnosticSeverity, SourceSpan};
 
     use super::{DiagnosticRoot, JsonDiagnosticEnvelope, sorted_diagnostics};
 
@@ -313,6 +313,40 @@ mod tests {
             .expect("diagnostic envelope serializes");
         assert_eq!(json["diagnostics"][0]["primary"]["file"], "imports/a.yaml");
         assert_eq!(json["diagnostics"][0]["primary"]["file_encoding"], "utf-8");
+    }
+
+    #[test]
+    fn json_diagnostics_preserve_non_fatal_warning_severity() {
+        let root = DiagnosticRoot(PathBuf::from("/workspace"));
+        let warning = Diagnostic::warning(
+            "resource.cluster_retry_post",
+            "retrying POST requires an explicit idempotency decision",
+            SourceSpan {
+                file: PathBuf::from("/workspace/oxidase.yaml"),
+                start_byte: 12,
+                end_byte: 16,
+                line: 3,
+                column: 5,
+                end_line: 3,
+                end_column: 9,
+                field_path: "resources.clusters.api.retry.methods[0]".to_owned(),
+            },
+        );
+
+        let json = serde_json::to_value(JsonDiagnosticEnvelope::new(&root, &[warning]))
+            .expect("warning envelope serializes");
+        assert_eq!(
+            json["schema_version"],
+            oxidase_core::DIAGNOSTIC_SCHEMA_VERSION
+        );
+        assert_eq!(
+            json["diagnostics"][0]["severity"],
+            serde_json::to_value(DiagnosticSeverity::Warning).expect("severity serializes")
+        );
+        assert_eq!(
+            json["diagnostics"][0]["code"],
+            "resource.cluster_retry_post"
+        );
     }
 
     #[test]

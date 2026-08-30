@@ -72,7 +72,7 @@ async fn main() {
     let root = DiagnosticRoot::for_config(cli.config_path());
     let reporter = Reporter::new(format);
     let (diagnostics, failed, stdout_payload) = match run(cli, &reporter).await {
-        Ok(success) => (Vec::new(), false, success.stdout_payload),
+        Ok(success) => (success.diagnostics, false, success.stdout_payload),
         Err(failure) => (failure.diagnostics, true, false),
     };
     if !(format == DiagnosticFormat::Json && stdout_payload)
@@ -101,6 +101,16 @@ impl Cli {
 #[derive(Debug, Default)]
 struct RunSuccess {
     stdout_payload: bool,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl RunSuccess {
+    fn with_diagnostics(diagnostics: Vec<Diagnostic>) -> Self {
+        Self {
+            stdout_payload: false,
+            diagnostics,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,6 +123,16 @@ impl CliFailure {
         Self {
             diagnostics: vec![diagnostic],
         }
+    }
+
+    fn with_prior(mut self, prior: &[Diagnostic]) -> Self {
+        if prior.is_empty() {
+            return self;
+        }
+        let mut diagnostics = prior.to_vec();
+        diagnostics.append(&mut self.diagnostics);
+        self.diagnostics = diagnostics;
+        self
     }
 }
 
@@ -127,7 +147,10 @@ impl From<oxidase_config::CompileError> for CliFailure {
 async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
     match cli.command {
         Command::Check { config } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             reporter.human_stdout(format!(
                 "configuration {} is valid: {} listener(s), {} service node(s), {} resource(s)",
                 gateway.config_version,
@@ -137,14 +160,16 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     + gateway.resources.clusters.len()
                     + gateway.resources.sites.len()
             ));
-            Ok(RunSuccess::default())
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Explain {
             config,
             request,
             listener,
         } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway, ..
+            } = prepare_snapshot(&config)?;
             let request_source =
                 Compiler::parse_request_file(&request).map_err(CliFailure::from)?;
             let output = explain(&gateway, listener.as_deref(), &request_source, &request).await?;
@@ -159,10 +184,14 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
             println!("{output}");
             Ok(RunSuccess {
                 stdout_payload: true,
+                diagnostics: Vec::new(),
             })
         }
         Command::Compile { config, output } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             let manifest = CompilationManifest {
                 format: "oxidase.snapshot-manifest/v1",
                 summary: gateway.summary().clone(),
@@ -174,6 +203,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &config,
                     "compile.output",
                 ))
+                .with_prior(&warnings)
             })?;
             std::fs::write(&output, manifest).map_err(|error| {
                 CliFailure::one(diagnostic_at(
@@ -185,20 +215,29 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &output,
                     "compile.output",
                 ))
+                .with_prior(&warnings)
             })?;
-            Ok(RunSuccess::default())
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Test { config } => {
-            let gateway = prepare_snapshot(&config)?;
-            run_config_tests(&gateway, &config, reporter).await?;
-            Ok(RunSuccess::default())
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
+            run_config_tests(&gateway, &config, reporter)
+                .await
+                .map_err(|failure| failure.with_prior(&warnings))?;
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
         Command::Serve {
             config,
             watch,
             admin_bind,
         } => {
-            let gateway = prepare_snapshot(&config)?;
+            let PreparedSnapshot {
+                snapshot: gateway,
+                warnings,
+            } = prepare_snapshot(&config)?;
             let listener_protocols = gateway
                 .listeners
                 .iter()
@@ -216,14 +255,17 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                         .unwrap_or_else(|_| "oxidase=info".into()),
                 )
                 .try_init();
+            trace_compile_warnings(&warnings);
             let mut server = oxidase_server::GatewayServer::bind(gateway)
                 .await
-                .map_err(server_failure)?;
+                .map_err(server_failure)
+                .map_err(|failure| failure.with_prior(&warnings))?;
             if let Some(admin_bind) = admin_bind {
                 server = server
                     .with_admin_listener(admin_bind)
                     .await
-                    .map_err(server_failure)?;
+                    .map_err(server_failure)
+                    .map_err(|failure| failure.with_prior(&warnings))?;
             }
             for (name, address) in server.local_addresses() {
                 let protocol = listener_protocols
@@ -250,6 +292,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     &config,
                     "serve.signal",
                 ))
+                .with_prior(&warnings)
             })?;
             let _ = stop_watcher.send(true);
             if let Some(watcher) = watcher {
@@ -260,10 +303,15 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                         &config,
                         "serve.watch",
                     ))
+                    .with_prior(&warnings)
                 })?;
             }
-            running.shutdown().await.map_err(server_failure)?;
-            Ok(RunSuccess::default())
+            running
+                .shutdown()
+                .await
+                .map_err(server_failure)
+                .map_err(|failure| failure.with_prior(&warnings))?;
+            Ok(RunSuccess::with_diagnostics(warnings))
         }
     }
 }
@@ -285,11 +333,32 @@ fn listener_protocol_label(protocol: ListenerProtocol, versions: &[HttpVersion])
     }
 }
 
-fn prepare_snapshot(config: &Path) -> Result<RuntimeSnapshot, CliFailure> {
-    let gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
-    RuntimeSnapshot::prepare(gateway).map_err(|error| CliFailure {
-        diagnostics: error.into_diagnostics(),
-    })
+struct PreparedSnapshot {
+    snapshot: RuntimeSnapshot,
+    warnings: Vec<Diagnostic>,
+}
+
+fn prepare_snapshot(config: &Path) -> Result<PreparedSnapshot, CliFailure> {
+    let mut gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
+    let warnings = std::mem::take(&mut gateway.warnings);
+    let snapshot = RuntimeSnapshot::prepare(gateway).map_err(|error| {
+        CliFailure {
+            diagnostics: error.into_diagnostics(),
+        }
+        .with_prior(&warnings)
+    })?;
+    Ok(PreparedSnapshot { snapshot, warnings })
+}
+
+fn trace_compile_warnings(warnings: &[Diagnostic]) {
+    for warning in warnings {
+        tracing::warn!(
+            diagnostic_code = warning.code,
+            field_path = %warning.primary.field_path,
+            message = %warning.message,
+            "configuration compiled with a warning"
+        );
+    }
 }
 
 fn server_failure(error: oxidase_server::ServerError) -> CliFailure {
@@ -334,6 +403,7 @@ enum ExplainBody {
         resource: String,
         request_path: String,
         symbolic: bool,
+        cluster: Option<Box<ClusterPlanDescription>>,
     },
 }
 
@@ -373,6 +443,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                             resource: resource.to_string(),
                             request_path: request.path_and_query().to_owned(),
                             symbolic: false,
+                            cluster: None,
                         },
                     );
                     output.headers = response.headers;
@@ -400,6 +471,12 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
         request: &'a RequestFrame,
         _body: &'a mut Option<()>,
     ) -> BoxLeafFuture<'a, ExplainBody> {
+        let cluster = self
+            .snapshot
+            .resources
+            .clusters
+            .get(resource)
+            .map(|cluster| Box::new(describe_cluster_plan(cluster)));
         Box::pin(async move {
             ServiceOutcome::Handled(ResponseHead::new(
                 StatusCode::OK,
@@ -408,6 +485,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                     resource: resource.to_string(),
                     request_path: request.path_and_query().to_owned(),
                     symbolic: true,
+                    cluster,
                 },
             ))
         })
@@ -436,8 +514,127 @@ enum BodyDescription {
         resource: String,
         request_path: String,
         symbolic: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cluster: Option<Box<ClusterPlanDescription>>,
     },
     SafeError,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterPlanDescription {
+    protocol: &'static str,
+    load_balance: &'static str,
+    endpoint_count: usize,
+    health: ClusterHealthDescription,
+    retry: ClusterRetryDescription,
+    limits: ClusterLimitsDescription,
+    endpoint_selection: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterHealthDescription {
+    active: Option<ActiveHealthDescription>,
+    passive: Option<PassiveHealthDescription>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveHealthDescription {
+    healthy_statuses: Vec<String>,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PassiveHealthDescription {
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterRetryDescription {
+    max_attempts: u32,
+    methods: Vec<String>,
+    retry_on: Vec<&'static str>,
+    statuses: Vec<String>,
+    request_body: &'static str,
+    request_body_max_bytes: u64,
+    max_concurrent_retries: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterLimitsDescription {
+    max_in_flight: u32,
+    max_in_flight_per_endpoint: u32,
+}
+
+fn describe_cluster_plan(cluster: &oxidase_runtime::PreparedCluster) -> ClusterPlanDescription {
+    let spec = cluster.spec();
+    ClusterPlanDescription {
+        protocol: spec.protocol.as_str(),
+        load_balance: spec.load_balance.as_str(),
+        endpoint_count: spec.endpoints.len(),
+        health: ClusterHealthDescription {
+            active: spec
+                .health
+                .active
+                .as_ref()
+                .map(|active| ActiveHealthDescription {
+                    healthy_statuses: active
+                        .healthy_statuses
+                        .iter()
+                        .map(|status| describe_status_range(status.start, status.end))
+                        .collect(),
+                    healthy_threshold: active.healthy_threshold,
+                    unhealthy_threshold: active.unhealthy_threshold,
+                }),
+            passive: spec
+                .health
+                .passive
+                .as_ref()
+                .map(|passive| PassiveHealthDescription {
+                    consecutive_failures: passive.consecutive_failures,
+                }),
+        },
+        retry: ClusterRetryDescription {
+            max_attempts: spec.retry.max_attempts,
+            methods: spec
+                .retry
+                .methods
+                .iter()
+                .map(|method| method.as_str().to_owned())
+                .collect(),
+            retry_on: spec
+                .retry
+                .retry_on
+                .iter()
+                .map(|cause| cause.as_str())
+                .collect(),
+            statuses: spec
+                .retry
+                .statuses
+                .iter()
+                .map(|status| describe_status_range(status.start, status.end))
+                .collect(),
+            request_body: match spec.retry.request_body.mode {
+                oxidase_config::RetryBodyMode::None => "none",
+                oxidase_config::RetryBodyMode::Buffer => "buffer",
+            },
+            request_body_max_bytes: spec.retry.request_body.max_bytes,
+            max_concurrent_retries: spec.retry.max_concurrent_retries,
+        },
+        limits: ClusterLimitsDescription {
+            max_in_flight: spec.limits.max_in_flight,
+            max_in_flight_per_endpoint: spec.limits.max_in_flight_per_endpoint,
+        },
+        endpoint_selection: "actual endpoint selection is runtime state dependent",
+    }
+}
+
+fn describe_status_range(start: u16, end: u16) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -551,11 +748,13 @@ fn describe_report(
                     resource,
                     request_path,
                     symbolic,
+                    cluster,
                 } => BodyDescription::Leaf {
                     service: kind,
                     resource,
                     request_path,
                     symbolic,
+                    cluster,
                 },
             };
             ("handled", response.status.as_u16(), body)
@@ -674,7 +873,35 @@ fn compare_expectation(
         BodyDescription::Bytes { .. } | BodyDescription::SafeError => None,
     };
     compare_leaf(expected, leaf, &mut mismatches);
+    compare_cluster_plan(output, expected, &mut mismatches);
     mismatches
+}
+
+fn compare_cluster_plan(
+    output: &ExplainOutput,
+    expected: &TestExpectationSource,
+    mismatches: &mut Vec<ExpectationMismatch>,
+) {
+    let cluster = match &output.body {
+        BodyDescription::Leaf { cluster, .. } => cluster.as_ref(),
+        BodyDescription::Bytes { .. } | BodyDescription::SafeError => None,
+    };
+    if let Some(protocol) = &expected.cluster_protocol
+        && !cluster.is_some_and(|cluster| cluster.protocol == protocol)
+    {
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_cluster_protocol",
+            message: format!("expected Cluster protocol `{protocol}`"),
+        });
+    }
+    if let Some(policy) = &expected.load_balance
+        && !cluster.is_some_and(|cluster| cluster.load_balance == policy)
+    {
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_load_balance",
+            message: format!("expected Cluster load-balancing policy `{policy}`"),
+        });
+    }
 }
 
 fn compare_leaf(
@@ -754,6 +981,7 @@ async fn watch_dependencies_with_timing(
                 let before_attempt = dependency_stamp(&dependencies_before).await;
                 match reload.reload_path(&config).await {
                     Ok(report) => {
+                        trace_compile_warnings(&report.warnings);
                         tracing::info!(
                             previous_version = report.previous_version,
                             current_version = report.current_version,
@@ -819,18 +1047,188 @@ async fn dependency_stamp(dependencies: &[PathBuf]) -> WatchStamp {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
 
-    use oxidase_config::{Compiler, HttpVersion, ListenerProtocol};
-    use oxidase_core::{RespondBody, ServiceKind};
+    use oxidase_config::{
+        Compiler, ExplainRequestSource, HttpVersion, ListenerProtocol, TestExpectationSource,
+    };
+    use oxidase_core::{DiagnosticSeverity, RespondBody, ServiceKind};
     use oxidase_runtime::RuntimeSnapshot;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{listener_protocol_label, watch_dependencies_with_timing};
+    use super::{
+        compare_expectation, explain, listener_protocol_label, prepare_snapshot,
+        watch_dependencies_with_timing,
+    };
+
+    #[tokio::test]
+    async fn explain_and_declarative_tests_describe_runtime_cluster_policy() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+          weight: 2
+        - name: secondary
+          url: http://127.0.0.1:3001
+          weight: 1
+      load_balance:
+        policy: least_requests
+      health:
+        active:
+          path: /healthz
+          interval: 5s
+          timeout: 1s
+          healthy_statuses: ["200-299"]
+          healthy_threshold: 2
+          unhealthy_threshold: 3
+        passive:
+          consecutive_failures: 4
+          eject_for: 30s
+      retry:
+        max_attempts: 2
+        methods: [GET, HEAD]
+        retry_on: [connect_failure, refused_stream]
+        statuses: [503]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 7
+      limits:
+        max_in_flight: 100
+        max_in_flight_per_endpoint: 40
+        queue_timeout: 0ms
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("Cluster explain fixture can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("Cluster explain fixture compiles"),
+        )
+        .expect("Cluster explain fixture prepares");
+        let request = ExplainRequestSource {
+            method: "GET".to_owned(),
+            scheme: "http".to_owned(),
+            host: "example.test".to_owned(),
+            path: "/api".to_owned(),
+            headers: BTreeMap::new(),
+        };
+
+        let output = explain(&snapshot, None, &request, &config)
+            .await
+            .expect("symbolic Cluster request explains");
+        let json = serde_json::to_value(&output).expect("Explain output serializes");
+        assert_eq!(json["body"]["cluster"]["protocol"], "h2");
+        assert_eq!(json["body"]["cluster"]["load_balance"], "least_requests");
+        assert_eq!(json["body"]["cluster"]["endpoint_count"], 2);
+        assert_eq!(
+            json["body"]["cluster"]["health"]["active"]["healthy_statuses"],
+            serde_json::json!(["200-299"])
+        );
+        assert_eq!(
+            json["body"]["cluster"]["health"]["passive"]["consecutive_failures"],
+            4
+        );
+        assert_eq!(json["body"]["cluster"]["retry"]["max_attempts"], 2);
+        assert_eq!(
+            json["body"]["cluster"]["retry"]["retry_on"],
+            serde_json::json!(["connect_failure", "refused_stream"])
+        );
+        assert_eq!(json["body"]["cluster"]["limits"]["max_in_flight"], 100);
+        assert_eq!(
+            json["body"]["cluster"]["endpoint_selection"],
+            "actual endpoint selection is runtime state dependent"
+        );
+
+        let expected = TestExpectationSource {
+            cluster: Some("api".to_owned()),
+            cluster_protocol: Some("h2".to_owned()),
+            load_balance: Some("least_requests".to_owned()),
+            ..TestExpectationSource::default()
+        };
+        assert!(compare_expectation(&output, &expected).is_empty());
+
+        let mismatches = compare_expectation(
+            &output,
+            &TestExpectationSource {
+                cluster_protocol: Some("http1".to_owned()),
+                load_balance: Some("round_robin".to_owned()),
+                ..TestExpectationSource::default()
+            },
+        );
+        assert_eq!(
+            mismatches
+                .iter()
+                .map(|mismatch| mismatch.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "test.expectation_cluster_protocol",
+                "test.expectation_load_balance"
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_preparation_preserves_non_fatal_compiler_warnings() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - name: primary
+          url: http://127.0.0.1:3000
+      retry:
+        max_attempts: 2
+        methods: [POST]
+        retry_on: [connect_failure]
+services:
+  root:
+    type: respond
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("warning fixture can be written");
+
+        let prepared = prepare_snapshot(&config).expect("warning does not reject preparation");
+        assert_eq!(prepared.warnings.len(), 1);
+        assert_eq!(prepared.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(prepared.warnings[0].code, "resource.cluster_retry_post");
+        assert_eq!(
+            prepared.warnings[0].primary.field_path,
+            "resources.clusters.api.retry.methods[0]"
+        );
+        assert_eq!(prepared.snapshot.resources.clusters.len(), 1);
+    }
 
     #[test]
     fn listener_protocol_labels_describe_cleartext_and_tls_alpn() {

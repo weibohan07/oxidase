@@ -74,6 +74,22 @@ Template evaluation, argument-contract, and response-metadata failures are
 `Failed(InvalidState)`; concrete asset file I/O remains `Failed(SiteIo)`. Internal
 detail stays in diagnostics and is never copied into the safe client response.
 
+Root failures use a fixed public mapping; the internal detail is logged but never
+rendered into the client body:
+
+| Error class | Default HTTP status | Safe client body |
+| --- | ---: | --- |
+| `UpstreamConnect`, `UpstreamProtocol` | 502 | `Bad Gateway` |
+| `UpstreamUnavailable`, `UpstreamOverloaded` | 503 | `Service Unavailable` |
+| `Timeout` | 504 | `Gateway Timeout` |
+| all other classes | 500 | `Internal Server Error` |
+
+`Recover` may intercept any of these classes before the root mapping. Cluster
+selection with no eligible endpoint uses `UpstreamUnavailable`; exhausted
+cluster/endpoint concurrency capacity uses `UpstreamOverloaded`. Those two
+conditions are distinct from a selected endpoint failing to connect or violating
+the upstream protocol.
+
 Predicates in v0.2 inspect only the request head. A body-consuming Service marks the
 body irreversible; fallback after such a candidate requires a future explicit
 replay plan and is rejected in the meantime.

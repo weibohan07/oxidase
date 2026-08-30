@@ -44,11 +44,223 @@ pub(crate) struct CertificateSource {
 pub(crate) struct ClusterSource {
     #[serde(default = "default_cluster_protocol")]
     pub protocol: String,
-    pub endpoints: Vec<String>,
+    pub endpoints: Vec<ClusterEndpointSource>,
+    #[serde(default)]
+    pub load_balance: LoadBalanceSource,
+    #[serde(default)]
+    pub health: ClusterHealthSource,
+    #[serde(default)]
+    pub retry: RetrySource,
+    #[serde(default)]
+    pub limits: ClusterLimitsSource,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: String,
     #[serde(default = "default_response_timeout")]
     pub response_timeout: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ClusterEndpointSource {
+    Shorthand(String),
+    Structured(StructuredClusterEndpointSource),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StructuredClusterEndpointSource {
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_endpoint_weight")]
+    pub weight: u64,
+}
+
+fn default_endpoint_weight() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LoadBalanceSource {
+    #[serde(default = "default_load_balance_policy")]
+    pub policy: String,
+}
+
+impl Default for LoadBalanceSource {
+    fn default() -> Self {
+        Self {
+            policy: default_load_balance_policy(),
+        }
+    }
+}
+
+fn default_load_balance_policy() -> String {
+    "round_robin".to_owned()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClusterHealthSource {
+    pub active: Option<ActiveHealthSource>,
+    pub passive: Option<PassiveHealthSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActiveHealthSource {
+    #[serde(default = "default_health_path")]
+    pub path: String,
+    #[serde(default = "default_health_interval")]
+    pub interval: String,
+    #[serde(default = "default_health_timeout")]
+    pub timeout: String,
+    #[serde(default = "default_healthy_statuses")]
+    pub healthy_statuses: Vec<StatusRangeSource>,
+    #[serde(default = "default_health_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_threshold")]
+    pub unhealthy_threshold: u32,
+}
+
+fn default_health_path() -> String {
+    "/healthz".to_owned()
+}
+
+fn default_health_interval() -> String {
+    "5s".to_owned()
+}
+
+fn default_health_timeout() -> String {
+    "1s".to_owned()
+}
+
+fn default_healthy_statuses() -> Vec<StatusRangeSource> {
+    vec![StatusRangeSource::Text("200-299".to_owned())]
+}
+
+fn default_health_threshold() -> u32 {
+    2
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PassiveHealthSource {
+    #[serde(default = "default_passive_failure_threshold")]
+    pub consecutive_failures: u32,
+    #[serde(default = "default_eject_for")]
+    pub eject_for: String,
+}
+
+fn default_passive_failure_threshold() -> u32 {
+    3
+}
+
+fn default_eject_for() -> String {
+    "30s".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StatusRangeSource {
+    Code(u16),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetrySource {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub retry_on: Vec<String>,
+    #[serde(default)]
+    pub statuses: Vec<StatusRangeSource>,
+    #[serde(default)]
+    pub request_body: RetryRequestBodySource,
+    #[serde(default = "default_max_concurrent_retries")]
+    pub max_concurrent_retries: u32,
+}
+
+impl Default for RetrySource {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            methods: Vec::new(),
+            retry_on: Vec::new(),
+            statuses: Vec::new(),
+            request_body: RetryRequestBodySource::default(),
+            max_concurrent_retries: default_max_concurrent_retries(),
+        }
+    }
+}
+
+fn default_max_attempts() -> u32 {
+    1
+}
+
+fn default_max_concurrent_retries() -> u32 {
+    32
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetryRequestBodySource {
+    #[serde(default = "default_retry_body_mode")]
+    pub mode: String,
+    #[serde(default = "default_retry_body_max_bytes")]
+    pub max_bytes: String,
+}
+
+impl Default for RetryRequestBodySource {
+    fn default() -> Self {
+        Self {
+            mode: default_retry_body_mode(),
+            max_bytes: default_retry_body_max_bytes(),
+        }
+    }
+}
+
+fn default_retry_body_mode() -> String {
+    "none".to_owned()
+}
+
+fn default_retry_body_max_bytes() -> String {
+    "64KiB".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClusterLimitsSource {
+    #[serde(default = "default_cluster_max_in_flight")]
+    pub max_in_flight: u32,
+    #[serde(default = "default_endpoint_max_in_flight")]
+    pub max_in_flight_per_endpoint: u32,
+    #[serde(default = "default_queue_timeout")]
+    pub queue_timeout: String,
+}
+
+impl Default for ClusterLimitsSource {
+    fn default() -> Self {
+        Self {
+            max_in_flight: default_cluster_max_in_flight(),
+            max_in_flight_per_endpoint: default_endpoint_max_in_flight(),
+            queue_timeout: default_queue_timeout(),
+        }
+    }
+}
+
+fn default_cluster_max_in_flight() -> u32 {
+    1_024
+}
+
+fn default_endpoint_max_in_flight() -> u32 {
+    256
+}
+
+fn default_queue_timeout() -> String {
+    "0ms".to_owned()
 }
 
 fn default_cluster_protocol() -> String {
@@ -331,6 +543,8 @@ pub(crate) enum ErrorClassSource {
     Timeout,
     UpstreamConnect,
     UpstreamProtocol,
+    UpstreamUnavailable,
+    UpstreamOverloaded,
     SiteIo,
     TemplateLimit,
     BodyUnavailable,
@@ -402,6 +616,10 @@ pub struct TestExpectationSource {
     pub status: Option<u16>,
     pub service: Option<String>,
     pub cluster: Option<String>,
+    /// Upstream protocol policy expected for the selected Cluster.
+    pub cluster_protocol: Option<String>,
+    /// Load-balancing policy expected for the selected Cluster.
+    pub load_balance: Option<String>,
     pub site: Option<String>,
     pub rewritten_path: Option<String>,
 }

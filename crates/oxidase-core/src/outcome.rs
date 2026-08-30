@@ -8,6 +8,8 @@ pub enum ErrorClass {
     Timeout,
     UpstreamConnect,
     UpstreamProtocol,
+    UpstreamUnavailable,
+    UpstreamOverloaded,
     SiteIo,
     TemplateLimit,
     BodyUnavailable,
@@ -28,6 +30,9 @@ impl ServiceError {
         let public_status = match class {
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ErrorClass::UpstreamConnect | ErrorClass::UpstreamProtocol => StatusCode::BAD_GATEWAY,
+            ErrorClass::UpstreamUnavailable | ErrorClass::UpstreamOverloaded => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -35,6 +40,36 @@ impl ServiceError {
             public_status,
             internal_detail: internal_detail.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::StatusCode;
+
+    use super::{ErrorClass, ServiceError};
+
+    #[test]
+    fn upstream_error_classes_have_stable_default_statuses() {
+        for class in [ErrorClass::UpstreamConnect, ErrorClass::UpstreamProtocol] {
+            assert_eq!(
+                ServiceError::new(class, "internal test detail").public_status,
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        for class in [
+            ErrorClass::UpstreamUnavailable,
+            ErrorClass::UpstreamOverloaded,
+        ] {
+            assert_eq!(
+                ServiceError::new(class, "internal test detail").public_status,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            ServiceError::new(ErrorClass::Timeout, "internal test detail").public_status,
+            StatusCode::GATEWAY_TIMEOUT
+        );
     }
 }
 
