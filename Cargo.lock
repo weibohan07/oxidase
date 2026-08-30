@@ -930,6 +930,7 @@ version = "0.2.0-alpha.1"
 dependencies = [
  "bytes",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -942,6 +943,7 @@ dependencies = [
  "oxidase-runtime",
  "oxidase-site",
  "rcgen",
+ "rustls-native-certs",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

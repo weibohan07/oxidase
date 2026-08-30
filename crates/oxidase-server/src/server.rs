@@ -29,6 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body_with_snapshot};
+use crate::cluster_health::ClusterHealthManager;
 use crate::connection::TrackedExecutor;
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
@@ -60,6 +61,7 @@ fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
 pub struct GatewayServer {
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
+    health: ClusterHealthManager,
     metrics: Arc<Metrics>,
     listeners: Vec<BoundListener>,
     admin: Option<BoundAdmin>,
@@ -139,9 +141,12 @@ impl GatewayServer {
                 local_address,
             });
         }
+        let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
+        let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
         Ok(Self {
             store: Arc::new(SnapshotStore::new(snapshot)),
-            proxy: Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?),
+            proxy,
+            health,
             metrics: Arc::new(Metrics::default()),
             listeners,
             admin: None,
@@ -230,6 +235,7 @@ impl GatewayServer {
     }
 
     async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Result<(), ServerError> {
+        self.health.activate_snapshot(&self.store.pin());
         let (completion_sender, mut completions) = mpsc::unbounded_channel();
         let mut listeners = BTreeMap::new();
         let mut generation = 1u64;
@@ -267,6 +273,7 @@ impl GatewayServer {
                                 store: &self.store,
                                 proxy: &self.proxy,
                                 metrics: &self.metrics,
+                                health: &mut self.health,
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
                             };
@@ -282,12 +289,14 @@ impl GatewayServer {
                         Some(Control::Shutdown { response }) => {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
+                            self.health.shutdown().await;
                             let _ = response.send(());
                             return Ok(());
                         }
                         None => {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
+                            self.health.shutdown().await;
                             return Ok(());
                         }
                     }
@@ -561,6 +570,7 @@ pub struct ReloadReport {
     pub current_version: String,
     pub reused_sites: usize,
     pub reused_clusters: usize,
+    pub reused_cluster_endpoints: usize,
     pub reused_certificates: usize,
     pub listeners_added: Vec<String>,
     pub listeners_removed: Vec<String>,
@@ -682,6 +692,9 @@ async fn apply_reload(
     let previous_version = environment.store.pin().config_version.to_string();
     let current_version = snapshot.config_version.to_string();
     environment.store.publish(snapshot);
+    environment
+        .health
+        .activate_snapshot(&environment.store.pin());
 
     let listeners_added = prepared
         .iter()
@@ -712,6 +725,7 @@ async fn apply_reload(
         current_version,
         reused_sites: reuse.sites,
         reused_clusters: reuse.clusters,
+        reused_cluster_endpoints: reuse.cluster_endpoints,
         reused_certificates: reuse.certificates,
         listeners_added,
         listeners_removed: to_stop,
@@ -728,6 +742,7 @@ struct ReloadEnvironment<'a> {
     store: &'a Arc<SnapshotStore>,
     proxy: &'a Arc<ProxyClient>,
     metrics: &'a Arc<Metrics>,
+    health: &'a mut ClusterHealthManager,
     drain_timeout: Duration,
     completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
 }

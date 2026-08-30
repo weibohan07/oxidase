@@ -6,6 +6,7 @@ mod connection;
 mod leaves;
 mod metrics;
 mod protocol;
+mod proxy_body;
 mod response;
 mod server;
 mod upgrade;
