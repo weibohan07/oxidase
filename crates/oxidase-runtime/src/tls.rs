@@ -888,6 +888,37 @@ mod tests {
     }
 
     #[test]
+    fn accepts_common_rsa_pkcs1_private_keys() {
+        let directory = tempdir().expect("temporary directory is available");
+        let certificate_path = directory.path().join("rsa-cert.pem");
+        let private_key_path = directory.path().join("rsa-key.pem");
+        fs::write(
+            &certificate_path,
+            include_bytes!("../tests/fixtures/test-only-rsa-cert.pem"),
+        )
+        .expect("test-only RSA certificate can be written");
+        fs::write(
+            &private_key_path,
+            include_bytes!("../tests/fixtures/test-only-rsa-key.pem"),
+        )
+        .expect("test-only RSA private key can be written");
+
+        let prepared = PreparedCertificate::prepare(&CertificateSpec {
+            id: ResourceId::new("certificate:rsa"),
+            cert_chain: certificate_path,
+            private_key: private_key_path,
+            cert_chain_source: SourceSpan::synthetic("resources.certificates.rsa.cert_chain"),
+            private_key_source: SourceSpan::synthetic("resources.certificates.rsa.private_key"),
+            source: SourceSpan::synthetic("resources.certificates.rsa"),
+        })
+        .expect("a matching PKCS#1 RSA identity is supported");
+        assert_eq!(prepared.certificate_count(), 1);
+        prepared
+            .matches_server_name("rsa.example.test")
+            .expect("test-only certificate covers its DNS name");
+    }
+
+    #[test]
     fn resolves_exact_then_single_label_wildcard_then_default() {
         let directory = tempdir().expect("temporary directory is available");
         let inputs = [
