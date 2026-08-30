@@ -18,6 +18,8 @@ use oxidase_runtime::{ClusterRequestPermit, PreparedCluster, RuntimeSnapshot};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::protocol::RequestTrailerGuard;
+
 /// A validated, normalized HTTP Upgrade protocol identifier.
 ///
 /// The protocol name and optional version use the HTTP `token` grammar. The
@@ -90,15 +92,24 @@ impl UpgradeCandidate {
 pub(crate) struct GatewayRequestPayload {
     body: Incoming,
     upgrade: Option<PendingUpgrade>,
+    trailer_guard: RequestTrailerGuard,
 }
 
 impl GatewayRequestPayload {
-    pub(crate) fn new(body: Incoming, upgrade: Option<PendingUpgrade>) -> Self {
-        Self { body, upgrade }
+    pub(crate) fn new(
+        body: Incoming,
+        upgrade: Option<PendingUpgrade>,
+        trailer_guard: RequestTrailerGuard,
+    ) -> Self {
+        Self {
+            body,
+            upgrade,
+            trailer_guard,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (Incoming, Option<PendingUpgrade>) {
-        (self.body, self.upgrade)
+    pub(crate) fn into_parts(self) -> (Incoming, Option<PendingUpgrade>, RequestTrailerGuard) {
+        (self.body, self.upgrade, self.trailer_guard)
     }
 }
 
@@ -773,6 +784,21 @@ mod tests {
         assert_eq!(
             validate_upgrade_request(&request),
             Err(UpgradeValidationError::DuplicateConnectionUpgrade)
+        );
+
+        let mut request = upgrade_request();
+        request.headers_mut().remove(header::CONNECTION);
+        request
+            .headers_mut()
+            .append(header::CONNECTION, "Upgrade".parse().expect("header"));
+        request.headers_mut().append(
+            header::CONNECTION,
+            "keep-alive, upgrade".parse().expect("header"),
+        );
+        assert_eq!(
+            validate_upgrade_request(&request),
+            Err(UpgradeValidationError::DuplicateConnectionUpgrade),
+            "two Connection field lines cannot mint one ambiguous capability"
         );
 
         for value in [
