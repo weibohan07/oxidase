@@ -116,6 +116,8 @@ trusted from client-supplied forwarding Headers.
 
 ## Not implemented
 
-This alpha does not implement client-certificate authentication/mTLS, ACME, OCSP
-stapling, TLS 1.0/1.1, user-configurable cipher suites, QUIC/HTTP/3, or automatic
-certificate issuance. Do not configure publicly known test keys for a real service.
+Inbound client-certificate authentication and custom Trust Stores are documented in
+[`mtls.md`](mtls.md). This alpha does not implement ACME, CRL/OCSP revocation,
+TLS 1.0/1.1, user-configurable cipher suites, QUIC/HTTP/3, automatic certificate
+issuance, or certificate-to-role mapping. Do not configure publicly known test keys
+for a real service.

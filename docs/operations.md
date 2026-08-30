@@ -10,15 +10,16 @@ serve/reload without binding sockets. `oxidase test <config>` then runs declarat
 request expectations. Use both before deployment.
 
 `oxidase serve <config>` prepares every resource and listener before accepting
-traffic. Certificate chains, private keys, key/certificate consistency, SNI rules,
-TLS server configurations, Sites, and listener sockets all validate before
-publication. Any initial compile, resource preparation, or bind failure prevents
-partial startup. Source parsing uses one strict YAML subset for Gateway, `.oxsite`, `.oxr`,
-`.oxt`, and explain request documents: duplicate keys, anchors, aliases, merge keys,
-custom tags, tab indentation, and flow mappings are rejected; flow sequences are
-allowed. Literal and folded block scalars (including chomping and indentation
-indicators accepted by the YAML decoder) are supported; their contents are not
-mistaken for mapping keys or YAML graph features by the strict pre-scan.
+traffic. Secrets, Trust Stores, certificate chains, private keys,
+key/certificate consistency, SNI/client-auth rules, upstream TLS policies, Sites,
+and listener sockets all validate before publication. Any initial compile, resource
+preparation, or bind failure prevents partial startup. Source parsing uses one
+strict YAML subset for Gateway, `.oxsite`, `.oxr`, `.oxt`, and explain request
+documents: duplicate keys, anchors, aliases, merge keys, custom tags, tab
+indentation, and flow mappings are rejected; flow sequences are allowed. Literal
+and folded block scalars (including chomping and indentation indicators accepted by
+the YAML decoder) are supported; their contents are not mistaken for mapping keys
+or YAML graph features by the strict pre-scan.
 
 ## Reload
 
@@ -29,11 +30,12 @@ fingerprints run on a single-concurrency blocking compiler worker, not a Tokio a
 worker. New listener sockets are prebound and publication remains serialized by the
 manager.
 
-Certificate chain and private-key paths, including missing declared paths and their
-parents, are watcher dependencies. A candidate key is always parsed and positively
-matched to its leaf certificate even when the public chain digest is unchanged.
-Private-key bytes and fingerprints are never emitted in diagnostics, manifests,
-logs, or metrics.
+Secret, Trust Store, certificate-chain, and private-key paths, including missing
+declared paths and their parents, are watcher dependencies. A candidate key is
+always parsed and positively matched to its leaf certificate even when the public
+chain digest is unchanged. Private-key and Secret bytes are never emitted in
+diagnostics, manifests, logs, or metrics. Secret paths are also omitted from
+inspection-safe snapshot summaries.
 
 Site preparation is a single candidate pipeline: scan to `SiteSourceIndex`, compare
 its SHA-256 identity with the published resource, then either reuse the old
@@ -61,11 +63,11 @@ drain deadline are aborted. HTTP/2 pins the Service snapshot per request/stream,
 per connection, so a new stream accepted after publication sees the new snapshot.
 
 When listener name and bind remain unchanged, the listening socket is retained.
-Every newly accepted connection loads the current prepared TLS/HTTP plan; certificate
-or protocol-setting changes therefore do not require a rebind. Existing TLS
-connections keep the rustls configuration selected at their handshake. Invalid
-certificate rotation remains a failed candidate and the last-known-good certificate
-continues serving.
+Every newly accepted connection loads the current prepared TLS/HTTP plan;
+certificate, client-auth Trust Store, or protocol-setting changes therefore do not
+require a rebind. Existing TLS connections keep the rustls configuration and client
+identity selected at their handshake. Invalid certificate or Trust Store rotation
+remains a failed candidate and last-known-good continues serving.
 
 The watcher polls every 500ms. A filesystem edit that preserves path, byte length,
 and modification timestamp can still be missed until another observed dependency
@@ -105,7 +107,8 @@ needed to finalize an HTTP/1 `101 Switching Protocols` response.
 Cleartext listeners support HTTP/1.1 only. HTTPS listeners use rustls TLS 1.2/1.3
 defaults and select enabled HTTP versions through ALPN. Exact SNI rules win over a
 single-label left-most wildcard; unmatched or absent SNI uses the configured default
-certificate. See [`configuration/tls.md`](configuration/tls.md) and
+certificate. See [`configuration/tls.md`](configuration/tls.md),
+[`configuration/mtls.md`](configuration/mtls.md), and
 [`configuration/http2.md`](configuration/http2.md) for the DSL, defaults, and
 rejected configurations.
 
@@ -114,11 +117,38 @@ Connection-derived request metadata is read-only:
 - `request.http_version` is `"1.1"` or `"2"`;
 - `request.tls.enabled` distinguishes cleartext and TLS;
 - `request.tls.server_name`, `request.tls.alpn`, and `request.tls.version` describe
-  the accepted TLS connection and are null/absent as appropriate for cleartext.
+  the accepted TLS connection and are null/absent as appropriate for cleartext;
+- `request.tls.client.verified` is true only for a rustls-verified client chain;
+- `request.tls.client.sha256`, `.subject`, `.dns_sans`, and `.uri_sans` expose
+  bounded verified leaf metadata. Subject is informational, not a stable principal.
 
 Forwarded/X-Forwarded scheme metadata is constructed from the accepted connection,
 not from client-supplied forwarding Headers. Raw SNI and peer addresses may appear
 as controlled tracing fields but never as metric labels.
+
+### Secret and trust operations
+
+The file-backed Secret Resource defaults to a 64 KiB maximum and preserves exact
+bytes, including a final newline. Use a regular file owned by the Oxidase account;
+on Unix, mode `0600` or stricter avoids the advisory group/other-readable warning.
+Secret Debug/Display/Serialize output is redacted. Final-owner zeroization is best
+effort and cannot erase filesystem cache, allocator, swap, crash-dump, or external
+copies. See [`configuration/secrets.md`](configuration/secrets.md).
+
+Custom Trust Stores are strict, non-empty, certificate-only PEM bundles. They are
+public CA material, not Secret values. Inbound `optional` mTLS accepts an anonymous
+connection but rejects an invalid certificate if one is presented; `required`
+rejects both anonymous and invalid clients. Neither mode assigns application roles.
+Authorize only after checking `request.tls.client.verified` and a deliberately
+chosen verified SAN or leaf fingerprint.
+
+HTTPS Clusters use system roots by default. A Cluster can use custom roots alone or
+combine them with system roots, fix an exact DNS/IP verification name, and present a
+prepared Certificate Resource as its upstream client identity. Proxy and active
+health-check pools include the effective TLS policy digest, so changed trust,
+verification name, or client certificate starts a compatible new pool while work
+pinned to an older snapshot may finish on the old pool. Oxidase exposes no
+certificate-verification bypass.
 
 ## Ingress governance
 

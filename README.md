@@ -16,8 +16,9 @@ runtime snapshot. Each listener binds network traffic to any root Service.
   wrapper (`Transform`, `Observe`, `Timeout`, `RequestBodyLimit`,
   `ConcurrencyLimit`, `RateLimit`, `Recover`), and composition (`Route`, `Fallback`,
   `Reenter`) nodes.
-- **Resource Registry** owns reusable state such as validated Certificate material,
-  compiled Site snapshots, and Cluster definitions. Resources are not Services.
+- **Resource Registry** owns reusable state such as validated Secret, Trust Store,
+  and Certificate material, compiled Site snapshots, and prepared Clusters.
+  Resources are not Services.
 - **Router DSL** is optional source syntax lowered to ordinary Service IR before
   execution; the runtime has no privileged Router.
 - **Oxista** compiles `.oxsite`, `.oxr`, and `.oxt` sources into an immutable Site
@@ -56,7 +57,10 @@ ejection control eligibility; Cluster and per-endpoint semaphores bound admissio
 before the body is consumed. Retry is disabled by default and is allowed only for
 explicit methods and pre-response-head causes/statuses with an empty body or an
 explicitly bounded replay buffer. Runtime health/counters survive only a compatible
-endpoint reload identity.
+endpoint reload identity. HTTPS Clusters can use system roots, a custom Trust Store,
+or both, fix an exact DNS/IP verification identity, and present a prepared
+Certificate Resource as the upstream client identity. The TLS policy is part of
+Proxy and health-check pool compatibility; verification cannot be disabled.
 
 Inbound governance is explicit at both transport and Service boundaries. Listener
 limits bound total and per-kernel-peer connections, idle progress, Header bytes and
@@ -108,14 +112,19 @@ versioned `oxidase.diagnostics/v1` envelope and keeps stdout machine-readable.
 Request expression views are frame-local and lazy, so effective Headers, query
 values, bindings, and the request namespace are built once per unchanged frame.
 
-Certificates are prepared as Resources: PEM/X.509 structure, one supported private
-key, key/certificate consistency, SNI certificate compatibility, and all listener
-settings are validated before publication. Exact SNI names take precedence over a
-single-label left-most wildcard, then the default certificate. A retained listener
-socket loads the current immutable TLS/HTTP plan for each new connection, so a valid
-certificate rotation is atomic without rebinding; existing connections keep their
-old TLS state. Each HTTP/2 stream pins the snapshot current when that request starts,
-and listener retirement sends graceful shutdown before the drain deadline.
+Secrets are bounded file-only Resources with redacted formatting and best-effort
+final-owner zeroization; they are not general expression/template values. Strict,
+certificate-only Trust Store Resources provide roots for inbound client
+authentication and upstream private PKI. Certificates are prepared as Resources:
+PEM/X.509 structure, one supported private key, key/certificate consistency, SNI
+certificate compatibility, and all listener settings are validated before
+publication. HTTPS Listeners support `none`, `optional`, or `required` client
+authentication and expose only bounded, rustls-verified leaf metadata under
+`request.tls.client`. A retained listener socket loads the current immutable
+TLS/HTTP plan for each new connection, so valid certificate or trust rotation is
+atomic without rebinding; existing connections keep their old TLS state. Each
+HTTP/2 stream pins the snapshot current when that request starts, and listener
+retirement sends graceful shutdown before the drain deadline.
 
 HTTP/1 Proxy now has a server-local trusted Upgrade path: ordinary Respond/OXR/
 Transform output cannot forge its 101 response, and validated tunnels use
@@ -125,9 +134,9 @@ tests. Socket fixtures cover plain/TLS HTTP/1 handshakes, WebSocket-style bytes 
 both directions, either peer closing, reload with the old snapshot pinned, Listener
 drain timeout, trusted-capability isolation, and bounded metrics. Oxidase transparently
 tunnels WebSocket traffic rather than parsing its frames. HTTP/2 extended CONNECT,
-arbitrary CONNECT, cleartext h2c, gRPC-Web, client-certificate authentication/mTLS,
-ACME, OCSP stapling, and user-selected cipher suites are not implemented. OXT
-`extends`/`block` remains unsupported.
+arbitrary CONNECT, cleartext h2c, gRPC-Web, ACME, OCSP/CRL revocation, automatic
+certificate-to-role mapping, and user-selected cipher suites are not implemented.
+OXT `extends`/`block` remains unsupported.
 
 Atomic last-known-good reload is available with `serve --watch`; health, bounded
 metrics, and read-only `/api/v1/clusters` status are available on an explicit
@@ -209,6 +218,13 @@ Inbound transport configuration is documented in
 [`docs/configuration/http2.md`](docs/configuration/http2.md). An HTTPS listener
 defaults to `versions: [h2, http1]`; a cleartext listener defaults to `http1` and
 rejects `h2` rather than implying h2c support.
+
+File-backed Secret handling is documented in
+[`docs/configuration/secrets.md`](docs/configuration/secrets.md). Custom Trust Store,
+inbound mTLS, verified request metadata, and upstream TLS/mTLS policy are documented
+in [`docs/configuration/mtls.md`](docs/configuration/mtls.md). mTLS authenticates a
+certificate chain but does not by itself authorize a request; no
+`dangerous_skip_verify` option exists.
 
 Listener ingress limits and protection wrappers are defined in
 [`ADR 0009`](docs/adr/0009-ingress-resource-governance.md). Defaults remain finite:
