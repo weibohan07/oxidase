@@ -66,9 +66,13 @@ impl EndpointHealthState {
 /// object, while a URL or protocol change creates a fresh state object.
 pub struct EndpointRuntimeState {
     health: AtomicU8,
+    consecutive_active_health_successes: AtomicU64,
+    consecutive_active_health_failures: AtomicU64,
     active_health_successes: AtomicU64,
     active_health_failures: AtomicU64,
     passive_failures: AtomicU64,
+    passive_ejections: AtomicU64,
+    health_transitions: AtomicU64,
     successes: AtomicU64,
     failures: AtomicU64,
     selections: AtomicU64,
@@ -105,9 +109,13 @@ impl EndpointRuntimeState {
     fn new_at(now: Instant) -> Self {
         Self {
             health: AtomicU8::new(HEALTH_UNKNOWN_ELIGIBLE),
+            consecutive_active_health_successes: AtomicU64::new(0),
+            consecutive_active_health_failures: AtomicU64::new(0),
             active_health_successes: AtomicU64::new(0),
             active_health_failures: AtomicU64::new(0),
             passive_failures: AtomicU64::new(0),
+            passive_ejections: AtomicU64::new(0),
+            health_transitions: AtomicU64::new(0),
             successes: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             selections: AtomicU64::new(0),
@@ -146,9 +154,11 @@ impl EndpointRuntimeState {
 
     fn record_active_health(&self, succeeded: bool, plan: &ActiveHealthSpec, now: Instant) {
         if succeeded {
-            self.active_health_failures.store(0, Ordering::Release);
+            self.active_health_successes.fetch_add(1, Ordering::Relaxed);
+            self.consecutive_active_health_failures
+                .store(0, Ordering::Release);
             let successes = self
-                .active_health_successes
+                .consecutive_active_health_successes
                 .fetch_add(1, Ordering::AcqRel)
                 .saturating_add(1);
             if successes >= u64::from(plan.healthy_threshold) {
@@ -157,9 +167,11 @@ impl EndpointRuntimeState {
                 self.transition_to(EndpointHealthState::Healthy);
             }
         } else {
-            self.active_health_successes.store(0, Ordering::Release);
+            self.active_health_failures.fetch_add(1, Ordering::Relaxed);
+            self.consecutive_active_health_successes
+                .store(0, Ordering::Release);
             let failures = self
-                .active_health_failures
+                .consecutive_active_health_failures
                 .fetch_add(1, Ordering::AcqRel)
                 .saturating_add(1);
             if failures >= u64::from(plan.unhealthy_threshold)
@@ -215,8 +227,11 @@ impl EndpointRuntimeState {
         {
             self.ejection_deadline_tick.store(0, Ordering::Release);
             self.passive_failures.store(0, Ordering::Release);
-            self.active_health_successes.store(0, Ordering::Release);
-            self.active_health_failures.store(0, Ordering::Release);
+            self.consecutive_active_health_successes
+                .store(0, Ordering::Release);
+            self.consecutive_active_health_failures
+                .store(0, Ordering::Release);
+            self.health_transitions.fetch_add(1, Ordering::Relaxed);
             self.last_transition_unix_ms
                 .store(unix_time_millis(), Ordering::Release);
         }
@@ -225,6 +240,10 @@ impl EndpointRuntimeState {
     fn transition_to(&self, state: EndpointHealthState) {
         let previous = self.health.swap(state.encode(), Ordering::AcqRel);
         if previous != state.encode() {
+            self.health_transitions.fetch_add(1, Ordering::Relaxed);
+            if state == EndpointHealthState::PassivelyEjected {
+                self.passive_ejections.fetch_add(1, Ordering::Relaxed);
+            }
             self.last_transition_unix_ms
                 .store(unix_time_millis(), Ordering::Release);
         }
@@ -244,6 +263,10 @@ impl EndpointRuntimeState {
             selections: self.selections(),
             successes: self.successes.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            active_health_successes: self.active_health_successes.load(Ordering::Relaxed),
+            active_health_failures: self.active_health_failures.load(Ordering::Relaxed),
+            passive_ejections: self.passive_ejections.load(Ordering::Relaxed),
+            health_transitions: self.health_transitions.load(Ordering::Relaxed),
             last_transition_unix_ms: self.last_transition_unix_ms.load(Ordering::Acquire),
             ejection_remaining_ms: (health == EndpointHealthState::PassivelyEjected)
                 .then(|| deadline.saturating_sub(current) / 1_000_000),
@@ -602,6 +625,35 @@ impl PreparedCluster {
         }
     }
 
+    /// Records a retry attempt after the retry budget and replacement endpoint
+    /// have both been acquired. First attempts must not call this method.
+    pub fn record_retry_attempt(&self) {
+        self.runtime.retry_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that policy, attempt, endpoint, or storm-protection limits ended
+    /// retry processing before another attempt could start.
+    pub fn record_retry_exhausted(&self) {
+        self.runtime.retry_exhausted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a bounded admission rejection without retaining dynamic error
+    /// strings or endpoint URLs.
+    pub fn record_admission_failure(&self, error: ClusterAdmissionError) {
+        match error {
+            ClusterAdmissionError::Unavailable => {
+                self.runtime
+                    .unavailable_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClusterAdmissionError::Overloaded => {
+                self.runtime
+                    .overload_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     #[must_use]
     pub fn status(&self, now: Instant) -> ClusterRuntimeStatus {
         ClusterRuntimeStatus {
@@ -610,6 +662,10 @@ impl PreparedCluster {
             policy: self.spec.load_balance.as_str().to_owned(),
             active_requests: self.active_requests(),
             active_retries: self.active_retries(),
+            retry_attempts: self.runtime.retry_attempts.load(Ordering::Relaxed),
+            retry_exhausted: self.runtime.retry_exhausted.load(Ordering::Relaxed),
+            overload_rejections: self.runtime.overload_rejections.load(Ordering::Relaxed),
+            unavailable_rejections: self.runtime.unavailable_rejections.load(Ordering::Relaxed),
             endpoints: self
                 .endpoints
                 .iter()
@@ -833,6 +889,10 @@ pub struct ClusterRuntimeStatus {
     pub policy: String,
     pub active_requests: u64,
     pub active_retries: u64,
+    pub retry_attempts: u64,
+    pub retry_exhausted: u64,
+    pub overload_rejections: u64,
+    pub unavailable_rejections: u64,
     pub endpoints: Vec<EndpointStatusSnapshot>,
 }
 
@@ -850,6 +910,10 @@ pub struct EndpointRuntimeStatus {
     pub selections: u64,
     pub successes: u64,
     pub failures: u64,
+    pub active_health_successes: u64,
+    pub active_health_failures: u64,
+    pub passive_ejections: u64,
+    pub health_transitions: u64,
     pub last_transition_unix_ms: u64,
     pub ejection_remaining_ms: Option<u64>,
 }
@@ -859,6 +923,10 @@ struct ClusterRuntimeState {
     admission: Arc<AdmissionCounter>,
     retries: Arc<AdmissionCounter>,
     endpoint_released: Arc<Notify>,
+    retry_attempts: AtomicU64,
+    retry_exhausted: AtomicU64,
+    overload_rejections: AtomicU64,
+    unavailable_rejections: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -1162,6 +1230,11 @@ mod tests {
             cluster.endpoints[0].health_state(now),
             EndpointHealthState::Healthy
         );
+        let runtime = &cluster.status(now).endpoints[0].runtime;
+        assert_eq!(runtime.active_health_failures, 2);
+        assert_eq!(runtime.active_health_successes, 2);
+        assert_eq!(runtime.health_transitions, 2);
+        assert_eq!(runtime.passive_ejections, 0);
     }
 
     #[test]
@@ -1191,6 +1264,9 @@ mod tests {
             cluster.endpoints[0].health_state(later),
             EndpointHealthState::Healthy
         );
+        let runtime = &cluster.status(later).endpoints[0].runtime;
+        assert_eq!(runtime.passive_ejections, 2);
+        assert_eq!(runtime.health_transitions, 4);
     }
 
     #[tokio::test]
@@ -1422,6 +1498,27 @@ mod tests {
     }
 
     #[test]
+    fn cluster_status_accumulates_only_fixed_retry_and_admission_results() {
+        let cluster = prepared(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        cluster.record_retry_attempt();
+        cluster.record_retry_attempt();
+        cluster.record_retry_exhausted();
+        cluster.record_admission_failure(ClusterAdmissionError::Overloaded);
+        cluster.record_admission_failure(ClusterAdmissionError::Unavailable);
+        let status = cluster.status(Instant::now());
+        assert_eq!(status.retry_attempts, 2);
+        assert_eq!(status.retry_exhausted, 1);
+        assert_eq!(status.overload_rejections, 1);
+        assert_eq!(status.unavailable_rejections, 1);
+        let json = serde_json::to_string(&status).expect("bounded counters serialize");
+        assert!(!json.contains("http://"));
+        assert!(!json.contains("a.test"));
+    }
+
+    #[test]
     fn reload_reuses_only_compatible_endpoint_runtime_state() {
         let first = prepared(
             LoadBalancePolicy::RoundRobin,
@@ -1431,6 +1528,7 @@ mod tests {
             ],
         );
         first.record_passive_failure("a", Instant::now());
+        first.record_retry_attempt();
 
         let mut policy_update = cluster(
             LoadBalancePolicy::LeastRequests,
@@ -1446,6 +1544,7 @@ mod tests {
             first.endpoints[0].runtime_state(),
             second.endpoints[0].runtime_state()
         ));
+        assert_eq!(second.status(Instant::now()).retry_attempts, 1);
 
         let url_update = cluster(
             LoadBalancePolicy::LeastRequests,
