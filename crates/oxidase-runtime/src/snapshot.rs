@@ -618,6 +618,16 @@ listeners:
         assert_eq!(cluster_fingerprint(&first), cluster_fingerprint(&same));
         assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&reordered));
         assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&forced_h2));
+
+        let mut policy = first.clone();
+        policy.load_balance = LoadBalancePolicy::LeastRequests;
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&policy));
+        let mut retry = first.clone();
+        retry.retry.max_attempts = 2;
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&retry));
+        let mut limits = first.clone();
+        limits.limits.max_in_flight = 7;
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&limits));
     }
 
     #[test]
@@ -665,6 +675,7 @@ listeners:
         let cluster_id = ResourceId::new("cluster:api");
         assert_eq!(reuse.sites, 1);
         assert_eq!(reuse.clusters, 1);
+        assert_eq!(reuse.cluster_endpoints, 1);
         assert!(Arc::ptr_eq(
             &first.resources.sites[&site_id],
             &second.resources.sites[&site_id]
@@ -682,6 +693,7 @@ listeners:
         .expect("third snapshot prepares");
         assert_eq!(reuse.sites, 0);
         assert_eq!(reuse.clusters, 1);
+        assert_eq!(reuse.cluster_endpoints, 1);
         assert!(!Arc::ptr_eq(
             &second.resources.sites[&site_id],
             &third.resources.sites[&site_id]

@@ -914,6 +914,7 @@ fn unix_time_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1171,6 +1172,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_preferred_endpoint_does_not_hide_other_capacity() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        let saturated = cluster.endpoints[0]
+            .state
+            .admission
+            .try_acquire(1, None)
+            .expect("fixture saturates the preferred endpoint");
+
+        let admitted = cluster
+            .acquire()
+            .await
+            .expect("capacity on the other endpoint is used");
+        assert_eq!(admitted.endpoint().name(), "b");
+        assert_eq!(cluster.endpoints[0].state.selections(), 0);
+        assert_eq!(cluster.endpoints[1].state.selections(), 1);
+        drop(admitted);
+        drop(saturated);
+    }
+
+    #[tokio::test]
+    async fn retry_exclusions_prefer_untried_endpoints_and_stop_after_all() {
+        let cluster = prepared(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        let attempted = BTreeSet::from(["a".to_owned()]);
+        let admitted = cluster
+            .acquire_excluding(&attempted)
+            .await
+            .expect("an untried endpoint remains");
+        assert_eq!(admitted.endpoint().name(), "b");
+        drop(admitted);
+
+        let attempted = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        assert!(matches!(
+            cluster.acquire_excluding(&attempted).await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_release_wakes_a_waiter_without_losing_notification() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        spec.limits.max_in_flight = 2;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        spec.limits.queue_timeout = Duration::from_secs(1);
+        let cluster = Arc::new(PreparedCluster::prepare(spec, None).0);
+        let first = cluster.acquire().await.expect("first request is admitted");
+        let waiting_cluster = Arc::clone(&cluster);
+        let waiting = tokio::spawn(async move { waiting_cluster.acquire().await });
+        tokio::task::yield_now().await;
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiter is notified before its queue deadline")
+            .expect("waiter task does not panic")
+            .expect("released endpoint admits the waiter");
+        drop(second);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+    }
+
+    #[tokio::test]
     async fn queued_admission_is_cancellation_safe() {
         let mut spec = cluster(
             LoadBalancePolicy::RoundRobin,
@@ -1265,6 +1343,62 @@ mod tests {
             third.endpoints[1].runtime_state(),
             fourth.endpoints[1].runtime_state()
         ));
+    }
+
+    #[tokio::test]
+    async fn reload_shared_counters_apply_new_limits_to_old_active_requests() {
+        let mut first_spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        first_spec.limits.max_in_flight = 1;
+        first_spec.limits.max_in_flight_per_endpoint = 1;
+        let first = PreparedCluster::prepare(first_spec, None).0;
+        let old_request = first.acquire().await.expect("old request is admitted");
+
+        let mut second_spec = cluster(
+            LoadBalancePolicy::LeastRequests,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        second_spec.limits.max_in_flight = 2;
+        second_spec.limits.max_in_flight_per_endpoint = 2;
+        let (second, reused) = PreparedCluster::prepare(second_spec, Some(&first));
+        assert_eq!(reused, 1);
+        let new_request = second
+            .acquire()
+            .await
+            .expect("new limit includes and permits one request beside the old request");
+        assert!(matches!(
+            second.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        drop(old_request);
+        drop(new_request);
+        assert_eq!(first.active_requests(), 0);
+        assert_eq!(second.active_requests(), 0);
+    }
+
+    #[test]
+    fn supervisor_activation_is_once_per_prepared_cluster() {
+        let first = Arc::new(prepared(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        ));
+        assert!(!first.supervisor_is_activated());
+        assert!(first.try_activate_supervisor());
+        assert!(!first.try_activate_supervisor());
+        assert!(Arc::clone(&first).supervisor_is_activated());
+
+        let replacement = PreparedCluster::prepare(
+            cluster(
+                LoadBalancePolicy::LeastRequests,
+                vec![endpoint("a", "http://a.test", 1)],
+            ),
+            Some(&first),
+        )
+        .0;
+        assert!(!replacement.supervisor_is_activated());
+        assert!(replacement.try_activate_supervisor());
     }
 
     #[test]
