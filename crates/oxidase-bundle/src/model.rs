@@ -88,7 +88,7 @@ fn parse_digest(input: &str) -> Result<BundleDigest, &'static str> {
         return Err("SHA-256 digest must contain exactly 64 lowercase hexadecimal characters");
     }
     let mut bytes = [0_u8; 32];
-    for (index, pair) in input.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in input.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
 
@@ -287,7 +287,9 @@ impl CanonicalBytes {
         }
         self.hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Ok((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
             .collect::<Result<Vec<_>, &'static str>>()
             .map_err(|message| BundleError::new(BundleErrorKind::InvalidModel, message))
