@@ -676,11 +676,13 @@ impl BodyTermination {
     }
 }
 
-const ERROR_CLASSES: [&str; 9] = [
+const ERROR_CLASSES: [&str; 11] = [
     "configuration",
     "timeout",
     "upstream_connect",
     "upstream_protocol",
+    "upstream_unavailable",
+    "upstream_overloaded",
     "site_io",
     "template_limit",
     "body_unavailable",
@@ -694,7 +696,7 @@ struct ObserveSeries {
     declined: AtomicU64,
     failed: AtomicU64,
     status_classes: [AtomicU64; 5],
-    error_classes: [AtomicU64; 9],
+    error_classes: [AtomicU64; 11],
     latency_buckets: [AtomicU64; 10],
 }
 
@@ -727,11 +729,13 @@ const fn error_class_index(class: ErrorClass) -> usize {
         ErrorClass::Timeout => 1,
         ErrorClass::UpstreamConnect => 2,
         ErrorClass::UpstreamProtocol => 3,
-        ErrorClass::SiteIo => 4,
-        ErrorClass::TemplateLimit => 5,
-        ErrorClass::BodyUnavailable => 6,
-        ErrorClass::InvalidState => 7,
-        ErrorClass::Internal => 8,
+        ErrorClass::UpstreamUnavailable => 4,
+        ErrorClass::UpstreamOverloaded => 5,
+        ErrorClass::SiteIo => 6,
+        ErrorClass::TemplateLimit => 7,
+        ErrorClass::BodyUnavailable => 8,
+        ErrorClass::InvalidState => 9,
+        ErrorClass::Internal => 10,
     }
 }
 
@@ -874,7 +878,7 @@ mod tests {
     use std::time::Duration;
 
     use http::StatusCode;
-    use oxidase_core::ServiceId;
+    use oxidase_core::{ErrorClass, ServiceId};
     use oxidase_runtime::{
         ExecutionObserver, ServiceObservationContext, ServiceObservationOutcome,
         ServiceObservationResult,
@@ -927,6 +931,40 @@ mod tests {
         ));
         assert!(!output.contains("secret?query=value"));
         assert!(!output.contains("service:observe"));
+    }
+
+    #[test]
+    fn production_observe_exports_cluster_failures_as_fixed_error_classes() {
+        let metrics = Metrics::default();
+        let observer = ProductionObserver::new(&metrics, "version", "listener", 7);
+        let service = ServiceId::new("service:observe");
+
+        for class in [
+            ErrorClass::UpstreamUnavailable,
+            ErrorClass::UpstreamOverloaded,
+        ] {
+            let scope = observer.service_started(ServiceObservationContext {
+                observe_name: "cluster-boundary",
+                service_id: &service,
+                depth: 0,
+            });
+            observer.service_finished(
+                scope,
+                ServiceObservationResult {
+                    outcome: ServiceObservationOutcome::Failed(class),
+                },
+            );
+        }
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "oxidase_observe_errors_total{observe=\"cluster-boundary\",class=\"upstream_unavailable\"} 1"
+        ));
+        assert!(output.contains(
+            "oxidase_observe_errors_total{observe=\"cluster-boundary\",class=\"upstream_overloaded\"} 1"
+        ));
+        assert!(!output.contains("endpoint="));
+        assert!(!output.contains("url="));
     }
 
     #[test]

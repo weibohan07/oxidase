@@ -1632,6 +1632,8 @@ fn safe_error_body(status: StatusCode) -> &'static str {
         "Gateway Timeout"
     } else if status == StatusCode::BAD_GATEWAY {
         "Bad Gateway"
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        "Service Unavailable"
     } else {
         "Internal Server Error"
     }
@@ -1791,7 +1793,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http::{HeaderName, HeaderValue, Request, Response, Version, header};
+    use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
     use http_body_util::{BodyExt, Empty, Full};
     use hyper::client::conn::http2 as client_http2;
     use hyper::server::conn::http1;
@@ -1808,8 +1810,8 @@ mod tests {
     use super::{
         AlpnSelectionError, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayConnectionContext,
         GatewayServer, H2DrainObservation, NegotiatedHttpProtocol, ProxyClient, ServerError,
-        http1_builder, reserve_tls_handshake, select_https_protocol, serve_http2_connection,
-        tls_accept_error_outcome,
+        http1_builder, reserve_tls_handshake, safe_error_body, select_https_protocol,
+        serve_http2_connection, tls_accept_error_outcome,
     };
     use crate::metrics::{Metrics, TlsHandshakeOutcome};
 
@@ -1827,6 +1829,23 @@ mod tests {
         assert_eq!(diagnostics[0].code, "server.listener_bind");
         assert_eq!(diagnostics[0].primary.field_path, "listeners[0].bind");
         assert!(diagnostics[0].message.contains("public"));
+    }
+
+    #[test]
+    fn root_error_bodies_are_safe_and_status_specific() {
+        assert_eq!(safe_error_body(StatusCode::BAD_GATEWAY), "Bad Gateway");
+        assert_eq!(
+            safe_error_body(StatusCode::SERVICE_UNAVAILABLE),
+            "Service Unavailable"
+        );
+        assert_eq!(
+            safe_error_body(StatusCode::GATEWAY_TIMEOUT),
+            "Gateway Timeout"
+        );
+        assert_eq!(
+            safe_error_body(StatusCode::INTERNAL_SERVER_ERROR),
+            "Internal Server Error"
+        );
     }
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
