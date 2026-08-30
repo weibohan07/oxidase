@@ -533,7 +533,12 @@ where
     let mut buffer = [0u8; 16 * 1024];
     loop {
         let length = match reader.read(&mut buffer).await {
-            Ok(0) => return CopyCompletion::EndOfStream,
+            Ok(0) => {
+                return match writer.shutdown().await {
+                    Ok(()) => CopyCompletion::EndOfStream,
+                    Err(error) => CopyCompletion::WriteError(error.kind()),
+                };
+            }
             Ok(length) => length,
             Err(error) => return CopyCompletion::ReadError(error.kind()),
         };

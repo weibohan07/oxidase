@@ -126,6 +126,7 @@ pub struct TrailerGuard {
 }
 
 impl TrailerGuard {
+    #[cfg(test)]
     pub(crate) const fn new(
         protocol: WireProtocol,
         accepts_http1_trailers: bool,
