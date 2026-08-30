@@ -175,8 +175,11 @@ impl EndpointRuntimeState {
         self.passive_failures.store(0, Ordering::Release);
     }
 
-    fn record_passive_failure(&self, plan: &PassiveHealthSpec, now: Instant) {
+    fn record_passive_failure(&self, plan: Option<&PassiveHealthSpec>, now: Instant) {
         self.failures.fetch_add(1, Ordering::Relaxed);
+        let Some(plan) = plan else {
+            return;
+        };
         let failures = self
             .passive_failures
             .fetch_add(1, Ordering::AcqRel)
@@ -549,11 +552,10 @@ impl PreparedCluster {
     }
 
     pub fn record_passive_failure(&self, endpoint_name: &str, now: Instant) {
-        let Some(plan) = &self.spec.health.passive else {
-            return;
-        };
         if let Some(endpoint) = self.endpoint(endpoint_name) {
-            endpoint.state.record_passive_failure(plan, now);
+            endpoint
+                .state
+                .record_passive_failure(self.spec.health.passive.as_ref(), now);
         }
     }
 
@@ -1416,5 +1418,25 @@ mod tests {
         assert!(json.contains("public-name"));
         assert!(!json.contains("secret-origin"));
         assert!(!json.contains("private"));
+    }
+
+    #[test]
+    fn request_result_counters_exist_without_passive_ejection_policy() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        spec.health.passive = None;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        let now = Instant::now();
+        cluster.record_passive_failure("a", now);
+        cluster.record_passive_success("a");
+        let status = cluster.status(now);
+        assert_eq!(status.endpoints[0].runtime.failures, 1);
+        assert_eq!(status.endpoints[0].runtime.successes, 1);
+        assert_eq!(
+            status.endpoints[0].runtime.health,
+            EndpointHealthState::UnknownEligible
+        );
     }
 }
