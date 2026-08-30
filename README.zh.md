@@ -14,8 +14,8 @@ Oxidase 是一个使用 Rust 编写的声明式 HTTP Service 程序编译器与�
 - **Service Program**：组合终结型（`Respond`、`Redirect`、`Site`、`Proxy`）、
   包装型（`Transform`、`Observe`、`Timeout`、`Recover`）与组合型（`Route`、
   `Fallback`、`Reenter`）节点。
-- **Resource Registry**：持有可复用的 SiteSnapshot、Cluster 等共享状态；Resource
-  不是 Service。
+- **Resource Registry**：持有已验证的 Certificate、可复用 SiteSnapshot、Cluster 等
+  共享状态；Resource 不是 Service。
 - **Router DSL**：可选的源码语法，在执行前降解为普通 Service IR；运行时没有
   特权 Router。
 - **Oxista**：把 `.oxsite`、`.oxr`、`.oxt` 编译为不可变 Site 索引；请求期不解析
@@ -28,8 +28,9 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 
 ## 当前 v0.2 alpha
 
-当前可运行的 HTTP/1.1 垂直切片支持所有现有 Service 节点，包括通过共享连接池
-执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2 的 Proxy。Asset 使用异步文件流，支持
+当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1
+或 HTTP/2 的 HTTPS；所有现有 Service 节点均可在选定协议上运行。Proxy 继续通过
+共享连接池执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2。Asset 使用异步文件流，支持
 按质量值选择 identity/Brotli/gzip、各表示独立 ETag、正确的 validator 优先级、
 If-Range 与单 Range。Range 只作用于 GET：有效单 bytes Range 在 identity 可接受时
 使用 identity；HEAD、未知/错误 unit、multiple Range，以及 identity 被排除的请求都
@@ -68,9 +69,17 @@ Gateway 与 Oxista semantic diagnostic 会保留精确 byte/行列、secondary l
 envelope，stdout 不混入人类输出。RequestFrame 的 Header/query/bindings/request
 namespace 采用 frame-local lazy cache，同一未修改 frame 只构造一次。
 
-入站 TLS/HTTP/2 及 OXT `extends/block` 尚未实现。使用 `serve --watch` 可以启用
-保留 last-known-good 的原子 reload；通过独立、显式的 `--admin-bind` 可启用健康检查
-与有界指标。准确边界见
+Certificate 作为 Resource 在发布前完成 PEM/X.509、唯一受支持私钥、证书与私钥
+匹配、SNI 与证书兼容性以及 Listener setting 验证。SNI 先精确匹配，再匹配仅一个
+label 的最左侧 wildcard，最后使用 default certificate。保留的 Listener socket 会在
+每次新连接时读取当前不可变 TLS/HTTP plan，因此合法证书轮换可在不重新 bind 的情况
+下原子生效；既有连接继续使用旧 TLS 状态。每个 HTTP/2 stream 在请求开始时固定当前
+snapshot，Listener retire 时先 graceful shutdown/GOAWAY，再受 drain deadline 约束。
+
+明文 h2c、客户端证书认证/mTLS、ACME、OCSP stapling、用户自定义 cipher suite、
+HTTP/2 WebSocket、Upgrade/trailers 与 gRPC 尚未实现；OXT `extends/block` 也仍不支持。
+使用 `serve --watch` 可以启用保留 last-known-good 的原子 reload；通过独立、显式的
+`--admin-bind` 可启用健康检查与有界指标。准确边界见
 [`docs/implementation-status.md`](docs/implementation-status.md)。
 本版本仍是 `0.2.0-alpha`，不宣称 production-ready。
 
@@ -136,6 +145,11 @@ sequence 以及 literal/folded block scalar。Import/reference cycle 会被检�
 但当前没有语义的字段值会带迁移建议直接拒绝。`check` 与 `serve` 使用同一条编译
 和 Site 准备管线。
 
+入站 transport 配置见 [`docs/configuration/tls.md`](docs/configuration/tls.md) 与
+[`docs/configuration/http2.md`](docs/configuration/http2.md)。HTTPS Listener 默认
+`versions: [h2, http1]`；明文 Listener 默认 `http1`，若配置 `h2` 会明确拒绝，而
+不会暗示支持 h2c。
+
 ## CLI
 
 ```text
@@ -155,9 +169,10 @@ oxidase test <config>
 `serve --watch` 会监控 imported config 和已编译 Site 的依赖。Reload 会先完成候选
 版本的完整编译与资源准备，预绑定新增 Listener，复用未变化资源，全部成功后才
 原子提交。阻塞式 preparation 不占用 Tokio worker；失败候选中新发现的 import
-仍会被观察。失败 Site 候选已扫描的 OXT/OXR/asset、缺失声明路径、template root、
-预压缩候选及父目录也会保留在 watcher 依赖集中。Retired HTTP/1 connection 会收到
-graceful shutdown：空闲 keep-alive 及时关闭，活跃请求继续在其固定旧快照上 drain。
+与无效证书轮换仍会被观察，last-known-good 继续服务。失败 Site 候选已扫描的
+OXT/OXR/asset、缺失声明路径、template root、预压缩候选及父目录也会保留在 watcher
+依赖集中。Retired HTTP/1 connection 会收到 graceful shutdown，HTTP/2 connection
+会收到 GOAWAY：空闲连接及时关闭，活跃请求/stream 继续在其固定快照上 drain。
 
 ## 开发
 

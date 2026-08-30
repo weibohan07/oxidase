@@ -15,8 +15,8 @@ runtime snapshot. Each listener binds network traffic to any root Service.
 - **Service Program** composes terminal (`Respond`, `Redirect`, `Site`, `Proxy`),
   wrapper (`Transform`, `Observe`, `Timeout`, `Recover`), and composition (`Route`,
   `Fallback`, `Reenter`) nodes.
-- **Resource Registry** owns reusable state such as compiled Site snapshots and
-  Cluster definitions. Resources are not Services.
+- **Resource Registry** owns reusable state such as validated Certificate material,
+  compiled Site snapshots, and Cluster definitions. Resources are not Services.
 - **Router DSL** is optional source syntax lowered to ordinary Service IR before
   execution; the runtime has no privileged Router.
 - **Oxista** compiles `.oxsite`, `.oxr`, and `.oxt` sources into an immutable Site
@@ -29,9 +29,11 @@ cannot leak captures or rewrites into its siblings.
 
 ## Current v0.2 alpha
 
-The runnable HTTP/1.1 slice supports every current Service node, including streaming
-Proxy over pooled HTTP/1.1, HTTPS, and upstream HTTP/2 connections. Assets are
-streamed from async files and support quality-weighted identity/Brotli/gzip
+The runnable inbound data plane supports cleartext HTTP/1.1 plus HTTPS over TLS
+1.2/1.3 with ALPN-selected HTTP/1.1 or HTTP/2. Every current Service node runs on
+either selected protocol. Proxy remains streaming over pooled HTTP/1.1, HTTPS, and
+upstream HTTP/2 connections. Assets are streamed from async files and support
+quality-weighted identity/Brotli/gzip
 selection, representation-specific ETags, correct validator precedence, If-Range,
 and single byte ranges. Range applies only to GET: a valid single bytes range uses
 identity when acceptable, while HEAD, unknown/malformed units, multipart requests,
@@ -78,9 +80,20 @@ versioned `oxidase.diagnostics/v1` envelope and keeps stdout machine-readable.
 Request expression views are frame-local and lazy, so effective Headers, query
 values, bindings, and the request namespace are built once per unchanged frame.
 
-Inbound TLS/HTTP/2 and OXT `extends`/`block` are not yet implemented. Atomic
-last-known-good reload is available with `serve --watch`; health and bounded metrics
-are available on an explicit separate `--admin-bind`. See
+Certificates are prepared as Resources: PEM/X.509 structure, one supported private
+key, key/certificate consistency, SNI certificate compatibility, and all listener
+settings are validated before publication. Exact SNI names take precedence over a
+single-label left-most wildcard, then the default certificate. A retained listener
+socket loads the current immutable TLS/HTTP plan for each new connection, so a valid
+certificate rotation is atomic without rebinding; existing connections keep their
+old TLS state. Each HTTP/2 stream pins the snapshot current when that request starts,
+and listener retirement sends graceful shutdown before the drain deadline.
+
+Cleartext h2c, client-certificate authentication/mTLS, ACME, OCSP stapling,
+user-selected cipher suites, HTTP/2 WebSocket, Upgrade/trailers, and gRPC are not yet
+implemented. OXT `extends`/`block` also remains unsupported. Atomic last-known-good
+reload is available with `serve --watch`; health and bounded metrics are available
+on an explicit separate `--admin-bind`. See
 [`docs/implementation-status.md`](docs/implementation-status.md) for exact status.
 This release remains `0.2.0-alpha` and is not described as production-ready.
 
@@ -148,6 +161,12 @@ references are cycle checked, and parsed-but-inert field values are rejected wit
 migration guidance. `check` and `serve` use the same compiler and Site preparation
 path.
 
+Inbound transport configuration is documented in
+[`docs/configuration/tls.md`](docs/configuration/tls.md) and
+[`docs/configuration/http2.md`](docs/configuration/http2.md). An HTTPS listener
+defaults to `versions: [h2, http1]`; a cleartext listener defaults to `http1` and
+rejects `h2` rather than implying h2c support.
+
 ## CLI
 
 ```text
@@ -169,9 +188,11 @@ binary runtime snapshot.
 `serve --watch` watches imported configuration and compiled Site dependencies.
 Reload compiles and prepares the complete candidate, prebinds new listeners, reuses
 unchanged resources, and atomically commits only on success. Blocking preparation
-runs off Tokio workers. Failed-candidate imports remain watched, and retired HTTP/1
-connections receive graceful shutdown: idle keep-alive closes promptly while active
-requests drain on their pinned snapshot. Failed Site candidates also retain scanned
+runs off Tokio workers. Failed-candidate imports and invalid certificate rotations
+remain watched while the last-known-good state stays active. Retired HTTP/1
+connections receive graceful shutdown and retired HTTP/2 connections receive
+GOAWAY: idle connections close promptly while active requests/streams drain on their
+pinned snapshot. Failed Site candidates also retain scanned
 OXT/OXR/assets, missing declared paths, template roots, precompressed candidates,
 and their parent directories in the watcher dependency set.
 

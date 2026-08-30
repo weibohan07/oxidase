@@ -43,12 +43,14 @@ pipeline:
 4. accepts exactly one PKCS#8, PKCS#1 RSA, or SEC1 key;
 5. asks the selected rustls provider to parse the key;
 6. verifies that the leaf certificate and private key match;
-7. computes a domain-separated digest over certificate and key bytes.
+7. computes a domain-separated digest over the public certificate-chain DER.
 
 Private-key bytes are never placed in diagnostics, Debug output, inspection
-manifests, tracing, or metrics. A matching content digest reuses the prior prepared
-resource. Certificate/key paths and their parent directories remain in the reload
-dependency set on success and failure.
+manifests, tracing, metrics, or a separately exposed key fingerprint. The candidate
+private key is reparsed and positively matched on every preparation; only after that
+check may a matching public-chain digest reuse the prior opaque signing resource.
+Certificate/key paths and their parent directories remain in the reload dependency
+set on success and failure.
 
 ### SNI and ALPN
 
@@ -110,9 +112,10 @@ Protocol-neutral request metadata exposes `request.http_version` and a read-only
 Forwarded/X-Forwarded-Proto continues to derive scheme from this trusted connection
 metadata, never from an incoming Header.
 
-Metrics use only configured listener names and fixed protocol/result enums. SNI,
-certificate paths, client addresses, and request data are not labels. SNI may appear
-as a controlled tracing field.
+Transport metrics use fixed protocol/result enums; existing Observe metrics use only
+configured Observe names and fixed result enums. SNI, certificate paths, client
+addresses, and request data are not labels. SNI may appear as a controlled tracing
+field.
 
 ## Rejected alternatives
 
