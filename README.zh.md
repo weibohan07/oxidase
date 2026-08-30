@@ -21,6 +21,8 @@ Oxidase 是一个使用 Rust 编写的声明式 HTTP Service 程序编译器与�
   特权 Router。
 - **Oxista**：把 `.oxsite`、`.oxr`、`.oxt` 编译为不可变 Site 索引；请求期不解析
   这些源文件。
+- **Portable Bundle**（`oxidase.bundle/v1`）：用稳定的 Service、transport、Resource、
+  Site 与 Asset section 交付程序，而不是序列化 Rust 运行时对象。
 
 每个 Service 明确返回 `Handled(response)`、`Declined` 或 `Failed(error)`。
 Fallback 只在 `Declined` 时继续；HTTP 404 和 500 仍是正常的 Handled 响应。请求
@@ -95,6 +97,22 @@ Gateway 与 Oxista semantic diagnostic 会保留精确 byte/行列、secondary l
 `--diagnostic-format human|json`；JSON 使用带版本的 `oxidase.diagnostics/v1`
 envelope，stdout 不混入人类输出。RequestFrame 的 Header/query/bindings/request
 namespace 采用 frame-local lazy cache，同一未修改 frame 只构造一次。
+
+Portable `.oxb` Bundle 可以构建、检查、验证、diff、签名，并在不重新读取 Gateway 或
+Oxista YAML 的情况下启动。默认 `embed` Asset 模式写入去重后的 raw blob，Range 响应
+继续从匿名、已验证的 spool 流式读取，因此原路径替换和原 inode 原地改写都不会影响已激活
+snapshot；`reference` 会记录显式 absolute/deployment-root 路径、长度与 SHA-256 digest，
+并在激活前完整验证，再从匿名验证副本提供内容而不是继续信任可变源 inode。带版本的稳定
+DTO 会重新解析成同一张
+Service graph 和同一套运行时 plan，因此 Bundle 启动不是第二套数据面。未知 required
+capability 或不兼容的最低运行时版本会 fail closed。
+
+Ed25519 签名覆盖 domain-separated canonical content digest，并支持多 verification key
+轮换。公开证书链可以进入 Bundle，但 Secret 内容与证书私钥绝不会进入：格式中只有强类型
+运行时文件引用，inspection/debug 输出会对其 redact，并在 prepare-before-commit 阶段
+重新验证。Bundle 格式与
+CLI 仍是 alpha；它不是包含连接、Cluster/limiter 活状态的可执行快照，也还不是经过认证
+的 staged control plane。详见 [`docs/bundles.md`](docs/bundles.md)。
 
 Secret 是有界、仅文件型的 Resource，格式化输出始终 redact，并在最后 owner drop 时
 尽力 zeroize；它不是通用 expression/template value。严格的 certificate-only Trust
@@ -226,7 +244,8 @@ oxidase test <config>
 `--diagnostic-format json` 可获得确定性的机器可读诊断。Alpha schema 与位置约定见
 [`docs/diagnostics.md`](docs/diagnostics.md)。
 
-`compile` 当前输出确定性的检查清单，并非包含全部资源的可执行二进制快照。
+`compile` 继续输出确定性的检查清单。Portable runtime artifact 使用
+[`docs/bundles.md`](docs/bundles.md) 中独立的 Bundle 流程；Bundle 不保存进程活状态。
 
 `serve --watch` 会监控 imported config 和已编译 Site 的依赖。Reload 会先完成候选
 版本的完整编译与资源准备，预绑定新增 Listener，复用未变化资源，全部成功后才

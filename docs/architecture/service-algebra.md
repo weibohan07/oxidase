@@ -24,6 +24,16 @@ one compiled source program. The source ordinal can change when the import set
 changes, so these alpha IDs are not durable API keys, long-lived metric labels,
 stable configuration references, or control-plane protocol identifiers.
 
+An `oxidase.bundle/v1` does not define a second Service representation at execution
+time. Its `oxidase.service-program/v1` section stores stable strings, integers,
+source spans, and source-language Pattern/Expression/Template forms. Loading
+recompiles those forms, rejects unknown nodes or invalid references, reconstructs
+one ordinary `ServiceGraph`, and runs the same graph validation before snapshot
+publication. Listener entries from the separate portable Gateway section must exist
+in that graph; expected Site IDs must exactly match separately decoded Site sections.
+No runtime pointer, executor, Hyper/rustls object, connection, pool, task, limiter
+bucket, or health state crosses this boundary.
+
 `Fallback` tries the next candidate only after `Declined`. `Recover` is the only
 generic mechanism that turns selected failures into another Service execution.
 `Route` evaluates predicates into local captures, commits the complete match into a

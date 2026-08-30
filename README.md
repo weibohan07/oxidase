@@ -23,6 +23,8 @@ runtime snapshot. Each listener binds network traffic to any root Service.
   execution; the runtime has no privileged Router.
 - **Oxista** compiles `.oxsite`, `.oxr`, and `.oxt` sources into an immutable Site
   index. Request handling never parses these files.
+- **Portable Bundle** (`oxidase.bundle/v1`) stores stable Service, transport,
+  Resource, Site, and Asset sections without serializing Rust runtime objects.
 
 Every Service returns one of `Handled(response)`, `Declined`, or `Failed(error)`.
 Fallback advances only on `Declined`; HTTP 404 and 500 responses are still handled
@@ -111,6 +113,26 @@ compiling CLI command accepts `--diagnostic-format human|json`; JSON uses the
 versioned `oxidase.diagnostics/v1` envelope and keeps stdout machine-readable.
 Request expression views are frame-local and lazy, so effective Headers, query
 values, bindings, and the request namespace are built once per unchanged frame.
+
+Portable `.oxb` Bundles can be built, inspected, verified, diffed, signed, and
+served without rereading Gateway or Oxista YAML. The default `embed` Asset mode
+stores deduplicated raw blobs and keeps range responses streaming from an anonymous
+verified spool, isolating both path replacement and in-place source-file writes;
+`reference` records an explicit absolute/deployment-root path, length, and SHA-256
+digest that must match before activation, then serves an anonymous verified copy
+rather than the mutable source inode. Stable versioned DTOs are
+reparsed into the same Service graph and runtime plans, so Bundle startup is not a
+second data plane. Unknown required capabilities or an incompatible minimum runtime
+version fail closed.
+
+Ed25519 signatures cover the domain-separated canonical content digest and support
+multiple verification keys for rotation. Public certificate chains may be bundled,
+but Secret values and certificate private keys never are: only typed runtime file
+references cross the format boundary, inspection/debug output redacts them, and
+their targets are revalidated during prepare-before-commit. The Bundle format and
+CLI are alpha, are not an executable
+snapshot of live connections or Cluster/limiter state, and do not yet constitute
+the authenticated staged control plane. See [`docs/bundles.md`](docs/bundles.md).
 
 Secrets are bounded file-only Resources with redacted formatting and best-effort
 final-owner zeroization; they are not general expression/template values. Strict,
@@ -256,8 +278,9 @@ failing `explain` invocation for deterministic machine-readable diagnostics. See
 [`docs/diagnostics.md`](docs/diagnostics.md) for the alpha schema and position
 conventions.
 
-`compile` currently writes a deterministic inspection manifest, not a self-contained
-binary runtime snapshot.
+`compile` continues to write a deterministic inspection manifest. Portable runtime
+artifacts use the separate Bundle workflow documented in
+[`docs/bundles.md`](docs/bundles.md); a Bundle does not preserve live process state.
 
 `serve --watch` watches imported configuration and compiled Site dependencies.
 Reload compiles and prepares the complete candidate, prebinds new listeners, reuses

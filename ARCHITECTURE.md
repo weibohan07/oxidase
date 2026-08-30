@@ -10,13 +10,18 @@ The workspace is intentionally layered:
 
 - `oxidase-core`: values, SHA-256 content identities, IDs, the renderer-neutral
   Diagnostic/SourceSpan model, patterns, expressions, lazy transactional request
-  frames, Service IR, and protocol-independent outcomes.
+  frames, Service IR, protocol-independent outcomes, and the stable portable
+  Service-program DTO.
 - `oxidase-source`: the shared strict YAML subset plus `SourceDocument<T>` original
   text and field-path span indexes.
 - `oxidase-config`: strict source models, import/reference resolution, diagnostics,
-  Certificate/Listener transport plans, immutable Cluster policies, and lowering.
-- `oxidase-site`: the single-scan `SiteSourceIndex`, typed lexical OXT compiler, and
-  immutable site resources.
+  Certificate/Listener transport plans, immutable Cluster policies, lowering, and
+  the stable portable Gateway transport/Resource DTO.
+- `oxidase-site`: the single-scan `SiteSourceIndex`, typed lexical OXT compiler,
+  immutable site resources, and stable portable Site/template DTOs.
+- `oxidase-bundle`: the bounded `oxidase.bundle/v1` container, canonical manifest,
+  raw content-addressed blobs, capability negotiation, inspection/diff, and
+  domain-separated Ed25519 signing/verification.
 - `oxidase-runtime`: transactional request frames, Service execution, prepared
   Certificate/TLS and Cluster plans, bounded endpoint state, resources, snapshots,
   and publication. Private signing material remains opaque and never enters Service
@@ -25,8 +30,8 @@ The workspace is intentionally layered:
   listener socket/transport lifecycle, rustls handshakes, ALPN-selected HTTP/1.1 or
   HTTP/2 connection drivers, active Cluster supervisors, the streaming proxy/body
   adapter, protocol-aware trailer handling, and trusted HTTP/1 Upgrade tunnels.
-- `oxidase-cli`: `check`, `explain`, `compile`, `test`, and `serve` commands plus the
-  final human/JSON diagnostic rendering boundary.
+- `oxidase-cli`: source and Bundle build/inspect/verify/diff/sign/serve commands plus
+  the final human/JSON diagnostic rendering boundary.
 - `oxidase-testkit`: reusable fixtures for integration and protocol tests.
 
 Detailed constraints live in `docs/architecture/` and accepted decisions in
@@ -58,3 +63,22 @@ protocol adapters. H2 trailers therefore remain trailers for transparent gRPC.
 HTTP/1 Upgrade is a private capability produced only by the validated Proxy path;
 ordinary Service responses still pass through the same protocol-aware finalizer and
 cannot opt into hop-by-hop framing.
+
+Portable Bundle loading joins independently versioned stable sections for the
+Service graph, Gateway transport/resources, and Site snapshots. Every textual URL,
+socket, method, status, SNI rule, expression, Pattern, Template, and resource
+reference is reparsed and cross-checked before runtime preparation. No YAML is read
+on this path, and no regex, Hyper, rustls, pointer, task, socket, pool, limiter, or
+health-state object is deserialized. Expected Site IDs must exactly match supplied
+Site sections.
+
+Bundle Asset storage preserves the existing data plane. Embedded representations
+are raw, digest-ordered file slices read from a verified anonymous spool; replacing
+or rewriting the original Bundle cannot change an old snapshot. Referenced Assets
+are resolved only from an explicit absolute/deployment-root base, have their length
+and SHA-256 digest verified, and are copied into snapshot-owned verified spools
+before publication. Secret bytes and certificate private keys remain file-backed
+runtime references; public certificate chains may be carried in the Bundle. The
+loader still executes prepare, validate, commit, and drain, so a Bundle is a
+deployment representation of the program rather than a second runtime or a
+serialization of live state.

@@ -27,10 +27,10 @@ system limits and upstream capacity remain part of the deployment boundary.
 ## Assets
 
 - Service programs, Site and Cluster plans, and the currently published snapshot;
-- private keys, future Secret Resources, trust roots, and operator credentials;
+- private keys, file-backed Secret Resources, trust roots, and operator credentials;
 - request/response bodies, bindings, client TLS metadata, and upstream data;
 - listener sockets, pooled upstream connections, permits, tasks, and file handles;
-- configuration, Oxista source, candidate dependencies, and future bundle files;
+- configuration, Oxista source, candidate dependencies, and untrusted Bundle files;
 - audit, access-log, tracing, metrics, and diagnostic outputs; and
 - management actions such as prepare, activate, rollback, drain, and reload.
 
@@ -43,7 +43,7 @@ system limits and upstream capacity remain part of the deployment boundary.
 | Configuration author | Privileged but fallible | Source is strictly compiled; accepted fields must have runtime meaning. Configuration is not allowed to mint trusted transport capabilities. |
 | Local source/certificate directory | Deployment trust boundary | Files can change between reloads. Each candidate is rediscovered, digested, parsed, and prepared before atomic publication. |
 | Administrator | Privileged | The v0.3 read-only admin listener relies on network isolation. Authenticated staged control is a later v0.4 boundary. |
-| Bundle producer | Not yet trusted by runtime | Portable bundles and signing do not exist in v0.3. YAML/source preparation remains authoritative. |
+| Bundle producer | Untrusted until explicit verification | Container bounds, canonical SHA-256 identity, capability negotiation, and an optional/required trusted Ed25519-key policy are checked before preparation. A signature authenticates content, not referenced files. |
 | DNS resolver | Operating-system/upstream dependency | v0.3 endpoints are static. Dynamic discovery must treat answers, TTLs, and rebinding as untrusted input. |
 | Operating system | Trusted computing base | Filesystem permissions, scheduling, entropy, clocks, sockets, and resource limits are assumed to work as specified. |
 | Metrics/log backend | External sink | Emitted labels and fields must be bounded and non-secret even if the sink is less trusted than the process. |
@@ -82,8 +82,9 @@ snapshot; retirement initiates graceful shutdown/GOAWAY and has a finite abort
 deadline. Regression tests exercise malformed frames, settings boundaries, resets,
 and concurrent drain.
 
-**Residual:** v0.3 has no configurable per-peer stream-churn or request rate policy.
-Listener-wide and per-IP governance belongs to the next v0.4 layer.
+**Residual:** Listener connection/request limits and explicit RateLimit Services bound
+accepted work, but there is no specialized adaptive H2 rapid-reset detector or
+distributed per-peer policy.
 
 ### TLS and SNI
 
@@ -101,10 +102,11 @@ handling.
 
 **Residual:** an expired or not-yet-valid certificate is a hard prepare failure,
 because publication would immediately serve it to new connections. The current
-source-reload path therefore cannot pre-stage a future certificate; a future staged
-artifact may retain the reference, but activation must revalidate time. Client
-authentication, trust-store Resources, and authenticated identity metadata are not
-yet implemented.
+source-reload path therefore cannot pre-stage a future certificate. A Bundle may
+retain its typed private-key reference, but activation still revalidates time and
+key/leaf consistency. Inbound optional/required client authentication and upstream
+custom Trust Store/client-certificate policy are implemented; revocation, SPIFFE
+authorization, and automatic identity-to-role mapping are not.
 
 ### Upgrade, tunnels, gRPC, and trailers
 
@@ -120,8 +122,9 @@ trailers fail the stream; a post-head error remains a stream error and cannot re
 or enter Fallback.
 
 **Residual:** RFC 8441 H2 WebSocket, arbitrary CONNECT, WebTransport, and gRPC-Web
-are intentionally unsupported. v0.3 bounds tunnel lifetime on retirement but does
-not yet expose general connection/tunnel quotas.
+are intentionally unsupported. Listener connection limits and a ConcurrencyLimit
+held through the tunnel can bound configured ingress, but there is no tunnel-specific
+bandwidth policy.
 
 ### Retry and upstream health
 
@@ -147,18 +150,52 @@ matchers, symlink validation, strict YAML without aliases/anchors/tags/flow maps
 compile-time expressions/templates, typed lexical includes, shared render budgets,
 HTML autoescape, content digests, and failed-candidate dependency tracking.
 
+### Portable Bundles and signatures
+
+**Threats:** truncated or malicious containers, size/count/nesting bombs, ambiguous
+encoding, blob substitution, unknown executable semantics, stale/incompatible
+runtime versions, signature replay or key confusion, path traversal, a mutable
+Bundle changing beneath a snapshot, and accidental inclusion of Secret/private-key
+bytes.
+
+**Controls:** a fixed network-order header and explicit bounds precede allocation;
+manifest/signature JSON must be canonical; domain-separated SHA-256 covers the
+complete unsigned manifest/blob payload; every blob has its own digest and ordered
+record; strict semantic runtime/capability negotiation fails on unknown required
+meaning. Ed25519 verifies a separate domain and configured public-key identity.
+Embedded Assets stream from an already verified open regular-file handle, while
+references use a normalized explicit absolute/deployment-root base and are fully
+digested before publication. Secret and private-key contents are forbidden; typed
+runtime references are reopened through existing Resource preparation.
+
+**Residual:** signing proves possession of a trusted producer key, not safety of an
+external Asset or sensitive reference at activation. The format is alpha and has no
+encryption, transparency log, HSM integration, remote registry, or delta update.
+Path-based Bundle activation and each unique reference Asset are copied through the
+verifier into private anonymous read-only spools. Neither replacing the source path
+nor rewriting its original inode can change bytes observed by a published snapshot.
+This consumes temporary disk proportional to the Bundle plus unique referenced
+content; operators should still use digest-addressed storage for auditability and
+bounded cleanup. The current read-only management listener is not an authenticated
+staging/rollback service.
+
 ### Secrets and observability
 
 **Threats:** key/token leakage through `Debug`, diagnostics, manifests, client
 errors, labels, access logs, or high-cardinality tracing; response splitting through
 dynamic Header values.
 
-**Controls:** private keys use redacted prepared types; dynamic Header values are
-parsed as `HeaderValue`; client errors are fixed safe envelopes; metrics labels use
-configured names and fixed enums; Explain is not collected on production requests.
+**Controls:** private keys and file Secrets use redacted prepared types; Secret,
+certificate-chain, and private-key file reads are bounded, and Secret bytes are
+best-effort zeroized on final-owner drop; dynamic Header
+values are parsed as `HeaderValue`; client errors are fixed safe envelopes; metrics
+labels use configured names and fixed enums; Explain is not collected on production
+requests. Bundle inspect/debug redacts sensitive references and never carries their
+contents.
 
-**Residual:** file Secret Resources, authenticated administration, access-log field
-policy, and OpenTelemetry export are not implemented in v0.3.
+**Residual:** authenticated administration, access-log field policy, and
+OpenTelemetry export are not implemented. The operating system, filesystem cache,
+allocator, swap, and crash dumps remain outside best-effort Secret zeroization.
 
 ### Snapshot, task, and resource leaks
 

@@ -4,8 +4,8 @@ Last updated: 2026-08-30
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-trust-mtls`
-- public starting point: v0.4 ingress-governance merge `afb20de`
+- active milestone branch: `feat/v0.4-portable-bundles`
+- public starting point: v0.4 trust/mTLS merge `8f45b04`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -314,7 +314,7 @@ Last updated: 2026-08-30
   visible bindings, and its Arc-backed evaluation context. Unchanged clones share
   caches; binding children and mutable overlays invalidate only affected layers.
 - Redirect and constant header validation fail closed; property-style generated
-  Pattern/path tests, template-limit tests, and seven cargo-fuzz harnesses cover the
+  Pattern/path tests, template-limit tests, and twelve cargo-fuzz harnesses cover the
   highest-risk parsers and resolvers.
 - Template rendering and argument validation use structured errors. Only
   output/loop/include-depth/expression-step/time budgets map to `TemplateLimit` for
@@ -344,6 +344,38 @@ Last updated: 2026-08-30
   admission policy, and Oxista Site. Its local fixture configuration provides two
   H2-only HTTPS upstream listeners; the committed key is publicly known and clearly
   forbidden for production use.
+- Portable `.oxb` artifacts use the explicit `oxidase.bundle/v1` container rather
+  than serializing Rust compiler/runtime objects. The fixed network-order header,
+  canonical JSON manifest/signature envelope, domain-separated SHA-256 identity,
+  raw digest-ordered blob table, and parser allocations/counts are bounded. Unknown
+  required capabilities, section schemas, format flags, or incompatible strict
+  semantic runtime versions fail before preparation.
+- Stable `oxidase.service-program/v1`, `oxidase.gateway-config/v1`, and portable Site
+  DTOs reconstruct Patterns, Expressions, Templates, Listener transport, SNI/client
+  authentication, Cluster policies, and Site snapshots without reading Gateway or
+  Oxista YAML. Textual sockets, URLs, methods, status ranges, paths, references, and
+  protocol settings are reparsed; expected Site IDs must match supplied sections.
+- Bundle `embed` mode is the source default and deduplicates identical Asset bytes as
+  uncompressed content-addressed blobs. Production startup streams the verified
+  archive into an anonymous temporary spool, pins it, and serves bounded blob slices,
+  including range responses; this requires bounded memory plus temporary disk up to
+  the Bundle size. `reference` mode uses an explicit absolute/deployment-root path
+  plus expected length/digest; current working directory is never an implicit base.
+  Each unique verified reference is copied into an anonymous temporary spool, so
+  both path replacement and later writes to the source inode are isolated from the
+  published snapshot.
+- Public certificate chains can be reconstructed from the artifact. Secret contents
+  and certificate private keys are excluded; only typed, redacted runtime file
+  references remain and are reopened/revalidated with explicit size bounds during
+  candidate preparation. Ed25519 signatures cover the domain-separated canonical
+  content digest, support multiple trusted verification keys for rotation, and
+  leave content identity stable when another signature is attached.
+- Bundle CLI operations build atomically, inspect with sensitive paths redacted by
+  default, verify, diff, sign, and serve the compiled artifact. Bundle startup
+  executes the same prepare/publish path without YAML and preserves listener/Cluster/
+  Site/data-plane semantics. A bounded parser fuzz target also drives arbitrary and
+  structured corruptions through verification, capability, inspect, and diff paths;
+  harness compilation is not reported as a fuzz campaign.
 
 ## Currently runnable
 
@@ -370,22 +402,39 @@ Last updated: 2026-08-30
   configured Trust Store on HTTP/1.1 or HTTP/2. Verified client identity is visible
   to the existing expression/template namespace. HTTPS Cluster traffic and active
   checks can use custom roots and an upstream client Certificate Resource.
+- A verified `.oxb` can start the same gateway without its Gateway/Oxista YAML
+  sources. Embedded and referenced Assets remain streaming, and an invalid digest,
+  signature policy, capability, sensitive reference, or portable section prevents
+  publication rather than partially replacing the current snapshot.
 
 ## Not implemented
 
-- gRPC-Web, OXT inheritance, and a self-contained executable snapshot artifact.
+- gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
+  state.
 - Cleartext h2c, ACME, OCSP stapling, user-configurable TLS cipher suites, HTTP/3,
   HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
 - Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
+- Authenticated/staged Admin activation and rollback, DNS/SRV discovery, standard
+  access-log/OpenTelemetry export, and deployment/release packaging remain future
+  v0.4 PRs.
 
 ## Known limitations
 
 - Pattern custom regex deliberately supports only a conservative first subset.
 - Expression evaluation is typed and reports missing fields as `Null`; Oxista
   enforces its configured strict-undefined policy at template interpolation.
-- `compile` writes a deterministic inspection manifest, not a portable executable
-  snapshot containing site assets or connection state.
+- `compile` writes a deterministic inspection manifest; portable deployment uses the
+  distinct Bundle workflow. A Bundle contains compiled program/resource/Site data
+  and optional Asset bytes, but never live connections, health state, limiter
+  buckets, tasks, pools, or other process state.
+- `oxidase.bundle/v1` is alpha. There is no encrypted/delta/remote-registry format,
+  HSM integration, transparency log, or promise that unknown required semantics can
+  be downgraded. Referenced Assets and sensitive runtime references must be provided
+  separately at the explicit deployment root. Embedded and referenced Asset serving
+  pins anonymous verified spools, so path replacement and later source-inode writes
+  cannot redirect an old snapshot's bytes; digest-addressed artifact paths remain
+  recommended operationally.
 - Gateway and the implemented `.oxsite`/`.oxr`/`.oxt` semantic checks now retain
   exact ranges and structured cross-file relationships. The JSON schema is alpha;
   successful Explain remains its separate explain schema, and non-fatal live reload
@@ -476,9 +525,9 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Extend commit-specific fuzz/soak evidence on Linux with longer operator-run
-   memory/fd observation while keeping ordinary CI bounded.
-2. Separate upstream connect, upload, and response-head timeout observability while
-   preserving streaming and pre-head retry safety.
-3. Build the portable Bundle and authenticated control-plane layers without making
-   Secret bytes general expression or serialization values.
+1. Build the authenticated Admin API with bounded candidate storage, signature-
+   required stage/validate/activate, rollback history, RBAC, and audit redaction.
+2. Add commit-activated DNS/SRV discovery, deterministic endpoint reconciliation,
+   address policy, stale-if-error, and separate upstream phase timeouts.
+3. Add bounded access logs and optional OpenTelemetry, deployment packaging, release
+   artifacts, and commit-specific Linux qualification/fuzz evidence.
