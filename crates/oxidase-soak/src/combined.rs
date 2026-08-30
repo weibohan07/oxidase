@@ -443,7 +443,14 @@ struct RotationPlan {
 async fn rotate_and_reload(plan: RotationPlan) {
     let mut generation = 1u64;
     loop {
-        tokio::time::sleep(plan.interval).await;
+        let now = Instant::now();
+        if now >= plan.deadline {
+            break;
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            (now + plan.interval).min(plan.deadline),
+        ))
+        .await;
         if Instant::now() >= plan.deadline {
             break;
         }

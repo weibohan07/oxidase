@@ -326,72 +326,87 @@ async fn connect_tls(
         .map_err(|error| SoakError::message(format!("protocol TLS handshake: {error}")))
 }
 
-async fn grpc_request(
-    address: SocketAddr,
-    config: Arc<ClientConfig>,
-    payload_size: usize,
-    cancel: bool,
-) -> Result<(u64, bool), SoakError> {
-    let tls = connect_tls(address, config).await?;
-    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-        return Err(SoakError::message("gRPC campaign negotiated wrong ALPN"));
+struct GrpcClient {
+    sender: client_http2::SendRequest<Full<Bytes>>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl GrpcClient {
+    async fn connect(address: SocketAddr, config: Arc<ClientConfig>) -> Result<Self, SoakError> {
+        let tls = connect_tls(address, config).await?;
+        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+            return Err(SoakError::message("gRPC campaign negotiated wrong ALPN"));
+        }
+        let (sender, connection) = client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .map_err(|error| SoakError::message(format!("gRPC H2 handshake: {error}")))?;
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self { sender, driver })
     }
-    let (mut sender, connection) = client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
-        .await
-        .map_err(|error| SoakError::message(format!("gRPC H2 handshake: {error}")))?;
-    let driver = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let message_length = u32::try_from(payload_size)
-        .map_err(|_| SoakError::message("payload_size exceeds gRPC u32 message limit"))?;
-    let mut message = BytesMut::with_capacity(payload_size.saturating_add(5));
-    message.put_u8(0);
-    message.put_u32(message_length);
-    message.resize(payload_size.saturating_add(5), b'q');
-    let request = Request::builder()
-        .method("POST")
-        .uri("https://gateway.example.test/soak.Service/Stream")
-        .header(header::CONTENT_TYPE, "application/grpc")
-        .header(header::TE, "trailers")
-        .body(Full::new(message.freeze()))
-        .map_err(|error| SoakError::message(format!("build gRPC request: {error}")))?;
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|error| SoakError::message(format!("send gRPC request: {error}")))?;
-    if response.status() != StatusCode::OK {
-        driver.abort();
-        return Err(SoakError::message(format!(
-            "gRPC response status {}",
-            response.status()
-        )));
-    }
-    let mut body = response.into_body();
-    let mut bytes = 0u64;
-    let mut grpc_status = None;
-    while let Some(frame) = body.frame().await {
-        let frame = frame
-            .map_err(|error| SoakError::message(format!("read gRPC response frame: {error}")))?;
-        if let Some(data) = frame.data_ref() {
-            bytes = bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-            if cancel {
-                drop(body);
-                driver.abort();
-                return Ok((bytes, true));
+
+    async fn request(
+        &mut self,
+        payload_size: usize,
+        cancel: bool,
+    ) -> Result<(u64, bool), SoakError> {
+        let message_length = u32::try_from(payload_size)
+            .map_err(|_| SoakError::message("payload_size exceeds gRPC u32 message limit"))?;
+        let mut message = BytesMut::with_capacity(payload_size.saturating_add(5));
+        message.put_u8(0);
+        message.put_u32(message_length);
+        message.resize(payload_size.saturating_add(5), b'q');
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://gateway.example.test/soak.Service/Stream")
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header(header::TE, "trailers")
+            .body(Full::new(message.freeze()))
+            .map_err(|error| SoakError::message(format!("build gRPC request: {error}")))?;
+        let response = self
+            .sender
+            .send_request(request)
+            .await
+            .map_err(|error| SoakError::message(format!("send gRPC request: {error}")))?;
+        if response.status() != StatusCode::OK {
+            return Err(SoakError::message(format!(
+                "gRPC response status {}",
+                response.status()
+            )));
+        }
+        let mut body = response.into_body();
+        let mut bytes = 0u64;
+        let mut grpc_status = None;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|error| {
+                SoakError::message(format!("read gRPC response frame: {error}"))
+            })?;
+            if let Some(data) = frame.data_ref() {
+                bytes = bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                if cancel {
+                    drop(body);
+                    return Ok((bytes, true));
+                }
+            }
+            if let Some(trailers) = frame.trailers_ref() {
+                grpc_status = trailers
+                    .get("grpc-status")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
             }
         }
-        if let Some(trailers) = frame.trailers_ref() {
-            grpc_status = trailers
-                .get("grpc-status")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
+        if grpc_status.as_deref() != Some("0") {
+            return Err(SoakError::message("gRPC response lost grpc-status trailer"));
         }
+        Ok((bytes, false))
     }
-    driver.abort();
-    if grpc_status.as_deref() != Some("0") {
-        return Err(SoakError::message("gRPC response lost grpc-status trailer"));
+}
+
+impl Drop for GrpcClient {
+    fn drop(&mut self) {
+        self.driver.abort();
     }
-    Ok((bytes, false))
 }
 
 async fn websocket_request(
@@ -417,21 +432,27 @@ async fn websocket_request(
             head.lines().next().unwrap_or("empty response")
         )));
     }
-    let payload = vec![0x5A; payload_size];
-    tls.write_all(&payload)
-        .await
-        .map_err(|error| SoakError::message(format!("write tunnel bytes: {error}")))?;
+    let mut payload = vec![0x5A; payload_size];
     let mut echoed = vec![0; payload_size];
-    tls.read_exact(&mut echoed)
-        .await
-        .map_err(|error| SoakError::message(format!("read tunnel echo: {error}")))?;
-    if echoed != payload {
-        return Err(SoakError::message("Upgrade tunnel changed payload bytes"));
+    let mut bytes = 0u64;
+    for exchange in 0..16u8 {
+        payload[0] = exchange;
+        tls.write_all(&payload)
+            .await
+            .map_err(|error| SoakError::message(format!("write tunnel bytes: {error}")))?;
+        tls.read_exact(&mut echoed)
+            .await
+            .map_err(|error| SoakError::message(format!("read tunnel echo: {error}")))?;
+        if echoed != payload {
+            return Err(SoakError::message("Upgrade tunnel changed payload bytes"));
+        }
+        bytes = bytes.saturating_add(u64::try_from(echoed.len()).unwrap_or(u64::MAX));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     tls.shutdown()
         .await
         .map_err(|error| SoakError::message(format!("close tunnel: {error}")))?;
-    Ok(u64::try_from(echoed.len()).unwrap_or(u64::MAX))
+    Ok(bytes)
 }
 
 struct WorkerPlan {
@@ -448,6 +469,8 @@ struct WorkerPlan {
 async fn worker(plan: WorkerPlan) {
     let mut random = XorShift64::new(plan.seed);
     let mut grpc_cancellation_pending = true;
+    let mut grpc_client = None;
+    let mut grpc_requests_on_connection = 0u64;
     while Instant::now() < plan.deadline {
         let value = random.next();
         plan.counters.requests.fetch_add(1, Ordering::Relaxed);
@@ -455,20 +478,32 @@ async fn worker(plan: WorkerPlan) {
             plan.counters.grpc.fetch_add(1, Ordering::Relaxed);
             let cancel = grpc_cancellation_pending || value.is_multiple_of(17);
             grpc_cancellation_pending = false;
-            match grpc_request(
-                plan.grpc_address,
-                Arc::clone(&plan.h2),
-                plan.payload_size,
-                cancel,
-            )
-            .await
-            {
+            if grpc_client.is_none() || grpc_requests_on_connection >= 128 {
+                grpc_client = GrpcClient::connect(plan.grpc_address, Arc::clone(&plan.h2))
+                    .await
+                    .ok();
+                grpc_requests_on_connection = 0;
+            }
+            let result = match &mut grpc_client {
+                Some(client) => client.request(plan.payload_size, cancel).await,
+                None => Err(SoakError::message(
+                    "gRPC connection could not be established",
+                )),
+            };
+            match result {
                 Ok((bytes, _)) => {
+                    grpc_requests_on_connection = grpc_requests_on_connection.saturating_add(1);
                     plan.counters.successes.fetch_add(1, Ordering::Relaxed);
                     plan.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
                 }
-                Err(_) => {
-                    plan.counters.errors.fetch_add(1, Ordering::Relaxed);
+                Err(error) => {
+                    grpc_client = None;
+                    grpc_requests_on_connection = 0;
+                    let previous = plan.counters.errors.fetch_add(1, Ordering::Relaxed);
+                    if previous < 3 {
+                        eprintln!("protocol soak gRPC request failed: {error}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
         } else {
@@ -484,8 +519,12 @@ async fn worker(plan: WorkerPlan) {
                     plan.counters.successes.fetch_add(1, Ordering::Relaxed);
                     plan.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
                 }
-                Err(_) => {
-                    plan.counters.errors.fetch_add(1, Ordering::Relaxed);
+                Err(error) => {
+                    let previous = plan.counters.errors.fetch_add(1, Ordering::Relaxed);
+                    if previous < 3 {
+                        eprintln!("protocol soak WebSocket request failed: {error}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
         }
@@ -507,7 +546,14 @@ struct RotationPlan {
 async fn rotate_and_reload(plan: RotationPlan) {
     let mut generation = 1u64;
     loop {
-        tokio::time::sleep(plan.interval).await;
+        let now = Instant::now();
+        if now >= plan.deadline {
+            break;
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            (now + plan.interval).min(plan.deadline),
+        ))
+        .await;
         if Instant::now() >= plan.deadline {
             break;
         }
@@ -605,7 +651,9 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
     let h1 = client_config(&[&first_identity, &second_identity], &[b"http/1.1"])?;
 
     // Warm both bridges before recording the resource baseline.
-    let _ = grpc_request(grpc_address, Arc::clone(&h2), arguments.payload_size, false).await?;
+    let mut warmup_grpc = GrpcClient::connect(grpc_address, Arc::clone(&h2)).await?;
+    let _ = warmup_grpc.request(arguments.payload_size, false).await?;
+    drop(warmup_grpc);
     let _ = websocket_request(websocket_address, Arc::clone(&h1), arguments.payload_size).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
