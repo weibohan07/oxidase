@@ -1,5 +1,6 @@
 //! Protocol-independent language and execution-plan types for Oxidase.
 
+pub mod diagnostic;
 pub mod digest;
 pub mod expression;
 pub mod http_policy;
@@ -11,6 +12,10 @@ pub mod request;
 pub mod template;
 pub mod value;
 
+pub use diagnostic::{
+    DIAGNOSTIC_SCHEMA_VERSION, Diagnostic, DiagnosticLabel, DiagnosticReference,
+    DiagnosticSeverity, RelatedDiagnostic,
+};
 pub use digest::{ContentDigest, ContentDigestBuilder, ContentHasher};
 pub use expression::{EvalContext, Expression, ExpressionError, PathSegment};
 pub use http_policy::{is_forbidden_user_header, is_hop_by_hop_header};
