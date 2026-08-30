@@ -26,6 +26,10 @@ impl Reporter {
             println!("{}", message.as_ref());
         }
     }
+
+    pub(crate) fn is_json(&self) -> bool {
+        self.format == DiagnosticFormat::Json
+    }
 }
 
 pub(crate) fn render(

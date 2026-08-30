@@ -21,6 +21,60 @@ and folded block scalars (including chomping and indentation indicators accepted
 the YAML decoder) are supported; their contents are not mistaken for mapping keys
 or YAML graph features by the strict pre-scan.
 
+## Portable Bundle startup
+
+An `oxidase.bundle/v1` `.oxb` is a compiled deployment input. Bundle build lowers
+Gateway, Service, and Oxista source into independently versioned stable sections;
+Bundle serve reparses those sections into the same compiler IR, prepares resources,
+and publishes the same `RuntimeSnapshot` used by source startup. It does not reread
+Gateway, `.oxsite`, `.oxr`, or `.oxt` YAML and does not deserialize sockets, tasks,
+connection pools, rustls/Hyper values, health state, or limiter buckets. See
+[`bundles.md`](bundles.md) for the existing command syntax and full format contract.
+
+The source packaging policy defaults to embedded Assets:
+
+```yaml
+bundle:
+  assets:
+    mode: embed
+```
+
+`embed` writes each final representation as a deduplicated, raw SHA-256-addressed
+blob. The runtime validates the archive while streaming it into a private anonymous
+read-only spool, then serves selected byte slices; range responses do not collect
+the Bundle or Asset in memory. The path-based reader/writer uses a fixed 64 KiB
+buffer. Both path replacement and same-inode source mutation are isolated from a
+published snapshot. Budget temporary disk up to the encoded Bundle size and store
+production Bundles under immutable digest-addressed filenames for auditability.
+
+`reference` keeps Asset bytes outside the artifact. Each descriptor has an explicit
+`absolute` or `deployment_root` base, normalized `/` path, length, and expected
+SHA-256. The deployment root is an explicit loader input; cwd is never a hidden
+base. The complete referenced file is checked and copied into an anonymous
+read-only spool before publication. Missing, changed, non-regular, or escaping
+references reject the candidate. Budget temporary disk for the unique referenced
+bytes retained by each live snapshot.
+
+Secret values and certificate private keys are not Bundle payloads. They remain
+typed runtime file references and go through the existing bounded Secret or
+Certificate preparation, key/leaf match, and permission-warning path. Public
+certificate chains and CA material may be carried in stable sections. Inspection
+redacts sensitive reference paths by default.
+
+Ed25519 signing covers `oxidase.bundle.signature/v1\0` plus the canonical content
+digest. Multiple trusted public keys support rotation; one recognized valid
+signature satisfies the current required-signature policy. Signing or attaching a
+second signature does not change content identity. The Bundle parser separately
+bounds the complete file, manifest, signature envelope, blob counts/bytes, stable
+sections, origins, sensitive references, and canonical JSON complexity. Invalid
+magic/length/digest/canonical encoding/signature, unknown required semantics, or an
+incompatible strict semantic runtime version fails before preparation.
+
+The format and compatibility API remain alpha. A Bundle is not encrypted, is not a
+Secret transport, and is not a backup of live runtime state. The current management
+listener cannot remotely stage, activate, or roll back signed Bundles; those remain
+part of the secure-control-plane work.
+
 ## Reload
 
 Use `oxidase serve <config> --watch` for the portable dependency watcher. Candidate
@@ -29,6 +83,12 @@ fully prepared first. Synchronous reads, site scans, template compilation, and
 fingerprints run on a single-concurrency blocking compiler worker, not a Tokio async
 worker. New listener sockets are prebound and publication remains serialized by the
 manager.
+
+This watcher is the source-file reload path. Bundle startup currently has no
+authenticated candidate store, activation history, or remote rollback API. Do not
+simulate one by overwriting a live Bundle path; use immutable artifacts and restart
+or an explicitly integrated local candidate publication path until the secure
+control plane is implemented.
 
 Secret, Trust Store, certificate-chain, and private-key paths, including missing
 declared paths and their parents, are watcher dependencies. A candidate key is

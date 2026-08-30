@@ -236,3 +236,25 @@ fn serve_bind_failure_keeps_stdout_json_pure() {
     assert_eq!(value["diagnostics"][0]["code"], "server.listener_bind");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("listener public accepting"));
 }
+
+#[test]
+fn invalid_bundle_failure_is_one_valid_json_diagnostic_envelope() {
+    let directory = tempdir().expect("temporary directory exists");
+    fs::write(directory.path().join("invalid.oxb"), b"not-a-bundle")
+        .expect("invalid Bundle can be written");
+    let output = run(
+        directory.path(),
+        &[
+            "bundle",
+            "verify",
+            "invalid.oxb",
+            "--diagnostic-format",
+            "json",
+        ],
+    );
+    assert!(!output.status.success());
+    let value = json(&output);
+    assert_envelope(&value);
+    assert_eq!(value["diagnostics"][0]["code"], "bundle.truncated");
+    assert!(output.stderr.is_empty());
+}

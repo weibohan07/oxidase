@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
-use oxidase_core::{CompiledTemplate, EvalContext, RequestFrame, ResourceId, Value};
+use oxidase_core::{CompiledTemplate, ContentDigest, EvalContext, RequestFrame, ResourceId, Value};
 use percent_encoding::percent_decode_str;
 
 use crate::template::{CompiledOxt, CompiledValue, TemplateLimits};
@@ -44,10 +47,83 @@ impl ContentEncoding {
 #[derive(Debug, Clone)]
 pub struct AssetRepresentation {
     pub encoding: Option<ContentEncoding>,
-    pub path: PathBuf,
+    pub source: AssetSource,
     pub length: u64,
+    pub digest: ContentDigest,
     pub etag: Option<EntityTag>,
     pub modified: Option<SystemTime>,
+}
+
+/// Seekable backing storage for one immutable Asset representation.
+///
+/// Bundle blobs are stored uncompressed in the archive so the HTTP data plane
+/// can seek to a byte range and stream exactly the selected representation
+/// without collecting it or unpacking the rest of the archive.
+#[derive(Clone)]
+pub enum AssetSource {
+    /// A standalone filesystem object prepared by the ordinary Site compiler.
+    File(PathBuf),
+    /// A verified, already-open regular file and the first representation byte
+    /// within it. Holding the handle pins the validated inode even if its
+    /// original path is atomically replaced after snapshot publication.
+    Pinned {
+        file: Arc<File>,
+        display: Arc<PathBuf>,
+        offset: u64,
+        /// Original verified filesystem object when the served bytes were
+        /// copied into a private spool. Retaining this handle lets snapshot
+        /// preparation compare device/inode identity against sensitive
+        /// Resources without serving from the mutable origin.
+        origin: Option<Arc<File>>,
+    },
+}
+
+impl AssetSource {
+    /// Constructs a pinned representation from an already verified file.
+    #[must_use]
+    pub fn pinned(file: File, display: PathBuf, offset: u64) -> Self {
+        Self::Pinned {
+            file: Arc::new(file),
+            display: Arc::new(display),
+            offset,
+            origin: None,
+        }
+    }
+
+    /// Constructs a pinned representation while retaining the exact verified
+    /// origin handle solely for sensitive-file identity checks.
+    #[must_use]
+    pub fn pinned_with_origin(file: File, origin: File, display: PathBuf, offset: u64) -> Self {
+        Self::Pinned {
+            file: Arc::new(file),
+            display: Arc::new(display),
+            offset,
+            origin: Some(Arc::new(origin)),
+        }
+    }
+
+    #[must_use]
+    pub fn display_path(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+            Self::Pinned { display, .. } => display,
+        }
+    }
+}
+
+impl fmt::Debug for AssetSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(path) => formatter.debug_tuple("File").field(path).finish(),
+            Self::Pinned {
+                display, offset, ..
+            } => formatter
+                .debug_struct("Pinned")
+                .field("display", display)
+                .field("offset", offset)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +144,11 @@ impl EntityTag {
     #[must_use]
     pub const fn is_weak(&self) -> bool {
         self.weak
+    }
+
+    #[must_use]
+    pub fn opaque(&self) -> &str {
+        &self.opaque
     }
 
     #[must_use]
@@ -144,6 +225,32 @@ pub(crate) struct ErrorPagePlan {
 impl SiteSnapshot {
     pub fn public_paths(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
+    }
+
+    /// Returns every filesystem/archive source that can be exposed by this
+    /// Site, including identity and precompressed representations.
+    ///
+    /// Runtime preparation uses this read-only view to prove that a public
+    /// Asset is not backed by the same file as a Secret or certificate private
+    /// key. The iterator deliberately exposes neither public URL paths nor
+    /// response metadata, so callers cannot accidentally turn the check into a
+    /// second Site index.
+    pub fn asset_sources(&self) -> impl Iterator<Item = &AssetSource> {
+        self.entries
+            .values()
+            .filter_map(|plan| match &plan.kind {
+                SiteResponseKind::Asset(asset) => Some(asset.as_ref()),
+                SiteResponseKind::Empty
+                | SiteResponseKind::Text(_)
+                | SiteResponseKind::Json(_)
+                | SiteResponseKind::Template { .. }
+                | SiteResponseKind::Redirect { .. } => None,
+            })
+            .flat_map(|asset| {
+                std::iter::once(&asset.identity.source)
+                    .chain(asset.brotli.iter().map(|value| &value.source))
+                    .chain(asset.gzip.iter().map(|value| &value.source))
+            })
     }
 
     pub fn execute(
@@ -223,7 +330,10 @@ impl SiteSnapshot {
                 )?;
                 (plan.status, PreparedSiteBody::Asset(asset.clone()))
             }
-            SiteResponseKind::Empty => (plan.status, PreparedSiteBody::Empty),
+            SiteResponseKind::Empty => {
+                ensure_configured_content_type(&mut headers, plan.content_type.as_deref())?;
+                (plan.status, PreparedSiteBody::Empty)
+            }
             SiteResponseKind::Text(template) => {
                 let body = template.render(&base_context).map_err(|error| {
                     template_evaluation_error(&source_name, "response.body.text", error.to_string())
@@ -285,6 +395,7 @@ impl SiteSnapshot {
                 location,
                 query,
             } => {
+                ensure_configured_content_type(&mut headers, plan.content_type.as_deref())?;
                 let mut location = location
                     .render(&base_context)
                     .map_err(|error| SiteError::Response(error.to_string()))?;
@@ -448,6 +559,18 @@ fn ensure_content_type(
             header::CONTENT_TYPE,
             header_value(configured.unwrap_or(fallback).to_owned())?,
         );
+    }
+    Ok(())
+}
+
+fn ensure_configured_content_type(
+    headers: &mut HeaderMap,
+    configured: Option<&str>,
+) -> Result<(), SiteError> {
+    if let Some(configured) = configured
+        && !headers.contains_key(header::CONTENT_TYPE)
+    {
+        headers.insert(header::CONTENT_TYPE, header_value(configured.to_owned())?);
     }
     Ok(())
 }

@@ -7,6 +7,7 @@ pub mod http_policy;
 pub mod ids;
 pub mod outcome;
 pub mod pattern;
+pub mod portable;
 pub mod program;
 pub mod request;
 pub mod template;
@@ -22,6 +23,9 @@ pub use http_policy::{is_forbidden_user_header, is_hop_by_hop_header};
 pub use ids::{ConfigVersion, ListenerId, ResourceId, RouteId, ServiceId, SourceSpan};
 pub use outcome::{ErrorClass, ResponseHead, ServiceError, ServiceOutcome};
 pub use pattern::{CompiledPattern, PatternContext, PatternError};
+pub use portable::{
+    PORTABLE_SERVICE_GRAPH_SCHEMA_V1, PortableIrError, PortableServiceGraphV1, PortableValueV1,
+};
 pub use program::{
     CompiledMetadata, HeaderPredicate, HeaderTransform, HeaderTransforms, PredicatePlan,
     RateLimitKey, RecoverHandler, RequestTransform, RespondBody, ResponseTransform, RouteCase,

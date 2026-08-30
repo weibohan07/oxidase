@@ -26,11 +26,11 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
-    ActiveHealthSource, BodySource, CertificateSource, ClientAuthSource, ClusterEndpointSource,
-    ClusterSource, ClusterTlsSource, ConfigTestSource, ErrorClassSource, GatewaySource,
-    HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource, HttpVersionSource,
-    InlineServiceSource, ListenerLimitsSource, ListenerProtocolSource, ListenerSource,
-    PassiveHealthSource, PredicateSource, RateLimitKeySource, RedirectQuerySource,
+    ActiveHealthSource, BodySource, BundleSource, CertificateSource, ClientAuthSource,
+    ClusterEndpointSource, ClusterSource, ClusterTlsSource, ConfigTestSource, ErrorClassSource,
+    GatewaySource, HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource,
+    HttpVersionSource, InlineServiceSource, ListenerLimitsSource, ListenerProtocolSource,
+    ListenerSource, PassiveHealthSource, PredicateSource, RateLimitKeySource, RedirectQuerySource,
     RequestTransformSource, ResourcesSource, ResponseTransformSource, RetryRequestBodySource,
     RetrySource, SecretSource, ServiceSource, SiteSource, StatusRangeSource, TlsListenerSource,
     TrustStoreSource,
@@ -40,6 +40,8 @@ use crate::source::{
 pub struct CompiledGateway {
     pub source: PathBuf,
     pub config_version: ConfigVersion,
+    /// Packaging policy consumed by `oxidase bundle build`.
+    pub bundle: BundleSpec,
     /// Complete filesystem dependency set used by preparation and reload.
     pub dependencies: Vec<PathBuf>,
     /// Inspection-safe dependency set with secret and private-key paths removed.
@@ -58,6 +60,7 @@ impl fmt::Debug for CompiledGateway {
             .debug_struct("CompiledGateway")
             .field("source", &self.source)
             .field("config_version", &self.config_version)
+            .field("bundle_asset_mode", &self.bundle.assets.mode)
             .field("dependency_count", &self.dependencies.len())
             .field("service_node_count", &self.graph.len())
             .field("certificate_count", &self.resources.certificates.len())
@@ -86,6 +89,11 @@ impl CompiledGateway {
         GatewaySummary {
             config_version: self.config_version.to_string(),
             source: self.source.display().to_string(),
+            bundle: BundleSummary {
+                assets: BundleAssetsSummary {
+                    mode: self.bundle.assets.mode,
+                },
+            },
             dependencies: self
                 .summary_dependencies
                 .iter()
@@ -130,6 +138,28 @@ impl CompiledGateway {
                 .collect(),
         }
     }
+}
+
+/// Source-controlled policy for constructing a portable Oxidase Bundle.
+#[derive(Debug, Clone)]
+pub struct BundleSpec {
+    pub assets: BundleAssetsSpec,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleAssetsSpec {
+    pub mode: BundleAssetMode,
+    pub mode_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleAssetMode {
+    #[default]
+    Embed,
+    Reference,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -559,12 +589,23 @@ pub struct Http2Settings {
 pub struct GatewaySummary {
     pub config_version: String,
     pub source: String,
+    pub bundle: BundleSummary,
     pub dependencies: Vec<String>,
     pub listeners: Vec<ListenerSummary>,
     pub services: Vec<String>,
     pub certificates: Vec<String>,
     pub clusters: Vec<ClusterSummary>,
     pub sites: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BundleSummary {
+    pub assets: BundleAssetsSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BundleAssetsSummary {
+    pub mode: BundleAssetMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -607,6 +648,7 @@ impl Compiler {
         discovered_dependencies.dedup();
         let result = (|| {
             validate_document_identity(&merged)?;
+            let bundle = compile_bundle(&merged)?;
             let (resources, warnings) = compile_resources(&merged)?;
             let summary_dependencies = summary_dependencies(&merged);
 
@@ -629,6 +671,7 @@ impl Compiler {
             Ok(CompiledGateway {
                 source: path,
                 config_version: ConfigVersion::new(format!("v2-sha256-{}", merged.hash)),
+                bundle,
                 dependencies: merged.dependencies,
                 summary_dependencies,
                 graph,
@@ -874,6 +917,9 @@ impl Loader {
                 field_path: "kind".to_owned(),
                 spans: spans.clone(),
             });
+            if let Some(bundle) = document.bundle {
+                merge_bundle(&mut merged, bundle, &file, Arc::clone(&spans));
+            }
             merge_resources(&mut merged, document.resources, &file, Arc::clone(&spans));
             for (name, service) in document.services {
                 insert_located(
@@ -1000,6 +1046,7 @@ struct MergedSource {
     hash: ContentDigest,
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
+    bundle: Option<Located<BundleSource>>,
     certificates: BTreeMap<String, Located<CertificateSource>>,
     secrets: BTreeMap<String, Located<SecretSource>>,
     trust_stores: BTreeMap<String, Located<TrustStoreSource>>,
@@ -1009,6 +1056,39 @@ struct MergedSource {
     listeners: Vec<Located<ListenerSource>>,
     tests: Vec<Located<ConfigTestSource>>,
     merge_errors: Vec<Diagnostic>,
+}
+
+fn merge_bundle(
+    merged: &mut MergedSource,
+    bundle: BundleSource,
+    file: &Path,
+    spans: Arc<FieldSpanIndex>,
+) {
+    let located = Located {
+        value: bundle,
+        file: file.to_path_buf(),
+        field_path: "bundle".to_owned(),
+        spans,
+    };
+    if let Some(previous) = &merged.bundle {
+        let first = previous.span();
+        let duplicate = located.span();
+        merged.merge_errors.push(
+            Diagnostic::new(
+                "bundle.duplicate_settings",
+                "the import graph may define only one top-level `bundle` block",
+                duplicate.clone(),
+            )
+            .with_label("first bundle settings", first.clone())
+            .with_related("previous bundle settings", first.clone())
+            .with_reference_chain([
+                DiagnosticReference::new("first bundle settings", first),
+                DiagnosticReference::new("duplicate bundle settings", duplicate),
+            ]),
+        );
+    } else {
+        merged.bundle = Some(located);
+    }
 }
 
 impl MergedSource {
@@ -1187,6 +1267,46 @@ fn validate_document_identity(merged: &MergedSource) -> Result<(), CompileError>
             discovered_dependencies: Vec::new(),
         })
     }
+}
+
+fn compile_bundle(merged: &MergedSource) -> Result<BundleSpec, CompileError> {
+    let Some(located) = &merged.bundle else {
+        return Ok(BundleSpec {
+            assets: BundleAssetsSpec {
+                mode: BundleAssetMode::Embed,
+                mode_source: span(&merged.root, "bundle.assets.mode"),
+                source: span(&merged.root, "bundle.assets"),
+            },
+            source: span(&merged.root, "bundle"),
+        });
+    };
+
+    let assets_path = format!("{}.assets", located.field_path);
+    let mode_path = format!("{assets_path}.mode");
+    let mode_source = located.span_at(&mode_path);
+    let mode = match located.value.assets.mode.as_str() {
+        "embed" => BundleAssetMode::Embed,
+        "reference" => BundleAssetMode::Reference,
+        value => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "bundle.asset_mode",
+                    format!("unsupported bundle asset mode `{value}`"),
+                    mode_source,
+                )
+                .with_help("use `embed` or `reference`"),
+            ));
+        }
+    };
+
+    Ok(BundleSpec {
+        assets: BundleAssetsSpec {
+            mode,
+            mode_source,
+            source: located.span_at(&assets_path),
+        },
+        source: located.span(),
+    })
 }
 
 fn compile_resources(
@@ -2194,14 +2314,21 @@ impl<'a> ProgramBuilder<'a> {
                     &format!("{field_path}.service"),
                 )?,
             }),
-            InlineServiceSource::Observe { name, service } => Ok(ServiceKind::Observe {
-                name: name.clone(),
-                service: self.compile_service(
-                    service,
-                    context,
-                    &format!("{field_path}.service"),
-                )?,
-            }),
+            InlineServiceSource::Observe { name, service } => {
+                validate_policy_name(
+                    name,
+                    "service.observe.name",
+                    context.span(&format!("{field_path}.name")),
+                )?;
+                Ok(ServiceKind::Observe {
+                    name: name.clone(),
+                    service: self.compile_service(
+                        service,
+                        context,
+                        &format!("{field_path}.service"),
+                    )?,
+                })
+            }
             InlineServiceSource::Timeout { duration, service } => Ok(ServiceKind::Timeout {
                 duration: parse_duration(
                     duration,
@@ -3787,6 +3914,175 @@ mod tests {
             } => body.source(),
             other => panic!("expected Respond, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bundle_assets_default_to_embed_and_are_inspectable() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("default bundle policy compiles");
+        assert_eq!(gateway.bundle.assets.mode, super::BundleAssetMode::Embed);
+        assert_eq!(gateway.bundle.source.field_path, "bundle");
+        assert_eq!(gateway.bundle.assets.source.field_path, "bundle.assets");
+        assert_eq!(
+            gateway.bundle.assets.mode_source.field_path,
+            "bundle.assets.mode"
+        );
+        assert_eq!(
+            serde_json::to_value(gateway.summary()).expect("summary serializes")["bundle"]["assets"]
+                ["mode"],
+            "embed"
+        );
+    }
+
+    #[test]
+    fn compiles_reference_bundle_assets_with_exact_source_spans() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+bundle:
+  assets:
+    mode: reference
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("reference policy compiles");
+        assert_eq!(
+            gateway.bundle.assets.mode,
+            super::BundleAssetMode::Reference
+        );
+        assert_eq!(gateway.bundle.source.line, 3);
+        assert_eq!(gateway.bundle.assets.source.line, 4);
+        assert_eq!(gateway.bundle.assets.mode_source.line, 5);
+        assert_eq!(
+            gateway.bundle.assets.mode_source.field_path,
+            "bundle.assets.mode"
+        );
+        assert!(
+            gateway.bundle.assets.mode_source.end_byte
+                > gateway.bundle.assets.mode_source.start_byte
+        );
+        assert_eq!(
+            serde_json::to_value(gateway.summary()).expect("summary serializes")["bundle"]["assets"]
+                ["mode"],
+            "reference"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_bundle_asset_mode_at_exact_value() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+bundle:
+  assets:
+    mode: magical
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let error = Compiler::compile_path(path).expect_err("unknown mode must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "bundle.asset_mode");
+        assert_eq!(diagnostic.primary.field_path, "bundle.assets.mode");
+        assert_eq!(diagnostic.primary.line, 5);
+        assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("use `embed` or `reference`")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_bundle_fields_instead_of_accepting_inert_policy() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+bundle:
+  assets:
+    mode: embed
+    compression: magical
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let error = Compiler::compile_path(path).expect_err("unknown field must fail");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+        assert!(error.diagnostics[0].message.contains("compression"));
+    }
+
+    #[test]
+    fn rejects_multiple_bundle_blocks_across_imports_with_both_spans() {
+        let directory = tempdir().expect("temporary directory is available");
+        write_file(
+            directory.path(),
+            "a.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+bundle:
+  assets:
+    mode: embed
+"#,
+        );
+        write_file(
+            directory.path(),
+            "b.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+bundle:
+  assets:
+    mode: reference
+"#,
+        );
+        write_file(
+            directory.path(),
+            "root.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [a.yaml, b.yaml]
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let error = Compiler::compile_path(directory.path().join("root.yaml"))
+            .expect_err("only one bundle block is allowed");
+        let diagnostic = error
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "bundle.duplicate_settings")
+            .expect("duplicate settings diagnostic exists");
+        assert_eq!(diagnostic.primary.field_path, "bundle");
+        assert_eq!(diagnostic.primary.line, 3);
+        assert!(diagnostic.primary.file.ends_with("b.yaml"));
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert!(diagnostic.labels[0].span.file.ends_with("a.yaml"));
+        assert_eq!(diagnostic.reference_chain.len(), 2);
     }
 
     #[test]

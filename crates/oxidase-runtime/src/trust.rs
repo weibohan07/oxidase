@@ -19,6 +19,7 @@ pub struct PreparedTrustStore {
     pub id: oxidase_core::ResourceId,
     digest: ContentDigest,
     roots: Arc<RootCertStore>,
+    certificates: Arc<Vec<CertificateDer<'static>>>,
 }
 
 impl PreparedTrustStore {
@@ -45,7 +46,7 @@ impl PreparedTrustStore {
         }
         validate_certificate_only_envelope(&bytes, source)?;
 
-        let mut certificates = CertificateDer::pem_slice_iter(&bytes)
+        let certificates = CertificateDer::pem_slice_iter(&bytes)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 TrustStorePreparationFailure::new(
@@ -55,6 +56,29 @@ impl PreparedTrustStore {
                     source.ca_bundle_source.clone(),
                 )
             })?;
+        Self::prepare_certificates(source, certificates)
+    }
+
+    /// Prepares a trust store from normalized public DER carried by a verified
+    /// Bundle. No source CA file is read on this path.
+    pub(crate) fn prepare_with_public_roots(
+        source: &TrustStoreSpec,
+        certificates: &[Vec<u8>],
+    ) -> Result<Self, TrustStorePreparationFailure> {
+        Self::prepare_certificates(
+            source,
+            certificates
+                .iter()
+                .cloned()
+                .map(CertificateDer::from)
+                .collect(),
+        )
+    }
+
+    fn prepare_certificates(
+        source: &TrustStoreSpec,
+        mut certificates: Vec<CertificateDer<'static>>,
+    ) -> Result<Self, TrustStorePreparationFailure> {
         if certificates.is_empty() {
             return Err(TrustStorePreparationFailure::new(
                 TrustStorePreparationErrorKind::Empty,
@@ -89,6 +113,7 @@ impl PreparedTrustStore {
             id: source.id.clone(),
             digest: digest.finish(),
             roots: Arc::new(roots),
+            certificates: Arc::new(certificates),
         })
     }
 
@@ -100,6 +125,15 @@ impl PreparedTrustStore {
     #[must_use]
     pub fn roots(&self) -> Arc<RootCertStore> {
         Arc::clone(&self.roots)
+    }
+
+    /// Copies normalized public trust anchors for a portable Bundle.
+    #[must_use]
+    pub fn public_roots_der(&self) -> Vec<Vec<u8>> {
+        self.certificates
+            .iter()
+            .map(|certificate| certificate.as_ref().to_vec())
+            .collect()
     }
 
     pub(crate) const fn digest(&self) -> ContentDigest {
