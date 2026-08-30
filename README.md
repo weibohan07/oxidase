@@ -44,7 +44,9 @@ H2 downstream to an explicit H2 Cluster, Proxy preserves DATA and trailer frames
 The current TLS/H2 integration fixture verifies request/response trailers and transparent
 multi-message `application/grpc`, including `grpc-status` and `grpc-message` in the
 terminal trailer frame. Oxidase does not parse protobuf, reinterpret gRPC status, or
-implement gRPC-Web.
+implement gRPC-Web. Additional socket fixtures verify HTTP/1 chunked request trailers
+crossing to H2 and declared H2 response trailers crossing to an accepting HTTP/1
+client; undeclared trailers fail the stream instead of being silently dropped.
 
 Listener programs share one immutable `ServiceGraph`; normal requests do not clone
 the graph or collect explain traces. Every handled response passes through one
@@ -99,13 +101,14 @@ and listener retirement sends graceful shutdown before the drain deadline.
 HTTP/1 Proxy now has a server-local trusted Upgrade path: ordinary Respond/OXR/
 Transform output cannot forge its 101 response, and validated tunnels use
 connection-owned bidirectional streaming with bounded metrics. Its parser, matching
-101 validation, partial byte accounting, and in-memory copy/cancellation are covered
-by focused tests. Complete plain/TLS WebSocket, reload, and drain socket qualification
-is still pending, so this alpha does not yet advertise fully qualified WebSocket
-support. HTTP/2 extended CONNECT, arbitrary CONNECT, cleartext h2c, gRPC-Web,
-client-certificate authentication/mTLS, ACME, OCSP stapling, and user-selected cipher
-suites are not implemented. Cross-version HTTP/1/H2 trailer combinations also await
-socket-level qualification. OXT `extends`/`block` remains unsupported.
+101 validation, partial byte accounting, and in-memory copy/cancellation have focused
+tests. Socket fixtures cover plain/TLS HTTP/1 handshakes, WebSocket-style bytes in
+both directions, either peer closing, reload with the old snapshot pinned, Listener
+drain timeout, trusted-capability isolation, and bounded metrics. Oxidase transparently
+tunnels WebSocket traffic rather than parsing its frames. HTTP/2 extended CONNECT,
+arbitrary CONNECT, cleartext h2c, gRPC-Web, client-certificate authentication/mTLS,
+ACME, OCSP stapling, and user-selected cipher suites are not implemented. OXT
+`extends`/`block` remains unsupported.
 
 Atomic last-known-good reload is available with `serve --watch`; health and bounded
 metrics are available on an explicit separate `--admin-bind`. See
@@ -210,8 +213,8 @@ GOAWAY: idle connections close promptly while active requests/streams drain on t
 pinned snapshot. A trusted HTTP/1 tunnel also pins its original snapshot and is owned
 by that connection task; retained Listeners leave it running, while retirement gives
 it the normal drain window before forced cancellation. This lifecycle is implemented,
-but its complete WebSocket reload/drain socket matrix remains pending. Failed Site
-candidates also retain scanned
+and its reload/new-Listener/drain-timeout behavior is covered by a socket fixture.
+Failed Site candidates also retain scanned
 OXT/OXR/assets, missing declared paths, template roots, precompressed candidates,
 and their parent directories in the watcher dependency set.
 

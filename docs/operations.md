@@ -137,8 +137,10 @@ HTTP/1 rules: a downstream HTTP/1 client must advertise `TE: trailers`, and resp
 trailer names must have appeared in the initial trusted `Trailer` declaration.
 Unsafe or undeclared trailers terminate the streaming body with a protocol error;
 they are not silently dropped and cannot become a synthetic 502 after the response
-head. HTTP/1-to-H2 and H2-to-HTTP/1 trailer directions still need socket-level
-qualification before this alpha claims those combinations.
+head. Socket-level fixtures verify an HTTP/1 chunked request crossing to H2, declared
+H2 response trailers crossing to an accepting HTTP/1 client, explicit failure for
+undeclared trailers, and an upstream post-head reset remaining a body error rather
+than becoming 502.
 
 HTTP/1 Proxy owns a private Upgrade capability extracted by the connection driver.
 Both the downstream request and upstream 101 response must contain one valid,
@@ -152,10 +154,11 @@ connection task is aborted.
 
 This is generic Upgrade transport and does not inspect WebSocket frames. Focused
 unit tests cover validation, matching 101 responses, partial byte accounting,
-bidirectional copy, and first-EOF cancellation. Complete plain/TLS WebSocket and
-reload/drain socket tests remain pending, so WebSocket is not yet described as a
-fully qualified alpha protocol. HTTP/2 extended CONNECT, arbitrary CONNECT tunnels,
-and WebTransport are rejected.
+bidirectional copy, and first-EOF cancellation. Socket tests cover plain and TLS
+HTTP/1 handshakes, WebSocket-style bytes in both directions, downstream/upstream
+close, reload with an old pinned tunnel and a new Listener, bounded drain-time abort,
+non-Proxy 101 isolation, and tunnel metrics. HTTP/2 extended CONNECT, arbitrary
+CONNECT tunnels, h2c Upgrade, and WebTransport are rejected.
 
 ## Asset request order
 

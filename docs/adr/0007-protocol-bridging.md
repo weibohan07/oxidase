@@ -75,8 +75,8 @@ Oxidase does not parse protobuf or gRPC message frames, does not translate
 HTTP/2 to HTTP/2 forwards validated DATA and trailers in both directions. A real
 TLS/H2 gateway fixture verifies request and response trailer frames across the
 Proxy. HTTP/1 chunked request trailers may be forwarded to H2 after
-protocol-aware Header sanitation, but that cross-version direction is not yet
-black-box qualified in this milestone branch.
+protocol-aware Header sanitation; a socket-level fixture verifies the chunked H1
+request DATA and trailer frame at the H2 upstream.
 
 For H2 response trailers sent to an HTTP/1 client, Hyper requires trailer names in
 the initial response `Trailer` declaration and the downstream request must have
@@ -112,11 +112,13 @@ tunnel. Listener retirement lets it continue during the drain window; expiry abo
 the connection and tunnel.
 
 This is a generic byte tunnel after the HTTP/1 handshake. Oxidase does not parse or
-rewrite WebSocket frames. The validator, matching upstream 101 response, partial
-byte accounting, first-EOF cancellation, and bidirectional copy have focused unit
-tests. Plain/TLS WebSocket handshakes and reload/drain behavior do not yet have a
-complete socket-level integration test, so this ADR does not claim that final
-WebSocket qualification has been completed.
+rewrite WebSocket frames. Focused unit tests cover the validator, matching upstream
+101 response, partial byte accounting, first-EOF cancellation, and bidirectional
+copy. Socket-level fixtures additionally cover plain and TLS HTTP/1 Upgrade,
+WebSocket-style bytes in both directions, downstream and upstream close, reload to
+a new Listener while the old tunnel retains its snapshot, drain-time abort,
+non-Proxy 101 isolation, and rejection of CONNECT, RFC 8441 extended CONNECT, and
+h2c Upgrade.
 
 ### Errors and observation
 
@@ -143,14 +145,23 @@ The committed black-box protocol fixture currently proves:
 - TLS/H2 downstream to H2 upstream request DATA plus request trailers;
 - H2 upstream response DATA plus response trailers to TLS/H2 downstream;
 - opaque multi-message `application/grpc` DATA forwarding with `grpc-status` and
-  `grpc-message` left in the terminal trailer frame.
+  `grpc-message` left in the terminal trailer frame;
+- HTTP/1 chunked request DATA/trailers to an H2 upstream;
+- declared H2 response trailers to an accepting HTTP/1 client, plus explicit stream
+  failure for undeclared trailers;
+- an upstream reset after the response head remains a body error rather than being
+  rewritten as 502;
+- plain and TLS HTTP/1 Upgrade tunnels, close propagation, snapshot pinning,
+  Listener replacement/drain, trusted-capability isolation, bounded telemetry, and
+  explicit rejection of unsupported H2/h2c/CONNECT forms.
 
 The fixture does not parse protobuf, and it does not establish support for
 gRPC-Web. Focused unit tests prove frame preservation through timeout and body
 instrumentation adapters, HTTP/1/H2 Header sanitation, trailer validation, trusted
-Upgrade validation, and the in-memory bidirectional tunnel. HTTP/1-to-H2 and
-H2-to-HTTP/1 trailer socket fixtures plus end-to-end WebSocket/TLS/reload/drain
-coverage remain acceptance work rather than implied success.
+Upgrade validation, and the in-memory bidirectional tunnel. The socket fixtures
+cover the supported cross-protocol trailer and HTTP/1 Upgrade matrix described
+above; they do not establish support for RFC 8441, generic CONNECT, WebTransport,
+or gRPC-Web.
 
 ## Consequences
 
