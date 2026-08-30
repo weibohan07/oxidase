@@ -221,14 +221,14 @@ impl Drop for InstrumentedBody {
     }
 }
 
-struct TimeoutBody {
-    inner: Pin<Box<Incoming>>,
+struct TimeoutBody<B> {
+    inner: Pin<Box<B>>,
     deadline: Pin<Box<Sleep>>,
     timeout: Duration,
 }
 
-impl TimeoutBody {
-    fn new(inner: Incoming, timeout: Duration) -> Self {
+impl<B> TimeoutBody<B> {
+    fn new(inner: B, timeout: Duration) -> Self {
         Self {
             inner: Box::pin(inner),
             deadline: Box::pin(tokio::time::sleep(timeout)),
@@ -237,7 +237,11 @@ impl TimeoutBody {
     }
 }
 
-impl Body for TimeoutBody {
+impl<B> Body for TimeoutBody<B>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<BoxError>,
+{
     type Data = Bytes;
     type Error = BoxError;
 
@@ -251,7 +255,7 @@ impl Body for TimeoutBody {
                 self.deadline.as_mut().reset(Instant::now() + timeout);
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(Box::new(error)))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => match self.deadline.as_mut().poll(context) {
                 Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
@@ -274,11 +278,13 @@ impl Body for TimeoutBody {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use bytes::Bytes;
-    use http::Response;
+    use http::{HeaderMap, HeaderValue, Response};
     use http_body::{Body, Frame, SizeHint};
     use http_body_util::BodyExt;
 
@@ -286,7 +292,7 @@ mod tests {
     use oxidase_runtime::RuntimeSnapshot;
 
     use super::{
-        BoxError, GatewayBody, full_body, instrument_response_body,
+        BoxError, GatewayBody, TimeoutBody, full_body, instrument_response_body,
         instrument_response_body_with_snapshot,
     };
     use crate::metrics::Metrics;
@@ -294,6 +300,52 @@ mod tests {
     struct FailingBody {
         data_sent: bool,
         error_kind: std::io::ErrorKind,
+    }
+
+    struct FrameSequenceBody {
+        frames: VecDeque<Result<Frame<Bytes>, BoxError>>,
+    }
+
+    impl FrameSequenceBody {
+        fn new(frames: impl IntoIterator<Item = Result<Frame<Bytes>, BoxError>>) -> Self {
+            Self {
+                frames: frames.into_iter().collect(),
+            }
+        }
+    }
+
+    impl Body for FrameSequenceBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.frames.pop_front())
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
     }
 
     impl Body for FailingBody {
@@ -390,6 +442,82 @@ mod tests {
             output.contains("oxidase_response_body_terminations_total{reason=\"cancelled\"} 1")
         );
         assert!(output.contains("oxidase_active_requests 0"));
+    }
+
+    #[tokio::test]
+    async fn instrumentation_forwards_trailers_without_counting_them_as_data() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        trailers.insert("grpc-message", HeaderValue::from_static("complete"));
+        let source = FrameSequenceBody::new([
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"de"))),
+            Ok(Frame::trailers(trailers.clone())),
+        ])
+        .boxed_unsync();
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+
+        let collected = instrument_response_body(Response::new(source), metrics.clone(), active)
+            .into_body()
+            .collect()
+            .await
+            .expect("instrumented body completes");
+
+        assert_eq!(collected.trailers(), Some(&trailers));
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"abcde"));
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_response_body_bytes_total 5"));
+        assert!(
+            output.contains("oxidase_response_body_terminations_total{reason=\"completed\"} 1")
+        );
+        assert!(output.contains("oxidase_active_requests 0"));
+    }
+
+    #[tokio::test]
+    async fn timeout_body_forwards_data_and_trailer_frames_unchanged() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let source = FrameSequenceBody::new([
+            Ok(Frame::data(Bytes::from_static(b"payload"))),
+            Ok(Frame::trailers(trailers.clone())),
+        ]);
+
+        let collected = TimeoutBody::new(source, Duration::from_secs(1))
+            .collect()
+            .await
+            .expect("timed body completes");
+
+        assert_eq!(collected.trailers(), Some(&trailers));
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"payload"));
+    }
+
+    #[tokio::test]
+    async fn timeout_body_still_reports_idle_timeout_without_a_frame() {
+        let error = TimeoutBody::new(PendingBody, Duration::from_millis(5))
+            .collect()
+            .await
+            .expect_err("idle body must time out");
+        let error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("timeout remains an io error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn timeout_body_forwards_inner_errors_without_reclassification() {
+        let source = FrameSequenceBody::new([Err::<Frame<Bytes>, BoxError>(Box::new(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture closed"),
+        ))]);
+
+        let error = TimeoutBody::new(source, Duration::from_secs(1))
+            .collect()
+            .await
+            .expect_err("source error must pass through");
+        let error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("source io error remains directly downcastable");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]
