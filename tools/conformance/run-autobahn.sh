@@ -14,9 +14,14 @@ python=${PYTHON:-python3}
 mkdir -p "$result_dir/autobahn"
 result_dir=$(CDPATH= cd -- "$result_dir" && pwd)
 container_name="oxidase-autobahn-echo-$$"
+relay_pid=
 
 cleanup() {
     docker stop "$container_name" >"$result_dir/autobahn-echo-stop.txt" 2>&1 || true
+    if [ -n "$relay_pid" ]; then
+        kill "$relay_pid" 2>/dev/null || true
+        wait "$relay_pid" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -28,9 +33,32 @@ echo_id=$(docker run --detach --rm --platform linux/amd64 \
 printf '%s\n' "$echo_id" >"$result_dir/autobahn-echo-container.txt"
 "$python" "$script_dir/wait-for-ports.py" 19001
 
+host_address=host-gateway
+if [ "$(uname -s)" = Linux ]; then
+    host_address=$(docker network inspect bridge \
+        --format '{{(index .IPAM.Config 0).Gateway}}')
+    relay_ready="$result_dir/autobahn-relay-ready.txt"
+    "$python" "$script_dir/autobahn-loopback-relay.py" \
+        "$host_address" "$relay_ready" \
+        >"$result_dir/autobahn-relay.txt" 2>&1 &
+    relay_pid=$!
+    attempts=0
+    while [ ! -s "$relay_ready" ] && [ "$attempts" -lt 100 ]; do
+        if ! kill -0 "$relay_pid" 2>/dev/null; then
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.1
+    done
+    if [ ! -s "$relay_ready" ]; then
+        echo "Autobahn loopback relay did not become ready" >&2
+        exit 1
+    fi
+fi
+
 status=0
 docker run --rm --platform linux/amd64 \
-    --add-host host.docker.internal:host-gateway \
+    --add-host "host.docker.internal:$host_address" \
     --volume "$script_dir/fixture:/config:ro" \
     --volume "$result_dir/autobahn:/reports" \
     "$AUTOBAHN_IMAGE" \
