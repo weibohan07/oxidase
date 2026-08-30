@@ -76,8 +76,11 @@ impl CompiledGateway {
             clusters: self
                 .resources
                 .clusters
-                .keys()
-                .map(ToString::to_string)
+                .values()
+                .map(|cluster| ClusterSummary {
+                    id: cluster.id.to_string(),
+                    protocol: cluster.protocol,
+                })
                 .collect(),
             certificates: self
                 .resources
@@ -120,10 +123,37 @@ pub struct CertificateSpec {
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
     pub id: ResourceId,
+    pub protocol: ClusterProtocol,
     pub endpoints: Vec<Url>,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    pub protocol_source: SourceSpan,
     pub source: SourceSpan,
+}
+
+/// The transport protocol policy for an upstream Cluster.
+///
+/// This is compiler IR rather than a data-plane client type. `Auto` permits
+/// HTTPS ALPN negotiation and otherwise uses HTTP/1.1; `Http1` and `H2` force
+/// the corresponding upstream policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterProtocol {
+    #[default]
+    Auto,
+    Http1,
+    H2,
+}
+
+impl ClusterProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Http1 => "http1",
+            Self::H2 => "h2",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,8 +297,14 @@ pub struct GatewaySummary {
     pub listeners: Vec<ListenerSummary>,
     pub services: Vec<String>,
     pub certificates: Vec<String>,
-    pub clusters: Vec<String>,
+    pub clusters: Vec<ClusterSummary>,
     pub sites: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummary {
+    pub id: String,
+    pub protocol: ClusterProtocol,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -844,6 +880,9 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
         );
     }
     for (name, located) in &merged.clusters {
+        let protocol_path = format!("{}.protocol", located.field_path);
+        let protocol_source = located.span_at(&protocol_path);
+        let protocol = parse_cluster_protocol(&located.value.protocol, &protocol_source)?;
         if located.value.endpoints.is_empty() {
             return Err(semantic_error_at(
                 "resource.cluster_empty",
@@ -884,6 +923,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
             id.clone(),
             ClusterSpec {
                 id,
+                protocol,
                 endpoints,
                 connect_timeout: parse_duration(
                     &located.value.connect_timeout,
@@ -893,6 +933,7 @@ fn compile_resources(merged: &MergedSource) -> Result<CompiledResources, Compile
                     &located.value.response_timeout,
                     &located.span_at(&format!("{}.response_timeout", located.field_path)),
                 )?,
+                protocol_source,
                 source: located.span(),
             },
         );
@@ -2052,6 +2093,25 @@ fn parse_duration(source: &str, source_span: &SourceSpan) -> Result<Duration, Co
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_cluster_protocol(
+    source: &str,
+    source_span: &SourceSpan,
+) -> Result<ClusterProtocol, CompileError> {
+    match source {
+        "auto" => Ok(ClusterProtocol::Auto),
+        "http1" => Ok(ClusterProtocol::Http1),
+        "h2" => Ok(ClusterProtocol::H2),
+        _ => Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_protocol",
+                format!("unsupported upstream protocol `{source}`"),
+                source_span.clone(),
+            )
+            .with_help("use `auto`, `http1`, or `h2`"),
+        )),
+    }
+}
+
 fn parse_byte_size(source: &str, source_span: &SourceSpan) -> Result<u64, CompileError> {
     let (number, multiplier) = if let Some(number) = source.strip_suffix("KiB") {
         (number, 1_024u64)
@@ -2334,6 +2394,130 @@ listeners:
             ServiceKind::Transform { .. }
         ));
         assert_eq!(gateway.listeners.len(), 1);
+    }
+
+    #[test]
+    fn cluster_protocol_defaults_to_auto_for_legacy_endpoint_shorthand() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      endpoints:
+        - http://127.0.0.1:3000
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let gateway = Compiler::compile_path(path).expect("legacy cluster shorthand compiles");
+        let cluster = gateway
+            .resources
+            .clusters
+            .get(&oxidase_core::ResourceId::new("cluster:api"))
+            .expect("cluster is compiled");
+        assert_eq!(cluster.protocol, super::ClusterProtocol::Auto);
+        assert_eq!(cluster.endpoints[0].as_str(), "http://127.0.0.1:3000/");
+        assert_eq!(gateway.summary().clusters.len(), 1);
+        assert_eq!(
+            gateway.summary().clusters[0].protocol,
+            super::ClusterProtocol::Auto
+        );
+    }
+
+    #[test]
+    fn compiles_each_upstream_cluster_protocol_into_ir_and_summary() {
+        for (source, expected) in [
+            ("auto", super::ClusterProtocol::Auto),
+            ("http1", super::ClusterProtocol::Http1),
+            ("h2", super::ClusterProtocol::H2),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: {source}
+      endpoints: [https://example.test]
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+
+            let gateway = Compiler::compile_path(path).expect("cluster protocol compiles");
+            let cluster =
+                &gateway.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")];
+            assert_eq!(cluster.protocol, expected);
+            assert_eq!(
+                cluster.protocol_source.field_path,
+                "resources.clusters.api.protocol"
+            );
+            assert_eq!(gateway.summary().clusters[0].protocol, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_cluster_protocol_at_the_protocol_value_span() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: http3
+      endpoints: [https://example.test]
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+
+        let error = Compiler::compile_path(path).expect_err("unknown protocol must fail");
+        let diagnostic = &error.diagnostics[0];
+        assert_eq!(diagnostic.code, "resource.cluster_protocol");
+        assert_eq!(
+            diagnostic.primary.field_path,
+            "resources.clusters.api.protocol"
+        );
+        assert_eq!(diagnostic.primary.line, 6);
+        assert!(diagnostic.primary.end_byte > diagnostic.primary.start_byte);
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("use `auto`, `http1`, or `h2`")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_cluster_fields_instead_of_accepting_inert_policy() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    api:
+      protocol: auto
+      upstream_protocol: h2
+      endpoints: [https://example.test]
+"#,
+        );
+
+        let error = Compiler::compile_path(path).expect_err("unknown cluster field must fail");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `upstream_protocol`")
+        );
     }
 
     #[test]

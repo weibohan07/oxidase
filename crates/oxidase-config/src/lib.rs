@@ -5,9 +5,10 @@ mod diagnostic;
 mod source;
 
 pub use compiler::{
-    CertificateSpec, ClusterSpec, CompiledGateway, CompiledListener, CompiledResources, Compiler,
-    GatewaySummary, Http1Settings, Http2Settings, HttpListenerSpec, HttpVersion, ListenerProtocol,
-    SiteSpec, SniCertificateSpec, SniPattern, TlsListenerSpec,
+    CertificateSpec, ClusterProtocol, ClusterSpec, ClusterSummary, CompiledGateway,
+    CompiledListener, CompiledResources, Compiler, GatewaySummary, Http1Settings, Http2Settings,
+    HttpListenerSpec, HttpVersion, ListenerProtocol, SiteSpec, SniCertificateSpec, SniPattern,
+    TlsListenerSpec,
 };
 pub use diagnostic::{CompileError, Diagnostic};
 pub use source::{ConfigTestSource, ExplainRequestSource, TestExpectationSource};
