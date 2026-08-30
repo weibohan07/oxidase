@@ -976,6 +976,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidase-soak"
+version = "0.3.0-alpha.1"
+dependencies = [
+ "bytes",
+ "clap",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "oxidase-config",
+ "oxidase-runtime",
+ "oxidase-server",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "oxidase-source"
 version = "0.3.0-alpha.1"
 dependencies = [

@@ -1,0 +1,29 @@
+[package]
+name = "oxidase-soak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+oxidase-config = { path = "../oxidase-config" }
+oxidase-runtime = { path = "../oxidase-runtime" }
+oxidase-server = { path = "../oxidase-server" }
+rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true

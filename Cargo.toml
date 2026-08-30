@@ -8,6 +8,7 @@ members = [
     "crates/oxidase-server",
     "crates/oxidase-site",
     "crates/oxidase-source",
+    "crates/oxidase-soak",
     "crates/oxidase-testkit",
 ]
 default-members = ["crates/oxidase-cli"]
