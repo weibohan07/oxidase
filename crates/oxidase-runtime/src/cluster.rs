@@ -524,6 +524,49 @@ impl PreparedCluster {
         }
     }
 
+    /// Attempts to move an admitted request to an untried endpoint while
+    /// retaining its Cluster permit and current endpoint lease until success.
+    ///
+    /// This is the status-retry handoff boundary. Returning `false` leaves
+    /// `current` byte-for-byte usable by the caller, so it can return the
+    /// original upstream response if no replacement endpoint is available. The
+    /// borrowed permit also remains owned by the caller if this future is
+    /// cancelled while waiting.
+    pub async fn retarget_excluding(
+        &self,
+        current: &mut ClusterRequestPermit,
+        excluded: &BTreeSet<String>,
+    ) -> bool {
+        if !Arc::ptr_eq(&current._cluster.counter, &self.runtime.admission) {
+            return false;
+        }
+        let mut excluded = excluded.clone();
+        excluded.insert(current.endpoint.name().to_owned());
+        let queue_timeout = self.spec.limits.queue_timeout;
+        let deadline =
+            (!queue_timeout.is_zero()).then(|| tokio::time::Instant::now() + queue_timeout);
+
+        loop {
+            let released = self.runtime.endpoint_released.notified();
+            match self.try_acquire_endpoint(&excluded, Instant::now()) {
+                EndpointAcquire::Acquired(endpoint, endpoint_permit) => {
+                    let old_endpoint = std::mem::replace(&mut current._endpoint, endpoint_permit);
+                    current.endpoint = endpoint;
+                    drop(old_endpoint);
+                    return true;
+                }
+                EndpointAcquire::Unavailable => return false,
+                EndpointAcquire::Saturated => {}
+            }
+            let Some(deadline) = deadline else {
+                return false;
+            };
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return false;
+            }
+        }
+    }
+
     /// Attempts to enter the retry storm-protection budget without waiting.
     #[must_use]
     pub fn try_acquire_retry(&self) -> Option<ClusterRetryPermit> {
@@ -1223,6 +1266,97 @@ mod tests {
             cluster.acquire_excluding(&attempted).await,
             Err(ClusterAdmissionError::Unavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn status_retry_reuses_cluster_permit_and_switches_endpoint_atomically() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        spec.limits.max_in_flight = 1;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        let mut current = cluster.acquire().await.expect("first endpoint is admitted");
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+
+        let attempted = BTreeSet::from(["a".to_owned()]);
+        assert!(cluster.retarget_excluding(&mut current, &attempted).await);
+        assert_eq!(current.endpoint().name(), "b");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        drop(current);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_status_retarget_retains_original_endpoint_lease() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        spec.limits.max_in_flight = 1;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        let saturated = cluster.endpoints[1]
+            .state
+            .admission
+            .try_acquire(1, None)
+            .expect("fixture saturates the retry endpoint");
+        let mut current = cluster.acquire().await.expect("first endpoint is admitted");
+        assert_eq!(current.endpoint().name(), "a");
+        let attempted = BTreeSet::from(["a".to_owned()]);
+
+        assert!(!cluster.retarget_excluding(&mut current, &attempted).await);
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        drop(saturated);
+        drop(current);
+    }
+
+    #[tokio::test]
+    async fn cancelled_status_retarget_keeps_original_lease_owned_by_caller() {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        spec.limits.max_in_flight = 1;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        spec.limits.queue_timeout = Duration::from_secs(10);
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        let saturated = cluster.endpoints[1]
+            .state
+            .admission
+            .try_acquire(1, None)
+            .expect("fixture saturates the retry endpoint");
+        let mut current = cluster.acquire().await.expect("first endpoint is admitted");
+        let attempted = BTreeSet::from(["a".to_owned()]);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(10),
+            cluster.retarget_excluding(&mut current, &attempted),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        drop(saturated);
+        drop(current);
     }
 
     #[tokio::test]
