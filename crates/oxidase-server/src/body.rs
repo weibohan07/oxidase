@@ -15,6 +15,7 @@ use oxidase_runtime::RuntimeSnapshot;
 use tokio::time::{Instant, Sleep};
 
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
+use crate::protocol::TrailerGuard;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -94,6 +95,77 @@ fn infallible_to_box(error: Infallible) -> BoxError {
 
 pub(crate) fn timeout_incoming_body(body: Incoming, timeout: Duration) -> GatewayBody {
     TimeoutBody::new(body, timeout).boxed_unsync()
+}
+
+/// Preserves streaming body frames while enforcing the downstream trailer
+/// contract selected from the response head and wire protocol.
+///
+/// DATA frames are returned unchanged and are never collected. An unsafe or
+/// undeclared trailer terminates the body with an explicit protocol error.
+pub(crate) struct ProtocolBody<B> {
+    inner: Pin<Box<B>>,
+    trailer_guard: TrailerGuard,
+    terminated: bool,
+}
+
+impl<B> ProtocolBody<B> {
+    pub(crate) fn new(inner: B, trailer_guard: TrailerGuard) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            trailer_guard,
+            terminated: false,
+        }
+    }
+}
+
+impl<B> Body for ProtocolBody<B>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref()
+                    && let Err(error) = self.trailer_guard.validate(trailers)
+                {
+                    self.terminated = true;
+                    return Poll::Ready(Some(Err(Box::new(error))));
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.terminated = true;
+                Poll::Ready(Some(Err(error.into())))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminated || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.terminated {
+            SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,7 +356,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http::{HeaderMap, HeaderValue, Response};
+    use http::{HeaderMap, HeaderValue, Response, header};
     use http_body::{Body, Frame, SizeHint};
     use http_body_util::BodyExt;
 
@@ -292,10 +364,11 @@ mod tests {
     use oxidase_runtime::RuntimeSnapshot;
 
     use super::{
-        BoxError, GatewayBody, TimeoutBody, full_body, instrument_response_body,
+        BoxError, GatewayBody, ProtocolBody, TimeoutBody, full_body, instrument_response_body,
         instrument_response_body_with_snapshot,
     };
     use crate::metrics::Metrics;
+    use crate::protocol::{TrailerDeclaration, TrailerGuard, TrailerValidationError, WireProtocol};
 
     struct FailingBody {
         data_sent: bool,
@@ -518,6 +591,97 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("source io error remains directly downcastable");
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn protocol_body_forwards_http2_data_and_safe_trailers() {
+        let data = Bytes::from_static(b"grpc-frame");
+        let data_pointer = data.as_ptr();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let source =
+            FrameSequenceBody::new([Ok(Frame::data(data)), Ok(Frame::trailers(trailers.clone()))]);
+        let mut body =
+            ProtocolBody::new(source, TrailerGuard::new(WireProtocol::Http2, false, None));
+
+        let data = body
+            .frame()
+            .await
+            .expect("DATA frame is present")
+            .expect("DATA frame is valid")
+            .into_data()
+            .expect("first frame is DATA");
+        assert_eq!(data.as_ptr(), data_pointer, "DATA bytes are not copied");
+        assert_eq!(data, Bytes::from_static(b"grpc-frame"));
+        let forwarded = body
+            .frame()
+            .await
+            .expect("trailer frame is present")
+            .expect("trailer frame is valid")
+            .into_trailers()
+            .expect("second frame is trailers");
+        assert_eq!(forwarded, trailers);
+    }
+
+    #[tokio::test]
+    async fn protocol_body_rejects_unsafe_http2_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let source = FrameSequenceBody::new([Ok(Frame::trailers(trailers))]);
+        let error = ProtocolBody::new(source, TrailerGuard::new(WireProtocol::Http2, false, None))
+            .collect()
+            .await
+            .expect_err("framing trailer must fail the stream");
+        assert!(matches!(
+            error.downcast_ref::<TrailerValidationError>(),
+            Some(TrailerValidationError::ForbiddenField(name))
+                if name == header::CONTENT_LENGTH
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_body_requires_http1_acceptance_and_complete_declaration() {
+        let mut declaration_headers = HeaderMap::new();
+        declaration_headers.insert(header::TRAILER, HeaderValue::from_static("grpc-status"));
+        let declaration = TrailerDeclaration::parse(&declaration_headers)
+            .expect("declaration is valid")
+            .expect("declaration is present");
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+
+        let forwarded = ProtocolBody::new(
+            FrameSequenceBody::new([Ok(Frame::trailers(trailers.clone()))]),
+            TrailerGuard::new(WireProtocol::Http1, true, Some(declaration.clone())),
+        )
+        .collect()
+        .await
+        .expect("accepted declared trailers are forwarded");
+        assert_eq!(forwarded.trailers(), Some(&trailers));
+
+        let error = ProtocolBody::new(
+            FrameSequenceBody::new([Ok(Frame::trailers(trailers.clone()))]),
+            TrailerGuard::new(WireProtocol::Http1, false, Some(declaration)),
+        )
+        .collect()
+        .await
+        .expect_err("unaccepted HTTP/1 trailers must fail the stream");
+        assert_eq!(
+            error.downcast_ref::<TrailerValidationError>(),
+            Some(&TrailerValidationError::NotAcceptedByHttp1Client)
+        );
+
+        let error = ProtocolBody::new(
+            FrameSequenceBody::new([Ok(Frame::trailers(trailers))]),
+            TrailerGuard::new(WireProtocol::Http1, true, None),
+        )
+        .collect()
+        .await
+        .expect_err("undeclared HTTP/1 trailers must fail the stream");
+        assert!(matches!(
+            error.downcast_ref::<TrailerValidationError>(),
+            Some(TrailerValidationError::UndeclaredField(name))
+                if name.as_str() == "grpc-status"
+        ));
     }
 
     #[tokio::test]
