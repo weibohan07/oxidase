@@ -149,9 +149,7 @@ impl PreparedCertificate {
         self.certified_key.cert.len()
     }
 
-    /// Clones the opaque rustls signing material for use by a TLS resolver.
-    #[must_use]
-    pub fn certified_key(&self) -> Arc<CertifiedKey> {
+    fn certified_key(&self) -> Arc<CertifiedKey> {
         Arc::clone(&self.certified_key)
     }
 
