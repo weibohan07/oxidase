@@ -336,10 +336,17 @@ async fn negotiates_http1_and_h2_and_exposes_only_bounded_transport_metrics() {
     );
 
     let metrics = admin_metrics(gateway.admin).await;
-    assert!(metrics.contains("oxidase_connections_accepted_total{protocol=\"http1\"} 1"));
-    assert!(metrics.contains("oxidase_connections_accepted_total{protocol=\"h2\"} 1"));
-    assert!(metrics.contains("oxidase_tls_alpn_total{protocol=\"http1\"} 1"));
-    assert!(metrics.contains("oxidase_tls_alpn_total{protocol=\"h2\"} 1"));
+    assert!(
+        metrics.contains(
+            "oxidase_connections_accepted_total{listener=\"secure\",protocol=\"http1\"} 1"
+        )
+    );
+    assert!(
+        metrics
+            .contains("oxidase_connections_accepted_total{listener=\"secure\",protocol=\"h2\"} 1")
+    );
+    assert!(metrics.contains("oxidase_tls_alpn_total{listener=\"secure\",protocol=\"http1\"} 1"));
+    assert!(metrics.contains("oxidase_tls_alpn_total{listener=\"secure\",protocol=\"h2\"} 1"));
     assert!(!metrics.contains("gateway.example.test"));
     assert!(!metrics.contains("sni="));
     gateway

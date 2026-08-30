@@ -24,7 +24,7 @@ use oxidase_runtime::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
@@ -32,12 +32,14 @@ use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body_with_sn
 use crate::connection::TrackedExecutor;
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
-    ConnectionProtocol, H2Shutdown, Metrics, ProductionObserver, TlsAlpn, TlsHandshakeOutcome,
+    ConnectionProtocol, H2Shutdown, ListenerTransportMetrics, Metrics, ProductionObserver, TlsAlpn,
+    TlsHandshakeOutcome,
 };
 use crate::response::ResponseFinalizer;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER: usize = 128;
 
 fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
     let mut builder = http1::Builder::new();
@@ -906,6 +908,8 @@ async fn run_listener(
 ) -> Result<(), ServerError> {
     let mut connections = JoinSet::new();
     let mut accept_error = None;
+    let transport_metrics = metrics.listener_transport(&listener.name);
+    let tls_handshake_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER));
     loop {
         tokio::select! {
             biased;
@@ -937,6 +941,22 @@ async fn run_listener(
                     )));
                     break;
                 };
+                let tls_handshake_permit = match reserve_tls_handshake(
+                    plan.protocol,
+                    &tls_handshake_gate,
+                    &transport_metrics,
+                ) {
+                    Ok(permit) => permit,
+                    Err(()) => {
+                        tracing::debug!(
+                            listener = listener.name,
+                            limit = MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER,
+                            "TLS handshake concurrency limit reached"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let listener_name = listener.name.clone();
                 let store = store.clone();
                 let proxy = proxy.clone();
@@ -948,11 +968,19 @@ async fn run_listener(
                     store,
                     proxy,
                     metrics,
+                    transport_metrics: transport_metrics.clone(),
                     scheme: "http",
                     tls: TlsConnectionMetadata::default(),
                 };
                 connections.spawn(async move {
-                    serve_connection(stream, plan, context, connection_shutdown).await;
+                    serve_connection(
+                        stream,
+                        plan,
+                        context,
+                        connection_shutdown,
+                        tls_handshake_permit,
+                    )
+                    .await;
                 });
             }
             result = connections.join_next(), if !connections.is_empty() => {
@@ -984,14 +1012,27 @@ async fn run_listener(
     }
 }
 
+fn reserve_tls_handshake(
+    protocol: ListenerProtocol,
+    gate: &Arc<Semaphore>,
+    metrics: &ListenerTransportMetrics,
+) -> Result<Option<OwnedSemaphorePermit>, ()> {
+    if protocol == ListenerProtocol::Http {
+        return Ok(None);
+    }
+    gate.clone().try_acquire_owned().map(Some).map_err(|_| {
+        metrics.record_tls_handshake(TlsHandshakeOutcome::Overloaded, Duration::ZERO);
+    })
+}
+
 async fn serve_connection(
     stream: TcpStream,
     plan: PreparedListenerPlan,
     mut context: GatewayConnectionContext,
     mut shutdown: watch::Receiver<bool>,
+    tls_handshake_permit: Option<OwnedSemaphorePermit>,
 ) {
     let listener_name = context.listener_name.clone();
-    let metrics = context.metrics.clone();
     match plan.protocol {
         ListenerProtocol::Http => {
             let Some(settings) = plan.http.http1.clone() else {
@@ -1004,6 +1045,13 @@ async fn serve_connection(
             serve_http1_connection(stream, context, settings, shutdown).await;
         }
         ListenerProtocol::Https => {
+            let Some(tls_handshake_permit) = tls_handshake_permit else {
+                tracing::error!(
+                    listener = listener_name,
+                    "HTTPS connection has no handshake permit"
+                );
+                return;
+            };
             let Some(tls) = plan.tls.clone() else {
                 tracing::error!(listener = listener_name, "HTTPS listener has no TLS plan");
                 return;
@@ -1014,24 +1062,22 @@ async fn serve_connection(
                 result = tokio::time::timeout(tls.handshake_timeout, acceptor.accept(stream)) => {
                     match result {
                         Ok(Ok(stream)) => {
-                            metrics.record_tls_handshake(
-                                TlsHandshakeOutcome::Success,
-                                handshake_started.elapsed(),
-                            );
                             stream
                         }
                         Ok(Err(error)) => {
-                            let outcome = if error.kind() == std::io::ErrorKind::InvalidData {
-                                TlsHandshakeOutcome::Protocol
-                            } else {
-                                TlsHandshakeOutcome::Io
-                            };
-                            metrics.record_tls_handshake(outcome, handshake_started.elapsed());
+                            let outcome = tls_accept_error_outcome(
+                                &error,
+                                http_versions_require_h2_alpn(&plan.http.versions),
+                            );
+                            context.transport_metrics.record_tls_handshake(
+                                outcome,
+                                handshake_started.elapsed(),
+                            );
                             tracing::debug!(listener = listener_name, error = %error, "TLS handshake failed");
                             return;
                         }
                         Err(_) => {
-                            metrics.record_tls_handshake(
+                            context.transport_metrics.record_tls_handshake(
                                 TlsHandshakeOutcome::Timeout,
                                 handshake_started.elapsed(),
                             );
@@ -1041,17 +1087,20 @@ async fn serve_connection(
                     }
                 }
                 () = wait_for_shutdown(&mut shutdown) => {
-                    metrics.record_tls_handshake(
+                    context.transport_metrics.record_tls_handshake(
                         TlsHandshakeOutcome::Failure,
                         handshake_started.elapsed(),
                     );
                     return;
                 }
             };
+            drop(tls_handshake_permit);
             let connection = tls_stream.get_ref().1;
             let server_name = connection.server_name().map(str::to_owned);
             let negotiated_alpn = connection.alpn_protocol().map(<[u8]>::to_vec);
-            metrics.record_tls_alpn(TlsAlpn::from_negotiated(negotiated_alpn.as_deref()));
+            context
+                .transport_metrics
+                .record_tls_alpn(TlsAlpn::from_negotiated(negotiated_alpn.as_deref()));
             let tls_metadata = TlsConnectionMetadata {
                 enabled: true,
                 server_name: server_name.clone(),
@@ -1070,8 +1119,31 @@ async fn serve_connection(
             );
             context.scheme = "https";
             context.tls = tls_metadata;
-            match negotiated_alpn.as_deref() {
-                Some(b"h2") if plan.http.versions.contains(&HttpVersion::H2) => {
+            let negotiated_protocol =
+                match select_https_protocol(&plan.http.versions, negotiated_alpn.as_deref()) {
+                    Ok(protocol) => {
+                        context.transport_metrics.record_tls_handshake(
+                            TlsHandshakeOutcome::Success,
+                            handshake_started.elapsed(),
+                        );
+                        protocol
+                    }
+                    Err(error) => {
+                        context.transport_metrics.record_tls_handshake(
+                            error.handshake_outcome(),
+                            handshake_started.elapsed(),
+                        );
+                        tracing::debug!(
+                            listener = context.listener_name,
+                            alpn = ?negotiated_alpn,
+                            result = error.as_str(),
+                            "TLS ALPN did not select an enabled HTTP protocol"
+                        );
+                        return;
+                    }
+                };
+            match negotiated_protocol {
+                NegotiatedHttpProtocol::H2 => {
                     let Some(settings) = plan.http.http2.clone() else {
                         tracing::error!(
                             listener = context.listener_name,
@@ -1081,7 +1153,7 @@ async fn serve_connection(
                     };
                     serve_http2_connection(tls_stream, context, settings, shutdown).await;
                 }
-                Some(b"http/1.1") if plan.http.versions.contains(&HttpVersion::Http1) => {
+                NegotiatedHttpProtocol::Http1 => {
                     let Some(settings) = plan.http.http1.clone() else {
                         tracing::error!(
                             listener = context.listener_name,
@@ -1090,26 +1162,73 @@ async fn serve_connection(
                         return;
                     };
                     serve_http1_connection(tls_stream, context, settings, shutdown).await;
-                }
-                None if plan.http.versions.contains(&HttpVersion::Http1) => {
-                    let Some(settings) = plan.http.http1.clone() else {
-                        tracing::error!(
-                            listener = context.listener_name,
-                            "HTTP/1 listener has no HTTP/1 settings"
-                        );
-                        return;
-                    };
-                    serve_http1_connection(tls_stream, context, settings, shutdown).await;
-                }
-                _ => {
-                    tracing::debug!(
-                        listener = context.listener_name,
-                        alpn = ?negotiated_alpn,
-                        "TLS ALPN did not select an enabled HTTP protocol"
-                    );
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegotiatedHttpProtocol {
+    Http1,
+    H2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlpnSelectionError {
+    Required,
+    Mismatch,
+}
+
+impl AlpnSelectionError {
+    const fn handshake_outcome(self) -> TlsHandshakeOutcome {
+        match self {
+            Self::Required => TlsHandshakeOutcome::AlpnRequired,
+            Self::Mismatch => TlsHandshakeOutcome::AlpnMismatch,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "alpn_required",
+            Self::Mismatch => "alpn_mismatch",
+        }
+    }
+}
+
+fn select_https_protocol(
+    versions: &[HttpVersion],
+    negotiated_alpn: Option<&[u8]>,
+) -> Result<NegotiatedHttpProtocol, AlpnSelectionError> {
+    match negotiated_alpn {
+        Some(b"h2") if versions.contains(&HttpVersion::H2) => Ok(NegotiatedHttpProtocol::H2),
+        Some(b"http/1.1") if versions.contains(&HttpVersion::Http1) => {
+            Ok(NegotiatedHttpProtocol::Http1)
+        }
+        None if versions.contains(&HttpVersion::Http1) => Ok(NegotiatedHttpProtocol::Http1),
+        None => Err(AlpnSelectionError::Required),
+        Some(_) => Err(AlpnSelectionError::Mismatch),
+    }
+}
+
+fn http_versions_require_h2_alpn(versions: &[HttpVersion]) -> bool {
+    versions.contains(&HttpVersion::H2) && !versions.contains(&HttpVersion::Http1)
+}
+
+fn tls_accept_error_outcome(error: &std::io::Error, h2_alpn_required: bool) -> TlsHandshakeOutcome {
+    if h2_alpn_required
+        && error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<tokio_rustls::rustls::Error>())
+            .is_some_and(|error| {
+                matches!(error, tokio_rustls::rustls::Error::NoApplicationProtocol)
+            })
+    {
+        TlsHandshakeOutcome::AlpnMismatch
+    } else if error.kind() == std::io::ErrorKind::InvalidData {
+        TlsHandshakeOutcome::Protocol
+    } else {
+        TlsHandshakeOutcome::Io
     }
 }
 
@@ -1120,6 +1239,7 @@ struct GatewayConnectionContext {
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
     metrics: Arc<Metrics>,
+    transport_metrics: ListenerTransportMetrics,
     scheme: &'static str,
     tls: TlsConnectionMetadata,
 }
@@ -1133,7 +1253,7 @@ async fn serve_http1_connection<Io>(
     Io: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let _active_connection = context
-        .metrics
+        .transport_metrics
         .connection_accepted(ConnectionProtocol::Http1);
     let service_context = context.clone();
     let service = service_fn(move |request| handle_request(request, service_context.clone()));
@@ -1161,9 +1281,9 @@ async fn serve_http2_connection<Io>(
     Io: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let _active_connection = context
-        .metrics
+        .transport_metrics
         .connection_accepted(ConnectionProtocol::Http2);
-    let executor = TrackedExecutor::new(context.metrics.clone());
+    let executor = TrackedExecutor::new(context.transport_metrics.clone());
     let mut builder = http2::Builder::new(executor);
     builder
         .timer(TokioTimer::new())
@@ -1175,7 +1295,7 @@ async fn serve_http2_connection<Io>(
     let service = service_fn(move |request| handle_request(request, service_context.clone()));
     let connection = builder.serve_connection(TokioIo::new(io), service);
     tokio::pin!(connection);
-    let mut drain = H2DrainObservation::new(context.metrics.clone());
+    let mut drain = H2DrainObservation::new(context.transport_metrics.clone());
     let result = tokio::select! {
         result = &mut connection => result,
         () = wait_for_shutdown(&mut shutdown) => {
@@ -1184,7 +1304,9 @@ async fn serve_http2_connection<Io>(
             let result = connection.await;
             if result.is_ok() {
                 drain.completed = true;
-                context.metrics.record_h2_shutdown(H2Shutdown::Graceful);
+                context
+                    .transport_metrics
+                    .record_h2_shutdown(H2Shutdown::Graceful);
             }
             result
         }
@@ -1195,13 +1317,13 @@ async fn serve_http2_connection<Io>(
 }
 
 struct H2DrainObservation {
-    metrics: Arc<Metrics>,
+    metrics: ListenerTransportMetrics,
     started: bool,
     completed: bool,
 }
 
 impl H2DrainObservation {
-    fn new(metrics: Arc<Metrics>) -> Self {
+    fn new(metrics: ListenerTransportMetrics) -> Self {
         Self {
             metrics,
             started: false,
@@ -1247,6 +1369,7 @@ async fn handle_request(
         store,
         proxy,
         metrics,
+        transport_metrics: _,
         scheme,
         tls,
     } = context;
@@ -1552,19 +1675,21 @@ mod tests {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use oxidase_config::{Compiler, Http2Settings};
+    use oxidase_config::{Compiler, Http2Settings, HttpVersion, ListenerProtocol};
     use oxidase_core::{SourceSpan, TlsConnectionMetadata};
     use oxidase_runtime::{RuntimeSnapshot, SnapshotStore};
     use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::{Notify, oneshot, watch};
+    use tokio::sync::{Notify, Semaphore, oneshot, watch};
 
     use super::{
-        DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayConnectionContext, GatewayServer,
-        H2DrainObservation, ProxyClient, ServerError, http1_builder, serve_http2_connection,
+        AlpnSelectionError, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayConnectionContext,
+        GatewayServer, H2DrainObservation, NegotiatedHttpProtocol, ProxyClient, ServerError,
+        http1_builder, reserve_tls_handshake, select_https_protocol, serve_http2_connection,
+        tls_accept_error_outcome,
     };
-    use crate::metrics::Metrics;
+    use crate::metrics::{Metrics, TlsHandshakeOutcome};
 
     #[test]
     fn listener_errors_expose_stable_structured_diagnostics() {
@@ -2034,6 +2159,7 @@ listeners:
         snapshot: RuntimeSnapshot,
         metrics: Arc<Metrics>,
     ) -> GatewayConnectionContext {
+        let transport_metrics = metrics.listener_transport("test");
         GatewayConnectionContext {
             peer_address: "127.0.0.1:43123"
                 .parse()
@@ -2042,6 +2168,7 @@ listeners:
             store: Arc::new(SnapshotStore::new(snapshot)),
             proxy: Arc::new(ProxyClient::new().expect("proxy client can be initialized")),
             metrics,
+            transport_metrics,
             scheme: "https",
             tls: TlsConnectionMetadata {
                 enabled: true,
@@ -2257,19 +2384,88 @@ listeners:
 
         let rendered = metrics.render_prometheus();
         assert!(
-            rendered.contains("oxidase_tls_handshakes_total{result=\"timeout\"} 1"),
+            rendered
+                .contains("oxidase_tls_handshakes_total{listener=\"test\",result=\"timeout\"} 1"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_active_connections{protocol=\"http1\"} 0"),
+            rendered.contains("oxidase_active_connections{listener=\"test\",protocol=\"http1\"} 0"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_active_connections{protocol=\"h2\"} 0"),
+            rendered.contains("oxidase_active_connections{listener=\"test\",protocol=\"h2\"} 0"),
             "{rendered}"
         );
 
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[test]
+    fn tls_handshake_gate_rejects_excess_work_without_waiting() {
+        let metrics = Metrics::default();
+        let transport = metrics.listener_transport("secure");
+        let gate = Arc::new(Semaphore::new(1));
+
+        let first = reserve_tls_handshake(ListenerProtocol::Https, &gate, &transport)
+            .expect("the first TLS handshake receives the only permit")
+            .expect("HTTPS reserves a handshake permit");
+        assert_eq!(gate.available_permits(), 0);
+        assert!(
+            reserve_tls_handshake(ListenerProtocol::Https, &gate, &transport).is_err(),
+            "an excess handshake must fail immediately instead of joining a queue"
+        );
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                "oxidase_tls_handshakes_total{listener=\"secure\",result=\"overloaded\"} 1"
+            ),
+            "{rendered}"
+        );
+
+        drop(first);
+        assert_eq!(gate.available_permits(), 1);
+        let plain = reserve_tls_handshake(ListenerProtocol::Http, &gate, &transport)
+            .expect("plain HTTP never consumes the TLS gate");
+        assert!(plain.is_none());
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn h2_only_listener_requires_matching_alpn() {
+        let h2_only = [HttpVersion::H2];
+        assert_eq!(
+            select_https_protocol(&h2_only, Some(b"h2")),
+            Ok(NegotiatedHttpProtocol::H2)
+        );
+        assert_eq!(
+            select_https_protocol(&h2_only, None),
+            Err(AlpnSelectionError::Required)
+        );
+        assert_eq!(
+            select_https_protocol(&h2_only, Some(b"http/1.1")),
+            Err(AlpnSelectionError::Mismatch)
+        );
+        assert_eq!(
+            select_https_protocol(&[HttpVersion::Http1], None),
+            Ok(NegotiatedHttpProtocol::Http1)
+        );
+    }
+
+    #[test]
+    fn rustls_no_application_protocol_is_a_distinct_h2_only_result() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            tokio_rustls::rustls::Error::NoApplicationProtocol,
+        );
+        assert_eq!(
+            tls_accept_error_outcome(&error, true),
+            TlsHandshakeOutcome::AlpnMismatch
+        );
+        assert_eq!(
+            tls_accept_error_outcome(&error, false),
+            TlsHandshakeOutcome::Protocol
+        );
     }
 
     #[tokio::test]
@@ -2338,15 +2534,17 @@ listeners:
 
         let rendered = metrics.render_prometheus();
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"graceful\"} 1"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"graceful\"} 1"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"forced\"} 0"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"forced\"} 0"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_http2_active_streams 0"),
+            rendered.contains("oxidase_http2_active_streams{listener=\"test\"} 0"),
             "{rendered}"
         );
 
@@ -2423,7 +2621,7 @@ listeners:
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let rendered = metrics.render_prometheus();
-                if rendered.contains("oxidase_http2_active_streams 0") {
+                if rendered.contains("oxidase_http2_active_streams{listener=\"test\"} 0") {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2433,11 +2631,13 @@ listeners:
         .expect("forced drain releases every HTTP/2 stream guard");
         let rendered = metrics.render_prometheus();
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"graceful\"} 0"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"graceful\"} 0"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"forced\"} 1"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"forced\"} 1"),
             "{rendered}"
         );
 
@@ -2448,17 +2648,19 @@ listeners:
     #[test]
     fn dropping_an_incomplete_h2_drain_records_a_forced_shutdown() {
         let metrics = Arc::new(Metrics::default());
-        let mut drain = H2DrainObservation::new(metrics.clone());
+        let mut drain = H2DrainObservation::new(metrics.listener_transport("test"));
         drain.started = true;
         drop(drain);
 
         let rendered = metrics.render_prometheus();
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"forced\"} 1"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"forced\"} 1"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("oxidase_http2_shutdown_total{result=\"graceful\"} 0"),
+            rendered
+                .contains("oxidase_http2_shutdown_total{listener=\"test\",result=\"graceful\"} 0"),
             "{rendered}"
         );
     }

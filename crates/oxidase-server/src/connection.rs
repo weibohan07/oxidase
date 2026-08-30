@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 use hyper::rt::Executor;
 use tokio::task::AbortHandle;
 
-use crate::metrics::Metrics;
+use crate::metrics::ListenerTransportMetrics;
 
 /// Per-HTTP/2-connection executor whose stream tasks cannot outlive a forced
 /// connection abort.
 #[derive(Clone)]
 pub(crate) struct TrackedExecutor {
     tasks: Arc<TrackedTasks>,
-    metrics: Arc<Metrics>,
+    metrics: ListenerTransportMetrics,
 }
 
 impl TrackedExecutor {
-    pub(crate) fn new(metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(metrics: ListenerTransportMetrics) -> Self {
         Self {
             tasks: Arc::new(TrackedTasks::default()),
             metrics,
@@ -76,13 +76,14 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_connection_executor_aborts_detached_stream_tasks() {
         let metrics = Arc::new(Metrics::default());
-        let executor = TrackedExecutor::new(metrics.clone());
+        let transport = metrics.listener_transport("public");
+        let executor = TrackedExecutor::new(transport);
         executor.execute(pending::<()>());
         tokio::task::yield_now().await;
         assert!(
             metrics
                 .render_prometheus()
-                .contains("oxidase_http2_active_streams 1")
+                .contains("oxidase_http2_active_streams{listener=\"public\"} 1")
         );
 
         drop(executor);
@@ -90,7 +91,7 @@ mod tests {
             loop {
                 if metrics
                     .render_prometheus()
-                    .contains("oxidase_http2_active_streams 0")
+                    .contains("oxidase_http2_active_streams{listener=\"public\"} 0")
                 {
                     break;
                 }
