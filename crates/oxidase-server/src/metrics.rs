@@ -27,6 +27,13 @@ pub struct Metrics {
     response_body_bytes: AtomicU64,
     response_body_terminations: [AtomicU64; 4],
     response_body_lifetime_buckets: [AtomicU64; 10],
+    connections_accepted: [AtomicU64; 2],
+    active_connections: [AtomicU64; 2],
+    tls_handshakes: [AtomicU64; 5],
+    tls_handshake_duration_buckets: [[AtomicU64; 10]; 5],
+    tls_alpn: [AtomicU64; 4],
+    h2_active_streams: AtomicU64,
+    h2_shutdowns: [AtomicU64; 2],
 }
 
 impl Metrics {
@@ -55,11 +62,7 @@ impl Metrics {
         if let Some(counter) = self.status_classes.get(class) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
-        let millis = latency.as_millis();
-        let bucket = LATENCY_BOUNDS_MS
-            .iter()
-            .position(|bound| millis <= u128::from(*bound))
-            .unwrap_or(LATENCY_BOUNDS_MS.len());
+        let bucket = latency_bucket(latency);
         self.latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -91,12 +94,42 @@ impl Metrics {
     ) {
         self.response_body_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.response_body_terminations[termination.index()].fetch_add(1, Ordering::Relaxed);
-        let millis = lifetime.as_millis();
-        let bucket = LATENCY_BOUNDS_MS
-            .iter()
-            .position(|bound| millis <= u128::from(*bound))
-            .unwrap_or(LATENCY_BOUNDS_MS.len());
+        let bucket = latency_bucket(lifetime);
         self.response_body_lifetime_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_accepted(
+        self: &Arc<Self>,
+        protocol: ConnectionProtocol,
+    ) -> ActiveConnection {
+        self.connections_accepted[protocol.index()].fetch_add(1, Ordering::Relaxed);
+        self.active_connections[protocol.index()].fetch_add(1, Ordering::Relaxed);
+        ActiveConnection {
+            metrics: self.clone(),
+            protocol,
+        }
+    }
+
+    pub(crate) fn record_tls_handshake(&self, outcome: TlsHandshakeOutcome, duration: Duration) {
+        self.tls_handshakes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        let bucket = latency_bucket(duration);
+        self.tls_handshake_duration_buckets[outcome.index()][bucket]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tls_alpn(&self, alpn: TlsAlpn) {
+        self.tls_alpn[alpn.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn h2_stream_started(self: &Arc<Self>) -> ActiveH2Stream {
+        self.h2_active_streams.fetch_add(1, Ordering::Relaxed);
+        ActiveH2Stream {
+            metrics: self.clone(),
+        }
+    }
+
+    pub(crate) fn record_h2_shutdown(&self, shutdown: H2Shutdown) {
+        self.h2_shutdowns[shutdown.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -211,7 +244,220 @@ impl Metrics {
                 "oxidase_response_body_lifetime_seconds_bucket{{le=\"{bound}\"}} {cumulative}\n"
             ));
         }
+        for protocol in ConnectionProtocol::ALL {
+            output.push_str(&format!(
+                "oxidase_connections_accepted_total{{protocol=\"{}\"}} {}\n",
+                protocol.as_str(),
+                self.connections_accepted[protocol.index()].load(Ordering::Relaxed)
+            ));
+            output.push_str(&format!(
+                "oxidase_active_connections{{protocol=\"{}\"}} {}\n",
+                protocol.as_str(),
+                self.active_connections[protocol.index()].load(Ordering::Relaxed)
+            ));
+        }
+        for outcome in TlsHandshakeOutcome::ALL {
+            output.push_str(&format!(
+                "oxidase_tls_handshakes_total{{result=\"{}\"}} {}\n",
+                outcome.as_str(),
+                self.tls_handshakes[outcome.index()].load(Ordering::Relaxed)
+            ));
+            let mut cumulative = 0u64;
+            for (index, value) in self.tls_handshake_duration_buckets[outcome.index()]
+                .iter()
+                .enumerate()
+            {
+                cumulative = cumulative.saturating_add(value.load(Ordering::Relaxed));
+                let bound = LATENCY_BOUNDS_MS.get(index).map_or_else(
+                    || "+Inf".to_owned(),
+                    |bound| format!("{:.3}", *bound as f64 / 1_000.0),
+                );
+                output.push_str(&format!(
+                    "oxidase_tls_handshake_duration_seconds_bucket{{result=\"{}\",le=\"{bound}\"}} {cumulative}\n",
+                    outcome.as_str()
+                ));
+            }
+        }
+        for alpn in TlsAlpn::ALL {
+            output.push_str(&format!(
+                "oxidase_tls_alpn_total{{protocol=\"{}\"}} {}\n",
+                alpn.as_str(),
+                self.tls_alpn[alpn.index()].load(Ordering::Relaxed)
+            ));
+        }
+        push_counter(
+            &mut output,
+            "oxidase_http2_active_streams",
+            self.h2_active_streams.load(Ordering::Relaxed),
+        );
+        for shutdown in H2Shutdown::ALL {
+            output.push_str(&format!(
+                "oxidase_http2_shutdown_total{{result=\"{}\"}} {}\n",
+                shutdown.as_str(),
+                self.h2_shutdowns[shutdown.index()].load(Ordering::Relaxed)
+            ));
+        }
         output
+    }
+}
+
+fn latency_bucket(duration: Duration) -> usize {
+    let millis = duration.as_millis();
+    LATENCY_BOUNDS_MS
+        .iter()
+        .position(|bound| millis <= u128::from(*bound))
+        .unwrap_or(LATENCY_BOUNDS_MS.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionProtocol {
+    Http1,
+    Http2,
+}
+
+impl ConnectionProtocol {
+    const ALL: [Self; 2] = [Self::Http1, Self::Http2];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Http1 => 0,
+            Self::Http2 => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "h2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsHandshakeOutcome {
+    Success,
+    Failure,
+    Timeout,
+    Protocol,
+    Io,
+}
+
+impl TlsHandshakeOutcome {
+    const ALL: [Self; 5] = [
+        Self::Success,
+        Self::Failure,
+        Self::Timeout,
+        Self::Protocol,
+        Self::Io,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::Failure => 1,
+            Self::Timeout => 2,
+            Self::Protocol => 3,
+            Self::Io => 4,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::Io => "io",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsAlpn {
+    Http1,
+    Http2,
+    None,
+    Other,
+}
+
+impl TlsAlpn {
+    const ALL: [Self; 4] = [Self::Http1, Self::Http2, Self::None, Self::Other];
+
+    #[must_use]
+    pub(crate) fn from_negotiated(protocol: Option<&[u8]>) -> Self {
+        match protocol {
+            Some(b"http/1.1") => Self::Http1,
+            Some(b"h2") => Self::Http2,
+            None => Self::None,
+            Some(_) => Self::Other,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Http1 => 0,
+            Self::Http2 => 1,
+            Self::None => 2,
+            Self::Other => 3,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "h2",
+            Self::None => "none",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum H2Shutdown {
+    Graceful,
+    Forced,
+}
+
+impl H2Shutdown {
+    const ALL: [Self; 2] = [Self::Graceful, Self::Forced];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Graceful => 0,
+            Self::Forced => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Forced => "forced",
+        }
+    }
+}
+
+#[must_use = "dropping the guard immediately records the connection as inactive"]
+pub(crate) struct ActiveConnection {
+    metrics: Arc<Metrics>,
+    protocol: ConnectionProtocol,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.metrics.active_connections[self.protocol.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[must_use = "dropping the guard immediately records the HTTP/2 stream as inactive"]
+pub(crate) struct ActiveH2Stream {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for ActiveH2Stream {
+    fn drop(&mut self) {
+        self.metrics
+            .h2_active_streams
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -285,11 +531,7 @@ impl ObserveSeries {
                 self.error_classes[error_class_index(class)].fetch_add(1, Ordering::Relaxed);
             }
         }
-        let millis = latency.as_millis();
-        let bucket = LATENCY_BOUNDS_MS
-            .iter()
-            .position(|bound| millis <= u128::from(*bound))
-            .unwrap_or(LATENCY_BOUNDS_MS.len());
+        let bucket = latency_bucket(latency);
         self.latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -453,7 +695,9 @@ mod tests {
         ServiceObservationResult,
     };
 
-    use super::{Metrics, ProductionObserver};
+    use super::{
+        ConnectionProtocol, H2Shutdown, Metrics, ProductionObserver, TlsAlpn, TlsHandshakeOutcome,
+    };
 
     #[test]
     fn metric_labels_are_from_fixed_bounded_sets() {
@@ -497,5 +741,64 @@ mod tests {
         ));
         assert!(!output.contains("secret?query=value"));
         assert!(!output.contains("service:observe"));
+    }
+
+    #[test]
+    fn transport_guards_release_active_counters() {
+        let metrics = Arc::new(Metrics::default());
+        let http1 = metrics.connection_accepted(ConnectionProtocol::Http1);
+        let h2 = metrics.connection_accepted(ConnectionProtocol::Http2);
+        let stream = metrics.h2_stream_started();
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_connections_accepted_total{protocol=\"http1\"} 1"));
+        assert!(output.contains("oxidase_connections_accepted_total{protocol=\"h2\"} 1"));
+        assert!(output.contains("oxidase_active_connections{protocol=\"http1\"} 1"));
+        assert!(output.contains("oxidase_active_connections{protocol=\"h2\"} 1"));
+        assert!(output.contains("oxidase_http2_active_streams 1"));
+
+        drop(http1);
+        drop(h2);
+        drop(stream);
+        let output = metrics.render_prometheus();
+        assert!(output.contains("oxidase_active_connections{protocol=\"http1\"} 0"));
+        assert!(output.contains("oxidase_active_connections{protocol=\"h2\"} 0"));
+        assert!(output.contains("oxidase_http2_active_streams 0"));
+    }
+
+    #[test]
+    fn tls_and_h2_metrics_only_emit_fixed_bounded_labels() {
+        let metrics = Metrics::default();
+        for outcome in TlsHandshakeOutcome::ALL {
+            metrics.record_tls_handshake(outcome, Duration::from_millis(7));
+        }
+        for alpn in [
+            TlsAlpn::from_negotiated(Some(b"http/1.1")),
+            TlsAlpn::from_negotiated(Some(b"h2")),
+            TlsAlpn::from_negotiated(None),
+            TlsAlpn::from_negotiated(Some(b"secret.example/path?user=42")),
+        ] {
+            metrics.record_tls_alpn(alpn);
+        }
+        metrics.record_h2_shutdown(H2Shutdown::Graceful);
+        metrics.record_h2_shutdown(H2Shutdown::Forced);
+
+        let output = metrics.render_prometheus();
+        for result in ["success", "failure", "timeout", "protocol", "io"] {
+            assert!(output.contains(&format!(
+                "oxidase_tls_handshakes_total{{result=\"{result}\"}} 1"
+            )));
+            assert!(output.contains(&format!(
+                "oxidase_tls_handshake_duration_seconds_bucket{{result=\"{result}\""
+            )));
+        }
+        for protocol in ["http1", "h2", "none", "other"] {
+            assert!(output.contains(&format!(
+                "oxidase_tls_alpn_total{{protocol=\"{protocol}\"}} 1"
+            )));
+        }
+        assert!(output.contains("oxidase_http2_shutdown_total{result=\"graceful\"} 1"));
+        assert!(output.contains("oxidase_http2_shutdown_total{result=\"forced\"} 1"));
+        assert!(!output.contains("secret.example"));
+        assert!(!output.contains("user=42"));
     }
 }

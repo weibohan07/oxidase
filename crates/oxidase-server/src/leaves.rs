@@ -242,17 +242,19 @@ fn apply_forwarding_headers(headers: &mut HeaderMap, request: &RequestFrame, end
     if let Ok(value) = HeaderValue::from_str(&peer_ip) {
         headers.insert(HeaderName::from_static("x-forwarded-for"), value);
     }
-    if let Ok(value) = HeaderValue::from_str(request.scheme()) {
+    let ingress_scheme = request.original().scheme.as_str();
+    let ingress_authority = request.original().authority.as_str();
+    if let Ok(value) = HeaderValue::from_str(ingress_scheme) {
         headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
     }
-    if let Ok(value) = HeaderValue::from_str(request.authority()) {
+    if let Ok(value) = HeaderValue::from_str(ingress_authority) {
         headers.insert(HeaderName::from_static("x-forwarded-host"), value);
     }
     let forwarded = format!(
         "for=\"{}\";proto={};host=\"{}\"",
         escape_forwarded(&peer_ip),
-        request.scheme(),
-        escape_forwarded(request.authority())
+        ingress_scheme,
+        escape_forwarded(ingress_authority)
     );
     if let Ok(value) = HeaderValue::from_str(&forwarded) {
         headers.insert(HeaderName::from_static("forwarded"), value);
@@ -752,11 +754,12 @@ mod tests {
     use std::path::PathBuf;
 
     use http::{HeaderMap, HeaderValue, header};
+    use oxidase_core::{RequestFrame, RequestMetadata};
     use oxidase_site::{AssetPlan, AssetRepresentation, ContentEncoding};
 
     use super::{
-        ByteRange, ParsedRange, ResolvedRange, UnresolvedByteRange, parse_quality, parse_range,
-        select_representation,
+        ByteRange, ParsedRange, ResolvedRange, UnresolvedByteRange, apply_forwarding_headers,
+        parse_quality, parse_range, select_representation,
     };
 
     fn representation(encoding: Option<ContentEncoding>) -> AssetRepresentation {
@@ -879,5 +882,59 @@ mod tests {
         let selected = select_representation(&encoding_headers("br, identity;q=0"), &asset, false)
             .expect("the ignored range permits Brotli negotiation");
         assert_eq!(selected.encoding, Some(ContentEncoding::Brotli));
+    }
+
+    #[test]
+    fn forwarding_headers_use_original_ingress_metadata_not_transform_overlay() {
+        let mut request = RequestFrame::new(
+            RequestMetadata::try_new(
+                http::Method::GET,
+                "https",
+                "public.example:8443",
+                "/original",
+                HeaderMap::new(),
+            )
+            .expect("request metadata is valid"),
+        );
+        request.overlay_mut().scheme = Some(http::uri::Scheme::HTTP);
+        request.overlay_mut().authority = Some(
+            "internal.example:9000"
+                .parse()
+                .expect("overlay authority is valid"),
+        );
+
+        let endpoint =
+            url::Url::parse("http://upstream.example:8080/base").expect("endpoint URL is valid");
+        let mut headers = HeaderMap::new();
+        apply_forwarding_headers(&mut headers, &request, &endpoint);
+
+        assert_eq!(
+            headers.get(header::HOST).expect("upstream Host is present"),
+            "upstream.example:8080"
+        );
+        assert_eq!(
+            headers
+                .get("x-forwarded-proto")
+                .expect("forwarded protocol is present"),
+            "https",
+            "the transform overlay must not rewrite ingress transport identity"
+        );
+        assert_eq!(
+            headers
+                .get("x-forwarded-host")
+                .expect("forwarded authority is present"),
+            "public.example:8443"
+        );
+        assert_eq!(
+            headers
+                .get("forwarded")
+                .expect("Forwarded header is present"),
+            "for=\"unknown\";proto=https;host=\"public.example:8443\""
+        );
+        assert!(!headers.values().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.contains("internal.example"))
+        }));
     }
 }

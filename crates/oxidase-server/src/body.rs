@@ -11,6 +11,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
+use oxidase_runtime::RuntimeSnapshot;
 use tokio::time::{Instant, Sleep};
 
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
@@ -95,13 +96,28 @@ pub(crate) fn timeout_incoming_body(body: Incoming, timeout: Duration) -> Gatewa
     TimeoutBody::new(body, timeout).boxed_unsync()
 }
 
+#[cfg(test)]
 pub(crate) fn instrument_response_body(
     response: http::Response<GatewayBody>,
     metrics: Arc<Metrics>,
     active_request: ActiveRequest,
 ) -> http::Response<GatewayBody> {
+    instrument_response_body_with_snapshot(response, metrics, active_request, None)
+}
+
+/// Instruments a response body while pinning the runtime snapshot that
+/// produced it until the body reaches a terminal state.
+///
+/// The pin is released on end-of-stream, body error, or cancellation/drop. It
+/// does not inspect or buffer body frames.
+pub(crate) fn instrument_response_body_with_snapshot(
+    response: http::Response<GatewayBody>,
+    metrics: Arc<Metrics>,
+    active_request: ActiveRequest,
+    snapshot: Option<Arc<RuntimeSnapshot>>,
+) -> http::Response<GatewayBody> {
     let (parts, body) = response.into_parts();
-    let body = InstrumentedBody::new(body, metrics, active_request).boxed_unsync();
+    let body = InstrumentedBody::new(body, metrics, active_request, snapshot).boxed_unsync();
     http::Response::from_parts(parts, body)
 }
 
@@ -112,10 +128,16 @@ struct InstrumentedBody {
     started: std::time::Instant,
     bytes: u64,
     termination: Option<BodyTermination>,
+    snapshot: Option<Arc<RuntimeSnapshot>>,
 }
 
 impl InstrumentedBody {
-    fn new(inner: GatewayBody, metrics: Arc<Metrics>, active_request: ActiveRequest) -> Self {
+    fn new(
+        inner: GatewayBody,
+        metrics: Arc<Metrics>,
+        active_request: ActiveRequest,
+        snapshot: Option<Arc<RuntimeSnapshot>>,
+    ) -> Self {
         let mut body = Self {
             inner,
             metrics,
@@ -123,6 +145,7 @@ impl InstrumentedBody {
             started: std::time::Instant::now(),
             bytes: 0,
             termination: None,
+            snapshot,
         };
         if body.inner.is_end_stream() {
             body.finish(BodyTermination::Completed);
@@ -135,6 +158,7 @@ impl InstrumentedBody {
             self.metrics
                 .record_response_body(self.bytes, termination, self.started.elapsed());
             self.active_request.take();
+            self.snapshot.take();
         }
     }
 }
@@ -258,7 +282,13 @@ mod tests {
     use http_body::{Body, Frame, SizeHint};
     use http_body_util::BodyExt;
 
-    use super::{BoxError, GatewayBody, full_body, instrument_response_body};
+    use oxidase_config::Compiler;
+    use oxidase_runtime::RuntimeSnapshot;
+
+    use super::{
+        BoxError, GatewayBody, full_body, instrument_response_body,
+        instrument_response_body_with_snapshot,
+    };
     use crate::metrics::Metrics;
 
     struct FailingBody {
@@ -360,5 +390,98 @@ mod tests {
             output.contains("oxidase_response_body_terminations_total{reason=\"cancelled\"} 1")
         );
         assert!(output.contains("oxidase_active_requests 0"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_pin_lives_until_body_completion_or_drop() {
+        let directory = tempfile::tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        std::fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: respond
+    body:
+      text: pinned
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("fixture config can be written");
+        let snapshot = Arc::new(
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("config compiles"))
+                .expect("snapshot prepares"),
+        );
+        let weak = Arc::downgrade(&snapshot);
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body_with_snapshot(
+            Response::new(full_body(Bytes::from_static(b"body"))),
+            metrics,
+            active,
+            Some(snapshot.clone()),
+        );
+        drop(snapshot);
+        assert!(weak.upgrade().is_some(), "body retains the snapshot pin");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body completes")
+                .to_bytes(),
+            Bytes::from_static(b"body")
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "end-of-stream releases the snapshot pin"
+        );
+
+        let snapshot = Arc::new(
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("config compiles"))
+                .expect("snapshot prepares"),
+        );
+        let weak = Arc::downgrade(&snapshot);
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body_with_snapshot(
+            Response::new(full_body(Bytes::from_static(b"cancel"))),
+            metrics,
+            active,
+            Some(snapshot.clone()),
+        );
+        drop(snapshot);
+        assert!(weak.upgrade().is_some(), "body retains the snapshot pin");
+        drop(response);
+        assert!(
+            weak.upgrade().is_none(),
+            "cancellation releases the snapshot pin"
+        );
+
+        let snapshot = Arc::new(
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("config compiles"))
+                .expect("snapshot prepares"),
+        );
+        let weak = Arc::downgrade(&snapshot);
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.request_started();
+        let response = instrument_response_body_with_snapshot(
+            Response::new(failing_body(std::io::ErrorKind::BrokenPipe)),
+            metrics,
+            active,
+            Some(snapshot.clone()),
+        );
+        drop(snapshot);
+        assert!(weak.upgrade().is_some(), "body retains the snapshot pin");
+        assert!(response.into_body().collect().await.is_err());
+        assert!(
+            weak.upgrade().is_none(),
+            "body error releases the snapshot pin"
+        );
     }
 }
