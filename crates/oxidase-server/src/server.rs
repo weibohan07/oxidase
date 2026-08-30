@@ -144,6 +144,7 @@ impl GatewayServer {
             });
         }
         let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
+        proxy.reconcile_snapshot(&snapshot);
         let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
         Ok(Self {
             store: Arc::new(SnapshotStore::new(snapshot)),
@@ -694,6 +695,9 @@ async fn apply_reload(
     let previous_version = environment.store.pin().config_version.to_string();
     let current_version = snapshot.config_version.to_string();
     environment.store.publish(snapshot);
+    environment
+        .proxy
+        .reconcile_snapshot(&environment.store.pin());
     environment
         .health
         .activate_snapshot(&environment.store.pin());
