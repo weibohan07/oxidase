@@ -1,18 +1,21 @@
-use std::error::Error;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use oxidase_config::{Compiler, ExplainRequestSource, TestExpectationSource};
 use oxidase_core::{
-    ContentDigest, ContentDigestBuilder, RequestFrame, RequestMetadata, ResourceId, ResponseHead,
-    ServiceOutcome,
+    ContentDigest, ContentDigestBuilder, Diagnostic, RequestFrame, RequestMetadata, ResourceId,
+    ResponseHead, ServiceOutcome, SourceSpan,
 };
 use oxidase_runtime::{BoxLeafFuture, ExecutionReport, Executor, LeafExecutor, RuntimeSnapshot};
 use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
+
+mod diagnostic_output;
+
+use diagnostic_output::{DiagnosticFormat, DiagnosticRoot, Reporter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +24,9 @@ use serde::Serialize;
     about = "Declarative HTTP Service compiler and runtime"
 )]
 struct Cli {
+    /// Selects human-readable or machine-readable diagnostics.
+    #[arg(long, value_enum, global = true, default_value = "human")]
+    diagnostic_format: DiagnosticFormat,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,89 +64,225 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run(Cli::parse()).await {
-        eprintln!("{error}");
+    let cli = Cli::parse();
+    let format = cli.diagnostic_format;
+    let root = DiagnosticRoot::for_config(cli.config_path());
+    let reporter = Reporter::new(format);
+    let (diagnostics, failed, stdout_payload) = match run(cli, &reporter).await {
+        Ok(success) => (Vec::new(), false, success.stdout_payload),
+        Err(failure) => (failure.diagnostics, true, false),
+    };
+    if !(format == DiagnosticFormat::Json && stdout_payload)
+        && let Err(error) = diagnostic_output::render(format, &root, diagnostics)
+    {
+        eprintln!("cannot render diagnostics: {error}");
+        std::process::exit(1);
+    }
+    if failed {
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+impl Cli {
+    fn config_path(&self) -> &Path {
+        match &self.command {
+            Command::Check { config }
+            | Command::Compile { config, .. }
+            | Command::Test { config }
+            | Command::Serve { config, .. }
+            | Command::Explain { config, .. } => config,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunSuccess {
+    stdout_payload: bool,
+}
+
+#[derive(Debug)]
+struct CliFailure {
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl CliFailure {
+    fn one(diagnostic: Diagnostic) -> Self {
+        Self {
+            diagnostics: vec![diagnostic],
+        }
+    }
+}
+
+impl From<oxidase_config::CompileError> for CliFailure {
+    fn from(error: oxidase_config::CompileError) -> Self {
+        Self {
+            diagnostics: error.diagnostics,
+        }
+    }
+}
+
+async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
     match cli.command {
         Command::Check { config } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
-            println!(
+            let gateway = prepare_snapshot(&config)?;
+            reporter.human_stdout(format!(
                 "configuration {} is valid: {} listener(s), {} service node(s), {} resource(s)",
                 gateway.config_version,
                 gateway.listeners.len(),
                 gateway.graph.len(),
                 gateway.resources.clusters.len() + gateway.resources.sites.len()
-            );
-            Ok(())
+            ));
+            Ok(RunSuccess::default())
         }
         Command::Explain {
             config,
             request,
             listener,
         } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
-            let request = Compiler::parse_request_file(request)?;
-            let output = explain(&gateway, listener.as_deref(), &request).await?;
-            println!("{}", serde_json::to_string_pretty(&output)?);
-            Ok(())
+            let gateway = prepare_snapshot(&config)?;
+            let request_source =
+                Compiler::parse_request_file(&request).map_err(CliFailure::from)?;
+            let output = explain(&gateway, listener.as_deref(), &request_source, &request).await?;
+            let output = serde_json::to_string_pretty(&output).map_err(|error| {
+                CliFailure::one(diagnostic_at(
+                    "explain.output_encode",
+                    format!("cannot encode explain output: {error}"),
+                    &request,
+                    "explain.output",
+                ))
+            })?;
+            println!("{output}");
+            Ok(RunSuccess {
+                stdout_payload: true,
+            })
         }
         Command::Compile { config, output } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
+            let gateway = prepare_snapshot(&config)?;
             let manifest = CompilationManifest {
                 format: "oxidase.snapshot-manifest/v1",
                 summary: gateway.summary().clone(),
             };
-            std::fs::write(output, serde_json::to_vec_pretty(&manifest)?)?;
-            Ok(())
+            let manifest = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                CliFailure::one(diagnostic_at(
+                    "compile.manifest_encode",
+                    format!("cannot encode compilation manifest: {error}"),
+                    &config,
+                    "compile.output",
+                ))
+            })?;
+            std::fs::write(&output, manifest).map_err(|error| {
+                CliFailure::one(diagnostic_at(
+                    "compile.output_write",
+                    format!(
+                        "cannot write compilation manifest `{}`: {error}",
+                        output.display()
+                    ),
+                    &output,
+                    "compile.output",
+                ))
+            })?;
+            Ok(RunSuccess::default())
         }
         Command::Test { config } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(config)?)?;
-            run_config_tests(&gateway).await
+            let gateway = prepare_snapshot(&config)?;
+            run_config_tests(&gateway, &config, reporter).await?;
+            Ok(RunSuccess::default())
         }
         Command::Serve {
             config,
             watch,
             admin_bind,
         } => {
-            let gateway = RuntimeSnapshot::prepare(Compiler::compile_path(&config)?)?;
+            let gateway = prepare_snapshot(&config)?;
             let _ = tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| "oxidase=info".into()),
                 )
                 .try_init();
-            let mut server = oxidase_server::GatewayServer::bind(gateway).await?;
+            let mut server = oxidase_server::GatewayServer::bind(gateway)
+                .await
+                .map_err(server_failure)?;
             if let Some(admin_bind) = admin_bind {
-                server = server.with_admin_listener(admin_bind).await?;
+                server = server
+                    .with_admin_listener(admin_bind)
+                    .await
+                    .map_err(server_failure)?;
             }
             for (name, address) in server.local_addresses() {
-                println!("listener {name} accepting HTTP/1.1 on {address}");
+                reporter.human_stdout(format!("listener {name} accepting HTTP/1.1 on {address}"));
             }
             if let Some(address) = server.admin_address() {
-                println!("admin listener accepting HTTP/1.1 on {address}");
+                reporter.human_stdout(format!("admin listener accepting HTTP/1.1 on {address}"));
             }
             let running = server.spawn();
             let (stop_watcher, watcher_stopped) = tokio::sync::watch::channel(false);
             let watcher = watch.then(|| {
                 tokio::spawn(watch_dependencies(
-                    config,
+                    config.clone(),
                     running.reload_handle(),
                     watcher_stopped,
                 ))
             });
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::signal::ctrl_c().await.map_err(|error| {
+                CliFailure::one(diagnostic_at(
+                    "serve.signal",
+                    format!("cannot listen for the shutdown signal: {error}"),
+                    &config,
+                    "serve.signal",
+                ))
+            })?;
             let _ = stop_watcher.send(true);
             if let Some(watcher) = watcher {
-                let _ = watcher.await;
+                watcher.await.map_err(|error| {
+                    CliFailure::one(diagnostic_at(
+                        "serve.watcher",
+                        format!("dependency watcher task failed: {error}"),
+                        &config,
+                        "serve.watch",
+                    ))
+                })?;
             }
-            running.shutdown().await?;
-            Ok(())
+            running.shutdown().await.map_err(server_failure)?;
+            Ok(RunSuccess::default())
         }
     }
+}
+
+fn prepare_snapshot(config: &Path) -> Result<RuntimeSnapshot, CliFailure> {
+    let gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
+    RuntimeSnapshot::prepare(gateway).map_err(|error| CliFailure {
+        diagnostics: error.into_diagnostics(),
+    })
+}
+
+fn server_failure(error: oxidase_server::ServerError) -> CliFailure {
+    CliFailure {
+        diagnostics: error.into_diagnostics(),
+    }
+}
+
+fn diagnostic_at(
+    code: &'static str,
+    message: impl Into<String>,
+    file: &Path,
+    field_path: &str,
+) -> Diagnostic {
+    Diagnostic::new(
+        code,
+        message,
+        SourceSpan {
+            file: file.to_path_buf(),
+            start_byte: 0,
+            end_byte: 0,
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 1,
+            field_path: field_path.to_owned(),
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -275,22 +417,39 @@ async fn explain(
     gateway: &RuntimeSnapshot,
     listener_name: Option<&str>,
     request: &ExplainRequestSource,
-) -> Result<ExplainOutput, Box<dyn Error>> {
+    source: &Path,
+) -> Result<ExplainOutput, CliFailure> {
     let listener = match listener_name {
         Some(name) => gateway
             .listeners
             .iter()
             .find(|listener| listener.name == name)
-            .ok_or_else(|| format!("listener `{name}` does not exist"))?,
-        None => gateway
-            .listeners
-            .first()
-            .ok_or("compiled gateway has no listener")?,
+            .ok_or_else(|| {
+                CliFailure::one(diagnostic_at(
+                    "explain.listener_missing",
+                    format!("listener `{name}` does not exist"),
+                    source,
+                    "listener",
+                ))
+            })?,
+        None => gateway.listeners.first().ok_or_else(|| {
+            CliFailure::one(diagnostic_at(
+                "explain.listener_missing",
+                "compiled gateway has no listener",
+                source,
+                "listeners",
+            ))
+        })?,
     };
-    let program = gateway
-        .program_for(&listener.name)
-        .ok_or("listener root program is unavailable")?;
-    let frame = request_frame(request)?;
+    let program = gateway.program_for(&listener.name).ok_or_else(|| {
+        CliFailure::one(diagnostic_at(
+            "explain.listener_program",
+            "listener root program is unavailable",
+            source,
+            "listener",
+        ))
+    })?;
+    let frame = request_frame(request, source)?;
     let leaves = ExplainLeaves { snapshot: gateway };
     let report = Executor::new(&program, &leaves)
         .execute_traced(frame, None)
@@ -298,19 +457,46 @@ async fn explain(
     Ok(describe_report(gateway, &listener.name, report))
 }
 
-fn request_frame(source: &ExplainRequestSource) -> Result<RequestFrame, Box<dyn Error>> {
-    let method = source.method.parse::<Method>()?;
+fn request_frame(source: &ExplainRequestSource, file: &Path) -> Result<RequestFrame, CliFailure> {
+    let method = source.method.parse::<Method>().map_err(|error| {
+        CliFailure::one(diagnostic_at(
+            "request.method",
+            format!("invalid request method `{}`: {error}", source.method),
+            file,
+            "request.method",
+        ))
+    })?;
     let mut headers = HeaderMap::new();
     for (name, value) in &source.headers {
-        headers.insert(name.parse::<HeaderName>()?, value.parse::<HeaderValue>()?);
+        let parsed_name = name.parse::<HeaderName>().map_err(|error| {
+            CliFailure::one(diagnostic_at(
+                "request.header_name",
+                format!("invalid request Header name `{name}`: {error}"),
+                file,
+                &format!("request.headers.{name}"),
+            ))
+        })?;
+        let parsed_value = value.parse::<HeaderValue>().map_err(|error| {
+            CliFailure::one(diagnostic_at(
+                "request.header_value",
+                format!("invalid value for request Header `{name}`: {error}"),
+                file,
+                &format!("request.headers.{name}"),
+            ))
+        })?;
+        headers.insert(parsed_name, parsed_value);
     }
-    Ok(RequestFrame::new(RequestMetadata::try_new(
-        method,
-        &source.scheme,
-        &source.host,
-        &source.path,
-        headers,
-    )?))
+    let metadata =
+        RequestMetadata::try_new(method, &source.scheme, &source.host, &source.path, headers)
+            .map_err(|error| {
+                CliFailure::one(diagnostic_at(
+                    "request.metadata",
+                    format!("invalid request metadata: {error}"),
+                    file,
+                    "request",
+                ))
+            })?;
+    Ok(RequestFrame::new(metadata))
 }
 
 fn describe_report(
@@ -370,38 +556,65 @@ fn describe_report(
     }
 }
 
-async fn run_config_tests(gateway: &RuntimeSnapshot) -> Result<(), Box<dyn Error>> {
+async fn run_config_tests(
+    gateway: &RuntimeSnapshot,
+    config: &Path,
+    reporter: &Reporter,
+) -> Result<(), CliFailure> {
     if gateway.tests.is_empty() {
-        return Err("configuration contains no declarative tests".into());
+        return Err(CliFailure::one(diagnostic_at(
+            "test.no_cases",
+            "configuration contains no declarative tests",
+            config,
+            "tests",
+        )));
     }
     let mut failures = Vec::new();
-    for test in &gateway.tests {
-        let output = explain(gateway, test.listener.as_deref(), &test.request).await?;
+    for (index, test) in gateway.tests.iter().enumerate() {
+        let output = explain(gateway, test.listener.as_deref(), &test.request, config).await?;
         let mismatches = compare_expectation(&output, &test.expect);
         if mismatches.is_empty() {
-            println!("ok - {}", test.name);
+            reporter.human_stdout(format!("ok - {}", test.name));
         } else {
-            failures.push(format!("{}: {}", test.name, mismatches.join(", ")));
+            failures.extend(mismatches.into_iter().map(|mismatch| {
+                diagnostic_at(
+                    mismatch.code,
+                    format!(
+                        "configuration test `{}` failed: {}",
+                        test.name, mismatch.message
+                    ),
+                    config,
+                    &format!("tests[{index}].expect"),
+                )
+            }));
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "{} configuration test(s) failed:\n{}",
-            failures.len(),
-            failures.join("\n")
-        )
-        .into())
+        Err(CliFailure {
+            diagnostics: failures,
+        })
     }
 }
 
-fn compare_expectation(output: &ExplainOutput, expected: &TestExpectationSource) -> Vec<String> {
+struct ExpectationMismatch {
+    code: &'static str,
+    message: String,
+}
+
+fn compare_expectation(
+    output: &ExplainOutput,
+    expected: &TestExpectationSource,
+) -> Vec<ExpectationMismatch> {
     let mut mismatches = Vec::new();
     if let Some(status) = expected.status
         && output.status != status
     {
-        mismatches.push(format!("expected status {status}, got {}", output.status));
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_status",
+            message: format!("expected status {status}, got {}", output.status),
+        });
     }
     if let Some(service) = &expected.service {
         let service = format!("service:{service}");
@@ -410,7 +623,10 @@ fn compare_expectation(output: &ExplainOutput, expected: &TestExpectationSource)
             .iter()
             .any(|event| event.event == "enter" && event.service == service)
         {
-            mismatches.push(format!("service `{service}` was not entered"));
+            mismatches.push(ExpectationMismatch {
+                code: "test.expectation_service",
+                message: format!("service `{service}` was not entered"),
+            });
         }
     }
     let leaf = match &output.body {
@@ -429,7 +645,7 @@ fn compare_expectation(output: &ExplainOutput, expected: &TestExpectationSource)
 fn compare_leaf(
     expected: &TestExpectationSource,
     leaf: Option<(&str, &String, &String)>,
-    mismatches: &mut Vec<String>,
+    mismatches: &mut Vec<ExpectationMismatch>,
 ) {
     let expected_resource = expected
         .cluster
@@ -446,12 +662,18 @@ fn compare_leaf(
             actual_kind == kind && actual_resource == &resource
         })
     {
-        mismatches.push(format!("expected {kind} resource `{resource}`"));
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_resource",
+            message: format!("expected {kind} resource `{resource}"),
+        });
     }
     if let Some(path) = &expected.rewritten_path
         && !leaf.is_some_and(|(_, _, actual_path)| actual_path == path)
     {
-        mismatches.push(format!("expected rewritten path `{path}`"));
+        mismatches.push(ExpectationMismatch {
+            code: "test.expectation_path",
+            message: format!("expected rewritten path `{path}"),
+        });
     }
 }
 
