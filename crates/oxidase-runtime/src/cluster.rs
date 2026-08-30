@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oxidase_config::{
-    ActiveHealthSpec, ClusterEndpointSpec, ClusterProtocol, ClusterSpec, LoadBalancePolicy,
-    PassiveHealthSpec,
+    ActiveHealthSpec, ClusterEndpointSpec, ClusterHealthSpec, ClusterProtocol, ClusterSpec,
+    LoadBalancePolicy, PassiveHealthSpec,
 };
 use oxidase_core::ResourceId;
 use serde::Serialize;
@@ -62,9 +62,11 @@ impl EndpointHealthState {
 /// Reload-stable, concurrency-safe state for one endpoint identity.
 ///
 /// Identity is supplied by [`PreparedCluster`]: Cluster resource ID, endpoint
-/// name, canonical URL, and upstream protocol. Policy-only reloads share this
-/// object, while a URL or protocol change creates a fresh state object.
+/// name, canonical URL, upstream protocol, and health policy. Reloads that
+/// change the health state machine create a fresh object so an old pinned
+/// supervisor cannot mutate the new policy's state.
 pub struct EndpointRuntimeState {
+    health_transition_lock: Mutex<()>,
     health: AtomicU8,
     consecutive_active_health_successes: AtomicU64,
     consecutive_active_health_failures: AtomicU64,
@@ -107,7 +109,12 @@ impl EndpointRuntimeState {
     }
 
     fn new_at(now: Instant) -> Self {
+        Self::new_at_with_admission(now, Arc::new(AdmissionCounter::default()))
+    }
+
+    fn new_at_with_admission(now: Instant, admission: Arc<AdmissionCounter>) -> Self {
         Self {
+            health_transition_lock: Mutex::new(()),
             health: AtomicU8::new(HEALTH_UNKNOWN_ELIGIBLE),
             consecutive_active_health_successes: AtomicU64::new(0),
             consecutive_active_health_failures: AtomicU64::new(0),
@@ -122,7 +129,7 @@ impl EndpointRuntimeState {
             ejection_deadline_tick: AtomicU64::new(0),
             last_transition_unix_ms: AtomicU64::new(unix_time_millis()),
             clock_origin: now,
-            admission: Arc::new(AdmissionCounter::default()),
+            admission,
         }
     }
 
@@ -153,6 +160,10 @@ impl EndpointRuntimeState {
     }
 
     fn record_active_health(&self, succeeded: bool, plan: &ActiveHealthSpec, now: Instant) {
+        let _transition_guard = self
+            .health_transition_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if succeeded {
             self.active_health_successes.fetch_add(1, Ordering::Relaxed);
             self.consecutive_active_health_failures
@@ -174,16 +185,24 @@ impl EndpointRuntimeState {
                 .consecutive_active_health_failures
                 .fetch_add(1, Ordering::AcqRel)
                 .saturating_add(1);
-            if failures >= u64::from(plan.unhealthy_threshold)
-                && self.health_state(now) != EndpointHealthState::PassivelyEjected
-            {
-                self.transition_to(EndpointHealthState::Unhealthy);
+            if failures >= u64::from(plan.unhealthy_threshold) {
+                // Passive ejection has precedence over an active-health
+                // failure. The conditional transition must be one atomic
+                // operation: a preceding read followed by an unconditional
+                // swap could overwrite an ejection that won between them.
+                self.recover_expired_ejection_locked(now);
+                let observed = self.health.load(Ordering::Acquire);
+                self.transition_to_unhealthy_from(observed);
             }
         }
     }
 
     fn record_passive_success(&self) {
         self.successes.fetch_add(1, Ordering::Relaxed);
+        let _transition_guard = self
+            .health_transition_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.passive_failures.store(0, Ordering::Release);
     }
 
@@ -192,6 +211,10 @@ impl EndpointRuntimeState {
         let Some(plan) = plan else {
             return;
         };
+        let _transition_guard = self
+            .health_transition_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let failures = self
             .passive_failures
             .fetch_add(1, Ordering::AcqRel)
@@ -208,6 +231,21 @@ impl EndpointRuntimeState {
     }
 
     fn recover_expired_ejection(&self, now: Instant) {
+        if self.health.load(Ordering::Acquire) != HEALTH_PASSIVELY_EJECTED {
+            return;
+        }
+        let deadline = self.ejection_deadline_tick.load(Ordering::Acquire);
+        if deadline == 0 || self.tick(now) < deadline {
+            return;
+        }
+        let _transition_guard = self
+            .health_transition_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_expired_ejection_locked(now);
+    }
+
+    fn recover_expired_ejection_locked(&self, now: Instant) {
         if self.health.load(Ordering::Acquire) != HEALTH_PASSIVELY_EJECTED {
             return;
         }
@@ -239,6 +277,30 @@ impl EndpointRuntimeState {
 
     fn transition_to(&self, state: EndpointHealthState) {
         let previous = self.health.swap(state.encode(), Ordering::AcqRel);
+        self.record_transition(previous, state);
+    }
+
+    fn transition_to_unhealthy_from(&self, mut observed: u8) {
+        loop {
+            if matches!(observed, HEALTH_UNHEALTHY | HEALTH_PASSIVELY_EJECTED) {
+                return;
+            }
+            match self.health.compare_exchange_weak(
+                observed,
+                HEALTH_UNHEALTHY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => {
+                    self.record_transition(previous, EndpointHealthState::Unhealthy);
+                    return;
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn record_transition(&self, previous: u8, state: EndpointHealthState) {
         if previous != state.encode() {
             self.health_transitions.fetch_add(1, Ordering::Relaxed);
             if state == EndpointHealthState::PassivelyEjected {
@@ -352,6 +414,8 @@ impl PreparedCluster {
     pub fn prepare(spec: ClusterSpec, previous: Option<&Self>) -> (Self, usize) {
         let same_cluster = previous.filter(|previous| previous.spec.id == spec.id);
         let same_protocol = same_cluster.filter(|previous| previous.spec.protocol == spec.protocol);
+        let same_health_policy = same_protocol
+            .filter(|previous| health_policy_compatible(&previous.spec.health, &spec.health));
         let runtime = same_cluster.map_or_else(
             || Arc::new(ClusterRuntimeState::default()),
             |previous| Arc::clone(&previous.runtime),
@@ -362,18 +426,23 @@ impl PreparedCluster {
             .iter()
             .cloned()
             .map(|endpoint| {
-                let state = same_protocol
-                    .and_then(|previous| {
-                        previous.endpoints.iter().find(|candidate| {
-                            candidate.name() == endpoint.name && candidate.url() == &endpoint.url
-                        })
+                let previous_endpoint = same_protocol.and_then(|previous| {
+                    previous.endpoints.iter().find(|candidate| {
+                        candidate.name() == endpoint.name && candidate.url() == &endpoint.url
                     })
-                    .map(|endpoint| Arc::clone(endpoint.runtime_state()));
-                let state = if let Some(state) = state {
-                    reused += 1;
-                    state
-                } else {
-                    Arc::new(EndpointRuntimeState::new())
+                });
+                let state = match (previous_endpoint, same_health_policy.is_some()) {
+                    (Some(endpoint), true) => {
+                        reused += 1;
+                        Arc::clone(endpoint.runtime_state())
+                    }
+                    (Some(endpoint), false) => {
+                        Arc::new(EndpointRuntimeState::new_at_with_admission(
+                            Instant::now(),
+                            Arc::clone(&endpoint.runtime_state().admission),
+                        ))
+                    }
+                    (None, _) => Arc::new(EndpointRuntimeState::new()),
                 };
                 Arc::new(PreparedEndpoint {
                     spec: endpoint,
@@ -828,6 +897,30 @@ impl PreparedCluster {
     }
 }
 
+fn health_policy_compatible(previous: &ClusterHealthSpec, next: &ClusterHealthSpec) -> bool {
+    let active_matches = match (&previous.active, &next.active) {
+        (None, None) => true,
+        (Some(previous), Some(next)) => {
+            previous.path == next.path
+                && previous.interval == next.interval
+                && previous.timeout == next.timeout
+                && previous.healthy_statuses == next.healthy_statuses
+                && previous.healthy_threshold == next.healthy_threshold
+                && previous.unhealthy_threshold == next.unhealthy_threshold
+        }
+        _ => false,
+    };
+    let passive_matches = match (&previous.passive, &next.passive) {
+        (None, None) => true,
+        (Some(previous), Some(next)) => {
+            previous.consecutive_failures == next.consecutive_failures
+                && previous.eject_for == next.eject_for
+        }
+        _ => false,
+    };
+    active_matches && passive_matches
+}
+
 /// Admission failure before request-body consumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterAdmissionError {
@@ -1028,7 +1121,8 @@ fn unix_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     use http::Method;
@@ -1040,7 +1134,10 @@ mod tests {
     use oxidase_core::{ResourceId, SourceSpan};
     use url::Url;
 
-    use super::{ClusterAdmissionError, EndpointHealthState, PreparedCluster};
+    use super::{
+        ClusterAdmissionError, EndpointHealthState, EndpointRuntimeState, HEALTH_UNKNOWN_ELIGIBLE,
+        PreparedCluster,
+    };
 
     fn endpoint(name: &str, url: &str, weight: u16) -> ClusterEndpointSpec {
         ClusterEndpointSpec {
@@ -1267,6 +1364,95 @@ mod tests {
         let runtime = &cluster.status(later).endpoints[0].runtime;
         assert_eq!(runtime.passive_ejections, 2);
         assert_eq!(runtime.health_transitions, 4);
+    }
+
+    #[test]
+    fn stale_active_failure_transitions_cannot_overwrite_passive_ejection() {
+        const ACTIVE_FAILURES: usize = 32;
+
+        let now = Instant::now();
+        let state = Arc::new(EndpointRuntimeState::new_at(now));
+        let stale_observation = state.health.load(Ordering::Acquire);
+        assert_eq!(stale_observation, HEALTH_UNKNOWN_ELIGIBLE);
+
+        // Model every active-health worker having observed eligibility before
+        // the passive failure wins. The old read-then-swap implementation
+        // changed this ejection to Unhealthy. Every stale CAS must now fail and
+        // preserve the higher-priority state.
+        state.transition_to(EndpointHealthState::PassivelyEjected);
+        let start = Arc::new(Barrier::new(ACTIVE_FAILURES + 1));
+        let workers = (0..ACTIVE_FAILURES)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    state.transition_to_unhealthy_from(stale_observation);
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("active-health worker does not panic");
+        }
+
+        assert_eq!(
+            state.health_state(now),
+            EndpointHealthState::PassivelyEjected
+        );
+        let status = state.status(now);
+        assert_eq!(status.passive_ejections, 1);
+        assert_eq!(status.health_transitions, 1);
+    }
+
+    #[test]
+    fn expired_ejection_cleanup_cannot_erase_a_concurrent_new_ejection() {
+        let now = Instant::now();
+        let expired_at = now + Duration::from_secs(11);
+        let new_failure_at = now + Duration::from_secs(12);
+        let plan = PassiveHealthSpec {
+            consecutive_failures: 1,
+            eject_for: Duration::from_secs(10),
+            source: SourceSpan::synthetic("health.passive"),
+        };
+        let state = Arc::new(EndpointRuntimeState::new_at(now));
+        state.record_passive_failure(Some(&plan), now);
+        assert_eq!(
+            EndpointHealthState::decode(state.health.load(Ordering::Acquire)),
+            EndpointHealthState::PassivelyEjected
+        );
+
+        let transition_guard = state
+            .health_transition_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = Arc::new(Barrier::new(2));
+        let worker = {
+            let state = Arc::clone(&state);
+            let started = Arc::clone(&started);
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                started.wait();
+                state.record_passive_failure(Some(&plan), new_failure_at);
+            })
+        };
+        started.wait();
+
+        // Model the old lazy recovery winning the transition lock just before
+        // a new request reports failure. Cleanup completes under the same lock,
+        // then the new failure establishes its own complete ejection state.
+        state.recover_expired_ejection_locked(expired_at);
+        drop(transition_guard);
+        worker
+            .join()
+            .expect("passive failure worker does not panic");
+
+        assert_eq!(
+            state.health_state(new_failure_at),
+            EndpointHealthState::PassivelyEjected
+        );
+        assert_eq!(state.passive_failures.load(Ordering::Acquire), 1);
+        assert!(state.ejection_deadline_tick.load(Ordering::Acquire) > state.tick(new_failure_at));
     }
 
     #[tokio::test]
@@ -1578,6 +1764,52 @@ mod tests {
             third.endpoints[1].runtime_state(),
             fourth.endpoints[1].runtime_state()
         ));
+    }
+
+    #[tokio::test]
+    async fn health_policy_reload_isolates_health_state_but_shares_endpoint_admission() {
+        let mut first_spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        first_spec.limits.max_in_flight = 2;
+        first_spec.limits.max_in_flight_per_endpoint = 1;
+        let first = PreparedCluster::prepare(first_spec, None).0;
+        let mut next_spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![endpoint("a", "http://a.test", 1)],
+        );
+        next_spec.limits.max_in_flight = 2;
+        next_spec.limits.max_in_flight_per_endpoint = 1;
+        next_spec
+            .health
+            .active
+            .as_mut()
+            .expect("fixture has active health")
+            .path = "/ready".to_owned();
+
+        let (second, reused) = PreparedCluster::prepare(next_spec, Some(&first));
+        assert_eq!(reused, 0, "health generation must not be shared");
+        assert!(!Arc::ptr_eq(
+            first.endpoints[0].runtime_state(),
+            second.endpoints[0].runtime_state()
+        ));
+        assert!(Arc::ptr_eq(
+            &first.endpoints[0].runtime_state().admission,
+            &second.endpoints[0].runtime_state().admission
+        ));
+
+        let old_request = first.acquire().await.expect("old request is admitted");
+        assert!(matches!(
+            second.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        drop(old_request);
+        let new_request = second
+            .acquire()
+            .await
+            .expect("dropping the old request releases shared admission");
+        drop(new_request);
     }
 
     #[tokio::test]
