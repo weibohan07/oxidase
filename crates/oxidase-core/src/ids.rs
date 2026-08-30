@@ -67,6 +67,40 @@ impl SourceSpan {
             field_path: field_path.into(),
         }
     }
+
+    /// Validates the path/position subset accepted from portable artifacts.
+    pub fn validate_portable(&self) -> Result<(), String> {
+        let file = self
+            .file
+            .to_str()
+            .ok_or_else(|| "source span file must be portable UTF-8".to_owned())?;
+        if file.is_empty()
+            || file.len() > 16 * 1024
+            || self.file.is_absolute()
+            || file.contains(['\\', '\0', '\r', '\n'])
+            || file.split('/').any(|component| component == "..")
+        {
+            return Err(
+                "source span file must be bounded, project-relative, and traversal-free".to_owned(),
+            );
+        }
+        if self.start_byte > self.end_byte
+            || self.line == 0
+            || self.column == 0
+            || self.end_line == 0
+            || self.end_column == 0
+            || (self.end_line, self.end_column) < (self.line, self.column)
+        {
+            return Err("source span positions are invalid".to_owned());
+        }
+        if self.field_path.is_empty()
+            || self.field_path.len() > 16 * 1024
+            || self.field_path.contains(['\0', '\r', '\n'])
+        {
+            return Err("source span field path is empty, too large, or unsafe".to_owned());
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for SourceSpan {

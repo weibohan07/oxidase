@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 http = "1"
 libfuzzer-sys = "0.4"
+oxidase-bundle = { path = "../crates/oxidase-bundle" }
 oxidase-cli = { path = "../crates/oxidase-cli", features = ["fuzzing"] }
 oxidase-config = { path = "../crates/oxidase-config" }
 oxidase-core = { path = "../crates/oxidase-core" }
@@ -91,6 +92,13 @@ bench = false
 [[bin]]
 name = "diagnostic_json"
 path = "fuzz_targets/diagnostic_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle_parser"
+path = "fuzz_targets/bundle_parser.rs"
 test = false
 doc = false
 bench = false

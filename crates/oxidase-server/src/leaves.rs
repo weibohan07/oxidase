@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::body::{
-    BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBodyPlan, GatewayRequestBody,
+    BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBody, GatewayBodyPlan, GatewayRequestBody,
     timeout_upstream_response_body,
 };
 use crate::metrics::Metrics;
@@ -1043,39 +1043,135 @@ async fn stream_asset(
         });
     }
 
-    let mut file = tokio::fs::File::open(&representation.path)
-        .await
-        .map_err(|error| {
-            ServiceError::new(
-                ErrorClass::SiteIo,
-                format!(
-                    "cannot open compiled asset `{}`: {error}",
-                    representation.path.display()
-                ),
-            )
-        })?;
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|error| {
+    let body = match &representation.source {
+        oxidase_site::AssetSource::File(backing_file) => {
+            let mut file = tokio::fs::File::open(backing_file).await.map_err(|error| {
                 ServiceError::new(
                     ErrorClass::SiteIo,
                     format!(
-                        "cannot seek compiled asset `{}`: {error}",
-                        representation.path.display()
+                        "cannot open compiled asset `{}`: {error}",
+                        backing_file.display()
                     ),
                 )
             })?;
-    }
-    let reader = file.take(response_length);
-    let stream = ReaderStream::new(reader)
-        .map_ok(Frame::data)
-        .map_err(|error| -> BoxError { Box::new(error) });
+            if offset > 0 {
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|error| {
+                        ServiceError::new(
+                            ErrorClass::SiteIo,
+                            format!(
+                                "cannot seek compiled asset `{}`: {error}",
+                                backing_file.display()
+                            ),
+                        )
+                    })?;
+            }
+            let reader = file.take(response_length);
+            let stream = ReaderStream::new(reader)
+                .map_ok(Frame::data)
+                .map_err(|error| -> BoxError { Box::new(error) });
+            StreamBody::new(stream).boxed_unsync()
+        }
+        oxidase_site::AssetSource::Pinned {
+            file,
+            display,
+            offset: representation_offset,
+            ..
+        } => {
+            let file_offset = representation_offset.checked_add(offset).ok_or_else(|| {
+                ServiceError::new(
+                    ErrorClass::SiteIo,
+                    "compiled asset offset exceeds the supported file range",
+                )
+            })?;
+            pinned_file_body(file.clone(), display.clone(), file_offset, response_length)
+        }
+    };
     Ok(GatewayBodyPlan::Stream {
-        body: StreamBody::new(stream).boxed_unsync(),
+        body,
         known_length: Some(response_length),
         trailer_guard: None,
     })
+}
+
+fn pinned_file_body(
+    file: Arc<std::fs::File>,
+    display: Arc<std::path::PathBuf>,
+    offset: u64,
+    length: u64,
+) -> GatewayBody {
+    struct State {
+        file: Arc<std::fs::File>,
+        display: Arc<std::path::PathBuf>,
+        offset: u64,
+        remaining: u64,
+    }
+
+    let stream = futures_util::stream::try_unfold(
+        State {
+            file,
+            display,
+            offset,
+            remaining: length,
+        },
+        |state| async move {
+            if state.remaining == 0 {
+                return Ok(None);
+            }
+            let wanted = usize::try_from(state.remaining.min(64 * 1024))
+                .expect("fixed Asset frame limit fits usize");
+            let file = state.file.clone();
+            let position = state.offset;
+            let bytes = tokio::task::spawn_blocking(move || {
+                let mut bytes = vec![0_u8; wanted];
+                let read = read_file_at(&file, &mut bytes, position)?;
+                bytes.truncate(read);
+                Ok::<_, std::io::Error>(bytes)
+            })
+            .await
+            .map_err(|error| -> BoxError {
+                Box::new(std::io::Error::other(format!(
+                    "pinned Asset reader task failed: {error}"
+                )))
+            })?
+            .map_err(|error| -> BoxError { Box::new(error) })?;
+            if bytes.is_empty() {
+                return Err::<_, BoxError>(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "pinned Asset `{}` ended before its verified length",
+                        state.display.display()
+                    ),
+                )));
+            }
+            let read = bytes.len() as u64;
+            let next_offset = state.offset.checked_add(read).ok_or_else(|| -> BoxError {
+                Box::new(std::io::Error::other("pinned Asset offset overflow"))
+            })?;
+            Ok(Some((
+                Frame::data(Bytes::from(bytes)),
+                State {
+                    offset: next_offset,
+                    remaining: state.remaining - read,
+                    ..state
+                },
+            )))
+        },
+    );
+    StreamBody::new(stream).boxed_unsync()
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_read(buffer, offset)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1432,7 +1528,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http::{HeaderMap, HeaderValue, Request, Response, Version, header};
+    use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version, header};
     use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::server::conn::{http1, http2};
@@ -1441,7 +1537,7 @@ mod tests {
     use oxidase_config::{ClusterProtocol, Compiler};
     use oxidase_core::{RequestFrame, RequestMetadata};
     use oxidase_runtime::RuntimeSnapshot;
-    use oxidase_site::{AssetPlan, AssetRepresentation, ContentEncoding};
+    use oxidase_site::{AssetPlan, AssetRepresentation, AssetSource, ContentEncoding};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, watch};
@@ -1449,7 +1545,7 @@ mod tests {
     use super::{
         ByteRange, ParsedRange, ProxyPoolKind, ResolvedRange, UnresolvedByteRange,
         apply_forwarding_headers, parse_quality, parse_range, response_wire_protocol,
-        select_representation,
+        select_representation, stream_asset,
     };
     use crate::protocol::WireProtocol;
     use crate::server::GatewayServer;
@@ -1641,8 +1737,9 @@ listeners:
     fn representation(encoding: Option<ContentEncoding>) -> AssetRepresentation {
         AssetRepresentation {
             encoding,
-            path: PathBuf::from("fixture"),
+            source: AssetSource::File(PathBuf::from("fixture")),
             length: 10,
+            digest: oxidase_core::ContentDigest::of_bytes(b"0123456789"),
             etag: None,
             modified: None,
         }
@@ -1665,6 +1762,155 @@ listeners:
             HeaderValue::from_str(value).expect("valid test header"),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn pinned_bundle_slice_survives_path_replacement_and_streams_the_selected_range() {
+        let directory = tempdir().expect("temporary directory exists");
+        let archive = directory.path().join("gateway.oxb");
+        fs::write(&archive, b"archive-prefix0123456789archive-suffix")
+            .expect("bundle fixture can be written");
+        let asset = AssetPlan {
+            identity: AssetRepresentation {
+                encoding: None,
+                source: AssetSource::pinned(
+                    std::fs::File::open(&archive).expect("bundle fixture opens"),
+                    archive.clone(),
+                    b"archive-prefix".len() as u64,
+                ),
+                length: 10,
+                digest: oxidase_core::ContentDigest::of_bytes(b"0123456789"),
+                etag: None,
+                modified: None,
+            },
+            brotli: None,
+            gzip: None,
+            content_type: "application/octet-stream".to_owned(),
+            range_requests: true,
+        };
+        fs::rename(&archive, directory.path().join("published-old.oxb"))
+            .expect("published path can be atomically replaced");
+        fs::write(&archive, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+            .expect("replacement path can contain unrelated bytes");
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        let mut response_headers = HeaderMap::new();
+        let mut status = StatusCode::OK;
+
+        let plan = stream_asset(
+            &asset,
+            &Method::GET,
+            &request_headers,
+            &mut status,
+            &mut response_headers,
+            false,
+        )
+        .await
+        .expect("bundle-backed range prepares");
+        let crate::body::GatewayBodyPlan::Stream {
+            body, known_length, ..
+        } = plan
+        else {
+            panic!("bundle-backed Asset must remain streaming");
+        };
+        let collected = body
+            .collect()
+            .await
+            .expect("bundle slice streams")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(known_length, Some(4));
+        assert_eq!(collected, Bytes::from_static(b"2345"));
+        assert_eq!(
+            response_headers
+                .get(header::CONTENT_RANGE)
+                .expect("range response has metadata"),
+            "bytes 2-5/10"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pinned_ranges_use_positional_reads_without_cursor_races() {
+        let directory = tempdir().expect("temporary directory exists");
+        let archive = directory.path().join("gateway.oxb");
+        let payload = (0..200_000_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut encoded = b"fixed-prefix".to_vec();
+        encoded.extend_from_slice(&payload);
+        encoded.extend_from_slice(b"fixed-suffix");
+        fs::write(&archive, encoded).expect("bundle fixture can be written");
+        let asset = AssetPlan {
+            identity: AssetRepresentation {
+                encoding: None,
+                source: AssetSource::pinned(
+                    std::fs::File::open(&archive).expect("bundle fixture opens"),
+                    archive,
+                    b"fixed-prefix".len() as u64,
+                ),
+                length: payload.len() as u64,
+                digest: oxidase_core::ContentDigest::of_bytes(&payload),
+                etag: None,
+                modified: None,
+            },
+            brotli: None,
+            gzip: None,
+            content_type: "application/octet-stream".to_owned(),
+            range_requests: true,
+        };
+        let mut left_headers = HeaderMap::new();
+        left_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-99999"));
+        let mut right_headers = HeaderMap::new();
+        right_headers.insert(
+            header::RANGE,
+            HeaderValue::from_static("bytes=100000-199999"),
+        );
+        let mut left_status = StatusCode::OK;
+        let mut right_status = StatusCode::OK;
+        let mut left_response_headers = HeaderMap::new();
+        let mut right_response_headers = HeaderMap::new();
+        let (left, right) = tokio::join!(
+            stream_asset(
+                &asset,
+                &Method::GET,
+                &left_headers,
+                &mut left_status,
+                &mut left_response_headers,
+                false,
+            ),
+            stream_asset(
+                &asset,
+                &Method::GET,
+                &right_headers,
+                &mut right_status,
+                &mut right_response_headers,
+                false,
+            )
+        );
+        let crate::body::GatewayBodyPlan::Stream {
+            body: left_body, ..
+        } = left.expect("left range prepares")
+        else {
+            panic!("left range remains streaming")
+        };
+        let crate::body::GatewayBodyPlan::Stream {
+            body: right_body, ..
+        } = right.expect("right range prepares")
+        else {
+            panic!("right range remains streaming")
+        };
+        let (left, right) = tokio::join!(left_body.collect(), right_body.collect());
+        assert_eq!(
+            left.expect("left range streams").to_bytes().as_ref(),
+            &payload[..100_000]
+        );
+        assert_eq!(
+            right.expect("right range streams").to_bytes().as_ref(),
+            &payload[100_000..]
+        );
+        assert_eq!(left_status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(right_status, StatusCode::PARTIAL_CONTENT);
     }
 
     #[test]

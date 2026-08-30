@@ -18,6 +18,7 @@ use oxidase_runtime::{
 use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
 
+mod bundle_support;
 mod diagnostic_output;
 
 use diagnostic_output::{DiagnosticFormat, DiagnosticRoot, Reporter};
@@ -56,14 +57,80 @@ enum Command {
     },
     /// Execute declarative tests embedded in the gateway source.
     Test { config: PathBuf },
+    /// Build, inspect, verify, compare, or sign a portable Oxidase Bundle.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
     /// Serve a compiled gateway (enabled by the data-plane phase).
     Serve {
-        config: PathBuf,
-        #[arg(long)]
+        #[arg(
+            value_name = "CONFIG",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        config: Option<PathBuf>,
+        /// Serve a verified portable Bundle instead of Gateway source.
+        #[arg(
+            long,
+            value_name = "OXB",
+            required_unless_present = "config",
+            conflicts_with = "config"
+        )]
+        bundle: Option<PathBuf>,
+        #[arg(long, requires = "config", conflicts_with = "bundle")]
         watch: bool,
+        /// Trusted Ed25519 public key used to verify --bundle; repeat for rotation.
+        #[arg(long = "bundle-key", value_name = "PUBLIC_KEY", requires = "bundle")]
+        bundle_keys: Vec<PathBuf>,
+        /// Explicitly allow an unsigned Bundle for standalone development use.
+        #[arg(long, requires = "bundle", conflicts_with = "bundle_keys")]
+        allow_unsigned_bundle: bool,
+        /// Root for deployment-relative Bundle Asset and sensitive references.
+        #[arg(long, value_name = "DIR", requires = "bundle")]
+        deployment_root: Option<PathBuf>,
         /// Explicit bind for the separate health/metrics listener.
         #[arg(long)]
         admin_bind: Option<SocketAddr>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BundleCommand {
+    /// Compile source into a deterministic `.oxb` archive.
+    Build {
+        config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// Root used to encode deployment-relative runtime references.
+        #[arg(long, value_name = "DIR")]
+        deployment_root: Option<PathBuf>,
+    },
+    /// Print a safe structural inspection; --verbose includes external Asset paths.
+    Inspect {
+        bundle: PathBuf,
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Verify structure, digests, and optionally a trusted Ed25519 signature.
+    Verify {
+        bundle: PathBuf,
+        #[arg(long = "key", value_name = "PUBLIC_KEY")]
+        keys: Vec<PathBuf>,
+        /// Root used to resolve deployment-relative external Assets.
+        #[arg(long, value_name = "DIR")]
+        deployment_root: Option<PathBuf>,
+    },
+    /// Compare two Bundle manifests and content identities.
+    Diff { old: PathBuf, new: PathBuf },
+    /// Add or replace one Ed25519 signature using an offline key file.
+    Sign {
+        bundle: PathBuf,
+        #[arg(long, value_name = "PRIVATE_KEY")]
+        key: PathBuf,
+        /// Output path; omitted means an atomic in-place replacement.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -94,8 +161,18 @@ impl Cli {
             Command::Check { config }
             | Command::Compile { config, .. }
             | Command::Test { config }
-            | Command::Serve { config, .. }
             | Command::Explain { config, .. } => config,
+            Command::Serve { config, bundle, .. } => config
+                .as_deref()
+                .or(bundle.as_deref())
+                .expect("clap requires one serve input"),
+            Command::Bundle { command } => match command {
+                BundleCommand::Build { config, .. } => config,
+                BundleCommand::Inspect { bundle, .. }
+                | BundleCommand::Verify { bundle, .. }
+                | BundleCommand::Sign { bundle, .. } => bundle,
+                BundleCommand::Diff { old, .. } => old,
+            },
         }
     }
 }
@@ -112,6 +189,30 @@ impl RunSuccess {
             stdout_payload: false,
             diagnostics,
         }
+    }
+}
+
+fn bundle_payload_success(
+    reporter: &Reporter,
+    payload: &impl Serialize,
+    human_message: impl AsRef<str>,
+    diagnostics: Vec<Diagnostic>,
+    source: &Path,
+) -> Result<RunSuccess, CliFailure> {
+    if reporter.is_json() {
+        if !diagnostics.is_empty() {
+            return Ok(RunSuccess::with_diagnostics(diagnostics));
+        }
+        let encoded =
+            bundle_support::json_payload(payload).map_err(|error| bundle_failure(error, source))?;
+        println!("{encoded}");
+        Ok(RunSuccess {
+            stdout_payload: true,
+            diagnostics,
+        })
+    } else {
+        reporter.human_stdout(human_message);
+        Ok(RunSuccess::with_diagnostics(diagnostics))
     }
 }
 
@@ -144,6 +245,30 @@ impl From<oxidase_config::CompileError> for CliFailure {
             diagnostics: error.diagnostics,
         }
     }
+}
+
+fn bundle_failure(error: bundle_support::BundleCliError, source: &Path) -> CliFailure {
+    if let Some(diagnostics) = error.structured_diagnostics() {
+        return CliFailure { diagnostics };
+    }
+    let offset = error
+        .offset()
+        .and_then(|offset| usize::try_from(offset).ok())
+        .unwrap_or(0);
+    CliFailure::one(Diagnostic::new(
+        error.code(),
+        error.message(),
+        SourceSpan {
+            file: source.to_path_buf(),
+            start_byte: offset,
+            end_byte: offset,
+            line: 1,
+            column: offset.saturating_add(1),
+            end_line: 1,
+            end_column: offset.saturating_add(1),
+            field_path: "bundle".to_owned(),
+        },
+    ))
 }
 
 async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
@@ -229,15 +354,161 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                 .map_err(|failure| failure.with_prior(&warnings))?;
             Ok(RunSuccess::with_diagnostics(warnings))
         }
+        Command::Bundle { command } => match command {
+            BundleCommand::Build {
+                config,
+                output,
+                deployment_root,
+            } => {
+                let PreparedBundleSource {
+                    gateway,
+                    snapshot,
+                    warnings,
+                } = prepare_bundle_source(&config)?;
+                let deployment_root =
+                    bundle_support::resolve_deployment_root(deployment_root.as_deref(), &config)
+                        .map_err(|error| bundle_failure(error, &config).with_prior(&warnings))?;
+                let built =
+                    bundle_support::build_bundle(&gateway, &snapshot, &output, &deployment_root)
+                        .map_err(|error| bundle_failure(error, &config).with_prior(&warnings))?;
+                bundle_payload_success(
+                    reporter,
+                    &built,
+                    format!(
+                        "built Bundle {} (content {}, {} Asset(s), {} embedded blob(s))",
+                        built.output, built.content_digest, built.assets, built.embedded_blobs
+                    ),
+                    warnings,
+                    &output,
+                )
+            }
+            BundleCommand::Inspect { bundle, verbose } => {
+                let inspection = bundle_support::inspect_bundle(&bundle, verbose)
+                    .map_err(|error| bundle_failure(error, &bundle))?;
+                let mut human_message = format!(
+                    "Bundle {}: content {}, {} Asset(s), {} signature(s)",
+                    bundle.display(),
+                    inspection.content_digest,
+                    inspection.assets,
+                    inspection.signatures
+                );
+                if verbose && !inspection.reference_assets.is_empty() {
+                    human_message.push_str("\nreference Assets:");
+                    for (asset, path) in &inspection.reference_assets {
+                        human_message.push_str(&format!("\n  {asset}: {path}"));
+                    }
+                }
+                bundle_payload_success(reporter, &inspection, human_message, Vec::new(), &bundle)
+            }
+            BundleCommand::Verify {
+                bundle,
+                keys,
+                deployment_root,
+            } => {
+                let verification =
+                    bundle_support::verify_bundle(&bundle, &keys, deployment_root.as_deref())
+                        .map_err(|error| bundle_failure(error, &bundle))?;
+                bundle_payload_success(
+                    reporter,
+                    &verification,
+                    format!(
+                        "verified Bundle {}: {} blob(s), {} trusted signature(s)",
+                        bundle.display(),
+                        verification.structural.blob_count,
+                        verification.verified_key_ids.len()
+                    ),
+                    Vec::new(),
+                    &bundle,
+                )
+            }
+            BundleCommand::Diff { old, new } => {
+                let diff = bundle_support::diff_bundles(&old, &new)
+                    .map_err(|error| bundle_failure(error, &old))?;
+                bundle_payload_success(
+                    reporter,
+                    &diff,
+                    if diff.identical_content {
+                        "Bundles have identical canonical content".to_owned()
+                    } else {
+                        format!(
+                            "Bundles differ: runtime_requirement={}, features=+{}/-{}, sections=+{}/-{}/~{}, assets=+{}/-{}/~{}, origins=+{}/-{}/~{}, sensitive_refs=+{}/-{}/~{}",
+                            diff.minimum_runtime_version_changed,
+                            diff.required_features_added.len(),
+                            diff.required_features_removed.len(),
+                            diff.sections_added.len(),
+                            diff.sections_removed.len(),
+                            diff.sections_changed.len(),
+                            diff.assets_added.len(),
+                            diff.assets_removed.len(),
+                            diff.assets_changed.len(),
+                            diff.origins_added.len(),
+                            diff.origins_removed.len(),
+                            diff.origins_changed.len(),
+                            diff.sensitive_references_added.len(),
+                            diff.sensitive_references_removed.len(),
+                            diff.sensitive_references_changed.len(),
+                        )
+                    },
+                    Vec::new(),
+                    &old,
+                )
+            }
+            BundleCommand::Sign {
+                bundle,
+                key,
+                output,
+            } => {
+                let signed = bundle_support::sign_bundle(&bundle, &key, output.as_deref())
+                    .map_err(|error| bundle_failure(error, &bundle))?;
+                bundle_payload_success(
+                    reporter,
+                    &signed,
+                    format!("signed Bundle {} with key {}", signed.output, signed.key_id),
+                    Vec::new(),
+                    &bundle,
+                )
+            }
+        },
         Command::Serve {
             config,
+            bundle,
             watch,
+            bundle_keys,
+            allow_unsigned_bundle,
+            deployment_root,
             admin_bind,
         } => {
-            let PreparedSnapshot {
-                snapshot: gateway,
-                warnings,
-            } = prepare_snapshot(&config)?;
+            let input = config
+                .as_deref()
+                .or(bundle.as_deref())
+                .expect("clap requires one serve input")
+                .to_path_buf();
+            let (gateway, warnings) = if let Some(config) = &config {
+                let PreparedSnapshot { snapshot, warnings } = prepare_snapshot(config)?;
+                (snapshot, warnings)
+            } else {
+                let bundle = bundle.as_deref().expect("clap requires the Bundle path");
+                let loaded = bundle_support::load_bundle_snapshot(
+                    bundle,
+                    &bundle_keys,
+                    allow_unsigned_bundle,
+                    deployment_root.as_deref(),
+                )
+                .map_err(|error| bundle_failure(error, bundle))?;
+                let signature_summary = if loaded.verification.verified_key_ids.is_empty() {
+                    "unsigned policy".to_owned()
+                } else {
+                    format!(
+                        "{} trusted signature(s)",
+                        loaded.verification.verified_key_ids.len()
+                    )
+                };
+                reporter.human_stdout(format!(
+                    "activated Bundle content {} with {signature_summary}",
+                    loaded.inspection.content_digest
+                ));
+                (loaded.snapshot, Vec::new())
+            };
             let listener_protocols = gateway
                 .listeners
                 .iter()
@@ -280,7 +551,9 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
             let (stop_watcher, watcher_stopped) = tokio::sync::watch::channel(false);
             let watcher = watch.then(|| {
                 tokio::spawn(watch_dependencies(
-                    config.clone(),
+                    config
+                        .clone()
+                        .expect("--watch is accepted only with source config"),
                     running.reload_handle(),
                     watcher_stopped,
                 ))
@@ -289,7 +562,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                 CliFailure::one(diagnostic_at(
                     "serve.signal",
                     format!("cannot listen for the shutdown signal: {error}"),
-                    &config,
+                    &input,
                     "serve.signal",
                 ))
                 .with_prior(&warnings)
@@ -300,7 +573,7 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     CliFailure::one(diagnostic_at(
                         "serve.watcher",
                         format!("dependency watcher task failed: {error}"),
-                        &config,
+                        &input,
                         "serve.watch",
                     ))
                     .with_prior(&warnings)
@@ -338,6 +611,12 @@ struct PreparedSnapshot {
     warnings: Vec<Diagnostic>,
 }
 
+struct PreparedBundleSource {
+    gateway: oxidase_config::CompiledGateway,
+    snapshot: RuntimeSnapshot,
+    warnings: Vec<Diagnostic>,
+}
+
 fn snapshot_resource_count(snapshot: &RuntimeSnapshot) -> usize {
     snapshot.resources.certificates.len()
         + snapshot.resources.secrets.len()
@@ -357,6 +636,23 @@ fn prepare_snapshot(config: &Path) -> Result<PreparedSnapshot, CliFailure> {
     })?;
     warnings.extend(snapshot.preparation_warnings().iter().cloned());
     Ok(PreparedSnapshot { snapshot, warnings })
+}
+
+fn prepare_bundle_source(config: &Path) -> Result<PreparedBundleSource, CliFailure> {
+    let mut gateway = Compiler::compile_path(config).map_err(CliFailure::from)?;
+    let mut warnings = std::mem::take(&mut gateway.warnings);
+    let snapshot = RuntimeSnapshot::prepare(gateway.clone()).map_err(|error| {
+        CliFailure {
+            diagnostics: error.into_diagnostics(),
+        }
+        .with_prior(&warnings)
+    })?;
+    warnings.extend(snapshot.preparation_warnings().iter().cloned());
+    Ok(PreparedBundleSource {
+        gateway,
+        snapshot,
+        warnings,
+    })
 }
 
 fn trace_compile_warnings(warnings: &[Diagnostic]) {
@@ -1067,6 +1363,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use clap::Parser as _;
     use http::StatusCode;
     use oxidase_config::{
         Compiler, ExplainRequestSource, HttpVersion, ListenerProtocol, TestExpectationSource,
@@ -1077,9 +1374,80 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        CompilationManifest, compare_expectation, explain, listener_protocol_label,
-        prepare_snapshot, snapshot_resource_count, watch_dependencies_with_timing,
+        BundleCommand, Cli, Command, CompilationManifest, compare_expectation, explain,
+        listener_protocol_label, prepare_snapshot, snapshot_resource_count,
+        watch_dependencies_with_timing,
     };
+
+    #[test]
+    fn bundle_cli_inputs_are_explicit_and_source_watch_cannot_target_a_bundle() {
+        let parsed = Cli::try_parse_from([
+            "oxidase",
+            "bundle",
+            "build",
+            "oxidase.yaml",
+            "--output",
+            "gateway.oxb",
+            "--deployment-root",
+            "/srv/oxidase",
+        ])
+        .expect("Bundle build syntax parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Bundle {
+                command: BundleCommand::Build { .. }
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "oxidase",
+                "serve",
+                "oxidase.yaml",
+                "--bundle",
+                "gateway.oxb"
+            ])
+            .is_err(),
+            "source and Bundle inputs are mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from(["oxidase", "serve", "--bundle", "gateway.oxb", "--watch"])
+                .is_err(),
+            "source watcher cannot reinterpret a Bundle as YAML"
+        );
+        assert!(
+            Cli::try_parse_from(["oxidase", "serve", "--bundle", "gateway.oxb"]).is_ok(),
+            "signature policy is enforced after trusted keys are loaded"
+        );
+        let unsigned = Cli::try_parse_from([
+            "oxidase",
+            "serve",
+            "--bundle",
+            "gateway.oxb",
+            "--allow-unsigned-bundle",
+        ])
+        .expect("explicit unsigned development policy parses");
+        assert!(matches!(
+            unsigned.command,
+            Command::Serve {
+                allow_unsigned_bundle: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "oxidase",
+                "serve",
+                "--bundle",
+                "gateway.oxb",
+                "--allow-unsigned-bundle",
+                "--bundle-key",
+                "release.pub",
+            ])
+            .is_err(),
+            "unsigned policy cannot be combined with a trusted key"
+        );
+    }
 
     #[tokio::test]
     async fn explain_and_declarative_tests_describe_runtime_cluster_policy() {

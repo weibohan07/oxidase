@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::{HeaderName, HeaderValue, StatusCode};
 use oxidase_core::{
@@ -17,8 +17,9 @@ use oxidase_source::{FieldSpanIndex, field_path_child};
 
 use crate::error::{SiteCompileError, SiteCompileFailure};
 use crate::runtime::{
-    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, HeaderPlan, HeaderPolicyLayer,
-    RedirectQuery, SiteMissing, SiteResponseKind, SiteResponsePlan, SiteSnapshot, path_is_within,
+    AssetPlan, AssetRepresentation, AssetSource, ContentEncoding, EntityTag, HeaderPlan,
+    HeaderPolicyLayer, RedirectQuery, SiteMissing, SiteResponseKind, SiteResponsePlan,
+    SiteSnapshot, path_is_within,
 };
 use crate::source::{
     EtagSource, HeadersSource, IndexCanonicalSource, ManifestSource, MissingSource, OutputSource,
@@ -524,6 +525,23 @@ fn scan_site_source(
             .field_bytes("kind", site_source_kind_name(entry.kind).as_bytes())
             .field_u64("length", entry.length)
             .field_digest("content", entry.digest);
+        if source.assets.last_modified && entry.kind == SiteSourceKind::Asset {
+            match entry.modified {
+                Some(modified) => {
+                    let (side, duration) = match modified.duration_since(UNIX_EPOCH) {
+                        Ok(duration) => (b"after".as_slice(), duration),
+                        Err(error) => (b"before".as_slice(), error.duration()),
+                    };
+                    digest
+                        .field_bytes("modified_side", side)
+                        .field_u64("modified_seconds", duration.as_secs())
+                        .field_u64("modified_nanos", u64::from(duration.subsec_nanos()));
+                }
+                None => {
+                    digest.field_bytes("modified", b"unavailable");
+                }
+            }
+        }
     }
     let mut symlinks = collection.symlinks;
     symlinks.sort();
@@ -1251,7 +1269,7 @@ fn compile_templates(
     Ok(templates)
 }
 
-fn validate_template_graph(
+pub(crate) fn validate_template_graph(
     templates: &BTreeMap<String, CompiledOxt>,
 ) -> Result<(), SiteCompileError> {
     fn visit(
@@ -1402,9 +1420,10 @@ fn compile_oxr(
         })
         .collect::<Result<_, SiteCompileError>>()?;
 
-    let status = StatusCode::from_u16(source.response.status.unwrap_or(200)).map_err(|error| {
-        locator.error("site.response_status", "response.status", error.to_string())
-    })?;
+    let mut status =
+        StatusCode::from_u16(source.response.status.unwrap_or(200)).map_err(|error| {
+            locator.error("site.response_status", "response.status", error.to_string())
+        })?;
     if let Some(content_type) = source.response.content_type.as_deref() {
         HeaderValue::from_str(content_type).map_err(|_| {
             locator.error(
@@ -1415,14 +1434,21 @@ fn compile_oxr(
         })?;
     }
     let (kind, backing) = if let Some(redirect) = &source.response.redirect {
-        let status = StatusCode::from_u16(redirect.status).map_err(|error| {
+        if source.response.status.is_some() {
+            return Err(locator.error(
+                "site.redirect_status_ambiguity",
+                "response.status",
+                "response.status is not allowed with response.redirect; use response.redirect.status",
+            ));
+        }
+        let redirect_status = StatusCode::from_u16(redirect.status).map_err(|error| {
             locator.error(
                 "site.redirect_status",
                 "response.redirect.status",
                 error.to_string(),
             )
         })?;
-        if !status.is_redirection() {
+        if !redirect_status.is_redirection() {
             return Err(locator.error(
                 "site.redirect_status",
                 "response.redirect.status",
@@ -1451,9 +1477,10 @@ fn compile_oxr(
                 ));
             }
         };
+        status = redirect_status;
         (
             SiteResponseKind::Redirect {
-                status,
+                status: redirect_status,
                 location: CompiledTemplate::compile(&redirect.location).map_err(|error| {
                     locator.error(
                         "site.redirect_location",
@@ -2072,8 +2099,9 @@ fn compile_representation(
     };
     Ok(AssetRepresentation {
         encoding,
-        path: path.to_path_buf(),
+        source: AssetSource::File(path.to_path_buf()),
         length: entry.length,
+        digest: entry.digest,
         etag,
         modified: source
             .assets
@@ -3880,6 +3908,57 @@ templates:
         assert_eq!(compressed_changed, removed_digest);
     }
 
+    #[test]
+    fn source_index_digest_tracks_exposed_last_modified_metadata() {
+        fn set_modified(path: &std::path::Path, seconds: u64) {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("asset opens for timestamp update");
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .expect("asset timestamp can be set");
+        }
+
+        let directory = tempdir().expect("temporary site directory is available");
+        let root = directory.path().join("site");
+        fs::create_dir(&root).expect("site directory can be created");
+        let manifest = root.join("site.oxsite");
+        let asset = root.join("asset.txt");
+        fs::write(&manifest, "oxista: site/v1\n").expect("manifest can be written");
+        fs::write(&asset, "same bytes").expect("asset can be written");
+
+        set_modified(&asset, 1_700_000_000);
+        let first = SiteCompiler::scan(&root, &manifest)
+            .expect("first scan succeeds")
+            .source_digest();
+        set_modified(&asset, 1_700_000_001);
+        let second = SiteCompiler::scan(&root, &manifest)
+            .expect("second scan succeeds")
+            .source_digest();
+        assert_ne!(first, second, "published Last-Modified is snapshot input");
+
+        fs::write(
+            &manifest,
+            "oxista: site/v1\nassets:\n  last_modified: false\n",
+        )
+        .expect("manifest can disable Last-Modified");
+        set_modified(&asset, 1_700_000_002);
+        let disabled_first = SiteCompiler::scan(&root, &manifest)
+            .expect("disabled scan succeeds")
+            .source_digest();
+        set_modified(&asset, 1_700_000_003);
+        let disabled_second = SiteCompiler::scan(&root, &manifest)
+            .expect("repeat disabled scan succeeds")
+            .source_digest();
+        assert_eq!(
+            disabled_first, disabled_second,
+            "mtime is irrelevant when Last-Modified is disabled"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_index_digest_tracks_symlink_target_identity() {
@@ -4080,6 +4159,11 @@ templates:
                 "response:\n  redirect:\n    status: 200\n    location: /next\n",
                 "site.redirect_status",
                 "response.redirect.status",
+            ),
+            (
+                "response:\n  status: 308\n  redirect:\n    status: 308\n    location: /next\n",
+                "site.redirect_status_ambiguity",
+                "response.status",
             ),
             (
                 "response:\n  body:\n    asset: sibling\n    text: duplicate\n",

@@ -7,6 +7,7 @@ use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderName, Method, StatusCode};
 use thiserror::Error;
 
+use crate::is_forbidden_user_header;
 use crate::{
     CompiledPattern, CompiledTemplate, ErrorClass, Expression, ExpressionError, PatternContext,
     ResourceId, RouteId, ServiceId, SourceSpan, Value,
@@ -84,6 +85,36 @@ impl ServiceProgram {
                 return Err(ServiceProgramError::ZeroReenterBudget(id.clone()));
             }
             match &node.kind {
+                ServiceKind::Respond { headers, .. } | ServiceKind::Redirect { headers, .. } => {
+                    validate_user_headers(id, headers)?;
+                }
+                ServiceKind::Transform {
+                    request, response, ..
+                } => {
+                    validate_user_headers(id, &request.headers)?;
+                    validate_user_headers(id, &response.headers)?;
+                }
+                _ => {}
+            }
+            match &node.kind {
+                ServiceKind::Redirect { status, .. } if !status.is_redirection() => {
+                    return Err(ServiceProgramError::InvalidStatus {
+                        service: id.clone(),
+                        field: "status",
+                    });
+                }
+                ServiceKind::Timeout { duration, .. } if duration.is_zero() => {
+                    return Err(ServiceProgramError::InvalidLimit {
+                        service: id.clone(),
+                        field: "duration",
+                    });
+                }
+                ServiceKind::Observe { name, .. } if !valid_policy_name(name) => {
+                    return Err(ServiceProgramError::InvalidName {
+                        service: id.clone(),
+                        field: "name",
+                    });
+                }
                 ServiceKind::RequestBodyLimit { max_bytes, .. } if *max_bytes == 0 => {
                     return Err(ServiceProgramError::InvalidLimit {
                         service: id.clone(),
@@ -93,16 +124,27 @@ impl ServiceProgram {
                 ServiceKind::ConcurrencyLimit {
                     name,
                     max_in_flight,
+                    reject_status,
                     ..
-                } if name.is_empty() || *max_in_flight == 0 => {
-                    return Err(ServiceProgramError::InvalidLimit {
-                        service: id.clone(),
-                        field: if name.is_empty() {
-                            "name"
-                        } else {
-                            "max_in_flight"
-                        },
-                    });
+                } => {
+                    if !valid_policy_name(name) {
+                        return Err(ServiceProgramError::InvalidName {
+                            service: id.clone(),
+                            field: "name",
+                        });
+                    }
+                    if *max_in_flight == 0 {
+                        return Err(ServiceProgramError::InvalidLimit {
+                            service: id.clone(),
+                            field: "max_in_flight",
+                        });
+                    }
+                    if !(reject_status.is_client_error() || reject_status.is_server_error()) {
+                        return Err(ServiceProgramError::InvalidStatus {
+                            service: id.clone(),
+                            field: "on_reject.status",
+                        });
+                    }
                 }
                 ServiceKind::RateLimit {
                     name,
@@ -113,33 +155,38 @@ impl ServiceProgram {
                     max_keys,
                     idle_ttl,
                     ..
-                } if name.is_empty()
-                    || matches!(key, RateLimitKey::Binding(name) if name.is_empty())
-                    || *requests == 0
-                    || per.is_zero()
-                    || *burst == 0
-                    || *max_keys == 0
-                    || idle_ttl.is_zero() =>
-                {
-                    let field = if name.is_empty() {
-                        "name"
-                    } else if matches!(key, RateLimitKey::Binding(name) if name.is_empty()) {
-                        "key.name"
-                    } else if *requests == 0 {
-                        "rate.requests"
+                } => {
+                    if !valid_policy_name(name) {
+                        return Err(ServiceProgramError::InvalidName {
+                            service: id.clone(),
+                            field: "name",
+                        });
+                    }
+                    if matches!(key, RateLimitKey::Binding(name) if !valid_binding_name(name)) {
+                        return Err(ServiceProgramError::InvalidName {
+                            service: id.clone(),
+                            field: "key.name",
+                        });
+                    }
+                    let invalid_limit = if *requests == 0 {
+                        Some("rate.requests")
                     } else if per.is_zero() {
-                        "rate.per"
+                        Some("rate.per")
                     } else if *burst == 0 {
-                        "burst"
+                        Some("burst")
                     } else if *max_keys == 0 {
-                        "state.max_keys"
+                        Some("state.max_keys")
+                    } else if idle_ttl.is_zero() {
+                        Some("state.idle_ttl")
                     } else {
-                        "state.idle_ttl"
+                        None
                     };
-                    return Err(ServiceProgramError::InvalidLimit {
-                        service: id.clone(),
-                        field,
-                    });
+                    if let Some(field) = invalid_limit {
+                        return Err(ServiceProgramError::InvalidLimit {
+                            service: id.clone(),
+                            field,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -244,6 +291,42 @@ impl ServiceProgram {
         visiting.remove(id);
         Ok(consumes)
     }
+}
+
+fn valid_policy_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn valid_binding_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn validate_user_headers(
+    service: &ServiceId,
+    headers: &HeaderTransforms,
+) -> Result<(), ServiceProgramError> {
+    let forbidden = headers
+        .set
+        .iter()
+        .map(|header| &header.name)
+        .chain(headers.add.iter().map(|header| &header.name))
+        .chain(headers.remove.iter())
+        .find(|name| is_forbidden_user_header(name));
+    if let Some(header) = forbidden {
+        return Err(ServiceProgramError::ForbiddenHeader {
+            service: service.clone(),
+            header: header.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +607,21 @@ pub enum ServiceProgramError {
         service: ServiceId,
         field: &'static str,
     },
+    #[error("service `{service}` has an invalid `{field}` name")]
+    InvalidName {
+        service: ServiceId,
+        field: &'static str,
+    },
+    #[error("service `{service}` has an invalid `{field}` response status")]
+    InvalidStatus {
+        service: ServiceId,
+        field: &'static str,
+    },
+    #[error("service `{service}` attempts to control forbidden header `{header}`")]
+    ForbiddenHeader {
+        service: ServiceId,
+        header: HeaderName,
+    },
     #[error(
         "fallback `{fallback}` places body-consuming service `{candidate}` before another candidate"
     )]
@@ -537,12 +635,13 @@ pub enum ServiceProgramError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use http::StatusCode;
+    use http::{StatusCode, header};
 
     use super::{
-        HeaderTransforms, RateLimitKey, RespondBody, ServiceKind, ServiceNode, ServiceProgram,
+        HeaderTransform, HeaderTransforms, RateLimitKey, RespondBody, ServiceKind, ServiceNode,
+        ServiceProgram,
     };
-    use crate::{ServiceId, SourceSpan};
+    use crate::{CompiledTemplate, ServiceId, SourceSpan};
 
     fn node(id: &str, kind: ServiceKind) -> ServiceNode {
         ServiceNode {
@@ -732,6 +831,83 @@ mod tests {
                 field: "rate.requests",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn rejects_source_impossible_http_and_policy_ir() {
+        let forbidden = node(
+            "forbidden",
+            ServiceKind::Respond {
+                status: StatusCode::OK,
+                headers: HeaderTransforms {
+                    set: vec![HeaderTransform {
+                        name: header::CONTENT_LENGTH,
+                        value: CompiledTemplate::compile("1").expect("template compiles"),
+                    }],
+                    ..HeaderTransforms::default()
+                },
+                body: RespondBody::Empty,
+            },
+        );
+        let program = ServiceProgram::from_nodes(
+            forbidden.id.clone(),
+            BTreeMap::from([(forbidden.id.clone(), forbidden)]),
+        );
+        assert!(matches!(
+            program.validate(),
+            Err(super::ServiceProgramError::ForbiddenHeader { .. })
+        ));
+
+        let redirect = node(
+            "redirect",
+            ServiceKind::Redirect {
+                status: StatusCode::OK,
+                location: CompiledTemplate::compile("/").expect("template compiles"),
+                preserve_query: false,
+                headers: HeaderTransforms::default(),
+            },
+        );
+        let program = ServiceProgram::from_nodes(
+            redirect.id.clone(),
+            BTreeMap::from([(redirect.id.clone(), redirect)]),
+        );
+        assert!(matches!(
+            program.validate(),
+            Err(super::ServiceProgramError::InvalidStatus {
+                field: "status",
+                ..
+            })
+        ));
+
+        let respond = node(
+            "respond",
+            ServiceKind::Respond {
+                status: StatusCode::OK,
+                headers: HeaderTransforms::default(),
+                body: RespondBody::Empty,
+            },
+        );
+        let concurrency = node(
+            "concurrency",
+            ServiceKind::ConcurrencyLimit {
+                name: "x".repeat(129),
+                max_in_flight: 1,
+                queue_timeout: std::time::Duration::ZERO,
+                reject_status: StatusCode::OK,
+                service: respond.id.clone(),
+            },
+        );
+        let program = ServiceProgram::from_nodes(
+            concurrency.id.clone(),
+            BTreeMap::from([
+                (respond.id.clone(), respond),
+                (concurrency.id.clone(), concurrency),
+            ]),
+        );
+        assert!(matches!(
+            program.validate(),
+            Err(super::ServiceProgramError::InvalidName { field: "name", .. })
         ));
     }
 }

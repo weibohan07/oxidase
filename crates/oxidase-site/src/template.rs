@@ -23,12 +23,12 @@ pub struct TemplateLimits {
 #[derive(Debug, Clone)]
 pub struct CompiledOxt {
     pub(crate) name: String,
-    nodes: Vec<TemplateNode>,
-    params: BTreeMap<String, ValueType>,
-    param_spans: BTreeMap<String, SourceSpan>,
-    autoescape_html: bool,
-    output: TemplateOutput,
-    dependencies: BTreeSet<String>,
+    pub(crate) nodes: Vec<TemplateNode>,
+    pub(crate) params: BTreeMap<String, ValueType>,
+    pub(crate) param_spans: BTreeMap<String, SourceSpan>,
+    pub(crate) autoescape_html: bool,
+    pub(crate) output: TemplateOutput,
+    pub(crate) dependencies: BTreeSet<String>,
 }
 
 const PUBLIC_TEMPLATE_ROOTS: [&str; 5] = ["request", "bindings", "site", "resource", "page"];
@@ -383,7 +383,7 @@ impl CompiledOxt {
 }
 
 #[derive(Debug, Clone)]
-enum TemplateNode {
+pub(crate) enum TemplateNode {
     Text(String),
     Interpolation(Expression),
     If {
@@ -405,19 +405,19 @@ enum TemplateNode {
 }
 
 #[derive(Debug, Clone)]
-struct IncludeCall {
-    name: String,
-    arguments: BTreeMap<String, Expression>,
-    only: bool,
-    span: SourceSpan,
-    target_span: SourceSpan,
-    argument_spans: BTreeMap<String, SourceSpan>,
-    target_range: (usize, usize),
-    argument_ranges: BTreeMap<String, (usize, usize)>,
+pub(crate) struct IncludeCall {
+    pub(crate) name: String,
+    pub(crate) arguments: BTreeMap<String, Expression>,
+    pub(crate) only: bool,
+    pub(crate) span: SourceSpan,
+    pub(crate) target_span: SourceSpan,
+    pub(crate) argument_spans: BTreeMap<String, SourceSpan>,
+    pub(crate) target_range: (usize, usize),
+    pub(crate) argument_ranges: BTreeMap<String, (usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TemplateOutput {
+pub(crate) enum TemplateOutput {
     Html,
     Text,
     Json,
@@ -434,7 +434,7 @@ impl From<OutputSource> for TemplateOutput {
 }
 
 #[derive(Debug, Clone)]
-enum ValueType {
+pub(crate) enum ValueType {
     Any { optional: bool },
     Null,
     Bool { optional: bool },
@@ -1708,7 +1708,7 @@ fn tag_argument<'a>(tag: &'a str, keyword: &str) -> Result<&'a str, SiteCompileE
         })
 }
 
-fn validate_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
+pub(crate) fn validate_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
     let mut characters = binding.chars();
     if !matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
         || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
@@ -1721,7 +1721,7 @@ fn validate_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
     Ok(())
 }
 
-fn validate_local_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
+pub(crate) fn validate_local_binding(binding: &str, name: &str) -> Result<(), SiteCompileError> {
     if PUBLIC_TEMPLATE_ROOTS.contains(&binding) {
         return Err(SiteCompileError::source(
             name,

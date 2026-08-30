@@ -11,6 +11,7 @@ pub(crate) struct GatewaySource {
     pub kind: String,
     #[serde(default)]
     pub imports: Vec<PathBuf>,
+    pub bundle: Option<BundleSource>,
     #[serde(default)]
     pub resources: ResourcesSource,
     #[serde(default)]
@@ -19,6 +20,32 @@ pub(crate) struct GatewaySource {
     pub listeners: Vec<ListenerSource>,
     #[serde(default)]
     pub tests: Vec<ConfigTestSource>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BundleSource {
+    #[serde(default)]
+    pub assets: BundleAssetsSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BundleAssetsSource {
+    #[serde(default = "default_bundle_asset_mode")]
+    pub mode: String,
+}
+
+impl Default for BundleAssetsSource {
+    fn default() -> Self {
+        Self {
+            mode: default_bundle_asset_mode(),
+        }
+    }
+}
+
+fn default_bundle_asset_mode() -> String {
+    "embed".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

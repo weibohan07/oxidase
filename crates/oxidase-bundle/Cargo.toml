@@ -1,0 +1,23 @@
+[package]
+name = "oxidase-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+oxidase-core = { path = "../oxidase-core" }
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true

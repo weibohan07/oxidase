@@ -2,6 +2,7 @@
 
 mod compiler;
 mod error;
+mod portable;
 mod runtime;
 mod source;
 mod template;
@@ -11,8 +12,19 @@ pub use error::{
     SiteCompileError, SiteCompileFailure, SiteError, TemplateArgumentError, TemplateLimitKind,
     TemplateRenderError,
 };
+pub use portable::{
+    PORTABLE_SITE_SCHEMA_V1, PortableAssetInputV1, PortableAssetPlanV1,
+    PortableAssetRepresentationV1, PortableByteRangeV1, PortableCompiledValueV1,
+    PortableContentEncodingV1, PortableEntityTagV1, PortableErrorPageV1, PortableHeaderPlanV1,
+    PortableHeaderPolicyLayerV1, PortableHeaderTemplateV1, PortableIncludeCallV1, PortableOxtV1,
+    PortableRedirectQueryV1, PortableSiteDurationV1, PortableSiteError, PortableSiteExportV1,
+    PortableSiteMissingV1, PortableSiteResponseKindV1, PortableSiteResponsePlanV1,
+    PortableSiteSnapshotV1, PortableSourceSpanV1, PortableSystemTimeV1, PortableTemplateBranchV1,
+    PortableTemplateLimitsV1, PortableTemplateNodeV1, PortableTemplateOutputV1,
+    PortableValueTypeV1,
+};
 pub use runtime::{
-    AssetPlan, AssetRepresentation, ContentEncoding, EntityTag, PreparedSiteBody,
+    AssetPlan, AssetRepresentation, AssetSource, ContentEncoding, EntityTag, PreparedSiteBody,
     PreparedSiteResponse, SiteMissing, SiteSnapshot,
 };
 pub use template::{CompiledOxt, TemplateLimits};

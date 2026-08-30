@@ -28,6 +28,8 @@ use crate::trust::PreparedTrustStore;
 
 const MAX_CLIENT_IDENTITY_SAN_COUNT: usize = 64;
 const MAX_CLIENT_IDENTITY_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_CERTIFICATE_CHAIN_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
 
 /// Converts only rustls-verified client certificates into bounded core
 /// metadata. `None` is the anonymous result for optional/no client auth.
@@ -125,12 +127,6 @@ impl PreparedCertificate {
             &source.cert_chain_source,
             CertificateFileKind::Chain,
         )?;
-        let private_key_pem = read_regular_file(
-            &source.private_key,
-            &source.private_key_source,
-            CertificateFileKind::PrivateKey,
-        )?;
-
         let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
@@ -141,28 +137,50 @@ impl PreparedCertificate {
                     source.cert_chain_source.clone(),
                 )
             })?;
-        if certificates.is_empty() {
-            return Err(CertificatePreparationFailure::new(
-                CertificatePreparationErrorKind::CertificateChainEmpty,
-                "tls.certificate_chain_empty",
-                "certificate chain must contain at least one CERTIFICATE section",
-                source.cert_chain_source.clone(),
-            ));
-        }
-        for (index, certificate) in certificates.iter().enumerate() {
-            webpki::EndEntityCert::try_from(certificate).map_err(|error| {
-                CertificatePreparationFailure::new(
-                    CertificatePreparationErrorKind::CertificateX509,
-                    "tls.certificate_x509",
-                    format!(
-                        "certificate chain entry {} is not valid X.509: {error}",
-                        index + 1
-                    ),
-                    source.cert_chain_source.clone(),
-                )
-            })?;
-        }
-        validate_certificate_chain(&certificates, source)?;
+        Self::prepare_with_certificates(source, certificates)
+    }
+
+    /// Prepares a certificate whose public chain came from a verified Bundle.
+    ///
+    /// Private signing material remains an external runtime reference and is
+    /// read and matched against the embedded leaf before publication.
+    pub(crate) fn prepare_with_public_chain(
+        source: &CertificateSpec,
+        certificates: &[Vec<u8>],
+    ) -> Result<Self, CertificatePreparationFailure> {
+        let certificates = certificates
+            .iter()
+            .cloned()
+            .map(CertificateDer::from)
+            .collect();
+        Self::prepare_with_certificates(source, certificates)
+    }
+
+    /// Validates Bundle-embedded public chain material without reading a
+    /// private-key reference. Key/leaf consistency remains an activation check.
+    pub(crate) fn validate_public_chain(
+        source: &CertificateSpec,
+        certificates: &[Vec<u8>],
+    ) -> Result<(), CertificatePreparationFailure> {
+        let certificates = certificates
+            .iter()
+            .cloned()
+            .map(CertificateDer::from)
+            .collect::<Vec<_>>();
+        validate_public_certificates(&certificates, source)
+    }
+
+    fn prepare_with_certificates(
+        source: &CertificateSpec,
+        certificates: Vec<CertificateDer<'static>>,
+    ) -> Result<Self, CertificatePreparationFailure> {
+        validate_public_certificates(&certificates, source)?;
+
+        let private_key_pem = read_regular_file(
+            &source.private_key,
+            &source.private_key_source,
+            CertificateFileKind::PrivateKey,
+        )?;
 
         if appears_to_be_encrypted_private_key(&private_key_pem) {
             return Err(CertificatePreparationFailure::new(
@@ -208,9 +226,6 @@ impl PreparedCertificate {
         let provider = default_provider();
         let certified_key = CertifiedKey::from_der(certificates, private_key, &provider)
             .map_err(|error| certified_key_error(source, error))?;
-        // `from_der` deliberately accepts providers that cannot expose their
-        // public key. Oxidase's preparation contract is stricter: consistency
-        // must be positively established before publication.
         certified_key
             .keys_match()
             .map_err(|error| certified_key_error(source, error))?;
@@ -233,6 +248,17 @@ impl PreparedCertificate {
     #[must_use]
     pub fn certificate_count(&self) -> usize {
         self.certified_key.cert.len()
+    }
+
+    /// Copies only the public DER certificate chain for a portable Bundle.
+    /// Private signing material remains opaque and is never returned here.
+    #[must_use]
+    pub fn public_chain_der(&self) -> Vec<Vec<u8>> {
+        self.certified_key
+            .cert
+            .iter()
+            .map(|certificate| certificate.as_ref().to_vec())
+            .collect()
     }
 
     pub(crate) fn certified_key(&self) -> Arc<CertifiedKey> {
@@ -697,6 +723,7 @@ pub enum CertificatePreparationErrorKind {
     CertificateMissing,
     CertificateNotFile,
     CertificateRead,
+    CertificateTooLarge,
     CertificatePem,
     CertificateChainEmpty,
     CertificateX509,
@@ -707,6 +734,7 @@ pub enum CertificatePreparationErrorKind {
     PrivateKeyMissingFile,
     PrivateKeyNotFile,
     PrivateKeyRead,
+    PrivateKeyTooLarge,
     PrivateKeyEncrypted,
     PrivateKeyPem,
     PrivateKeyMissing,
@@ -722,6 +750,7 @@ impl fmt::Display for CertificatePreparationErrorKind {
             Self::CertificateMissing => "certificate chain file does not exist",
             Self::CertificateNotFile => "certificate chain path is not a regular file",
             Self::CertificateRead => "certificate chain file cannot be read",
+            Self::CertificateTooLarge => "certificate chain file exceeds the size limit",
             Self::CertificatePem => "certificate chain PEM is invalid",
             Self::CertificateChainEmpty => "certificate chain is empty",
             Self::CertificateX509 => "certificate chain contains invalid X.509",
@@ -736,6 +765,7 @@ impl fmt::Display for CertificatePreparationErrorKind {
             Self::PrivateKeyMissingFile => "private key file does not exist",
             Self::PrivateKeyNotFile => "private key path is not a regular file",
             Self::PrivateKeyRead => "private key file cannot be read",
+            Self::PrivateKeyTooLarge => "private key file exceeds the size limit",
             Self::PrivateKeyEncrypted => "private key is encrypted",
             Self::PrivateKeyPem => "private key PEM is invalid",
             Self::PrivateKeyMissing => "private key is missing",
@@ -745,6 +775,34 @@ impl fmt::Display for CertificatePreparationErrorKind {
             Self::KeyMatchUnavailable => "private-key consistency cannot be established",
         })
     }
+}
+
+fn validate_public_certificates(
+    certificates: &[CertificateDer<'_>],
+    source: &CertificateSpec,
+) -> Result<(), CertificatePreparationFailure> {
+    if certificates.is_empty() {
+        return Err(CertificatePreparationFailure::new(
+            CertificatePreparationErrorKind::CertificateChainEmpty,
+            "tls.certificate_chain_empty",
+            "certificate chain must contain at least one CERTIFICATE section",
+            source.cert_chain_source.clone(),
+        ));
+    }
+    for (index, certificate) in certificates.iter().enumerate() {
+        webpki::EndEntityCert::try_from(certificate).map_err(|error| {
+            CertificatePreparationFailure::new(
+                CertificatePreparationErrorKind::CertificateX509,
+                "tls.certificate_x509",
+                format!(
+                    "certificate chain entry {} is not valid X.509: {error}",
+                    index + 1
+                ),
+                source.cert_chain_source.clone(),
+            )
+        })?;
+    }
+    validate_certificate_chain(certificates, source)
 }
 
 fn validate_certificate_chain(
@@ -979,25 +1037,62 @@ fn read_regular_file(
     source: &SourceSpan,
     kind: CertificateFileKind,
 ) -> Result<Vec<u8>, CertificatePreparationFailure> {
-    let (mut file, _) =
+    let (file, metadata) =
         open_regular_file(path).map_err(|error| certificate_open_failure(source, kind, error))?;
+    let limit = match kind {
+        CertificateFileKind::Chain => MAX_CERTIFICATE_CHAIN_BYTES,
+        CertificateFileKind::PrivateKey => MAX_PRIVATE_KEY_BYTES,
+    };
+    if metadata.len() > limit {
+        return Err(certificate_too_large(source, kind, limit));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        let (kind, code, message) = match kind {
-            CertificateFileKind::Chain => (
-                CertificatePreparationErrorKind::CertificateRead,
-                "tls.certificate_read",
-                format!("cannot read certificate chain file: {error}"),
-            ),
-            CertificateFileKind::PrivateKey => (
-                CertificatePreparationErrorKind::PrivateKeyRead,
-                "tls.private_key_read",
-                format!("cannot read private key file: {error}"),
-            ),
-        };
-        CertificatePreparationFailure::new(kind, code, message, source.clone())
-    })?;
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            let (kind, code, message) = match kind {
+                CertificateFileKind::Chain => (
+                    CertificatePreparationErrorKind::CertificateRead,
+                    "tls.certificate_read",
+                    format!("cannot read certificate chain file: {error}"),
+                ),
+                CertificateFileKind::PrivateKey => (
+                    CertificatePreparationErrorKind::PrivateKeyRead,
+                    "tls.private_key_read",
+                    format!("cannot read private key file: {error}"),
+                ),
+            };
+            CertificatePreparationFailure::new(kind, code, message, source.clone())
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(certificate_too_large(source, kind, limit));
+    }
     Ok(bytes)
+}
+
+fn certificate_too_large(
+    source: &SourceSpan,
+    kind: CertificateFileKind,
+    limit: u64,
+) -> CertificatePreparationFailure {
+    let (kind, code, label) = match kind {
+        CertificateFileKind::Chain => (
+            CertificatePreparationErrorKind::CertificateTooLarge,
+            "tls.certificate_too_large",
+            "certificate chain",
+        ),
+        CertificateFileKind::PrivateKey => (
+            CertificatePreparationErrorKind::PrivateKeyTooLarge,
+            "tls.private_key_too_large",
+            "private key",
+        ),
+    };
+    CertificatePreparationFailure::new(
+        kind,
+        code,
+        format!("{label} file exceeds the {limit}-byte preparation limit"),
+        source.clone(),
+    )
 }
 
 fn certificate_open_failure(
@@ -1124,8 +1219,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CertificatePreparationErrorKind, PreparedCertificate, PreparedCertificateResolver,
-        verified_client_metadata,
+        CertificatePreparationErrorKind, MAX_CERTIFICATE_CHAIN_BYTES, MAX_PRIVATE_KEY_BYTES,
+        PreparedCertificate, PreparedCertificateResolver, verified_client_metadata,
     };
 
     #[test]
@@ -1338,6 +1433,51 @@ mod tests {
             CertificatePreparationErrorKind::CertificatePem
         );
         assert_eq!(failure.diagnostic.code, "tls.certificate_pem");
+    }
+
+    #[test]
+    fn rejects_oversized_certificate_and_private_key_files_before_reading() {
+        let directory = tempdir().expect("temporary directory is available");
+        let generated = identity(&["default.example.test"]);
+        let certificate = certificate_spec(
+            directory.path(),
+            "oversized-certificate",
+            &generated.certificate_pem,
+            &generated.private_key_pem,
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&certificate.cert_chain)
+            .expect("certificate file opens")
+            .set_len(MAX_CERTIFICATE_CHAIN_BYTES + 1)
+            .expect("sparse certificate fixture grows");
+        let failure = PreparedCertificate::prepare(&certificate)
+            .expect_err("oversized certificate chain must fail before parsing");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::CertificateTooLarge
+        );
+        assert_eq!(failure.diagnostic.code, "tls.certificate_too_large");
+
+        let private_key = certificate_spec(
+            directory.path(),
+            "oversized-key",
+            &generated.certificate_pem,
+            &generated.private_key_pem,
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&private_key.private_key)
+            .expect("private key file opens")
+            .set_len(MAX_PRIVATE_KEY_BYTES + 1)
+            .expect("sparse private-key fixture grows");
+        let failure = PreparedCertificate::prepare(&private_key)
+            .expect_err("oversized private key must fail before parsing");
+        assert_eq!(
+            failure.kind,
+            CertificatePreparationErrorKind::PrivateKeyTooLarge
+        );
+        assert_eq!(failure.diagnostic.code, "tls.private_key_too_large");
     }
 
     #[test]

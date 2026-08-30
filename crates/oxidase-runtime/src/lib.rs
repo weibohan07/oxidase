@@ -3,6 +3,7 @@
 mod cluster;
 mod executor;
 mod governance;
+mod portable;
 mod regular_file;
 mod secret;
 mod snapshot;
@@ -20,15 +21,19 @@ pub use governance::{
     ConcurrencyPermit, ConcurrencyRejection, GovernanceRegistry, GovernanceReuse,
     RateLimitDecision, RateLimitRejection,
 };
+pub use portable::{
+    PORTABLE_RUNTIME_PLAN_SCHEMA_V1, PortablePublicCertificateV1, PortablePublicTrustStoreV1,
+    PortableRuntimeError, PortableRuntimeExportV1, PortableRuntimePlanV1,
+};
 pub use secret::{PreparedSecret, SecretBytes, SecretPreparationErrorKind};
 pub use snapshot::{
     PreparationError, PreparationErrorKind, ResourceRegistry, ResourceReuse, RuntimeSnapshot,
     SnapshotStore,
 };
 pub use tls::{
-    CertificatePreparationErrorKind, PreparedCertificate, PreparedCertificateResolver,
-    PreparedListenerPlan, PreparedTlsListener, TlsClientMetadataError,
-    TlsListenerPreparationErrorKind, verified_client_metadata,
+    CertificatePreparationErrorKind, MAX_CERTIFICATE_CHAIN_BYTES, MAX_PRIVATE_KEY_BYTES,
+    PreparedCertificate, PreparedCertificateResolver, PreparedListenerPlan, PreparedTlsListener,
+    TlsClientMetadataError, TlsListenerPreparationErrorKind, verified_client_metadata,
 };
 pub use trust::{PreparedTrustStore, TrustStorePreparationErrorKind};
 pub use upstream_tls::{PreparedUpstreamTls, UpstreamTlsPreparationErrorKind};

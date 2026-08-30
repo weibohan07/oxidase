@@ -10,10 +10,11 @@ use oxidase_core::{
     ConfigVersion, ContentDigest, ContentDigestBuilder, Diagnostic, ResourceId, ServiceGraph,
     ServiceProgram, SourceSpan,
 };
-use oxidase_site::{SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
+use oxidase_site::{AssetSource, SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
 use crate::cluster::PreparedCluster;
 use crate::governance::GovernanceRegistry;
+use crate::regular_file::open_regular_file;
 use crate::secret::{PreparedSecret, SecretPreparationErrorKind, SecretPreparationFailure};
 use crate::tls::{
     CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
@@ -33,6 +34,23 @@ pub struct ResourceRegistry {
     pub certificates: BTreeMap<ResourceId, Arc<PreparedCertificate>>,
     pub clusters: BTreeMap<ResourceId, Arc<PreparedCluster>>,
     pub sites: BTreeMap<ResourceId, Arc<SiteSnapshot>>,
+}
+
+pub(crate) struct PortablePreparedSite {
+    pub snapshot: Arc<SiteSnapshot>,
+    pub fingerprint: ContentDigest,
+}
+
+/// Source-free public resources decoded from a portable Bundle.
+///
+/// Secret and private-key bytes are intentionally absent. Their compiler-owned
+/// file references remain in `CompiledGateway` and are validated during the
+/// ordinary candidate preparation transaction.
+pub(crate) struct PortablePreparedResources {
+    pub dependencies: Vec<std::path::PathBuf>,
+    pub sites: BTreeMap<ResourceId, PortablePreparedSite>,
+    pub certificate_chains: BTreeMap<ResourceId, Vec<Vec<u8>>>,
+    pub trust_store_roots: BTreeMap<ResourceId, Vec<Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -81,6 +99,14 @@ impl RuntimeSnapshot {
         gateway: CompiledGateway,
         previous: Option<&Self>,
     ) -> Result<(Self, ResourceReuse), PreparationError> {
+        Self::prepare_reusing_with_resources(gateway, previous, None)
+    }
+
+    pub(crate) fn prepare_reusing_with_resources(
+        gateway: CompiledGateway,
+        previous: Option<&Self>,
+        portable: Option<&PortablePreparedResources>,
+    ) -> Result<(Self, ResourceReuse), PreparationError> {
         let mut summary = gateway.summary();
         let mut sites = BTreeMap::new();
         let mut site_fingerprints = BTreeMap::new();
@@ -92,6 +118,9 @@ impl RuntimeSnapshot {
         reuse.concurrency_limiters = governance_reuse.concurrency;
         reuse.rate_limiters = governance_reuse.rate_limits;
         let mut dependencies = gateway.dependencies.clone();
+        if let Some(portable) = portable {
+            dependencies.extend(portable.dependencies.iter().cloned());
+        }
         let mut preparation_warnings = Vec::new();
         let mut sensitive_dependencies = gateway
             .resources
@@ -106,49 +135,69 @@ impl RuntimeSnapshot {
                 .values()
                 .flat_map(|source| dependency_path_forms(&source.private_key)),
         );
-        for (id, source) in &gateway.resources.sites {
-            let index = SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
-                preparation_error_from_site(id, &source.source, &dependencies, failure)
-            })?;
-            let fingerprint = index.fingerprint(&source.inputs).map_err(|message| {
-                let mut candidate_dependencies = dependencies.clone();
-                candidate_dependencies.extend(index.dependencies().iter().cloned());
-                normalize_dependencies(&mut candidate_dependencies);
-                let diagnostic = Diagnostic::new(
-                    "site.fingerprint",
-                    "cannot fingerprint the prepared Site inputs",
-                    source.source.clone(),
-                )
-                .with_note(message.clone());
-                PreparationError {
-                    resource: id.clone(),
-                    kind: PreparationErrorKind::Fingerprint(message),
-                    diagnostics: vec![diagnostic],
-                    candidate_dependencies,
-                }
-            })?;
-            let snapshot = previous
-                .filter(|previous| previous.site_fingerprints.get(id) == Some(&fingerprint))
-                .and_then(|previous| previous.resources.sites.get(id).cloned());
-            let snapshot = if let Some(snapshot) = snapshot {
-                reuse.sites += 1;
-                snapshot
-            } else {
-                let compiled = SiteCompiler::compile_indexed_with_input_spans(
-                    id.clone(),
-                    &index,
-                    source.inputs.clone(),
-                    source.input_spans.clone(),
-                )
-                .map_err(|failure| {
-                    preparation_error_from_site(id, &source.source, &dependencies, failure)
+        if let Some(portable) = portable {
+            for (id, candidate) in &portable.sites {
+                let snapshot = previous
+                    .filter(|previous| {
+                        previous.site_fingerprints.get(id) == Some(&candidate.fingerprint)
+                    })
+                    .and_then(|previous| previous.resources.sites.get(id).cloned());
+                let snapshot = if let Some(snapshot) = snapshot {
+                    reuse.sites += 1;
+                    snapshot
+                } else {
+                    Arc::clone(&candidate.snapshot)
+                };
+                site_fingerprints.insert(id.clone(), candidate.fingerprint);
+                sites.insert(id.clone(), snapshot);
+            }
+            summary.sites = sites.keys().map(ToString::to_string).collect();
+        } else {
+            for (id, source) in &gateway.resources.sites {
+                let index =
+                    SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
+                        preparation_error_from_site(id, &source.source, &dependencies, failure)
+                    })?;
+                let fingerprint = index.fingerprint(&source.inputs).map_err(|message| {
+                    let mut candidate_dependencies = dependencies.clone();
+                    candidate_dependencies.extend(index.dependencies().iter().cloned());
+                    normalize_dependencies(&mut candidate_dependencies);
+                    let diagnostic = Diagnostic::new(
+                        "site.fingerprint",
+                        "cannot fingerprint the prepared Site inputs",
+                        source.source.clone(),
+                    )
+                    .with_note(message.clone());
+                    PreparationError {
+                        resource: id.clone(),
+                        kind: PreparationErrorKind::Fingerprint(message),
+                        diagnostics: vec![diagnostic],
+                        candidate_dependencies,
+                    }
                 })?;
-                Arc::new(compiled)
-            };
-            dependencies.extend(index.dependencies().iter().cloned());
-            dependencies.extend(site_directories(&snapshot));
-            site_fingerprints.insert(id.clone(), fingerprint);
-            sites.insert(id.clone(), snapshot);
+                let snapshot = previous
+                    .filter(|previous| previous.site_fingerprints.get(id) == Some(&fingerprint))
+                    .and_then(|previous| previous.resources.sites.get(id).cloned());
+                let snapshot = if let Some(snapshot) = snapshot {
+                    reuse.sites += 1;
+                    snapshot
+                } else {
+                    let compiled = SiteCompiler::compile_indexed_with_input_spans(
+                        id.clone(),
+                        &index,
+                        source.inputs.clone(),
+                        source.input_spans.clone(),
+                    )
+                    .map_err(|failure| {
+                        preparation_error_from_site(id, &source.source, &dependencies, failure)
+                    })?;
+                    Arc::new(compiled)
+                };
+                dependencies.extend(index.dependencies().iter().cloned());
+                dependencies.extend(site_directories(&snapshot));
+                site_fingerprints.insert(id.clone(), fingerprint);
+                sites.insert(id.clone(), snapshot);
+            }
         }
         let mut secrets = BTreeMap::new();
         let mut secret_fingerprints = BTreeMap::new();
@@ -178,9 +227,20 @@ impl RuntimeSnapshot {
         let mut trust_stores = BTreeMap::new();
         let mut trust_store_fingerprints = BTreeMap::new();
         for (id, source) in &gateway.resources.trust_stores {
-            let candidate = PreparedTrustStore::prepare(source).map_err(|failure| {
-                preparation_error_from_trust_store(id, &dependencies, &source.ca_bundle, failure)
-            })?;
+            let candidate = portable
+                .and_then(|portable| portable.trust_store_roots.get(id))
+                .map_or_else(
+                    || PreparedTrustStore::prepare(source),
+                    |roots| PreparedTrustStore::prepare_with_public_roots(source, roots),
+                )
+                .map_err(|failure| {
+                    preparation_error_from_trust_store(
+                        id,
+                        &dependencies,
+                        &source.ca_bundle,
+                        failure,
+                    )
+                })?;
             let fingerprint = candidate.digest();
             let trust_store = previous
                 .filter(|previous| previous.trust_store_fingerprints.get(id) == Some(&fingerprint))
@@ -191,7 +251,9 @@ impl RuntimeSnapshot {
             } else {
                 Arc::new(candidate)
             };
-            if let Ok(canonical) = source.ca_bundle.canonicalize() {
+            if portable.is_none()
+                && let Ok(canonical) = source.ca_bundle.canonicalize()
+            {
                 dependencies.push(canonical);
             }
             trust_store_fingerprints.insert(id.clone(), fingerprint);
@@ -203,9 +265,15 @@ impl RuntimeSnapshot {
             // Even when the public chain digest is unchanged, parse and validate
             // the candidate private key before deciding to reuse the old opaque
             // signing state. An invalid key-only rotation must never commit.
-            let candidate = PreparedCertificate::prepare(source).map_err(|failure| {
-                preparation_error_from_certificate(id, &dependencies, failure)
-            })?;
+            let candidate = portable
+                .and_then(|portable| portable.certificate_chains.get(id))
+                .map_or_else(
+                    || PreparedCertificate::prepare(source),
+                    |chain| PreparedCertificate::prepare_with_public_chain(source, chain),
+                )
+                .map_err(|failure| {
+                    preparation_error_from_certificate(id, &dependencies, failure)
+                })?;
             let fingerprint = candidate.digest;
             let certificate = previous
                 .filter(|previous| previous.certificate_fingerprints.get(id) == Some(&fingerprint))
@@ -216,7 +284,12 @@ impl RuntimeSnapshot {
             } else {
                 Arc::new(candidate)
             };
-            for path in [&source.cert_chain, &source.private_key] {
+            let dependency_paths: &[&std::path::Path] = if portable.is_some() {
+                &[source.private_key.as_path()]
+            } else {
+                &[source.cert_chain.as_path(), source.private_key.as_path()]
+            };
+            for path in dependency_paths {
                 if let Ok(canonical) = path.canonicalize() {
                     dependencies.push(canonical);
                 }
@@ -224,6 +297,7 @@ impl RuntimeSnapshot {
             certificate_fingerprints.insert(id.clone(), fingerprint);
             certificates.insert(id.clone(), certificate);
         }
+        validate_sensitive_site_asset_isolation(&gateway, &sites, &dependencies)?;
         let mut clusters = BTreeMap::new();
         let mut cluster_fingerprints = BTreeMap::new();
         for (id, source) in gateway.resources.clusters {
@@ -417,6 +491,7 @@ pub enum PreparationErrorKind {
     Secret(SecretPreparationErrorKind),
     TrustStore(TrustStorePreparationErrorKind),
     Certificate(CertificatePreparationErrorKind),
+    SensitiveAssetIsolation,
     Fingerprint(String),
     Site(Box<SiteCompileError>),
     TlsListener(TlsListenerPreparationErrorKind),
@@ -498,6 +573,200 @@ fn preparation_error_from_tls_listener(
         resource: ResourceId::new(format!("listener:{}", listener.name)),
         kind: PreparationErrorKind::TlsListener(failure.kind),
         diagnostics: vec![*failure.diagnostic],
+        candidate_dependencies,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    canonical: Option<std::path::PathBuf>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(
+        display_path: &std::path::Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Self, ()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            Ok(Self {
+                canonical: display_path.canonicalize().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                canonical: Some(display_path.canonicalize().map_err(|_| ())?),
+            })
+        }
+    }
+
+    fn refers_to_same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        if self.device == other.device && self.inode == other.inode {
+            return true;
+        }
+        self.canonical
+            .as_ref()
+            .zip(other.canonical.as_ref())
+            .is_some_and(|(left, right)| left == right)
+    }
+}
+
+fn asset_file_identity(source: &AssetSource) -> Result<FileIdentity, ()> {
+    match source {
+        AssetSource::File(path) => {
+            let (_file, metadata) = open_regular_file(path).map_err(|_| ())?;
+            FileIdentity::from_metadata(path, &metadata)
+        }
+        AssetSource::Pinned {
+            file,
+            display,
+            origin,
+            ..
+        } => {
+            // Reference-mode Assets are served from an immutable spool, but
+            // the spool's inode says nothing about whether the original file
+            // was a hardlink to a Secret/private key. The loader retains the
+            // exact verified origin handle for this identity check only.
+            let identity_file = origin.as_deref().unwrap_or(file);
+            let metadata = identity_file.metadata().map_err(|_| ())?;
+            if !metadata.is_file() {
+                return Err(());
+            }
+            FileIdentity::from_metadata(display, &metadata)
+        }
+    }
+}
+
+fn sensitive_file_identity(path: &std::path::Path) -> Result<FileIdentity, ()> {
+    let (_file, metadata) = open_regular_file(path).map_err(|_| ())?;
+    FileIdentity::from_metadata(path, &metadata)
+}
+
+fn validate_sensitive_site_asset_isolation(
+    gateway: &CompiledGateway,
+    sites: &BTreeMap<ResourceId, Arc<SiteSnapshot>>,
+    dependencies: &[std::path::PathBuf],
+) -> Result<(), PreparationError> {
+    if gateway.resources.secrets.is_empty() && gateway.resources.certificates.is_empty() {
+        return Ok(());
+    }
+    let mut public_assets = Vec::new();
+    for (site_id, site) in sites {
+        for source in site.asset_sources() {
+            let identity = asset_file_identity(source).map_err(|()| {
+                sensitive_asset_identity_error(
+                    site_id,
+                    site_source_span(gateway, site_id),
+                    dependencies,
+                    true,
+                )
+            })?;
+            public_assets.push((site_id, identity));
+        }
+    }
+
+    for (resource, path, source) in gateway
+        .resources
+        .secrets
+        .iter()
+        .map(|(id, secret)| (id, secret.file.as_path(), &secret.file_source))
+        .chain(
+            gateway
+                .resources
+                .certificates
+                .iter()
+                .map(|(id, certificate)| {
+                    (
+                        id,
+                        certificate.private_key.as_path(),
+                        &certificate.private_key_source,
+                    )
+                }),
+        )
+    {
+        let sensitive = sensitive_file_identity(path).map_err(|()| {
+            sensitive_asset_identity_error(resource, source.clone(), dependencies, false)
+        })?;
+        if let Some((site_id, _)) = public_assets
+            .iter()
+            .find(|(_, asset)| sensitive.refers_to_same_file(asset))
+        {
+            return Err(sensitive_asset_overlap_error(
+                gateway,
+                resource,
+                source,
+                site_id,
+                dependencies,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn site_source_span(gateway: &CompiledGateway, site: &ResourceId) -> SourceSpan {
+    gateway
+        .resources
+        .sites
+        .get(site)
+        .map(|source| source.source.clone())
+        .unwrap_or_else(|| SourceSpan::synthetic(format!("resources.sites.{site}")))
+}
+
+fn sensitive_asset_identity_error(
+    resource: &ResourceId,
+    source: SourceSpan,
+    existing_dependencies: &[std::path::PathBuf],
+    site_asset: bool,
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    normalize_dependencies(&mut candidate_dependencies);
+    let message = if site_asset {
+        "cannot verify that a public Site Asset is isolated from sensitive resources"
+    } else {
+        "cannot verify that a sensitive resource is isolated from public Site Assets"
+    };
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::SensitiveAssetIsolation,
+        diagnostics: vec![
+            Diagnostic::new("resource.sensitive_asset_identity", message, source)
+                .with_help("keep Secret and private-key files outside every public Site Asset"),
+        ],
+        candidate_dependencies,
+    }
+}
+
+fn sensitive_asset_overlap_error(
+    gateway: &CompiledGateway,
+    resource: &ResourceId,
+    sensitive_source: &SourceSpan,
+    site: &ResourceId,
+    existing_dependencies: &[std::path::PathBuf],
+) -> PreparationError {
+    let mut candidate_dependencies = existing_dependencies.to_vec();
+    normalize_dependencies(&mut candidate_dependencies);
+    PreparationError {
+        resource: resource.clone(),
+        kind: PreparationErrorKind::SensitiveAssetIsolation,
+        diagnostics: vec![Diagnostic::new(
+            "resource.sensitive_site_asset_overlap",
+            format!(
+                "sensitive resource `{resource}` is also exposed as a public Asset by Site `{site}`"
+            ),
+            sensitive_source.clone(),
+        )
+        .with_related("public Site resource", site_source_span(gateway, site))
+        .with_help("move the sensitive file outside the Site or deny the public Asset")],
         candidate_dependencies,
     }
 }
@@ -706,6 +975,9 @@ impl fmt::Display for PreparationErrorKind {
             Self::Secret(error) => error.fmt(formatter),
             Self::TrustStore(error) => error.fmt(formatter),
             Self::Certificate(error) => error.fmt(formatter),
+            Self::SensitiveAssetIsolation => {
+                formatter.write_str("sensitive resource and public Site Asset isolation failed")
+            }
             Self::Fingerprint(message) => formatter.write_str(message),
             Self::Site(error) => error.fmt(formatter),
             Self::TlsListener(error) => error.fmt(formatter),
@@ -752,7 +1024,7 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
-    use super::{RuntimeSnapshot, cluster_fingerprint};
+    use super::{PreparationErrorKind, RuntimeSnapshot, cluster_fingerprint};
 
     fn write_test_identity(directory: &std::path::Path, names: &[&str]) {
         let GeneratedCertificate { cert, signing_key } = generate_simple_self_signed(
@@ -825,6 +1097,166 @@ listeners:
         )
         .expect("Secret/Trust gateway can be written");
         config
+    }
+
+    fn write_site_secret_gateway(
+        directory: &std::path::Path,
+        secret_path: &str,
+    ) -> std::path::PathBuf {
+        let site = directory.join("site");
+        fs::create_dir_all(&site).expect("Site directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\nvisibility:\n  deny: []\n",
+        )
+        .expect("Site manifest can be written");
+        let config = directory.join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    token:
+      file: {secret_path}
+      max_bytes: 1KiB
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#
+            ),
+        )
+        .expect("Gateway config can be written");
+        config
+    }
+
+    fn assert_sensitive_site_overlap(config: &std::path::Path, forbidden: &[&str]) {
+        let gateway = Compiler::compile_path(config).expect("Gateway source compiles");
+        let error = RuntimeSnapshot::prepare(gateway)
+            .expect_err("a sensitive file cannot also be a public Site Asset");
+        assert!(matches!(
+            error.kind,
+            PreparationErrorKind::SensitiveAssetIsolation
+        ));
+        let diagnostics = error.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "resource.sensitive_site_asset_overlap");
+        let rendered = diagnostics[0].to_string();
+        for value in forbidden {
+            assert!(
+                !rendered.contains(value),
+                "sensitive diagnostic leaked forbidden value `{value}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_literal_secret_and_private_key_public_site_assets_without_leaking_values() {
+        let directory = tempdir().expect("temporary directory is available");
+        let marker = "literal-secret-marker-never-bundle";
+        fs::create_dir(directory.path().join("site")).expect("Site directory can be created");
+        fs::write(directory.path().join("site/token.txt"), marker)
+            .expect("test-only Secret can be written");
+        let config = write_site_secret_gateway(directory.path(), "site/token.txt");
+        assert_sensitive_site_overlap(&config, &[marker, "site/token.txt"]);
+
+        let certificate_directory = tempdir().expect("temporary directory is available");
+        let site = certificate_directory.path().join("site");
+        fs::create_dir(&site).expect("Site directory can be created");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\nvisibility:\n  deny: []\n",
+        )
+        .expect("Site manifest can be written");
+        let GeneratedCertificate { cert, signing_key } =
+            generate_simple_self_signed(vec!["private.example.test".to_owned()])
+                .expect("test-only certificate can be generated");
+        fs::write(certificate_directory.path().join("cert.pem"), cert.pem())
+            .expect("test-only public chain can be written");
+        let private_key = signing_key.serialize_pem();
+        fs::write(site.join("private-key.pem"), &private_key)
+            .expect("test-only private key can be written");
+        let config = certificate_directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    public:
+      cert_chain: cert.pem
+      private_key: site/private-key.pem
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("Gateway config can be written");
+        assert_sensitive_site_overlap(&config, &[private_key.trim(), "site/private-key.pem"]);
+    }
+
+    #[test]
+    fn rejects_sensitive_precompressed_site_representations() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir(&site).expect("Site directory can be created");
+        fs::write(site.join("page.txt"), "identity")
+            .expect("identity representation can be written");
+        let marker = "brotli-secret-marker-never-bundle";
+        fs::write(site.join("page.txt.br"), marker)
+            .expect("precompressed representation can be written");
+        let config = write_site_secret_gateway(directory.path(), "site/page.txt.br");
+        fs::write(
+            site.join("site.oxsite"),
+            "oxista: site/v1\nvisibility:\n  deny: []\nassets:\n  precompressed:\n    brotli: .br\n",
+        )
+        .expect("precompressed Site manifest can be written");
+        assert_sensitive_site_overlap(&config, &[marker, "site/page.txt.br"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_and_hardlink_aliases_of_public_site_assets() {
+        use std::os::unix::fs::symlink;
+
+        for alias_kind in ["symlink", "hardlink"] {
+            let directory = tempdir().expect("temporary directory is available");
+            let public = directory.path().join("site/public.txt");
+            fs::create_dir_all(public.parent().expect("public Asset has parent"))
+                .expect("Site directory can be created");
+            fs::write(&public, format!("{alias_kind}-secret-marker"))
+                .expect("public Asset can be written");
+            let alias = directory.path().join("secret-alias.txt");
+            if alias_kind == "symlink" {
+                symlink(&public, &alias).expect("Secret symlink can be created");
+            } else {
+                fs::hard_link(&public, &alias).expect("Secret hardlink can be created");
+            }
+            let config = write_site_secret_gateway(directory.path(), "secret-alias.txt");
+            assert_sensitive_site_overlap(
+                &config,
+                &[&format!("{alias_kind}-secret-marker"), "secret-alias.txt"],
+            );
+        }
     }
 
     #[test]
