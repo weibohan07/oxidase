@@ -71,10 +71,12 @@ length-prefixed structured encoding. Strong Asset validators are
 `"sha256-<64 lowercase hex>"` over the selected representation bytes. One
 `SiteSourceIndex` scan supplies Site reuse identity, representation ETags, cached
 Oxista source text, and compilation metadata; large Asset bytes are not retained.
-Gateway semantic diagnostics and OXT tags/interpolations carry exact byte and
-line/column ranges. Request expression views are frame-local and lazy, so effective
-Headers, query values, bindings, and the request namespace are built once per
-unchanged frame.
+Gateway and Oxista semantic diagnostics carry exact byte and line/column ranges,
+secondary labels, related definitions, and import/include reference chains. Every
+compiling CLI command accepts `--diagnostic-format human|json`; JSON uses the
+versioned `oxidase.diagnostics/v1` envelope and keeps stdout machine-readable.
+Request expression views are frame-local and lazy, so effective Headers, query
+values, bindings, and the request namespace are built once per unchanged frame.
 
 Inbound TLS/HTTP/2 and OXT `extends`/`block` are not yet implemented. Atomic
 last-known-good reload is available with `serve --watch`; health and bounded metrics
@@ -155,6 +157,11 @@ oxidase explain <config> --request <request-file> [--listener <name>]
 oxidase compile <config> --output <manifest.json>
 oxidase test <config>
 ```
+
+Append `--diagnostic-format json` to `check`, `compile`, `test`, `serve`, or a
+failing `explain` invocation for deterministic machine-readable diagnostics. See
+[`docs/diagnostics.md`](docs/diagnostics.md) for the alpha schema and position
+conventions.
 
 `compile` currently writes a deterministic inspection manifest, not a self-contained
 binary runtime snapshot.

@@ -1,11 +1,11 @@
 # Implementation status
 
-Last updated: 2026-08-23
+Last updated: 2026-08-30
 
 ## Baseline
 
-- hardening branch: `hardening/v0.2-alpha-runtime-semantics`
-- public starting point: semantic-closure merge `61970dad1f3ba159ad1a961096a8b8a9bb2fbbe0`
+- active milestone branch: `feat/v0.3-diagnostics`
+- public starting point: runtime-semantics merge `69d1d538bea493be46fc0dc867ca69016da50a4b`
 - release line: `0.2.0-alpha`; production readiness is not claimed
 
 ## Completed
@@ -143,6 +143,14 @@ Last updated: 2026-08-23
   ranges for listeners, references, endpoints, durations, Headers, Patterns,
   Expressions, and Transform metadata. OXR Header policies, OXT tokens, and include
   edges retain exact spans, including CRLF and Unicode-column tests.
+- One renderer-neutral Diagnostic model now carries stable code, severity, exact
+  primary span, secondary labels, related cross-file spans, notes/help, and
+  structured import/include chains through config, Site preparation, Runtime, and
+  reload. Site inputs relate the Gateway injection to the `.oxsite` declaration.
+- `check`, `compile`, `test`, and `serve` accept a global human/JSON diagnostic
+  format. JSON emits one deterministic `oxidase.diagnostics/v1` envelope with
+  explicit path encoding and no ANSI or human stdout; I/O and bind failures remain
+  valid JSON with a nonzero exit. Successful Explain keeps its own JSON document.
 - `RequestFrame` lazily caches effective Headers, query values, request namespace,
   visible bindings, and its Arc-backed evaluation context. Unchanged clones share
   caches; binding children and mutable overlays invalidate only affected layers.
@@ -162,7 +170,7 @@ Last updated: 2026-08-23
 ## Currently runnable
 
 - A v1alpha1 config and Oxista site can be fully prepared, served over HTTP/1.1,
-  executed in memory, explained, reloaded, observed, and tested. More than 130
+  executed in memory, explained, reloaded, observed, and tested. More than 150
   workspace tests pass, including real listener/upstream/watcher tests that require
   permission to bind loopback ports; manual smoke benchmarks remain ignored by the
   ordinary test suite.
@@ -181,10 +189,11 @@ Last updated: 2026-08-23
   enforces its configured strict-undefined policy at template interpolation.
 - `compile` writes a deterministic inspection manifest, not a portable executable
   snapshot containing site assets or connection state.
-- Gateway semantic diagnostics, OXR Header policies, and OXT tags/interpolations
-  have exact ranges. Some other deeper `.oxsite`/`.oxr` front-matter semantic errors
-  still identify the containing file rather than the exact scalar; JSON diagnostic
-  output is not implemented.
+- Gateway and the implemented `.oxsite`/`.oxr`/`.oxt` semantic checks now retain
+  exact ranges and structured cross-file relationships. The JSON schema is alpha;
+  successful Explain remains its separate explain schema, and non-fatal live reload
+  events remain structured operational logs on stderr rather than additional JSON
+  documents on stdout.
 - Generated inline Service/Route IDs are deterministic within one source program
   but can change when the import set changes. They are alpha inspection identities,
   not durable API keys, metrics labels, control-plane IDs, or configuration refs.
@@ -222,10 +231,11 @@ Last updated: 2026-08-23
 
 - Rust 1.88 was installed locally; the locked MSRV workspace
   all-target/all-feature check and locked workspace test suite passed.
-- Stable formatting, locked workspace/all-target/all-feature Clippy with warnings
-  denied, locked workspace tests, locked docs with warnings denied, and the locked
-  release workspace build passed. Loopback tests ran with the required local
-  permission.
+- Stable formatting and locked workspace/all-target/all-feature Clippy with warnings
+  denied passed. The current diagnostic branch has 154 passing non-ignored workspace
+  tests and four ignored manual benchmarks/soaks; loopback tests ran with the required
+  local permission. Final docs, release, MSRV, deny, and fuzz gates are rerun before
+  PR publication.
 - `cargo deny check` passed advisories, bans, licenses, and sources; one allowed
   indirect `syn` duplicate-version warning remains.
 - All seven fuzz harnesses compile; no long fuzz campaign was run.
@@ -248,8 +258,7 @@ Last updated: 2026-08-23
 
 ## Next concrete work
 
-1. Finish exact `.oxsite`/`.oxr` semantic spans and add JSON diagnostic rendering.
-2. Run sustained fuzz plus memory/fd proxy and reload soak campaigns using the new
-   bounded metrics and repeatable smoke baselines.
-3. Design the next explicit transport increment (inbound TLS and HTTP/2 lifecycle)
-   without weakening snapshot pinning or graceful drain.
+1. Add the inbound TLS Certificate resource, SNI resolver, and atomic rotation.
+2. Add ALPN-selected HTTP/1.1 and HTTP/2 connection drivers with per-stream snapshot
+   pinning and GOAWAY drain.
+3. Preserve DATA/trailer frames before adding gRPC and trusted HTTP/1 Upgrade paths.
