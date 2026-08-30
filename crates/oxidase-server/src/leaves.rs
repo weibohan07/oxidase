@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
@@ -13,6 +13,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
+use oxidase_config::ClusterProtocol;
 use oxidase_core::{
     ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
@@ -24,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::body::{BoxError, GatewayBodyPlan, timeout_incoming_body};
-use crate::response::remove_hop_by_hop;
+use crate::protocol::{WireProtocol, sanitize_runtime_headers};
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
@@ -38,28 +39,77 @@ impl HyperLeaves {
 }
 
 pub(crate) struct ProxyClient {
-    client: Client<HttpsConnector<HttpConnector>, Incoming>,
+    auto: ProxyPool,
+    http1: ProxyPool,
+    h2: ProxyPool,
     endpoint_sequence: AtomicU64,
+}
+
+type ProxyPool = Client<HttpsConnector<HttpConnector>, Incoming>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyPoolKind {
+    Auto,
+    Http1,
+    H2,
+}
+
+impl ProxyPoolKind {
+    const fn for_cluster(protocol: ClusterProtocol) -> Self {
+        match protocol {
+            ClusterProtocol::Auto => Self::Auto,
+            ClusterProtocol::Http1 => Self::Http1,
+            ClusterProtocol::H2 => Self::H2,
+        }
+    }
+
+    const fn request_wire_protocol(self) -> WireProtocol {
+        match self {
+            // `auto` negotiates HTTPS with ALPN, so the exact wire protocol is
+            // not known before the request is dispatched. Conservatively use
+            // HTTP/1 rules; this removes TE/trailer metadata rather than
+            // accidentally forwarding an HTTP/1 hop-by-hop field over H2.
+            Self::Auto | Self::Http1 => WireProtocol::Http1,
+            Self::H2 => WireProtocol::Http2,
+        }
+    }
 }
 
 impl ProxyClient {
     pub(crate) fn new() -> Result<Self, String> {
-        let connector = HttpsConnectorBuilder::new()
+        let auto_connector = HttpsConnectorBuilder::new()
             .with_native_roots()
             .map_err(|error| format!("cannot load native TLS roots: {error}"))?
             .https_or_http()
             .enable_http1()
             .enable_http2()
             .build();
-        let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(32)
-            .build(connector);
+        let http1_connector = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|error| format!("cannot load native TLS roots: {error}"))?
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let h2_connector = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|error| format!("cannot load native TLS roots: {error}"))?
+            .https_or_http()
+            .enable_http2()
+            .build();
         Ok(Self {
-            client,
+            auto: build_proxy_pool(auto_connector, false),
+            http1: build_proxy_pool(http1_connector, false),
+            h2: build_proxy_pool(h2_connector, true),
             endpoint_sequence: AtomicU64::new(0),
         })
+    }
+
+    fn pool(&self, kind: ProxyPoolKind) -> &ProxyPool {
+        match kind {
+            ProxyPoolKind::Auto => &self.auto,
+            ProxyPoolKind::Http1 => &self.http1,
+            ProxyPoolKind::H2 => &self.h2,
+        }
     }
 
     async fn execute(
@@ -75,6 +125,7 @@ impl ProxyClient {
                 format!("prepared cluster `{cluster}` is missing"),
             ));
         };
+        let pool_kind = ProxyPoolKind::for_cluster(cluster_spec.protocol);
         let sequence = self.endpoint_sequence.fetch_add(1, Ordering::Relaxed);
         let endpoint = &cluster_spec.endpoints[sequence as usize % cluster_spec.endpoints.len()];
         let uri = match upstream_uri(endpoint, request.path_and_query()) {
@@ -91,37 +142,52 @@ impl ProxyClient {
         *upstream.method_mut() = request.method().clone();
         *upstream.uri_mut() = uri;
         *upstream.headers_mut() = request.effective_headers().clone();
-        remove_hop_by_hop(upstream.headers_mut());
+        if sanitize_runtime_headers(upstream.headers_mut(), pool_kind.request_wire_protocol())
+            .is_err()
+        {
+            return ServiceOutcome::Failed(ServiceError::new(
+                ErrorClass::InvalidState,
+                "request contains invalid connection-specific metadata",
+            ));
+        }
         apply_forwarding_headers(upstream.headers_mut(), request, endpoint);
 
         let timeout = cluster_spec
             .connect_timeout
             .checked_add(cluster_spec.response_timeout)
             .unwrap_or(cluster_spec.response_timeout);
-        let response = match tokio::time::timeout(timeout, self.client.request(upstream)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                let class = if error.is_connect() {
-                    ErrorClass::UpstreamConnect
-                } else {
-                    ErrorClass::UpstreamProtocol
-                };
-                return ServiceOutcome::Failed(ServiceError::new(
-                    class,
-                    format!("upstream request to `{endpoint}` failed: {error}"),
-                ));
-            }
-            Err(_) => {
-                return ServiceOutcome::Failed(ServiceError::new(
-                    ErrorClass::Timeout,
-                    format!(
-                        "upstream `{endpoint}` did not produce response headers in {timeout:?}"
-                    ),
-                ));
-            }
-        };
+        let response =
+            match tokio::time::timeout(timeout, self.pool(pool_kind).request(upstream)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    let class = if error.is_connect() {
+                        ErrorClass::UpstreamConnect
+                    } else {
+                        ErrorClass::UpstreamProtocol
+                    };
+                    return ServiceOutcome::Failed(ServiceError::new(
+                        class,
+                        format!("upstream request to `{endpoint}` failed: {error}"),
+                    ));
+                }
+                Err(_) => {
+                    return ServiceOutcome::Failed(ServiceError::new(
+                        ErrorClass::Timeout,
+                        format!(
+                            "upstream `{endpoint}` did not produce response headers in {timeout:?}"
+                        ),
+                    ));
+                }
+            };
         let (mut parts, body) = response.into_parts();
-        remove_hop_by_hop(&mut parts.headers);
+        if sanitize_runtime_headers(&mut parts.headers, response_wire_protocol(parts.version))
+            .is_err()
+        {
+            return ServiceOutcome::Failed(ServiceError::new(
+                ErrorClass::UpstreamProtocol,
+                "upstream response contains invalid connection-specific metadata",
+            ));
+        }
         parts.headers.remove(header::CONTENT_LENGTH);
         let body = if request.method() == Method::HEAD {
             GatewayBodyPlan::Head {
@@ -138,6 +204,24 @@ impl ProxyClient {
             headers: parts.headers,
             body,
         })
+    }
+}
+
+fn build_proxy_pool(connector: HttpsConnector<HttpConnector>, http2_only: bool) -> ProxyPool {
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(32);
+    builder.http2_only(http2_only);
+    builder.build(connector)
+}
+
+fn response_wire_protocol(version: Version) -> WireProtocol {
+    if version == Version::HTTP_2 {
+        WireProtocol::Http2
+    } else {
+        WireProtocol::Http1
     }
 }
 
@@ -751,16 +835,219 @@ fn header_value(value: String) -> Result<HeaderValue, ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use http::{HeaderMap, HeaderValue, header};
+    use bytes::Bytes;
+    use http::{HeaderMap, HeaderValue, Request, Response, Version, header};
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper::server::conn::{http1, http2};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use oxidase_config::{ClusterProtocol, Compiler};
     use oxidase_core::{RequestFrame, RequestMetadata};
+    use oxidase_runtime::RuntimeSnapshot;
     use oxidase_site::{AssetPlan, AssetRepresentation, ContentEncoding};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{mpsc, watch};
 
     use super::{
-        ByteRange, ParsedRange, ResolvedRange, UnresolvedByteRange, apply_forwarding_headers,
-        parse_quality, parse_range, select_representation,
+        ByteRange, ParsedRange, ProxyPoolKind, ResolvedRange, UnresolvedByteRange,
+        apply_forwarding_headers, parse_quality, parse_range, response_wire_protocol,
+        select_representation,
     };
+    use crate::protocol::WireProtocol;
+    use crate::server::GatewayServer;
+
+    #[derive(Clone, Copy)]
+    enum FixtureProtocol {
+        Http1,
+        Http2,
+    }
+
+    async fn spawn_protocol_fixture(
+        protocol: FixtureProtocol,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        mpsc::UnboundedReceiver<Version>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream fixture binds");
+        let address = listener.local_addr().expect("fixture address is known");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = accepts.clone();
+        let (versions, received_versions) = mpsc::unbounded_channel();
+        let (shutdown, mut shutdown_receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            break;
+                        };
+                        accepts_for_task.fetch_add(1, Ordering::Relaxed);
+                        let versions = versions.clone();
+                        connections.spawn(async move {
+                            let service = service_fn(move |request: Request<Incoming>| {
+                                let versions = versions.clone();
+                                async move {
+                                    let version = request.version();
+                                    let _ = versions.send(version);
+                                    let request_body = request
+                                        .into_body()
+                                        .collect()
+                                        .await
+                                        .expect("fixture request body is readable")
+                                        .to_bytes();
+                                    let mut response = Response::new(Full::new(Bytes::from(
+                                        format!("{}:{}", version_text(version), request_body.len()),
+                                    )));
+                                    response.headers_mut().insert(
+                                        "x-fixture-version",
+                                        HeaderValue::from_static("observed"),
+                                    );
+                                    Ok::<_, Infallible>(response)
+                                }
+                            });
+                            match protocol {
+                                FixtureProtocol::Http1 => {
+                                    let _ = http1::Builder::new()
+                                        .keep_alive(true)
+                                        .serve_connection(TokioIo::new(stream), service)
+                                        .await;
+                                }
+                                FixtureProtocol::Http2 => {
+                                    let _ = http2::Builder::new(TokioExecutor::new())
+                                        .serve_connection(TokioIo::new(stream), service)
+                                        .await;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        (address, accepts, received_versions, shutdown, task)
+    }
+
+    fn version_text(version: Version) -> &'static str {
+        if version == Version::HTTP_2 {
+            "h2"
+        } else {
+            "http1"
+        }
+    }
+
+    async fn request_gateway(address: std::net::SocketAddr) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("gateway accepts the request");
+            stream
+                .write_all(b"GET /pool HTTP/1.1\r\nHost: gateway.test\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("gateway request can be written");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("gateway response is readable");
+            String::from_utf8(response).expect("fixture response is UTF-8")
+        })
+        .await
+        .expect("gateway response arrives before timeout")
+    }
+
+    async fn assert_proxy_pool(
+        cluster_protocol: ClusterProtocol,
+        fixture_protocol: FixtureProtocol,
+        expected_version: Version,
+    ) {
+        let (upstream, accepts, mut versions, upstream_shutdown, upstream_task) =
+            spawn_protocol_fixture(fixture_protocol).await;
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  clusters:
+    upstream:
+      protocol: {}
+      endpoints:
+        - http://{upstream}
+      connect_timeout: 1s
+      response_timeout: 1s
+services:
+  root:
+    type: proxy
+    cluster: upstream
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+                cluster_protocol.as_str()
+            ),
+        )
+        .expect("gateway fixture config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("gateway fixture config compiles"),
+        )
+        .expect("gateway fixture snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway fixture binds")
+            .spawn();
+        let gateway = running.local_addresses()[0].1;
+
+        for _ in 0..2 {
+            let response = request_gateway(gateway).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert!(
+                response.contains(version_text(expected_version)),
+                "{response}"
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(1), versions.recv())
+                .await
+                .expect("upstream observes a request")
+                .expect("version channel remains open");
+            assert_eq!(observed, expected_version);
+        }
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            1,
+            "both requests must reuse one long-lived upstream pool connection"
+        );
+
+        running
+            .shutdown()
+            .await
+            .expect("gateway fixture shuts down");
+        let _ = upstream_shutdown.send(true);
+        upstream_task.await.expect("upstream fixture shuts down");
+    }
 
     fn representation(encoding: Option<ContentEncoding>) -> AssetRepresentation {
         AssetRepresentation {
@@ -936,5 +1223,60 @@ mod tests {
                 .to_str()
                 .is_ok_and(|value| value.contains("internal.example"))
         }));
+    }
+
+    #[test]
+    fn cluster_protocol_selects_the_matching_long_lived_pool_and_header_policy() {
+        assert_eq!(
+            ProxyPoolKind::for_cluster(ClusterProtocol::Auto),
+            ProxyPoolKind::Auto
+        );
+        assert_eq!(
+            ProxyPoolKind::for_cluster(ClusterProtocol::Http1),
+            ProxyPoolKind::Http1
+        );
+        assert_eq!(
+            ProxyPoolKind::for_cluster(ClusterProtocol::H2),
+            ProxyPoolKind::H2
+        );
+        assert_eq!(
+            ProxyPoolKind::Auto.request_wire_protocol(),
+            WireProtocol::Http1,
+            "auto uses conservative request filtering before ALPN is known"
+        );
+        assert_eq!(
+            ProxyPoolKind::H2.request_wire_protocol(),
+            WireProtocol::Http2
+        );
+        assert_eq!(
+            response_wire_protocol(Version::HTTP_11),
+            WireProtocol::Http1
+        );
+        assert_eq!(response_wire_protocol(Version::HTTP_2), WireProtocol::Http2);
+    }
+
+    #[tokio::test]
+    async fn http1_cluster_reuses_a_long_lived_http1_pool_connection() {
+        assert_proxy_pool(
+            ClusterProtocol::Http1,
+            FixtureProtocol::Http1,
+            Version::HTTP_11,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn h2_cluster_uses_prior_knowledge_and_reuses_the_h2_connection() {
+        assert_proxy_pool(ClusterProtocol::H2, FixtureProtocol::Http2, Version::HTTP_2).await;
+    }
+
+    #[tokio::test]
+    async fn auto_cluster_uses_http1_for_cleartext_upstreams() {
+        assert_proxy_pool(
+            ClusterProtocol::Auto,
+            FixtureProtocol::Http1,
+            Version::HTTP_11,
+        )
+        .await;
     }
 }
