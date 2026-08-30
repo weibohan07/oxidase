@@ -3,6 +3,7 @@
 mod body;
 mod cluster_health;
 mod connection;
+mod ingress;
 mod leaves;
 mod metrics;
 mod protocol;

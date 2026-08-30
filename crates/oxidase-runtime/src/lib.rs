@@ -2,6 +2,7 @@
 
 mod cluster;
 mod executor;
+mod governance;
 mod snapshot;
 mod tls;
 
@@ -10,6 +11,10 @@ pub use executor::{
     ExplainTraceCollector, LeafExecutor, NoopExecutionObserver, NoopTraceSink,
     ServiceObservationContext, ServiceObservationOutcome, ServiceObservationResult, TraceDetail,
     TraceEvent, TraceSink,
+};
+pub use governance::{
+    ConcurrencyPermit, ConcurrencyRejection, GovernanceRegistry, GovernanceReuse,
+    RateLimitDecision, RateLimitRejection,
 };
 pub use snapshot::{
     PreparationError, PreparationErrorKind, ResourceRegistry, ResourceReuse, RuntimeSnapshot,

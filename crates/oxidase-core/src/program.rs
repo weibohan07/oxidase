@@ -83,6 +83,66 @@ impl ServiceProgram {
             {
                 return Err(ServiceProgramError::ZeroReenterBudget(id.clone()));
             }
+            match &node.kind {
+                ServiceKind::RequestBodyLimit { max_bytes, .. } if *max_bytes == 0 => {
+                    return Err(ServiceProgramError::InvalidLimit {
+                        service: id.clone(),
+                        field: "max_bytes",
+                    });
+                }
+                ServiceKind::ConcurrencyLimit {
+                    name,
+                    max_in_flight,
+                    ..
+                } if name.is_empty() || *max_in_flight == 0 => {
+                    return Err(ServiceProgramError::InvalidLimit {
+                        service: id.clone(),
+                        field: if name.is_empty() {
+                            "name"
+                        } else {
+                            "max_in_flight"
+                        },
+                    });
+                }
+                ServiceKind::RateLimit {
+                    name,
+                    key,
+                    requests,
+                    per,
+                    burst,
+                    max_keys,
+                    idle_ttl,
+                    ..
+                } if name.is_empty()
+                    || matches!(key, RateLimitKey::Binding(name) if name.is_empty())
+                    || *requests == 0
+                    || per.is_zero()
+                    || *burst == 0
+                    || *max_keys == 0
+                    || idle_ttl.is_zero() =>
+                {
+                    let field = if name.is_empty() {
+                        "name"
+                    } else if matches!(key, RateLimitKey::Binding(name) if name.is_empty()) {
+                        "key.name"
+                    } else if *requests == 0 {
+                        "rate.requests"
+                    } else if per.is_zero() {
+                        "rate.per"
+                    } else if *burst == 0 {
+                        "burst"
+                    } else if *max_keys == 0 {
+                        "state.max_keys"
+                    } else {
+                        "state.idle_ttl"
+                    };
+                    return Err(ServiceProgramError::InvalidLimit {
+                        service: id.clone(),
+                        field,
+                    });
+                }
+                _ => {}
+            }
             if let ServiceKind::Fallback { services } = &node.kind {
                 for service in services.iter().take(services.len().saturating_sub(1)) {
                     if self.may_consume_body(service, &mut BTreeSet::new())? {
@@ -165,7 +225,10 @@ impl ServiceProgram {
             }
             ServiceKind::Transform { service, .. }
             | ServiceKind::Observe { service, .. }
-            | ServiceKind::Timeout { service, .. } => self.may_consume_body(service, visiting)?,
+            | ServiceKind::Timeout { service, .. }
+            | ServiceKind::RequestBodyLimit { service, .. }
+            | ServiceKind::ConcurrencyLimit { service, .. }
+            | ServiceKind::RateLimit { service, .. } => self.may_consume_body(service, visiting)?,
             ServiceKind::Recover { service, handlers } => {
                 let mut consumes = self.may_consume_body(service, visiting)?;
                 for handler in handlers {
@@ -222,6 +285,30 @@ pub enum ServiceKind {
         duration: Duration,
         service: ServiceId,
     },
+    /// Enforces a streaming request-body byte ceiling around `service`.
+    RequestBodyLimit {
+        max_bytes: u64,
+        service: ServiceId,
+    },
+    /// Admits at most `max_in_flight` executions into `service`.
+    ConcurrencyLimit {
+        name: String,
+        max_in_flight: u32,
+        queue_timeout: Duration,
+        reject_status: StatusCode,
+        service: ServiceId,
+    },
+    /// Applies a bounded token-bucket admission policy before executing `service`.
+    RateLimit {
+        name: String,
+        key: RateLimitKey,
+        requests: u64,
+        per: Duration,
+        burst: u64,
+        max_keys: u32,
+        idle_ttl: Duration,
+        service: ServiceId,
+    },
     Recover {
         service: ServiceId,
         handlers: Vec<RecoverHandler>,
@@ -244,7 +331,10 @@ impl ServiceKind {
         match self {
             Self::Transform { service, .. }
             | Self::Observe { service, .. }
-            | Self::Timeout { service, .. } => vec![service],
+            | Self::Timeout { service, .. }
+            | Self::RequestBodyLimit { service, .. }
+            | Self::ConcurrencyLimit { service, .. }
+            | Self::RateLimit { service, .. } => vec![service],
             Self::Recover { service, handlers } => std::iter::once(service)
                 .chain(handlers.iter().map(|handler| &handler.service))
                 .collect(),
@@ -269,6 +359,14 @@ impl ServiceKind {
             self.references()
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKey {
+    /// The transport peer address, never a forwarded client header.
+    PeerIp,
+    /// A lexical route binding compiled from a static configuration name.
+    Binding(String),
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +519,11 @@ pub enum ServiceProgramError {
     ReferenceCycle(ServiceId),
     #[error("Reenter service `{0}` has a zero execution budget")]
     ZeroReenterBudget(ServiceId),
+    #[error("service `{service}` has an invalid `{field}` limit field")]
+    InvalidLimit {
+        service: ServiceId,
+        field: &'static str,
+    },
     #[error(
         "fallback `{fallback}` places body-consuming service `{candidate}` before another candidate"
     )]
@@ -436,7 +539,9 @@ mod tests {
 
     use http::StatusCode;
 
-    use super::{HeaderTransforms, RespondBody, ServiceKind, ServiceNode, ServiceProgram};
+    use super::{
+        HeaderTransforms, RateLimitKey, RespondBody, ServiceKind, ServiceNode, ServiceProgram,
+    };
     use crate::{ServiceId, SourceSpan};
 
     fn node(id: &str, kind: ServiceKind) -> ServiceNode {
@@ -523,5 +628,110 @@ mod tests {
             ]),
         );
         assert!(program.validate().is_err());
+    }
+
+    #[test]
+    fn governance_wrappers_preserve_fallback_body_consumption_analysis() {
+        let proxy = node(
+            "proxy",
+            ServiceKind::Proxy {
+                cluster: "api".into(),
+            },
+        );
+        let body_limit = node(
+            "body-limit",
+            ServiceKind::RequestBodyLimit {
+                max_bytes: 1024,
+                service: proxy.id.clone(),
+            },
+        );
+        let concurrency = node(
+            "concurrency",
+            ServiceKind::ConcurrencyLimit {
+                name: "public".to_owned(),
+                max_in_flight: 10,
+                queue_timeout: std::time::Duration::ZERO,
+                reject_status: StatusCode::SERVICE_UNAVAILABLE,
+                service: body_limit.id.clone(),
+            },
+        );
+        let rate = node(
+            "rate",
+            ServiceKind::RateLimit {
+                name: "public".to_owned(),
+                key: RateLimitKey::PeerIp,
+                requests: 100,
+                per: std::time::Duration::from_secs(1),
+                burst: 200,
+                max_keys: 1_000,
+                idle_ttl: std::time::Duration::from_secs(60),
+                service: concurrency.id.clone(),
+            },
+        );
+        let respond = node(
+            "respond",
+            ServiceKind::Respond {
+                status: StatusCode::OK,
+                headers: HeaderTransforms::default(),
+                body: RespondBody::Empty,
+            },
+        );
+        let fallback = node(
+            "fallback",
+            ServiceKind::Fallback {
+                services: vec![rate.id.clone(), respond.id.clone()],
+            },
+        );
+        let program = ServiceProgram::from_nodes(
+            fallback.id.clone(),
+            BTreeMap::from([
+                (proxy.id.clone(), proxy),
+                (body_limit.id.clone(), body_limit),
+                (concurrency.id.clone(), concurrency),
+                (rate.id.clone(), rate),
+                (respond.id.clone(), respond),
+                (fallback.id.clone(), fallback),
+            ]),
+        );
+        assert!(matches!(
+            program.validate(),
+            Err(super::ServiceProgramError::UnsafeFallbackBody { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_governance_ir_before_execution() {
+        let respond = node(
+            "respond",
+            ServiceKind::Respond {
+                status: StatusCode::OK,
+                headers: HeaderTransforms::default(),
+                body: RespondBody::Empty,
+            },
+        );
+        let invalid = node(
+            "invalid",
+            ServiceKind::RateLimit {
+                name: "public".to_owned(),
+                key: RateLimitKey::PeerIp,
+                requests: 0,
+                per: std::time::Duration::from_secs(1),
+                burst: 1,
+                max_keys: 1,
+                idle_ttl: std::time::Duration::from_secs(1),
+                service: respond.id.clone(),
+            },
+        );
+        let program = ServiceProgram::from_nodes(
+            invalid.id.clone(),
+            BTreeMap::from([(respond.id.clone(), respond), (invalid.id.clone(), invalid)]),
+        );
+        assert!(matches!(
+            program.validate(),
+            Err(super::ServiceProgramError::InvalidLimit {
+                field: "rate.requests",
+                ..
+            })
+        ));
     }
 }

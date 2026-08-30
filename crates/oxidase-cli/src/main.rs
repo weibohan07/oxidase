@@ -12,7 +12,9 @@ use oxidase_core::{
     ContentDigest, ContentDigestBuilder, Diagnostic, RequestFrame, RequestMetadata, ResourceId,
     ResponseHead, ServiceOutcome, SourceSpan,
 };
-use oxidase_runtime::{BoxLeafFuture, ExecutionReport, Executor, LeafExecutor, RuntimeSnapshot};
+use oxidase_runtime::{
+    BoxLeafFuture, ExecutionReport, Executor, GovernanceRegistry, LeafExecutor, RuntimeSnapshot,
+};
 use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
 
@@ -470,6 +472,7 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
         resource: &'a ResourceId,
         request: &'a RequestFrame,
         _body: &'a mut Option<()>,
+        _max_request_body_bytes: Option<u64>,
     ) -> BoxLeafFuture<'a, ExplainBody> {
         let cluster = self
             .snapshot
@@ -489,6 +492,10 @@ impl LeafExecutor<(), ExplainBody> for ExplainLeaves<'_> {
                 },
             ))
         })
+    }
+
+    fn governance(&self) -> Option<&GovernanceRegistry> {
+        Some(&self.snapshot.governance)
     }
 }
 
@@ -1053,6 +1060,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use http::StatusCode;
     use oxidase_config::{
         Compiler, ExplainRequestSource, HttpVersion, ListenerProtocol, TestExpectationSource,
     };
@@ -1186,6 +1194,101 @@ listeners:
                 "test.expectation_cluster_protocol",
                 "test.expectation_load_balance"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_describes_ingress_governance_without_dynamic_key_values() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  root:
+    type: request_body_limit
+    max_bytes: 4KiB
+    service:
+      type: concurrency_limit
+      name: public-admission
+      max_in_flight: 7
+      queue_timeout: 25ms
+      on_reject:
+        status: 503
+      service:
+        type: rate_limit
+        name: public-rate
+        key:
+          source: peer_ip
+        rate:
+          requests: 10
+          per: 1s
+        burst: 20
+        state:
+          max_keys: 100
+          idle_ttl: 1m
+        service:
+          type: respond
+          body:
+            text: allowed
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    service:
+      ref: root
+"#,
+        )
+        .expect("governance explain fixture can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("governance explain fixture compiles"),
+        )
+        .expect("governance explain fixture prepares");
+        let request = ExplainRequestSource {
+            method: "GET".to_owned(),
+            scheme: "http".to_owned(),
+            host: "example.test".to_owned(),
+            path: "/private?token=not-a-label".to_owned(),
+            headers: BTreeMap::new(),
+        };
+
+        let output = explain(&snapshot, None, &request, &config)
+            .await
+            .expect("governed request explains");
+        assert_eq!(output.status, StatusCode::TOO_MANY_REQUESTS.as_u16());
+        let policies = output
+            .trace
+            .iter()
+            .filter(|event| event.event == "policy")
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(policies.len(), 3);
+        assert!(policies.contains(&"max_bytes=4096"));
+        assert!(policies.iter().any(|detail| {
+            detail.contains("name=public-admission")
+                && detail.contains("max_in_flight=7")
+                && detail.contains("queue_timeout=25ms")
+                && detail.contains("reject_status=503")
+        }));
+        assert!(policies.iter().any(|detail| {
+            detail.contains("name=public-rate")
+                && detail.contains("key=peer_ip")
+                && detail.contains("requests=10")
+                && detail.contains("burst=20")
+                && detail.contains("max_keys=100")
+        }));
+        let serialized = serde_json::to_string(&output).expect("Explain output serializes");
+        assert!(!serialized.contains("token=not-a-label"));
+        assert!(
+            compare_expectation(
+                &output,
+                &TestExpectationSource {
+                    service: Some("root".to_owned()),
+                    status: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                    ..TestExpectationSource::default()
+                }
+            )
+            .is_empty()
         );
     }
 

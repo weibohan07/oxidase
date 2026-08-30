@@ -14,7 +14,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use oxidase_config::{Http1Settings, Http2Settings, HttpVersion, ListenerProtocol};
+use oxidase_config::{Http1Settings, Http2Settings, HttpVersion, ListenerLimits, ListenerProtocol};
 use oxidase_core::{
     Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan, TlsConnectionMetadata,
 };
@@ -30,9 +30,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
-use crate::body::{GatewayBody, GatewayBodyPlan, instrument_response_body_with_snapshot};
+use crate::body::{
+    DownstreamTimeoutSignal, GatewayBody, GatewayBodyPlan,
+    instrument_response_body_with_snapshot_timeout, timeout_request_body,
+};
 use crate::cluster_health::ClusterHealthManager;
 use crate::connection::TrackedExecutor;
+use crate::ingress::{ConnectionRequestBudget, IdleIo, ListenerIngressState, RequestAdmission};
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
     ConnectionProtocol, H2Shutdown, ListenerTransportMetrics, Metrics, ProductionObserver, TlsAlpn,
@@ -52,15 +56,37 @@ const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP1_MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_HTTP1_MAX_HEADERS: usize = 100;
 const DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
+const HTTP1_REQUEST_LINE_AND_FRAMING_ALLOWANCE: usize = 1024;
 const MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER: usize = 128;
+const MAX_CONCURRENT_ADMIN_CONNECTIONS: usize = 256;
 
 fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
+    http1_builder_with_limits(
+        header_read_timeout,
+        DEFAULT_HTTP1_MAX_HEADERS,
+        DEFAULT_HTTP1_MAX_HEADER_BYTES,
+    )
+}
+
+fn http1_builder_with_limits(
+    header_read_timeout: Duration,
+    max_headers: usize,
+    max_header_bytes: usize,
+) -> http1::Builder {
+    // Hyper's read buffer includes the request line and delimiter bytes, while
+    // `max_header_bytes` is the decoded Header name/value budget enforced
+    // after parsing. Reserve independent bounded space so a valid long target
+    // cannot silently consume the configured Header allowance.
+    let read_buffer = max_header_bytes
+        .saturating_add(DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES)
+        .saturating_add(max_headers.saturating_mul(4))
+        .saturating_add(HTTP1_REQUEST_LINE_AND_FRAMING_ALLOWANCE);
     let mut builder = http1::Builder::new();
     builder
         .keep_alive(true)
         .timer(TokioTimer::new())
-        .max_headers(DEFAULT_HTTP1_MAX_HEADERS)
-        .max_buf_size(DEFAULT_HTTP1_MAX_HEADER_BYTES)
+        .max_headers(max_headers)
+        .max_buf_size(read_buffer)
         .header_read_timeout(header_read_timeout);
     builder
 }
@@ -805,7 +831,9 @@ async fn run_admin_listener(
     drain_timeout: Duration,
 ) {
     let mut connections = JoinSet::new();
+    let admission = Arc::new(Semaphore::new(MAX_CONCURRENT_ADMIN_CONNECTIONS));
     loop {
+        reap_finished_connections(&mut connections, "admin");
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -818,10 +846,19 @@ async fn run_admin_listener(
                     tracing::error!("admin listener failed while accepting a connection");
                     break;
                 };
+                let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                    tracing::debug!(
+                        limit = MAX_CONCURRENT_ADMIN_CONNECTIONS,
+                        "admin connection admission rejected"
+                    );
+                    drop(stream);
+                    continue;
+                };
                 let store = store.clone();
                 let metrics = metrics.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
+                    let _permit = permit;
                     serve_admin_connection(
                         stream,
                         store,
@@ -986,7 +1023,9 @@ async fn run_listener(
     let mut accept_error = None;
     let transport_metrics = metrics.listener_transport(&listener.name);
     let tls_handshake_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER));
+    let ingress = ListenerIngressState::default();
     loop {
+        reap_finished_connections(&mut connections, "data-plane");
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -1016,6 +1055,18 @@ async fn run_listener(
                         listener.name
                     )));
                     break;
+                };
+                let connection_admission = match ingress.try_admit(peer_address, &plan.limits) {
+                    Ok(admission) => admission,
+                    Err(reason) => {
+                        tracing::debug!(
+                            listener = listener.name,
+                            reason = ?reason,
+                            "listener connection admission rejected"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                 };
                 let tls_handshake_permit = match reserve_tls_handshake(
                     plan.protocol,
@@ -1048,8 +1099,11 @@ async fn run_listener(
                     scheme: "http",
                     tls: TlsConnectionMetadata::default(),
                     tunnel_sender: None,
+                    limits: plan.limits.clone(),
+                    downstream_timeout: DownstreamTimeoutSignal::default(),
                 };
                 connections.spawn(async move {
+                    let _connection_admission = connection_admission;
                     serve_connection(
                         stream,
                         plan,
@@ -1089,6 +1143,14 @@ async fn run_listener(
     }
 }
 
+fn reap_finished_connections(connections: &mut JoinSet<()>, boundary: &'static str) {
+    while let Some(result) = connections.try_join_next() {
+        if let Err(error) = result {
+            tracing::warn!(error = %error, boundary, "connection task failed");
+        }
+    }
+}
+
 fn reserve_tls_handshake(
     protocol: ListenerProtocol,
     gate: &Arc<Semaphore>,
@@ -1119,7 +1181,21 @@ async fn serve_connection(
                 );
                 return;
             };
-            serve_http1_connection(stream, context, settings, shutdown).await;
+            let idle_timeout = context.limits.idle_timeout;
+            let response_body_idle_timeout = context.limits.response_body_idle_timeout;
+            let downstream_timeout = context.downstream_timeout.clone();
+            serve_http1_connection(
+                IdleIo::with_timeout_signal(
+                    stream,
+                    idle_timeout,
+                    response_body_idle_timeout,
+                    downstream_timeout,
+                ),
+                context,
+                settings,
+                shutdown,
+            )
+            .await;
         }
         ListenerProtocol::Https => {
             let Some(tls_handshake_permit) = tls_handshake_permit else {
@@ -1228,7 +1304,21 @@ async fn serve_connection(
                         );
                         return;
                     };
-                    serve_http2_connection(tls_stream, context, settings, shutdown).await;
+                    let idle_timeout = context.limits.idle_timeout;
+                    let response_body_idle_timeout = context.limits.response_body_idle_timeout;
+                    let downstream_timeout = context.downstream_timeout.clone();
+                    serve_http2_connection(
+                        IdleIo::with_timeout_signal(
+                            tls_stream,
+                            idle_timeout,
+                            response_body_idle_timeout,
+                            downstream_timeout,
+                        ),
+                        context,
+                        settings,
+                        shutdown,
+                    )
+                    .await;
                 }
                 NegotiatedHttpProtocol::Http1 => {
                     let Some(settings) = plan.http.http1.clone() else {
@@ -1238,7 +1328,21 @@ async fn serve_connection(
                         );
                         return;
                     };
-                    serve_http1_connection(tls_stream, context, settings, shutdown).await;
+                    let idle_timeout = context.limits.idle_timeout;
+                    let response_body_idle_timeout = context.limits.response_body_idle_timeout;
+                    let downstream_timeout = context.downstream_timeout.clone();
+                    serve_http1_connection(
+                        IdleIo::with_timeout_signal(
+                            tls_stream,
+                            idle_timeout,
+                            response_body_idle_timeout,
+                            downstream_timeout,
+                        ),
+                        context,
+                        settings,
+                        shutdown,
+                    )
+                    .await;
                 }
             }
         }
@@ -1320,6 +1424,8 @@ struct GatewayConnectionContext {
     scheme: &'static str,
     tls: TlsConnectionMetadata,
     tunnel_sender: Option<mpsc::Sender<TunnelPlan>>,
+    limits: ListenerLimits,
+    downstream_timeout: DownstreamTimeoutSignal,
 }
 
 async fn serve_http1_connection<Io>(
@@ -1336,10 +1442,24 @@ async fn serve_http1_connection<Io>(
     let (tunnel_sender, mut tunnel_receiver) = mpsc::channel(1);
     let mut service_context = context.clone();
     service_context.tunnel_sender = Some(tunnel_sender);
-    let service = service_fn(move |request| handle_request(request, service_context.clone()));
-    let connection = http1_builder(settings.header_read_timeout)
-        .serve_connection(TokioIo::new(io), service)
-        .with_upgrades();
+    let request_budget = Arc::new(ConnectionRequestBudget::new(
+        context.limits.max_requests_per_connection,
+    ));
+    let service = service_fn(move |request| {
+        serve_bounded_request(
+            request,
+            service_context.clone(),
+            request_budget.try_begin(),
+            WireProtocol::Http1,
+        )
+    });
+    let connection = http1_builder_with_limits(
+        settings.header_read_timeout,
+        context.limits.max_headers as usize,
+        context.limits.max_header_bytes as usize,
+    )
+    .serve_connection(TokioIo::new(io), service)
+    .with_upgrades();
     tokio::pin!(connection);
     let result = tokio::select! {
         result = &mut connection => result,
@@ -1401,20 +1521,50 @@ async fn serve_http2_connection<Io>(
         .connection_accepted(ConnectionProtocol::Http2);
     let executor = TrackedExecutor::new(context.transport_metrics.clone());
     let mut builder = http2::Builder::new(executor);
+    let max_header_list_size = settings
+        .max_header_list_size
+        .min(context.limits.max_header_bytes);
     builder
         .timer(TokioTimer::new())
         .max_concurrent_streams(Some(settings.max_concurrent_streams))
-        .max_header_list_size(settings.max_header_list_size)
+        .max_header_list_size(max_header_list_size)
         .keep_alive_interval(Some(settings.keep_alive_interval))
         .keep_alive_timeout(settings.keep_alive_timeout);
     let service_context = context.clone();
-    let service = service_fn(move |request| handle_request(request, service_context.clone()));
+    let request_budget = Arc::new(ConnectionRequestBudget::new(
+        context.limits.max_requests_per_connection,
+    ));
+    let (request_limit, mut request_limit_reached) = watch::channel(false);
+    let service = service_fn(move |request| {
+        let admission = request_budget.try_begin();
+        if admission == RequestAdmission::LastAllowed {
+            let _ = request_limit.send(true);
+        }
+        serve_bounded_request(
+            request,
+            service_context.clone(),
+            admission,
+            WireProtocol::Http2,
+        )
+    });
     let connection = builder.serve_connection(TokioIo::new(io), service);
     tokio::pin!(connection);
     let mut drain = H2DrainObservation::new(context.transport_metrics.clone());
     let result = tokio::select! {
         result = &mut connection => result,
         () = wait_for_shutdown(&mut shutdown) => {
+            drain.started = true;
+            connection.as_mut().graceful_shutdown();
+            let result = connection.await;
+            if result.is_ok() {
+                drain.completed = true;
+                context
+                    .transport_metrics
+                    .record_h2_shutdown(H2Shutdown::Graceful);
+            }
+            result
+        }
+        () = wait_for_shutdown(&mut request_limit_reached) => {
             drain.started = true;
             connection.as_mut().graceful_shutdown();
             let result = connection.await;
@@ -1475,6 +1625,43 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn serve_bounded_request(
+    request: Request<Incoming>,
+    context: GatewayConnectionContext,
+    admission: RequestAdmission,
+    protocol: WireProtocol,
+) -> Result<Response<GatewayBody>, Infallible> {
+    if admission == RequestAdmission::Rejected {
+        let method = request.method().clone();
+        drop(request);
+        let mut response = safe_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Connection Request Limit Reached",
+            &method,
+        );
+        if protocol == WireProtocol::Http1 {
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
+        return Ok(response);
+    }
+
+    let mut response = handle_request(request, context).await?;
+    if admission == RequestAdmission::LastAllowed
+        && protocol == WireProtocol::Http1
+        && response.status() != StatusCode::SWITCHING_PROTOCOLS
+    {
+        // This is server-owned connection control applied after the root
+        // ResponseFinalizer. It cannot be constructed by Gateway or Oxista
+        // source and causes Hyper to retire the connection after this response.
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    Ok(response)
+}
+
 async fn handle_request(
     mut request: Request<Incoming>,
     context: GatewayConnectionContext,
@@ -1489,6 +1676,8 @@ async fn handle_request(
         scheme,
         tls,
         tunnel_sender,
+        limits,
+        downstream_timeout,
     } = context;
     let active_request = metrics.request_started();
     let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1513,11 +1702,13 @@ async fn handle_request(
             "Internal Server Error",
             request.method(),
         );
-        return Ok(instrument_response_body_with_snapshot(
+        return Ok(instrument_response_body_with_snapshot_timeout(
             response,
             metrics,
             active_request,
             Some(snapshot),
+            Some(limits.response_body_idle_timeout),
+            Some(downstream_timeout.clone()),
         ));
     };
 
@@ -1534,11 +1725,13 @@ async fn handle_request(
             tracing::debug!(request_id, error = %error, "request trailer declaration is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
             let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
-            return Ok(instrument_response_body_with_snapshot(
+            return Ok(instrument_response_body_with_snapshot_timeout(
                 response,
                 metrics,
                 active_request,
                 Some(snapshot),
+                Some(limits.response_body_idle_timeout),
+                Some(downstream_timeout.clone()),
             ));
         }
     };
@@ -1549,17 +1742,19 @@ async fn handle_request(
             tracing::debug!(request_id, error = %error, "HTTP Upgrade request is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
             let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
-            return Ok(instrument_response_body_with_snapshot(
+            return Ok(instrument_response_body_with_snapshot_timeout(
                 response,
                 metrics,
                 active_request,
                 Some(snapshot),
+                Some(limits.response_body_idle_timeout),
+                Some(downstream_timeout.clone()),
             ));
         }
     };
     let (mut parts, body) = request.into_parts();
-    if wire_protocol == WireProtocol::Http1
-        && decoded_header_bytes(&parts.headers) > DEFAULT_HTTP1_MAX_HEADER_BYTES
+    if parts.headers.iter().count() > limits.max_headers as usize
+        || decoded_header_bytes(&parts.headers) > limits.max_header_bytes as usize
     {
         metrics.record_request(
             "failed",
@@ -1571,11 +1766,13 @@ async fn handle_request(
             "Request Header Fields Too Large",
             &request_method,
         );
-        return Ok(instrument_response_body_with_snapshot(
+        return Ok(instrument_response_body_with_snapshot_timeout(
             response,
             metrics,
             active_request,
             Some(snapshot),
+            Some(limits.response_body_idle_timeout),
+            Some(downstream_timeout.clone()),
         ));
     }
     if wire_protocol == WireProtocol::Http1
@@ -1583,11 +1780,13 @@ async fn handle_request(
     {
         metrics.record_request("failed", StatusCode::URI_TOO_LONG, started.elapsed());
         let response = safe_response(StatusCode::URI_TOO_LONG, "URI Too Long", &request_method);
-        return Ok(instrument_response_body_with_snapshot(
+        return Ok(instrument_response_body_with_snapshot_timeout(
             response,
             metrics,
             active_request,
             Some(snapshot),
+            Some(limits.response_body_idle_timeout),
+            Some(downstream_timeout.clone()),
         ));
     }
     let authority = match normalize_ingress_authority(&mut parts) {
@@ -1596,11 +1795,13 @@ async fn handle_request(
             tracing::warn!(request_id, error, "request authority is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
             let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
-            return Ok(instrument_response_body_with_snapshot(
+            return Ok(instrument_response_body_with_snapshot_timeout(
                 response,
                 metrics,
                 active_request,
                 Some(snapshot),
+                Some(limits.response_body_idle_timeout),
+                Some(downstream_timeout.clone()),
             ));
         }
     };
@@ -1620,24 +1821,26 @@ async fn handle_request(
             tracing::warn!(request_id, error = %error, "request metadata is invalid");
             metrics.record_request("failed", StatusCode::BAD_REQUEST, started.elapsed());
             let response = safe_response(StatusCode::BAD_REQUEST, "Bad Request", &request_method);
-            return Ok(instrument_response_body_with_snapshot(
+            return Ok(instrument_response_body_with_snapshot_timeout(
                 response,
                 metrics,
                 active_request,
                 Some(snapshot),
+                Some(limits.response_body_idle_timeout),
+                Some(downstream_timeout.clone()),
             ));
         }
     };
     metadata.peer_address = Some(peer_address);
     metadata.http_version = parts.version;
     metadata.tls = tls;
-    let leaves = HyperLeaves::new(snapshot.clone(), proxy);
+    let leaves = HyperLeaves::new(snapshot.clone(), proxy, Arc::clone(&metrics));
     let observer = ProductionObserver::new(&metrics, &config_version, &listener_name, request_id);
     let report = Executor::new(&program, &leaves)
         .execute_observed(
             RequestFrame::new(metadata),
             Some(GatewayRequestPayload::new(
-                body,
+                timeout_request_body(body, limits.request_body_idle_timeout),
                 pending_upgrade,
                 request_trailer_guard,
             )),
@@ -1732,11 +1935,13 @@ async fn handle_request(
         "request complete"
     );
     metrics.record_request(outcome, status, started.elapsed());
-    Ok(instrument_response_body_with_snapshot(
+    Ok(instrument_response_body_with_snapshot_timeout(
         response,
         metrics,
         active_request,
         Some(snapshot),
+        Some(limits.response_body_idle_timeout),
+        Some(downstream_timeout),
     ))
 }
 
@@ -2004,10 +2209,10 @@ mod tests {
     use tokio::sync::{Notify, Semaphore, oneshot, watch};
 
     use super::{
-        AlpnSelectionError, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, GatewayConnectionContext,
-        GatewayServer, H2DrainObservation, NegotiatedHttpProtocol, ProxyClient, ServerError,
-        http1_builder, reserve_tls_handshake, safe_error_body, select_https_protocol,
-        serve_http2_connection, tls_accept_error_outcome,
+        AlpnSelectionError, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DownstreamTimeoutSignal,
+        GatewayConnectionContext, GatewayServer, H2DrainObservation, NegotiatedHttpProtocol,
+        ProxyClient, ServerError, http1_builder, reap_finished_connections, reserve_tls_handshake,
+        safe_error_body, select_https_protocol, serve_http2_connection, tls_accept_error_outcome,
     };
     use crate::metrics::{Metrics, TlsHandshakeOutcome};
 
@@ -2042,6 +2247,21 @@ mod tests {
             safe_error_body(StatusCode::INTERNAL_SERVER_ERROR),
             "Internal Server Error"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_connection_tasks_are_reaped_during_sustained_churn() {
+        let mut connections = tokio::task::JoinSet::new();
+        for _ in 0..2_000 {
+            connections.spawn(async {});
+            tokio::task::yield_now().await;
+            reap_finished_connections(&mut connections, "test");
+            assert!(
+                connections.len() <= 1,
+                "completed connection tasks must not accumulate behind a ready accept loop"
+            );
+        }
+        while connections.join_next().await.is_some() {}
     }
 
     async fn request(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
@@ -2423,6 +2643,16 @@ listeners:
         write_respond_gateway_at(path, body, "127.0.0.1:0", extra_listener);
     }
 
+    fn write_limited_respond_gateway(path: &std::path::Path, limits: &str) {
+        fs::write(
+            path,
+            format!(
+                "api_version: oxidase.dev/v1alpha1\nkind: gateway\nservices:\n  root:\n    type: respond\n    body:\n      text: ok\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    limits:\n{limits}\n    service:\n      ref: root\n"
+            ),
+        )
+        .expect("limited gateway config can be written");
+    }
+
     fn write_respond_gateway_at(
         path: &std::path::Path,
         body: &str,
@@ -2497,6 +2727,11 @@ listeners:
         metrics: Arc<Metrics>,
     ) -> GatewayConnectionContext {
         let transport_metrics = metrics.listener_transport("test");
+        let limits = snapshot
+            .prepared_listener_for("test")
+            .expect("test listener has a prepared plan")
+            .limits
+            .clone();
         GatewayConnectionContext {
             peer_address: "127.0.0.1:43123"
                 .parse()
@@ -2514,6 +2749,8 @@ listeners:
                 version: Some("TLS1.3".to_owned()),
             },
             tunnel_sender: None,
+            limits,
+            downstream_timeout: DownstreamTimeoutSignal::default(),
         }
     }
 
@@ -2620,6 +2857,261 @@ listeners:
             "{metrics}"
         );
         running.shutdown().await.expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn listener_connection_limit_rejects_excess_and_releases_on_disconnect() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_limited_respond_gateway(
+            &config,
+            "      max_connections: 1\n      max_connections_per_ip: 1\n      idle_timeout: 5s",
+        );
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("limited config compiles"),
+        )
+        .expect("limited snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("limited gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let first = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("first socket connects");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let excess = raw_request_allow_disconnect(
+            address,
+            "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !excess.contains("200 OK"),
+            "an excess socket must not execute the Service graph: {excess}"
+        );
+
+        drop(first);
+        let recovered = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let response = request(address, "/", "").await;
+                if response.starts_with("HTTP/1.1 200 OK") {
+                    break response;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect releases listener and peer accounting");
+        assert!(recovered.ends_with("ok"));
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn listener_idle_timeout_closes_a_quiet_keep_alive_socket() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_limited_respond_gateway(
+            &config,
+            "      max_connections: 4\n      max_connections_per_ip: 4\n      idle_timeout: 40ms",
+        );
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("idle timeout config compiles"),
+        )
+        .expect("idle timeout snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("idle timeout gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("quiet socket connects");
+        let mut bytes = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(1), socket.read_to_end(&mut bytes))
+            .await
+            .expect("idle timeout closes the socket");
+        if let Err(error) = result {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected idle close error: {error}"
+            );
+        }
+        assert!(bytes.is_empty());
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn slow_downstream_write_is_reported_as_a_body_timeout() {
+        let directory = tempdir().expect("temporary directory is available");
+        let site = directory.path().join("site");
+        fs::create_dir_all(&site).expect("site directory can be created");
+        fs::write(site.join("site.oxsite"), "oxista: site/v1\n")
+            .expect("site manifest can be written");
+        fs::File::create(site.join("large.bin"))
+            .expect("large sparse asset can be created")
+            .set_len(32 * 1024 * 1024)
+            .expect("large sparse asset length can be set");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  sites:
+    web:
+      root: site
+services:
+  root:
+    type: site
+    site: web
+listeners:
+  - name: test
+    bind: 127.0.0.1:0
+    limits:
+      idle_timeout: 5s
+      response_body_idle_timeout: 40ms
+    service:
+      ref: root
+"#,
+        )
+        .expect("slow-client gateway config can be written");
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("slow-client config compiles"),
+        )
+        .expect("slow-client snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("slow-client gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind is valid"))
+            .await
+            .expect("admin listener binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin address is available");
+
+        let socket = tokio::net::TcpSocket::new_v4().expect("client socket is available");
+        socket
+            .set_recv_buffer_size(1_024)
+            .expect("client receive buffer can be bounded");
+        let mut client = socket.connect(address).await.expect("slow client connects");
+        client
+            .write_all(
+                b"GET /large.bin HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("slow-client request can be written");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let metrics = request(admin, "/metrics", "").await;
+                if metrics
+                    .contains("oxidase_response_body_terminations_total{reason=\"timeout\"} 1")
+                {
+                    assert!(metrics.contains("oxidase_active_requests 0"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("write backpressure reaches the configured body timeout");
+
+        drop(client);
+        running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn http1_request_count_and_header_limits_prevent_extra_service_execution() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_limited_respond_gateway(
+            &config,
+            "      max_headers: 3\n      max_header_bytes: 8KiB\n      max_requests_per_connection: 2",
+        );
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("HTTP/1 limits config compiles"),
+        )
+        .expect("HTTP/1 limits snapshot prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("HTTP/1 limits gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+
+        let pipelined = raw_request(
+            address,
+            concat!(
+                "GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                "GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                "GET /three HTTP/1.1\r\nHost: example.test\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            pipelined.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "{pipelined}"
+        );
+        assert!(
+            pipelined.to_ascii_lowercase().contains("connection: close"),
+            "{pipelined}"
+        );
+
+        let too_many_headers = raw_request_allow_disconnect(
+            address,
+            "GET / HTTP/1.1\r\nHost: example.test\r\nX-One: 1\r\nX-Two: 2\r\nX-Three: 3\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !too_many_headers.contains("200 OK"),
+            "header-count overflow must not execute the Service graph: {too_many_headers}"
+        );
+
+        let oversized_value = "a".repeat(9 * 1024);
+        let oversized = raw_request_allow_disconnect(
+            address,
+            &format!("GET / HTTP/1.1\r\nHost: example.test\r\nX-Large: {oversized_value}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            !oversized.contains("200 OK"),
+            "header-byte overflow must not execute the Service graph: {oversized}"
+        );
+
+        let long_target = format!("/{}", "p".repeat(7_000));
+        let large_but_valid_header = "a".repeat(7_000);
+        let independent_budgets = raw_request(
+            address,
+            &format!(
+                "GET {long_target} HTTP/1.1\r\nHost: example.test\r\nX-Large: {large_but_valid_header}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            independent_budgets.contains("HTTP/1.1 200 OK"),
+            "request-target bytes must not consume the decoded Header budget: {independent_budgets}"
+        );
+
+        let target_over_limit = format!("/{}", "p".repeat(8 * 1_024));
+        let target_rejection = raw_request(
+            address,
+            &format!(
+                "GET {target_over_limit} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            target_rejection.contains("HTTP/1.1 414 URI Too Long"),
+            "the independent request-target limit remains explicit: {target_rejection}"
+        );
+
+        running.shutdown().await.expect("gateway shuts down");
     }
 
     #[tokio::test]
@@ -2928,6 +3420,83 @@ listeners:
             tls_accept_error_outcome(&error, false),
             TlsHandshakeOutcome::Protocol
         );
+    }
+
+    #[tokio::test]
+    async fn http2_request_and_header_limits_apply_before_service_execution() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        write_respond_gateway(&config, "ok", None);
+        let snapshot = RuntimeSnapshot::prepare(
+            Compiler::compile_path(&config).expect("fixture config compiles"),
+        )
+        .expect("fixture snapshot prepares");
+        let metrics = Arc::new(Metrics::default());
+        let mut context = h2_connection_context(snapshot, metrics);
+        context.limits.max_requests_per_connection = 2;
+        context.limits.max_headers = 1;
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (shutdown, receiver) = watch::channel(false);
+        let server_task = tokio::spawn(serve_http2_connection(
+            server_io,
+            context,
+            h2_settings(),
+            receiver,
+        ));
+        let (mut sender, client_connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                .await
+                .expect("HTTP/2 client handshake succeeds");
+        let client_task = tokio::spawn(client_connection);
+
+        let too_many_headers = Request::builder()
+            .version(Version::HTTP_2)
+            .uri("https://example.test/headers")
+            .header("x-one", "1")
+            .header("x-two", "2")
+            .body(Empty::new())
+            .expect("header overflow request is valid");
+        let response = sender
+            .send_request(too_many_headers)
+            .await
+            .expect("header overflow receives a response");
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("header overflow response body is readable");
+
+        let response = sender
+            .send_request(h2_request("/allowed"))
+            .await
+            .expect("last allowed stream receives a response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("last allowed response body is readable")
+                .to_bytes(),
+            Bytes::from_static(b"ok")
+        );
+        wait_for_h2_goaway(&mut sender).await;
+
+        drop(sender);
+        let _ = shutdown.send(true);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("limited HTTP/2 server finishes")
+            .expect("limited HTTP/2 server task joins");
+        tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
+            .expect("limited HTTP/2 client finishes")
+            .expect("limited HTTP/2 client task joins")
+            .expect("limited HTTP/2 client connection closes cleanly");
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@ impl LeafExecutor<(), Bytes> for NoLeaves {
         _cluster: &'a ResourceId,
         _request: &'a RequestFrame,
         _body: &'a mut Option<()>,
+        _max_request_body_bytes: Option<u64>,
     ) -> BoxLeafFuture<'a, Bytes> {
         Box::pin(async { ServiceOutcome::Handled(ResponseHead::new(StatusCode::OK, Bytes::new())) })
     }

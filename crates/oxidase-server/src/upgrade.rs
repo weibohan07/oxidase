@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
-use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use oxidase_runtime::{ClusterRequestPermit, PreparedCluster, RuntimeSnapshot};
+use oxidase_runtime::{ClusterRequestPermit, ConcurrencyPermit, PreparedCluster, RuntimeSnapshot};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::body::GatewayRequestBody;
 use crate::protocol::RequestTrailerGuard;
 
 /// A validated, normalized HTTP Upgrade protocol identifier.
@@ -90,14 +90,14 @@ impl UpgradeCandidate {
 /// Keeping the upgrade capability next to the one-shot incoming body prevents
 /// fallback or a non-Proxy Service from recreating it from ordinary headers.
 pub(crate) struct GatewayRequestPayload {
-    body: Incoming,
+    body: GatewayRequestBody,
     upgrade: Option<PendingUpgrade>,
     trailer_guard: RequestTrailerGuard,
 }
 
 impl GatewayRequestPayload {
     pub(crate) fn new(
-        body: Incoming,
+        body: GatewayRequestBody,
         upgrade: Option<PendingUpgrade>,
         trailer_guard: RequestTrailerGuard,
     ) -> Self {
@@ -108,7 +108,13 @@ impl GatewayRequestPayload {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Incoming, Option<PendingUpgrade>, RequestTrailerGuard) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GatewayRequestBody,
+        Option<PendingUpgrade>,
+        RequestTrailerGuard,
+    ) {
         (self.body, self.upgrade, self.trailer_guard)
     }
 }
@@ -175,6 +181,7 @@ impl TrustedUpgrade {
             upstream,
             snapshot: self.snapshot,
             cluster_lease: None,
+            concurrency_permits: Vec::new(),
         })
     }
 }
@@ -196,6 +203,7 @@ pub struct TunnelPlan {
     upstream: OnUpgrade,
     snapshot: Arc<RuntimeSnapshot>,
     cluster_lease: Option<TunnelClusterLease>,
+    concurrency_permits: Vec<ConcurrencyPermit>,
 }
 
 impl TunnelPlan {
@@ -217,6 +225,11 @@ impl TunnelPlan {
         self
     }
 
+    pub(crate) fn retain_concurrency_permit(mut self, permit: ConcurrencyPermit) -> Self {
+        self.concurrency_permits.push(permit);
+        self
+    }
+
     /// Waits for both Hyper state machines to yield their upgraded transports,
     /// then pumps bytes in both directions without spawning a detached task.
     ///
@@ -229,6 +242,7 @@ impl TunnelPlan {
             upstream,
             snapshot: _snapshot,
             cluster_lease,
+            concurrency_permits: _concurrency_permits,
         } = self;
         let upgrades = tokio::try_join!(
             async {

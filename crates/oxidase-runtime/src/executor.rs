@@ -2,14 +2,21 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use oxidase_core::{
-    BodyState, CompiledMetadata, ErrorClass, HeaderTransforms, RequestFrame, RequestMetadataError,
-    RequestTransform, ResourceId, RespondBody, ResponseHead, ResponseTransform, RouteId,
-    ServiceError, ServiceId, ServiceKind, ServiceOutcome, ServiceProgram, SourceSpan, Value,
-    parse_transform_authority, parse_transform_path_and_query, parse_transform_scheme,
+    BodyState, CompiledMetadata, ErrorClass, HeaderTransforms, RateLimitKey, RequestFrame,
+    RequestMetadataError, RequestTransform, ResourceId, RespondBody, ResponseHead,
+    ResponseTransform, RouteId, ServiceError, ServiceId, ServiceKind, ServiceOutcome,
+    ServiceProgram, SourceSpan, Value, parse_transform_authority, parse_transform_path_and_query,
+    parse_transform_scheme,
+};
+
+use crate::governance::{
+    ConcurrencyPermit, ConcurrencyRejection, GovernanceRegistry, RateLimitDecision,
+    RateLimitRejection,
 };
 
 pub type BoxLeafFuture<'a, B> = Pin<Box<dyn Future<Output = ServiceOutcome<B>> + Send + 'a>>;
@@ -31,7 +38,22 @@ pub trait LeafExecutor<RequestBody, ResponseBody>: Send + Sync {
         cluster: &'a ResourceId,
         request: &'a RequestFrame,
         body: &'a mut Option<RequestBody>,
+        max_request_body_bytes: Option<u64>,
     ) -> BoxLeafFuture<'a, ResponseBody>;
+
+    fn governance(&self) -> Option<&GovernanceRegistry> {
+        None
+    }
+
+    fn retain_concurrency_permit(
+        &self,
+        body: ResponseBody,
+        _permit: ConcurrencyPermit,
+    ) -> ResponseBody {
+        body
+    }
+
+    fn record_governance_result(&self, _kind: &'static str, _name: &str, _result: &'static str) {}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +84,24 @@ pub enum TraceDetail<'a> {
         count: u32,
         budget: u32,
     },
+    RequestBodyLimit {
+        max_bytes: u64,
+    },
+    ConcurrencyLimit {
+        name: &'a str,
+        max_in_flight: u32,
+        queue_timeout: Duration,
+        reject_status: StatusCode,
+    },
+    RateLimit {
+        name: &'a str,
+        key: &'a RateLimitKey,
+        requests: u64,
+        per: Duration,
+        burst: u64,
+        max_keys: u32,
+        idle_ttl: Duration,
+    },
 }
 
 impl fmt::Display for TraceDetail<'_> {
@@ -77,6 +117,37 @@ impl fmt::Display for TraceDetail<'_> {
                 count,
                 budget,
             } => write!(formatter, "{target} ({count}/{budget})"),
+            Self::RequestBodyLimit { max_bytes } => {
+                write!(formatter, "max_bytes={max_bytes}")
+            }
+            Self::ConcurrencyLimit {
+                name,
+                max_in_flight,
+                queue_timeout,
+                reject_status,
+            } => write!(
+                formatter,
+                "name={name} max_in_flight={max_in_flight} queue_timeout={queue_timeout:?} reject_status={}",
+                reject_status.as_u16()
+            ),
+            Self::RateLimit {
+                name,
+                key,
+                requests,
+                per,
+                burst,
+                max_keys,
+                idle_ttl,
+            } => {
+                let key = match key {
+                    RateLimitKey::PeerIp => "peer_ip".to_owned(),
+                    RateLimitKey::Binding(binding) => format!("binding:{binding}"),
+                };
+                write!(
+                    formatter,
+                    "name={name} key={key} requests={requests} per={per:?} burst={burst} max_keys={max_keys} idle_ttl={idle_ttl:?}"
+                )
+            }
         }
     }
 }
@@ -335,7 +406,7 @@ where
             observer,
         };
         let outcome = self
-            .execute_node(&self.program.entry, request, &mut execution, 0)
+            .execute_node(&self.program.entry, request, &mut execution, 0, None)
             .await;
         ExecutionReport {
             outcome,
@@ -350,6 +421,7 @@ where
         request: RequestFrame,
         execution: &'b mut ExecutionContext<'_, RequestBody, Sink, Observer>,
         observation_depth: usize,
+        request_body_limit: Option<u64>,
     ) -> BoxLeafFuture<'b, ResponseBody>
     where
         Sink: TraceSink + 'b,
@@ -416,7 +488,12 @@ where
                         // partially consumed stream appear replayable.
                         execution.state.body_state = BodyState::Consumed;
                         self.leaves
-                            .execute_proxy(cluster, &request, &mut execution.body)
+                            .execute_proxy(
+                                cluster,
+                                &request,
+                                &mut execution.body,
+                                request_body_limit,
+                            )
                             .await
                     }
                 }
@@ -429,7 +506,13 @@ where
                     match apply_request_transform(request_transform, &mut child_request) {
                         Ok(()) => {
                             let outcome = self
-                                .execute_node(service, child_request, execution, observation_depth)
+                                .execute_node(
+                                    service,
+                                    child_request,
+                                    execution,
+                                    observation_depth,
+                                    request_body_limit,
+                                )
                                 .await;
                             apply_response_transform(outcome, response_transform, &request)
                         }
@@ -451,7 +534,13 @@ where
                             }),
                     );
                     let outcome = self
-                        .execute_node(service, request, execution, observation_depth + 1)
+                        .execute_node(
+                            service,
+                            request,
+                            execution,
+                            observation_depth + 1,
+                            request_body_limit,
+                        )
                         .await;
                     observation.finish(ServiceObservationResult {
                         outcome: observation_outcome(&outcome),
@@ -467,7 +556,13 @@ where
                 ServiceKind::Timeout { duration, service } => {
                     match tokio::time::timeout(
                         *duration,
-                        self.execute_node(service, request, execution, observation_depth),
+                        self.execute_node(
+                            service,
+                            request,
+                            execution,
+                            observation_depth,
+                            request_body_limit,
+                        ),
                     )
                     .await
                     {
@@ -478,9 +573,208 @@ where
                         )),
                     }
                 }
+                ServiceKind::RequestBodyLimit { max_bytes, service } => {
+                    execution.trace.record(
+                        id,
+                        None,
+                        "policy",
+                        TraceDetail::RequestBodyLimit {
+                            max_bytes: *max_bytes,
+                        },
+                    );
+                    let effective_limit =
+                        request_body_limit.map_or(*max_bytes, |current| current.min(*max_bytes));
+                    if request_content_length(&request)
+                        .is_some_and(|length| length > effective_limit)
+                    {
+                        self.leaves.record_governance_result(
+                            "request_body_limit",
+                            id.as_str(),
+                            "rejected",
+                        );
+                        rejection_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            self.leaves
+                                .body_from_bytes(Bytes::from_static(b"Payload Too Large")),
+                        )
+                    } else {
+                        self.leaves.record_governance_result(
+                            "request_body_limit",
+                            id.as_str(),
+                            "evaluated",
+                        );
+                        self.execute_node(
+                            service,
+                            request,
+                            execution,
+                            observation_depth,
+                            Some(effective_limit),
+                        )
+                        .await
+                    }
+                }
+                ServiceKind::ConcurrencyLimit {
+                    name,
+                    max_in_flight,
+                    queue_timeout,
+                    reject_status,
+                    service,
+                } => {
+                    execution.trace.record(
+                        id,
+                        None,
+                        "policy",
+                        TraceDetail::ConcurrencyLimit {
+                            name,
+                            max_in_flight: *max_in_flight,
+                            queue_timeout: *queue_timeout,
+                            reject_status: *reject_status,
+                        },
+                    );
+                    let admission = if let Some(governance) = self.leaves.governance() {
+                        governance
+                            .acquire_concurrency(id, *max_in_flight, *queue_timeout)
+                            .await
+                    } else {
+                        Ok(ConcurrencyPermit::untracked())
+                    };
+                    match admission {
+                        Ok(permit) => {
+                            self.leaves.record_governance_result(
+                                "concurrency_limit",
+                                name,
+                                "admitted",
+                            );
+                            let outcome = self
+                                .execute_node(
+                                    service,
+                                    request,
+                                    execution,
+                                    observation_depth,
+                                    request_body_limit,
+                                )
+                                .await;
+                            match outcome {
+                                ServiceOutcome::Handled(mut response) => {
+                                    response.body = self
+                                        .leaves
+                                        .retain_concurrency_permit(response.body, permit);
+                                    ServiceOutcome::Handled(response)
+                                }
+                                ServiceOutcome::Declined => ServiceOutcome::Declined,
+                                ServiceOutcome::Failed(error) => ServiceOutcome::Failed(error),
+                            }
+                        }
+                        Err(ConcurrencyRejection::MissingState) => {
+                            ServiceOutcome::Failed(ServiceError::new(
+                                ErrorClass::InvalidState,
+                                format!("concurrency state for `{id}` is missing"),
+                            ))
+                        }
+                        Err(rejection) => {
+                            self.leaves.record_governance_result(
+                                "concurrency_limit",
+                                name,
+                                rejection.as_str(),
+                            );
+                            rejection_response(
+                                *reject_status,
+                                self.leaves.body_from_bytes(Bytes::copy_from_slice(
+                                    reject_status
+                                        .canonical_reason()
+                                        .unwrap_or("Request Rejected")
+                                        .as_bytes(),
+                                )),
+                            )
+                        }
+                    }
+                }
+                ServiceKind::RateLimit {
+                    name,
+                    key,
+                    requests,
+                    per,
+                    burst,
+                    max_keys,
+                    idle_ttl,
+                    service,
+                } => {
+                    execution.trace.record(
+                        id,
+                        None,
+                        "policy",
+                        TraceDetail::RateLimit {
+                            name,
+                            key,
+                            requests: *requests,
+                            per: *per,
+                            burst: *burst,
+                            max_keys: *max_keys,
+                            idle_ttl: *idle_ttl,
+                        },
+                    );
+                    let decision =
+                        self.leaves
+                            .governance()
+                            .map_or(RateLimitDecision::Allowed, |governance| {
+                                governance.check_rate_limit(id, &request, std::time::Instant::now())
+                            });
+                    match decision {
+                        RateLimitDecision::Allowed => {
+                            self.leaves
+                                .record_governance_result("rate_limit", name, "admitted");
+                            self.execute_node(
+                                service,
+                                request,
+                                execution,
+                                observation_depth,
+                                request_body_limit,
+                            )
+                            .await
+                        }
+                        RateLimitDecision::Rejected {
+                            reason: RateLimitRejection::MissingState,
+                            ..
+                        } => ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::InvalidState,
+                            format!("rate-limit state for `{id}` is missing"),
+                        )),
+                        RateLimitDecision::Rejected {
+                            retry_after,
+                            reason,
+                        } => {
+                            self.leaves.record_governance_result(
+                                "rate_limit",
+                                name,
+                                reason.as_str(),
+                            );
+                            let mut response = ResponseHead::new(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                self.leaves
+                                    .body_from_bytes(Bytes::from_static(b"Too Many Requests")),
+                            );
+                            let seconds = retry_after
+                                .as_secs()
+                                .saturating_add(u64::from(retry_after.subsec_nanos() != 0))
+                                .max(1);
+                            response.headers.insert(
+                                header::RETRY_AFTER,
+                                HeaderValue::from_str(&seconds.to_string())
+                                    .expect("u64 seconds form a valid Retry-After value"),
+                            );
+                            ServiceOutcome::Handled(response)
+                        }
+                    }
+                }
                 ServiceKind::Recover { service, handlers } => {
                     let outcome = self
-                        .execute_node(service, request.clone(), execution, observation_depth)
+                        .execute_node(
+                            service,
+                            request.clone(),
+                            execution,
+                            observation_depth,
+                            request_body_limit,
+                        )
                         .await;
                     if let ServiceOutcome::Failed(error) = outcome {
                         if let Some(handler) = handlers
@@ -510,6 +804,7 @@ where
                                 request.with_bindings(bindings),
                                 execution,
                                 observation_depth,
+                                request_body_limit,
                             )
                             .await
                         } else {
@@ -553,6 +848,7 @@ where
                             request.with_bindings(bindings),
                             execution,
                             observation_depth,
+                            request_body_limit,
                         )
                         .await
                     } else if let Some(default) = default {
@@ -562,8 +858,14 @@ where
                             "route_default",
                             TraceDetail::Service(default),
                         );
-                        self.execute_node(default, request, execution, observation_depth)
-                            .await
+                        self.execute_node(
+                            default,
+                            request,
+                            execution,
+                            observation_depth,
+                            request_body_limit,
+                        )
+                        .await
                     } else {
                         ServiceOutcome::Declined
                     }
@@ -573,7 +875,13 @@ where
                     for service in services {
                         let body_before = execution.state.body_state;
                         outcome = self
-                            .execute_node(service, request.clone(), execution, observation_depth)
+                            .execute_node(
+                                service,
+                                request.clone(),
+                                execution,
+                                observation_depth,
+                                request_body_limit,
+                            )
                             .await;
                         if matches!(outcome, ServiceOutcome::Declined) {
                             if execution.state.body_state != body_before {
@@ -615,8 +923,14 @@ where
                                 budget: *budget,
                             },
                         );
-                        self.execute_node(target, request, execution, observation_depth)
-                            .await
+                        self.execute_node(
+                            target,
+                            request,
+                            execution,
+                            observation_depth,
+                            request_body_limit,
+                        )
+                        .await
                     }
                 }
             };
@@ -670,6 +984,21 @@ where
             Err(error) => ServiceOutcome::Failed(error),
         }
     }
+}
+
+fn request_content_length(request: &RequestFrame) -> Option<u64> {
+    request
+        .effective_headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn rejection_response<ResponseBody>(
+    status: StatusCode,
+    body: ResponseBody,
+) -> ServiceOutcome<ResponseBody> {
+    ServiceOutcome::Handled(ResponseHead::new(status, body))
 }
 
 fn observation_outcome<ResponseBody>(
@@ -848,20 +1177,22 @@ struct ExecutionState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
     use std::fs;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use bytes::Bytes;
     use http::{HeaderMap, HeaderName, Method, StatusCode};
     use oxidase_config::Compiler;
     use oxidase_core::{
         CompiledMetadata, CompiledTemplate, ErrorClass, HeaderTransform, HeaderTransforms,
-        PredicatePlan, RecoverHandler, RequestFrame, RequestMetadata, RequestTransform,
-        RespondBody, ResponseHead, ResponseTransform, RouteCase, RouteId, ServiceId, ServiceKind,
-        ServiceNode, ServiceOutcome, ServiceProgram, SourceSpan, parse_transform_path_and_query,
+        PredicatePlan, RateLimitKey, RecoverHandler, RequestFrame, RequestMetadata,
+        RequestTransform, RespondBody, ResponseHead, ResponseTransform, RouteCase, RouteId,
+        ServiceId, ServiceKind, ServiceNode, ServiceOutcome, ServiceProgram, SourceSpan, Value,
+        parse_transform_path_and_query,
     };
     use tempfile::tempdir;
 
@@ -869,11 +1200,13 @@ mod tests {
         BoxLeafFuture, ExecutionObserver, Executor, LeafExecutor, ServiceObservationContext,
         ServiceObservationOutcome, ServiceObservationResult,
     };
-    use crate::RuntimeSnapshot;
+    use crate::{GovernanceRegistry, RuntimeSnapshot};
 
     #[derive(Default)]
     struct MemoryLeaves {
         calls: Mutex<Vec<String>>,
+        proxy_limits: Mutex<Vec<Option<u64>>>,
+        governance: Option<GovernanceRegistry>,
     }
 
     impl LeafExecutor<(), Bytes> for MemoryLeaves {
@@ -921,17 +1254,26 @@ mod tests {
             cluster: &'a oxidase_core::ResourceId,
             _request: &'a RequestFrame,
             _body: &'a mut Option<()>,
+            max_request_body_bytes: Option<u64>,
         ) -> BoxLeafFuture<'a, Bytes> {
             self.calls
                 .lock()
                 .expect("call log mutex is not poisoned")
                 .push(cluster.to_string());
+            self.proxy_limits
+                .lock()
+                .expect("proxy limit log mutex is not poisoned")
+                .push(max_request_body_bytes);
             Box::pin(async {
                 ServiceOutcome::Handled(ResponseHead::new(
                     StatusCode::OK,
                     Bytes::from_static(b"proxy"),
                 ))
             })
+        }
+
+        fn governance(&self) -> Option<&GovernanceRegistry> {
+            self.governance.as_ref()
         }
     }
 
@@ -1641,5 +1983,228 @@ services:
             assert_eq!(response.body, Bytes::from_static(b"short"));
             assert!(report.trace.events.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_rejects_known_length_and_is_lexical_across_fallback() {
+        let proxy = node(
+            "proxy",
+            ServiceKind::Proxy {
+                cluster: "cluster:test".into(),
+            },
+        );
+        let limited = node(
+            "limited",
+            ServiceKind::RequestBodyLimit {
+                max_bytes: 4,
+                service: proxy.id.clone(),
+            },
+        );
+        let limited_program = program("limited", vec![proxy.clone(), limited]);
+        let leaves = MemoryLeaves::default();
+        let mut oversized = request("/");
+        oversized.overlay_mut().set_header(
+            http::header::CONTENT_LENGTH,
+            "5".parse().expect("fixture Content-Length is valid"),
+        );
+        let report = Executor::new(&limited_program, &leaves)
+            .execute(oversized, Some(()))
+            .await;
+        assert!(matches!(
+            report.outcome,
+            ServiceOutcome::Handled(ref response)
+                if response.status == StatusCode::PAYLOAD_TOO_LARGE
+        ));
+        assert!(
+            leaves
+                .proxy_limits
+                .lock()
+                .expect("proxy limit log mutex is not poisoned")
+                .is_empty()
+        );
+
+        let decline = node(
+            "decline",
+            ServiceKind::Site {
+                resource: "decline".into(),
+            },
+        );
+        let limited_decline = node(
+            "limited-decline",
+            ServiceKind::RequestBodyLimit {
+                max_bytes: 1,
+                service: decline.id.clone(),
+            },
+        );
+        let fallback = node(
+            "fallback",
+            ServiceKind::Fallback {
+                services: vec![limited_decline.id.clone(), proxy.id.clone()],
+            },
+        );
+        let fallback_program = program("fallback", vec![proxy, decline, limited_decline, fallback]);
+        fallback_program
+            .validate()
+            .expect("a non-consuming limited candidate is safe in Fallback");
+        let leaves = MemoryLeaves::default();
+        let report = Executor::new(&fallback_program, &leaves)
+            .execute(request("/"), Some(()))
+            .await;
+        assert!(matches!(report.outcome, ServiceOutcome::Handled(_)));
+        assert_eq!(
+            *leaves
+                .proxy_limits
+                .lock()
+                .expect("proxy limit log mutex is not poisoned"),
+            [None],
+            "a declined wrapper must not leak its lexical body limit to its sibling"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_overlap_and_releases_after_child_completion() {
+        let slow = node(
+            "slow",
+            ServiceKind::Site {
+                resource: "slow".into(),
+            },
+        );
+        let limit = node(
+            "limit",
+            ServiceKind::ConcurrencyLimit {
+                name: "tests".to_owned(),
+                max_in_flight: 1,
+                queue_timeout: Duration::ZERO,
+                reject_status: StatusCode::SERVICE_UNAVAILABLE,
+                service: slow.id.clone(),
+            },
+        );
+        let program = program("limit", vec![slow, limit]);
+        let leaves = MemoryLeaves {
+            governance: Some(GovernanceRegistry::prepare(&program.graph, None).0),
+            ..MemoryLeaves::default()
+        };
+        let first_executor = Executor::new(&program, &leaves);
+        let first = first_executor.execute(request("/"), None);
+        let second = async {
+            tokio::task::yield_now().await;
+            Executor::new(&program, &leaves)
+                .execute(request("/"), None)
+                .await
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert!(matches!(first.outcome, ServiceOutcome::Handled(_)));
+        assert!(matches!(
+            second.outcome,
+            ServiceOutcome::Handled(ref response)
+                if response.status == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        let third = Executor::new(&program, &leaves)
+            .execute(request("/"), None)
+            .await;
+        assert!(matches!(third.outcome, ServiceOutcome::Handled(_)));
+    }
+
+    #[tokio::test]
+    async fn concurrency_permits_release_on_decline_failure_and_timeout() {
+        for (resource, expected) in [
+            ("decline", None),
+            ("fail", Some(ErrorClass::SiteIo)),
+            ("slow", Some(ErrorClass::Timeout)),
+        ] {
+            let leaf = node(
+                "leaf",
+                ServiceKind::Site {
+                    resource: resource.into(),
+                },
+            );
+            let child = if resource == "slow" {
+                node(
+                    "child",
+                    ServiceKind::Timeout {
+                        duration: Duration::from_millis(1),
+                        service: leaf.id.clone(),
+                    },
+                )
+            } else {
+                node(
+                    "child",
+                    ServiceKind::Observe {
+                        name: "transparent".to_owned(),
+                        service: leaf.id.clone(),
+                    },
+                )
+            };
+            let limit = node(
+                "limit",
+                ServiceKind::ConcurrencyLimit {
+                    name: "tests".to_owned(),
+                    max_in_flight: 1,
+                    queue_timeout: Duration::ZERO,
+                    reject_status: StatusCode::SERVICE_UNAVAILABLE,
+                    service: child.id.clone(),
+                },
+            );
+            let program = program("limit", vec![leaf, child, limit]);
+            let leaves = MemoryLeaves {
+                governance: Some(GovernanceRegistry::prepare(&program.graph, None).0),
+                ..MemoryLeaves::default()
+            };
+
+            for _ in 0..2 {
+                let report = Executor::new(&program, &leaves)
+                    .execute(request("/"), None)
+                    .await;
+                match expected {
+                    None => assert!(matches!(report.outcome, ServiceOutcome::Declined)),
+                    Some(class) => assert!(matches!(
+                        report.outcome,
+                        ServiceOutcome::Failed(ref error) if error.class == class
+                    )),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_uses_lexical_binding_and_returns_retry_after() {
+        let child = text_response("child", StatusCode::OK, "allowed");
+        let limit = node(
+            "limit",
+            ServiceKind::RateLimit {
+                name: "tests".to_owned(),
+                key: RateLimitKey::Binding("tenant".to_owned()),
+                requests: 1,
+                per: Duration::from_secs(60),
+                burst: 1,
+                max_keys: 8,
+                idle_ttl: Duration::from_secs(120),
+                service: child.id.clone(),
+            },
+        );
+        let program = program("limit", vec![child, limit]);
+        let leaves = MemoryLeaves {
+            governance: Some(GovernanceRegistry::prepare(&program.graph, None).0),
+            ..MemoryLeaves::default()
+        };
+        let request = request("/").with_bindings(BTreeMap::from([(
+            "tenant".to_owned(),
+            Value::String("alpha".to_owned()),
+        )]));
+        let first = Executor::new(&program, &leaves)
+            .execute(request.clone(), None)
+            .await;
+        assert!(matches!(
+            first.outcome,
+            ServiceOutcome::Handled(ref response) if response.status == StatusCode::OK
+        ));
+        let second = Executor::new(&program, &leaves)
+            .execute(request, None)
+            .await;
+        let ServiceOutcome::Handled(response) = second.outcome else {
+            panic!("rate-limit rejection is a handled response");
+        };
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers[http::header::RETRY_AFTER], "60");
     }
 }

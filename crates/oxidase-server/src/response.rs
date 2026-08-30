@@ -75,17 +75,13 @@ impl<'a> ResponseFinalizer<'a> {
         // `Trailer` remains forbidden to source configuration. A declaration
         // reaching this boundary is trusted Proxy metadata, but it still must
         // parse and pass the protocol safety policy before being preserved.
-        let trailer_guard = match &response.body {
-            GatewayBodyPlan::Stream {
-                trailer_guard: Some(trailer_guard),
-                ..
-            } => trailer_guard.clone(),
-            _ => TrailerGuard::from_response_headers(
+        let trailer_guard = response.body.trailer_guard().cloned().unwrap_or_else(|| {
+            TrailerGuard::from_response_headers(
                 self.context.wire_protocol,
                 self.context.accepts_http1_trailers,
                 &response.headers,
-            ),
-        };
+            )
+        });
         remove_hop_by_hop(&mut response.headers);
 
         // Framing metadata is derived only from the selected, trusted body plan.
@@ -99,8 +95,7 @@ impl<'a> ResponseFinalizer<'a> {
             || response.status == StatusCode::NOT_MODIFIED;
         let head_only = self.method == Method::HEAD;
         let suppress_body = status_forbids_body || head_only;
-        let body_can_have_trailers =
-            !suppress_body && matches!(&response.body, GatewayBodyPlan::Stream { .. });
+        let body_can_have_trailers = !suppress_body && response.body.can_have_trailers();
         let forwards_http1_trailers = self.context.wire_protocol == WireProtocol::Http1
             && body_can_have_trailers
             && trailer_guard.forwarded_declaration().is_some();
