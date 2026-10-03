@@ -1201,6 +1201,17 @@ mod tests {
         }
         assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 2);
         assert_eq!(fixture.counts.tcp.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.counts.responses_for(&spec.name) != 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both fixture replies were actually sent");
+        assert_eq!(
+            fixture.counts.responses_for_type(&spec.name, RecordType::A),
+            1
+        );
     }
 
     #[tokio::test]

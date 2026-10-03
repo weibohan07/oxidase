@@ -1280,6 +1280,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "hickory-resolver",
  "http",
  "http-body",
  "http-body-util",

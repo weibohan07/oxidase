@@ -1,12 +1,13 @@
 //! Local test-only DNS fixture. Hickory parses/encodes both sides; this is not a
 //! second production DNS parser. UDP and TCP use the same ephemeral IP:port.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
-use hickory_resolver::proto::rr::Record;
+use hickory_resolver::proto::rr::{Record, RecordType};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
@@ -20,6 +21,8 @@ pub struct FixtureReply {
     pub truncate_udp: bool,
     pub delay: Duration,
     pub discard: bool,
+    /// Optional test-only fence: a response cannot be written until released.
+    pub response_gate: Option<Arc<Semaphore>>,
 }
 
 impl FixtureReply {
@@ -31,6 +34,7 @@ impl FixtureReply {
             truncate_udp: false,
             delay: Duration::ZERO,
             discard: false,
+            response_gate: None,
         }
     }
 
@@ -46,6 +50,40 @@ impl FixtureReply {
 pub struct FixtureCounts {
     pub udp: AtomicU64,
     pub tcp: AtomicU64,
+    sent: Mutex<BTreeMap<(String, u16), u64>>,
+}
+
+impl FixtureCounts {
+    /// Successful fixture response writes, not merely received questions.
+    pub fn responses_for(&self, canonical_name: &str) -> u64 {
+        self.sent
+            .lock()
+            .expect("fixture sent counts")
+            .iter()
+            .filter(|((name, _), _)| name == canonical_name)
+            .fold(0u64, |total, (_, count)| total.saturating_add(*count))
+    }
+
+    /// Acknowledges the requested family, so an AAAA sibling cannot stand in
+    /// for the A answer deliberately held across a publication boundary.
+    pub fn responses_for_type(&self, canonical_name: &str, record_type: RecordType) -> u64 {
+        self.sent
+            .lock()
+            .expect("fixture sent counts")
+            .get(&(canonical_name.to_owned(), u16::from(record_type)))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_response(&self, canonical_name: String, record_type: RecordType) {
+        let mut counts = self.sent.lock().expect("fixture sent counts");
+        let key = (canonical_name, u16::from(record_type));
+        // The helper remains bounded even for unexpected names and types.
+        if counts.contains_key(&key) || counts.len() < 128 {
+            let count = counts.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
 }
 
 pub struct DnsFixture {
@@ -87,13 +125,23 @@ impl DnsFixture {
                         let Some(question)=query.queries.first() else { continue; };
                         udp_counts.udp.fetch_add(1, Ordering::Relaxed);
                         let reply=udp_handler(question, false);
+                        let name = question.name().to_ascii();
+                        let record_type = question.query_type();
                         let Ok(permit)=Arc::clone(&quota).try_acquire_owned() else { continue; };
                         let socket=Arc::clone(&udp);
+                        let sent_counts=Arc::clone(&udp_counts);
                         pending.spawn(async move {
                             let _permit=permit;
                             if reply.discard { return; }
+                            if let Some(gate) = &reply.response_gate {
+                                let Ok(permit) = gate.acquire().await else { return; };
+                                permit.forget();
+                            }
                             tokio::time::sleep(reply.delay).await;
-                            if let Some(bytes)=response(query, reply, false) { let _=socket.send_to(&bytes, peer).await; }
+                            if let Some(bytes)=response(query, reply, false)
+                                && socket.send_to(&bytes, peer).await.is_ok() {
+                                sent_counts.record_response(name, record_type);
+                            }
                         });
                     }
                 }
@@ -152,8 +200,16 @@ async fn tcp_connection(mut socket: TcpStream, handler: Arc<Handler>, counts: Ar
         };
         counts.tcp.fetch_add(1, Ordering::Relaxed);
         let reply = handler(question, true);
+        let name = question.name().to_ascii();
+        let record_type = question.query_type();
         if reply.discard {
             break;
+        }
+        if let Some(gate) = &reply.response_gate {
+            let Ok(permit) = gate.acquire().await else {
+                break;
+            };
+            permit.forget();
         }
         tokio::time::sleep(reply.delay).await;
         let Some(bytes) = response(query, reply, true) else {
@@ -165,6 +221,7 @@ async fn tcp_connection(mut socket: TcpStream, handler: Arc<Handler>, counts: Ar
         if socket.write_u16(size).await.is_err() || socket.write_all(&bytes).await.is_err() {
             break;
         }
+        counts.record_response(name, record_type);
     }
 }
 
