@@ -1,7 +1,8 @@
 # Upstream transport and deadlines
 
-Phase 6A supports static Cluster endpoints and an explicit timing policy on the
-existing streaming Proxy. It does not expose dynamic A/AAAA or SRV configuration.
+Phase 6A established transport identity and phased timing for static Cluster
+endpoints. The same streaming Proxy contract now applies to [A/AAAA and SRV
+discovery](discovery.md), delivered in phases 6B and 6C.
 The workspace remains `0.3.0-alpha.1`; all APIs remain alpha.
 
 ```yaml
@@ -21,9 +22,12 @@ resources:
 ```
 
 Each duration must be positive and at most 24 hours. The values above are the
-defaults within a declared `timeouts` block; omitting that entire block selects
-the legacy mode described below. Unknown fields, null policy/values, zero values,
-and new/legacy fields together fail with exact source diagnostics.
+defaults within a declared `timeouts` block. For static endpoints, omitting the
+entire block selects the legacy mode described below. Discovery instead defaults
+to phased timing when the block is omitted and rejects either legacy timeout
+field; portable discovery plans retain the effective phased policy explicitly.
+Unknown fields, null policy/values, zero values, and new/legacy fields together
+fail with exact source diagnostics.
 
 ## Observable clocks
 
@@ -96,8 +100,8 @@ A subsequent logical request may select among the still validated static answers
 This is not same-attempt request-body replay or hidden business retry.
 
 This static native cache cannot report authoritative NXDOMAIN/NODATA or record
-TTLs. Those contracts belong to subsequent dynamic-discovery delivery, not to
-the native platform name-service interface.
+TTLs. Those contracts are provided by the distinct [dynamic-discovery
+resolver](discovery.md), not by the native platform name-service interface.
 
 ## Health and retry ownership
 

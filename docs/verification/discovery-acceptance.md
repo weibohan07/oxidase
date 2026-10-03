@@ -151,6 +151,64 @@ stable/Rust 1.88 process smoke passes with `successful_new_b_streams: 8`.
 A fresh campaign remains mandatory; this original SUCCESS run is retained,
 not retroactively given the stronger guarantee.
 
+### Short-smoke failure, retained evidence and planned-stop boundary
+
+The complete local stable workspace test on `ca0ffc9` failed one ordinary
+protocol process smoke at a generic final qualification guard. Its four Hosted
+required jobs passed independently in run `37150265178`; that green does not
+erase the local failure. The old guard omitted individual failing counts and the
+temporary test directory was removed, so the original failed term remains
+**UNKNOWN**, not retrospectively attributed to a particular production defect.
+Raw output is retained as
+`artifacts/discovery-6d-ca0ffc9-initial-process-gate-failure.log.gz`.
+
+The tool now records detailed final evidence and separate request-body transport,
+content and timeout faults before applying the same zero-fault guard. A failed
+ordinary test preserves its evidence directory instead of hiding the failure
+behind a missing success summary. Independent fault injection with a real H2
+seven-byte segmented POST proves that forced pre-head cancellation after the
+first byte causes a body error, not content corruption. Planned load shutdown
+instead stops between operations and lets the already-started request finish
+within its existing twelve-second bound, with a fifteen-second worker join bound.
+It does not disable intentional post-head cancellation or relax any zero-fault,
+trailer, new-peer or permit assertion. The new unit suite passes 20/20 and the
+ordinary two-process-campaign tests pass 2/2 on both stable and Rust 1.88; fresh
+complete gates and Linux qualification are separate receipts, not implied here.
+After separating Upgrade accounting, both final-source 35-second full-control
+campaigns pass: 16343 / 16311 worker results each exactly equal their worker
+outcome sum, protocol has ten separately recorded unavailable Upgrade probes,
+both have eight complete new-B streams and zero unexpected/request faults.
+Focused toolchain logs and summaries are retained under
+`artifacts/discovery-6d-final-tool-*`.
+
+### Strengthened replacement-stream campaign, before planned-stop repair
+
+[Run `37150296893`](https://github.com/weibohan07/oxidase/actions/runs/37150296893)
+completed SUCCESS on exact `ca0ffc92825530763f57df308b4668c44f271c25`.
+Both actual Linux campaigns now record `successful_new_b_streams: 8` after
+checking every full 200 response's physical peer, identity, DATA and trailers.
+Discovery observed 330800 requests, 78507 complete responses, 4844 cancellations
+and 1611 gateway retries; protocol observed 35256 requests, 7914 complete gRPC
+responses, 529 cancellations and 18 Upgrade tunnels. Both report zero unexpected
+errors. The gateway PIDs are 6091 / 7394, distinct from all controller/fixture PIDs.
+All 160 / 32 DNS-change runtime object pairs are unchanged. Measured final active
+and permit/supervisor counters are zero, while pool/health-task/old-snapshot
+measurements remain null. RSS post-warm / peak / final is 23712 / 25588 / 25200
+and 23560 / 24412 / 24164 KiB; steady slopes remain positive, +2.28997 / +6.41280
+KiB/s. This is not a leak-free or long-term qualification claim.
+
+Independent review also found that the protocol summary's `expected_unavailable`
+included fifteen control-loop Upgrade probes, while `requests` counted only load
+worker results. These old counts are preserved, not silently rewritten or claimed
+to partition one denominator. The tool separates unavailable Upgrade probes in
+new receipts and adds a successful-campaign worker-accounting assertion.
+
+Artifact `11284476091` has service digest
+`sha256:179a3d8a6a37432115d570928daa869a37db0e7d3a62edffde9b969829bc5b1e`;
+the raw archive and both summaries are retained as
+`artifacts/discovery-6d-linux-37150296893-*`. This run precedes the planned-stop
+tool repair above and cannot replace fresh qualification of that source.
+
 ## Protected 6A delivery receipt
 
 PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without
