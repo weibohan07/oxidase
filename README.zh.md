@@ -31,6 +31,15 @@ overlay 与 Route bindings 具有词法作用域，Declined 分支不会向兄�
 
 ## 当前 v0.3 alpha
 
+v0.4 第五阶段提供 Unix/HTTPS 管理认证、签名 Bundle 的 stage/validate/activate/
+rollback、有界操作收据和 JSONL 审计。source reload、Bundle 发布与 drain 都由同一
+manager 仲裁，使用进程 epoch/revision ETag。发布后的持久化故障明确返回
+`recovery_required`，不会假称运行版本未变化。管理凭据与静态权限属于独立、固定的
+bootstrap，修改时需重启。详见[管理 API](docs/admin-api.md)、
+[恢复契约](docs/control-plane-recovery.md)和[仅测试示例](examples/secure-admin-gateway/README.md)。
+workspace 仍为 `0.3.0-alpha.1`；本阶段不包含 DNS discovery、OpenTelemetry 或打包，
+也不代表 production-ready。
+
 当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1
 或 HTTP/2 的 HTTPS；所有现有 Service 节点均可在选定协议上运行。Proxy 继续通过
 共享连接池执行流式 HTTP/1.1、HTTPS 与上游 HTTP/2。Asset 使用异步文件流，支持

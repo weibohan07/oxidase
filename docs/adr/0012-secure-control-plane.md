@@ -1,209 +1,115 @@
 # ADR 0012: Secure control plane and staged activation
 
-- Status: Accepted design; PR5 implementation in progress
+- Status: Accepted; final PR5 qualification tracked separately
 - Date: 2026-08-30
-- Implementation notes updated: 2026-10-03
+- Transaction/recovery decision updated: 2026-10-03
 
 ## Context
 
-The historical management listener was an opt-in, read-only HTTP endpoint selected
-by a CLI bind address. It had no deployable authentication policy and therefore
-could not safely accept snapshots or mutate the live runtime. Oxidase v0.4 needs a
-control plane without weakening the data-plane snapshot and last-known-good
-invariants.
-
-The control plane handles untrusted network input and untrusted Bundle bytes. It
-must not expose Secret material, accept an unsigned candidate by default, write to
-caller-selected paths, or run two activation transactions concurrently.
+The initial PR5 WIP had an independent durable current value and completed storage
+bookkeeping only after an awaited HTTP callback. Source reload, cancellation,
+failed fsync, and process crashes could separate that record from the running
+snapshot. The control plane requires one publication owner and a recoverable local
+transaction using the existing data plane.
 
 ## Decision
 
-### Compiler-owned Admin plan
+The server manager arbitrates activate, rollback, source reload, watcher commits,
+and drain. SnapshotStore atomically contains PublishedRuntime: snapshot, process
+epoch/revision, config version, Source/Bundle origin, and serving state. CandidateStore
+owns artifacts/history/receipts and never decides which program is running. Startup
+explicitly chooses Source or Bundle, independently of storage history.
 
-The optional top-level `admin` block compiles into one immutable `AdminSpec`. The
-import graph may contain at most one such block. Unknown fields are rejected at
-the shared strict-YAML boundary.
+HTTP If-Match uses the process-specific revision ETag and is checked after prepare
+and prebind at the final publication boundary. Watcher work captures its starting
+revision and requires Source/Running authority at commit. Ordinary file events
+cannot undo Bundle deployment or drain. Explicit source reload uses retained
+SourceOrigin; Bundle-only startup cannot guess a YAML input. Stage/validation
+conditions apply at manager acceptance and thereafter to immutable artifacts, not
+to an unchanged runtime throughout their read-only preparation lifetime.
 
-```yaml
-admin:
-  listen:
-    unix:
-      path: /run/oxidase/admin.sock
-      mode: "0660"
+Admin transport, TLS/Trust, normalized bearer material, permissions, verification
+keys, storage limits, and audit policy form one fixed startup bootstrap. Requests
+cannot mix its old permissions/TLS with new data-plane token/limits. Data-only
+Bundles may omit the already-bound Admin Secret; changed supplied bootstrap fields
+fail with `admin.restart_required`. Online transport/credential/policy rebinding is
+outside this alpha. Authentication uses bearer, verified mTLS, or both; explicitly
+warned development-only `unsafe_none` is constrained. Permissions are independent,
+static, and shared by authenticated identities, not a multi-user role platform.
 
-  auth:
-    mode: bearer
-    token_secret: admin-token
+Server and ctl share bearer-file parsing: 1..=8192 visible ASCII bytes, optionally
+one final LF or CRLF. General Secrets remain raw bytes. Comparison is constant-time
+and token debug material is redacted.
 
-  storage:
-    directory: /var/lib/oxidase/admin
+Each accepted mutation has a bounded durable receipt. Principal, Idempotency-Key,
+action, target, expected ETag, and applicable body digest form an unambiguous SHA-256
+fingerprint. Identical retained requests replay; changed requests conflict. Responses
+distinguish committed and current revisions. Count-bounded replay is not exactly-once.
 
-  bundle_trust:
-    deployment_root: /srv/oxidase/current
-    verification_keys:
-      - /etc/oxidase/operators/current.pub
-      - /etc/oxidase/operators/next.pub
-
-  permissions:
-    read: true
-    stage: true
-    activate: true
-    rollback: true
-    drain: true
-    reload_source: false
-
-  candidates:
-    max_count: 8
-    max_bytes: 512MiB
-    max_candidate_bytes: 256MiB
-
-  history:
-    max_snapshots: 5
-    max_bytes: 1GiB
-```
-
-`listen` is exactly one of:
-
-- `unix`, with an absolute socket path and an octal mode string; or
-- `https`, with a bind address, Certificate Resource, and the existing strict
-  TLS client-auth plan.
-
-For HTTPS the compiler-owned shape is:
-
-```yaml
-listen:
-  https:
-    bind: 127.0.0.1:7590
-    certificate: admin-cert
-    client_auth:
-      mode: required
-      trust_store: operators
-```
-
-The compiled Admin plan carries transport, authentication, authorization, storage
-limits, and history limits. The current server binds and prepares the Admin
-transport, policy, TLS configuration, verification keys, and candidate store only
-at startup; these do not follow subsequent request snapshots. Changes to those
-settings require a process restart. Secret bytes remain exclusively
-inside the prepared Resource registry. Portable Bundles contain the Admin policy,
-Secret Resource identity, and external runtime path references, never token bytes,
-private keys, or signing keys.
-
-### Authentication
-
-`auth.mode` is one of:
-
-- `bearer`: requires `token_secret`;
-- `mtls`: requires HTTPS and `client_auth.mode: required`;
-- `bearer_and_mtls`: requires both conditions; or
-- `unsafe_none`: explicit development-only escape hatch.
-
-There is deliberately no `none` value. `unsafe_none` compiles only for a Unix
-socket or loopback HTTPS without client authentication and emits a warning.
-Deployments should not use it. Bearer comparison is constant-time and the token is
-never logged. A verified client-certificate identity comes only from rustls
-verification metadata, not a caller header.
-
-### Authorization
-
-Permissions are independent, deny by default except read access:
+The publication protocol is:
 
 ```text
-read, stage, activate, rollback, drain, reload_source
+accepted -> preparing -> final condition/deadline/cancel check + prebind
+-> durable intent -> runtime publication -> durable completion -> audit completion
 ```
 
-Every route maps to one permission before handler execution. Transport
-authentication is not authorization. A configuration with no enabled operation is
-rejected as inert.
+The manager owns commit completion independently of HTTP lifetime. Before commit,
+cooperative cancellation and a total deadline stop work. Hash/parse/copy/scan workers
+hold bounded shared admission until they actually return. A dropped caller cannot
+release the executing worker's permit early.
 
-### Signed candidates and local storage
+Durable updates build a next-state copy, write/sync a named temporary file, rename
+and sync its parent, then publish an immutable ArcSwap view. The writer mutex
+serializes persistence while receipt/history readers see the previous view.
+Pre-publication failure keeps last-known-good. Post-publication completion/audit
+failure exposes recovery-required with the known committed revision and closes
+new protected mutation; it never claims the change was undone.
 
-`storage.directory` is required and must be an absolute local path. The runtime opens or creates only descendants of
-this local state root, rejects symlink/path-traversal escapes, writes a temporary
-file, syncs it, and atomically renames it to a content-addressed name. Upload path
-components never influence a filesystem path.
-The mutable state directory and Bundle deployment root are intentionally not
-source-watcher dependencies; candidate/history writes must not trigger reload
-loops. Verification-key files are dependencies, but the bound CandidateStore
-retains the keys loaded at startup; key rotation currently requires a restart.
+One canonical absolute process-owned private `0700` storage root has an exclusive
+cross-process lock. Trusted parents, no-follow/nonblocking regular-file handles,
+inode identity checks, and directory-replacement checks supplement digest names.
+Unsafe objects, unknown files, and corrupt journals/artifacts fail explicitly.
+Locking targets supported Unix deployment platforms, not cross-host consensus.
 
-`bundle_trust.verification_keys` contains external Ed25519 public-key paths. When
-`stage`, `activate`, or `rollback` is allowed, at least one key is required. Thus
-the normal control plane fails closed for unsigned Bundles. Read-only and drain/
-source-reload deployments may omit Bundle keys. At most 32 rotation keys are
-accepted and duplicate resolved paths are rejected. Private signing keys are
-offline CLI inputs and are not server Resources.
+GC persists tombstones/index changes before deletion. Restart finishes that
+protocol, cleans recognized temp files, and verifies renamed orphan artifacts before
+importing them as staged. Every retained artifact is rechecked for digest, signature,
+compatibility, and structure. Legacy WIP v1 history can be retained, but its current
+value and unscoped replay keys cannot authorize runtime state or replay.
 
-The compiler accepts independent drain/source-reload permissions without Bundle
-keys. The current server, however, constructs mutation handling only when
-`stage`, `activate`, or `rollback` is enabled. A drain/source-reload-only deployment
-returns `503 admin.control_unavailable` for those operations. Supporting that
-configuration is unfinished.
+Interrupted work without intent becomes cancelled. Unfinished intent becomes
+recovery-required: restart cannot prove whether its predecessor published. Explicit
+startup selects its input while unresolved journal ambiguity closes new protected
+mutation. Recovery retains evidence and does not silently replay uncertain work.
+Uploads are safely adopted; peak capacity counts the upload and anonymous verified
+copy. History and operation retention have independent limits. Rollback verifies
+current external Secret/private-key/reference Assets, never old in-memory credentials.
 
-`bundle_trust.deployment_root` is distinct from state storage: it resolves
-external Asset, Secret, and private-key references inside a staged Bundle. Source
-mode defaults it to the root Gateway document's directory. Portable plans encode
-that choice explicitly; they never infer it from `storage.directory` or an upload
-filename. Explicit absolute Bundle references are also accepted, so the deployment
-root is not a general filesystem sandbox for a signed Bundle.
+Drain disables readiness before retiring data-plane listeners/connections. Live/Admin
+remain available. Repeat drain has no new side effect, and watcher work cannot reopen
+the runtime. Explicit activation/restart resumes through normal preparation.
 
-Candidate count, per-candidate bytes, total candidate bytes, history count, and
-history bytes are independently bounded. Candidate and history eviction is
-deterministic. Only completely uploaded, parsed, signature-verified candidates
-can enter the staged set.
-
-### Validate, activate, rollback
-
-The intended mutating transaction order is:
-
-```text
-authenticate -> authorize -> body/content-type limits -> store candidate
--> verify signature and Bundle -> prepare -> If-Match check -> commit -> drain
-```
-
-Validation does not publish. Activation operations are serialized. `If-Match`
-compares the currently published config version immediately before commit, so a
-stale operator cannot overwrite a newer activation. Repeating an activation of
-the already-current digest is idempotent.
-
-History contains only successfully activated snapshot descriptors. The current
-`GET /api/v1/snapshots` response exposes only the current config version, not the
-retained CandidateStore history. Rollback is a
-new prepare transaction, not resurrection of an old in-memory object. External
-Secret, private-key, and reference-Asset paths are reopened and validated against
-current files. Public certificate chains and Trust Store roots are reconstructed
-and validated from the retained Bundle. A failed prepare leaves the current
-snapshot unchanged.
-
-### Audit and backpressure
-
-The target is one structured audit outcome for each authenticated mutating request,
-containing the request ID, bounded principal identity, action, candidate digest,
-old/new versions, result, and stable error code, without bearer tokens, certificate
-bytes, Bundle/source bodies, or Secret values.
-
-The current implementation records only some CandidateStore stage, validate,
-activate, and rollback paths in a bounded, process-local memory ring. Early
-failures, idempotent paths, drain, and source reload are not comprehensively
-covered. The ring evicts its oldest event at capacity and has no configured output
-sink, durable delivery, or drop counter. Complete audit delivery remains work in
-progress.
-
-## Implementation boundary
-
-PR5 is work in progress as of 2026-10-03 and has no established Hosted validation
-for these changes. The release remains `0.3.0-alpha.1`; the API remains alpha.
-Admin JSON errors currently use `oxidase.admin/v1` with a `code` field, separately
-from the CLI's `oxidase.diagnostics/v1` envelope. Candidate validation, staging work
-after upload, and activation have no total execution deadline yet.
+Audit is bounded JSONL to stderr/stdout or a safe private file. Noise/read events
+enqueue without waiting and count drops. Protected operations reserve accepted and
+completion slots, acknowledging accepted delivery before side effects. Required
+completion belongs to commit ownership. Post-commit failure marks recovery-required.
+Accepted records persist an audit-pending marker atomically. Successful completion
+delivery clears it through another durable state transition; restart with a pending
+marker fails closed even if publication/completion had already succeeded. Storage-only
+stage/validate results retain their digest/action without inventing a runtime revision.
+Files are flushed/synced; process streams cannot certify collector durability.
+Fields are controlled identities/action/digest/revisions/result/code, never bodies
+or credentials.
 
 ## Consequences
 
-- The old CLI-only read-only bind remains a compatibility surface during the
-  alpha transition, but it is not a mutation-capable control plane.
-- Server activation code can consume a single compiled type from YAML or a
-  portable Bundle without interpreting source.
-- Operators must provision local storage and verification keys before granting
-  mutation permissions.
-- Multi-principal role tables, remote object storage, distributed consensus, and
-  an unauthenticated production mode remain out of scope.
+This is a single-process local transaction system, with fixed Admin bootstrap,
+count-bounded replay, Unix storage locking, current-file rollback validation, and
+operator-assisted ambiguous-intent recovery. It preserves prepare/validate/commit/
+drain and last-known-good. No distributed consensus, arbitrary remote execution,
+multi-user roles, DNS discovery, OpenTelemetry, or packaging are added by PR5.
+
+Workspace remains `0.3.0-alpha.1`; Gateway is `oxidase.dev/v1alpha1`, Oxista v1,
+Bundle `oxidase.bundle/v1`, and Admin `oxidase.admin/v1`. Actual tests, crash/fuzz
+campaigns, final PR checks, and post-merge main checks are recorded in
+[the acceptance matrix](../verification/control-plane-acceptance.md).

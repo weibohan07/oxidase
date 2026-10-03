@@ -71,9 +71,9 @@ magic/length/digest/canonical encoding/signature, unknown required semantics, or
 incompatible strict semantic runtime version fails before preparation.
 
 The format and compatibility API remain alpha. A Bundle is not encrypted, is not a
-Secret transport, and is not a backup of live runtime state. The current management
-listener cannot remotely stage, activate, or roll back signed Bundles; those remain
-part of the secure-control-plane work.
+Secret transport, and is not a backup of live runtime state. The authenticated
+Admin control plane can stage, validate, activate, and roll back signed Bundles;
+see [`admin-api.md`](admin-api.md) and its commit-specific acceptance evidence.
 
 ## Reload
 
@@ -84,11 +84,12 @@ fingerprints run on a single-concurrency blocking compiler worker, not a Tokio a
 worker. New listener sockets are prebound and publication remains serialized by the
 manager.
 
-This watcher is the source-file reload path. Bundle startup currently has no
-authenticated candidate store, activation history, or remote rollback API. Do not
-simulate one by overwriting a live Bundle path; use immutable artifacts and restart
-or an explicitly integrated local candidate publication path until the secure
-control plane is implemented.
+Watcher preparation captures the published revision. Final commit requires that
+revision and Source/Running authority still hold. A stale candidate cannot overwrite
+a later Bundle activation, and file events cannot reopen a drained runtime. An
+explicit Admin `reload-source` uses the retained Source startup path; Bundle-only
+startup cannot guess one. Use signed immutable artifacts and authenticated stage/
+validate/activate rather than overwriting a live Bundle file.
 
 Secret, Trust Store, certificate-chain, and private-key paths, including missing
 declared paths and their parents, are watcher dependencies. A candidate key is
@@ -438,7 +439,7 @@ oxidase serve config.yaml --watch --admin-bind 127.0.0.1:7590
 It serves:
 
 - `/health/live`: process/event-loop liveness;
-- `/health/ready`: a prepared snapshot with at least one user listener;
+- `/health/ready`: a Running published runtime with at least one user listener;
 - `/metrics`: Prometheus text with fixed outcome, status-class, latency, active
   request, reload, transport, tunnel, ingress-governance, and Cluster counters;
 - `/api/v1/clusters`: deterministic read-only Cluster/endpoint runtime status.
@@ -498,9 +499,21 @@ identifiers are never labels.
 Do not expose the admin bind directly to an untrusted network. Metric labels are
 intentionally bounded and never contain raw URLs, headers, user IDs, or Service
 source values.
-The current CLI-configured admin listener has a fixed 256-connection admission cap
-and incrementally reaps completed connection tasks. Source-configured authentication
-and per-admin policy remain part of the secure-control-plane work.
+The CLI-configured compatibility listener is loopback-only and read-only. The
+source-configured Admin listener adds coherent startup authentication and static
+permissions, a fixed 256-connection cap, bounded mutation/preparation admission,
+and independent lifecycle. Drain immediately disables readiness while leaving
+Admin/liveness available; explicit activation or restart resumes traffic.
+
+Admin If-Match uses the process-specific runtime ETag, not the Bundle digest or
+ConfigVersion. Use `ctl --if-match` for permitted mutations without preliminary
+read access, and `--idempotency-key` plus operation status after a lost response.
+The journal records intent before publication and completion afterward. Ambiguous
+post-commit persistence/audit outcomes expose recovery-required and close new
+mutation; they must not be treated as changes that never happened. Follow
+[`control-plane-recovery.md`](control-plane-recovery.md) and retain store/audit
+evidence before an explicit recovery restart. Admin bootstrap/token/permission/
+transport changes require restart in this version.
 
 User HTTP/1 mode and the management HTTP/1 listener use Hyper's timer-backed request
 header read timeout (30 seconds by default). TLS has a separate handshake timeout
