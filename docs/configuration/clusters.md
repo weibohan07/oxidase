@@ -45,8 +45,13 @@ resources:
         max_in_flight: 1024
         max_in_flight_per_endpoint: 256
         queue_timeout: 0ms
-      connect_timeout: 5s
-      response_timeout: 30s
+      timeouts:
+        connect: 5s
+        tls_handshake: 5s
+        request_body_idle: 30s
+        response_header: 10s
+        response_body_idle: 30s
+        pre_response_total: 60s
 ```
 
 Every accepted field above has runtime meaning. Unknown fields and unsupported
@@ -75,7 +80,10 @@ configured names for stable metrics and reload reuse.
 - `h2`: requires H2 over TLS and uses H2 prior knowledge for cleartext upstreams.
 
 Oxidase owns long-lived pools for these policies; it does not create one client per
-request.
+request. A pool additionally fixes the selected physical address, logical origin
+and complete prepared TLS identity. DNS is never repeated inside that connector.
+See [upstream transport and deadlines](upstream-timeouts.md) for native static-name
+caching, bounded address fallback and pool retirement.
 
 ## Load balancing
 
@@ -99,6 +107,8 @@ in the health-check set but are not selected for application traffic.
 Active checks call the configured origin-form path directly, use their own timeout,
 do not traverse the Service graph, do not retry, and discard only a bounded response
 body. Status values accept exact codes or inclusive ranges such as `"200-299"`.
+Health has a separate global 64-probe admission gate and at most 32 active futures
+per Cluster. Local queue/resolver failure is not a physical endpoint failure.
 
 Configured connect failures, response-head timeouts, H2 refused/reset conditions,
 upstream TLS failures, and configured retryable 5xx responses can contribute to
@@ -130,8 +140,9 @@ when all of these conditions hold:
 6. an eligible, not-yet-tried endpoint remains.
 
 Supported causes are `connect_failure`, `response_header_timeout`,
-`refused_stream`, and `reset`. A status retry drops the uncommitted upstream body
-before selecting the next endpoint. Oxidase stops after each eligible endpoint was
+`refused_stream`, and `reset`. A status retry reserves replacement capacity before
+closing the old upload or dropping the uncommitted response; without replacement,
+the original response remains usable. Oxidase stops after each eligible endpoint was
 tried rather than cycling back indefinitely. A non-waiting
 `max_concurrent_retries` semaphore limits amplification; initial attempts do not
 consume it.
@@ -150,7 +161,7 @@ counters; changing URL or protocol creates new endpoint state. Health supervisor
 start only after commit, stop after removal and release of old pinned snapshots,
 and use weak ownership to avoid task cycles.
 
-With `--admin-bind`, `GET /api/v1/clusters` returns sorted Cluster and endpoint
+On the configured authenticated Admin transport, `GET /api/v1/clusters` returns sorted Cluster and endpoint
 names, protocol/policy, health state, active counts, fixed counters, last transition,
 and remaining ejection time. It does not return origins, request data, credentials,
 or certificate material.
@@ -159,13 +170,14 @@ Prometheus output includes bounded Cluster/endpoint selection, in-flight, health
 ejection, retry, and admission series. Labels are limited to configured Cluster and
 endpoint names plus fixed protocol/policy/result/state enums. URLs, paths, queries,
 client addresses, Header values, and error strings are never labels. Bind the admin
-listener only to a trusted network.
+listener only to a trusted network. Permissions and writable candidate/source/
+drain operations follow the existing [Admin contract](../admin-api.md).
 
 ## Current limits
 
-Endpoints are static configuration. Dynamic DNS/service discovery, cross-process
-health consensus, hedging, arbitrary retry scripting, writable admin operations,
-and a general circuit-breaker policy beyond bounded admission/passive ejection are
-not implemented. The current `response_timeout` bounds connect plus request upload
-and response-head latency as one deadline; separate per-phase timing and
-observability are not exposed yet.
+Endpoints are static configuration at the 6A delivery boundary. Dynamic A/AAAA/SRV
+discovery, cross-process health consensus, hedging, arbitrary retry scripting and
+a general circuit-breaker policy beyond bounded admission/passive ejection are
+not implemented here. New phased timeouts have independent observable boundaries
+and one logical pre-head budget; legacy `connect_timeout`/`response_timeout` remain
+explicit compatibility mode. Native static-name caching is not TTL-aware discovery.

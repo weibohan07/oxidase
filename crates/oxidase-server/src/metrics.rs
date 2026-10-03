@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::upstream_timing::TimeoutPhase;
 use http::StatusCode;
 use oxidase_core::ErrorClass;
 use oxidase_runtime::{
@@ -48,9 +49,22 @@ pub struct Metrics {
     transport: Mutex<BTreeMap<String, Arc<TransportSeries>>>,
     transport_overflow: Arc<TransportSeries>,
     governance: RwLock<GovernanceSeriesMap>,
+    upstream_timeouts: [AtomicU64; 7],
 }
 
 impl Metrics {
+    pub(crate) fn record_upstream_timeout(&self, phase: TimeoutPhase) {
+        let index = match phase {
+            TimeoutPhase::Queue => 0,
+            TimeoutPhase::Connect => 1,
+            TimeoutPhase::Tls => 2,
+            TimeoutPhase::RequestBody => 3,
+            TimeoutPhase::ResponseHeader => 4,
+            TimeoutPhase::ResponseBody => 5,
+            TimeoutPhase::Total => 6,
+        };
+        self.upstream_timeouts[index].fetch_add(1, Ordering::Relaxed);
+    }
     pub(crate) fn request_started(self: &Arc<Self>) -> ActiveRequest {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.active_requests.fetch_add(1, Ordering::Relaxed);
@@ -183,6 +197,23 @@ impl Metrics {
     #[must_use]
     pub fn render_prometheus(&self) -> String {
         let mut output = String::new();
+        for (index, phase) in [
+            "queue",
+            "connect",
+            "tls",
+            "request_body",
+            "response_header",
+            "response_body",
+            "total",
+        ]
+        .iter()
+        .enumerate()
+        {
+            output.push_str(&format!(
+                "oxidase_upstream_timeouts_total{{phase=\"{phase}\"}} {}\n",
+                self.upstream_timeouts[index].load(Ordering::Relaxed)
+            ));
+        }
         push_counter(
             &mut output,
             "oxidase_requests_total",
@@ -1109,6 +1140,32 @@ mod tests {
         assert!(output.contains("outcome=\"handled\""));
         assert!(output.contains("class=\"2xx\""));
         assert!(!output.contains("http://"));
+    }
+
+    #[test]
+    fn upstream_timeout_metrics_use_only_the_closed_phase_set() {
+        use crate::upstream_timing::TimeoutPhase;
+
+        let metrics = Metrics::default();
+        for phase in [
+            TimeoutPhase::Queue,
+            TimeoutPhase::Connect,
+            TimeoutPhase::Tls,
+            TimeoutPhase::RequestBody,
+            TimeoutPhase::ResponseHeader,
+            TimeoutPhase::ResponseBody,
+            TimeoutPhase::Total,
+        ] {
+            metrics.record_upstream_timeout(phase);
+        }
+        let output = metrics.render_prometheus();
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("oxidase_upstream_timeouts_total{"))
+            .collect();
+        assert_eq!(lines.len(), 7);
+        assert!(lines.iter().all(|line| line.ends_with(" 1")));
+        assert!(lines.iter().all(|line| !line.contains(",")));
     }
 
     #[test]

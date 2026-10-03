@@ -262,6 +262,10 @@ pub(crate) fn timeout_upstream_response_body(body: Incoming, timeout: Duration) 
     TimeoutBody::new(body, timeout, BodyIdleDirection::UpstreamResponse).boxed_unsync()
 }
 
+pub(crate) fn timeout_proxy_request_body(body: GatewayBody, timeout: Duration) -> GatewayBody {
+    TimeoutBody::new(body, timeout, BodyIdleDirection::Request).boxed_unsync()
+}
+
 fn timeout_downstream_response_body(body: GatewayBody, timeout: Duration) -> GatewayBody {
     TimeoutBody::new(body, timeout, BodyIdleDirection::DownstreamResponse).boxed_unsync()
 }
@@ -501,18 +505,22 @@ impl Drop for InstrumentedBody {
 
 struct TimeoutBody<B> {
     inner: Pin<Box<B>>,
-    deadline: Pin<Box<Sleep>>,
+    deadline: Option<Pin<Box<Sleep>>>,
     timeout: Duration,
     direction: BodyIdleDirection,
+    terminated: bool,
+    waiting: bool,
 }
 
 impl<B> TimeoutBody<B> {
     fn new(inner: B, timeout: Duration, direction: BodyIdleDirection) -> Self {
         Self {
             inner: Box::pin(inner),
-            deadline: Box::pin(tokio::time::sleep(timeout)),
+            deadline: None,
             timeout,
             direction,
+            terminated: false,
+            waiting: false,
         }
     }
 }
@@ -559,29 +567,68 @@ where
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
         match self.inner.as_mut().poll_frame(context) {
             Poll::Ready(Some(Ok(frame))) => {
-                let timeout = self.timeout;
-                self.deadline.as_mut().reset(Instant::now() + timeout);
+                // Returning a frame ends this demand interval. Hyper may now
+                // wait for send capacity or downstream consumption without
+                // polling us; that backpressure is not peer body idleness.
+                self.waiting = false;
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => match self.deadline.as_mut().poll(context) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(BodyIdleTimeout {
-                    direction: self.direction,
-                })))),
-                Poll::Pending => Poll::Pending,
-            },
+            Poll::Ready(Some(Err(error))) => {
+                self.terminated = true;
+                self.deadline = None;
+                self.waiting = false;
+                Poll::Ready(Some(Err(error.into())))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                self.deadline = None;
+                self.waiting = false;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if !self.waiting {
+                    let now = Instant::now();
+                    let next = now.checked_add(self.timeout).unwrap_or(now);
+                    match self.deadline.as_mut() {
+                        Some(deadline) => deadline.as_mut().reset(next),
+                        None => self.deadline = Some(Box::pin(tokio::time::sleep_until(next))),
+                    }
+                    self.waiting = true;
+                }
+                let deadline = self
+                    .deadline
+                    .as_mut()
+                    .expect("pending demand arms idle timer");
+                match deadline.as_mut().poll(context) {
+                    Poll::Ready(()) => {
+                        self.terminated = true;
+                        self.deadline = None;
+                        self.waiting = false;
+                        Poll::Ready(Some(Err(Box::new(BodyIdleTimeout {
+                            direction: self.direction,
+                        }))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.terminated || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        if self.terminated {
+            SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
     }
 }
 
@@ -906,6 +953,90 @@ mod tests {
             .downcast_ref::<BodyIdleTimeout>()
             .expect("timeout retains its typed direction");
         assert_eq!(error.direction(), BodyIdleDirection::UpstreamResponse);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_time_starts_with_first_body_demand_and_terminates_once() {
+        let mut body = TimeoutBody::new(
+            PendingBody,
+            Duration::from_secs(10),
+            BodyIdleDirection::Request,
+        );
+        tokio::time::advance(Duration::from_secs(50)).await;
+        {
+            let next = body.frame();
+            tokio::pin!(next);
+            assert!(
+                futures_util::poll!(&mut next).is_pending(),
+                "construction is not demand"
+            );
+            tokio::time::advance(Duration::from_secs(9)).await;
+            assert!(futures_util::poll!(&mut next).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let error = next
+                .await
+                .expect("one terminal error frame")
+                .expect_err("idle expires");
+            assert!(error.downcast_ref::<BodyIdleTimeout>().is_some());
+        }
+        assert!(body.is_end_stream());
+        assert!(
+            body.frame().await.is_none(),
+            "the error is not emitted repeatedly"
+        );
+    }
+
+    struct DataThenPending(bool);
+
+    impl Body for DataThenPending {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            if self.0 {
+                Poll::Pending
+            } else {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"data")))))
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returning_data_suspends_idle_time_during_send_backpressure() {
+        let mut body = TimeoutBody::new(
+            DataThenPending(false),
+            Duration::from_secs(10),
+            BodyIdleDirection::UpstreamResponse,
+        );
+        assert_eq!(
+            body.frame()
+                .await
+                .expect("DATA")
+                .expect("valid frame")
+                .data_ref(),
+            Some(&Bytes::from_static(b"data"))
+        );
+        // Hyper owns this DATA while blocked on send capacity. It does not
+        // demand another frame, so the peer is not being charged idle time.
+        tokio::time::advance(Duration::from_secs(50)).await;
+        let next = body.frame();
+        tokio::pin!(next);
+        assert!(futures_util::poll!(&mut next).is_pending());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures_util::poll!(&mut next).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(next.await.expect("terminal error frame").is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrepresentable_legacy_body_timeout_fails_closed_without_panic() {
+        let mut body = TimeoutBody::new(PendingBody, Duration::MAX, BodyIdleDirection::Request);
+        assert!(body.frame().await.expect("terminal error frame").is_err());
+        assert!(body.frame().await.is_none());
     }
 
     #[tokio::test]

@@ -30,8 +30,8 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::common::{
-    Fixture, ResourceMonitor, TestIdentity, XorShift64, client_config, identity, metric_sum,
-    write_identity,
+    CancellationBarrier, Fixture, ResourceMonitor, TestIdentity, XorShift64, client_config,
+    identity, metric_sum, write_identity,
 };
 use crate::{Arguments, CampaignParameters, CampaignSummary, SoakError};
 
@@ -54,15 +54,23 @@ struct ChunkBody {
     chunk_size: usize,
     fill: u8,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    cancellation: Option<Arc<CancellationBarrier>>,
+    first_frame_sent: bool,
 }
 
 impl ChunkBody {
-    fn new(length: usize, fill: u8) -> Self {
+    fn new(length: usize, fill: u8, cancellation: Option<Arc<CancellationBarrier>>) -> Self {
         Self {
-            remaining: length,
+            remaining: if cancellation.is_some() {
+                length.max(2)
+            } else {
+                length
+            },
             chunk_size: 1024,
             fill,
             delay: None,
+            cancellation,
+            first_frame_sent: false,
         }
     }
 }
@@ -75,6 +83,12 @@ impl Body for ChunkBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // Cancellation fixtures always keep at least one byte unsent. Neither
+        // payload size nor an inter-frame timer can guarantee that the gateway
+        // still owns a live body when the downstream reads the first frame.
+        if self.cancellation.is_some() && self.first_frame_sent {
+            return Poll::Pending;
+        }
         if let Some(delay) = &mut self.delay {
             if delay.as_mut().poll(context).is_pending() {
                 return Poll::Pending;
@@ -84,9 +98,14 @@ impl Body for ChunkBody {
         if self.remaining == 0 {
             return Poll::Ready(None);
         }
-        let length = self.remaining.min(self.chunk_size);
+        let length = if self.cancellation.is_some() {
+            self.remaining.saturating_sub(1).min(self.chunk_size)
+        } else {
+            self.remaining.min(self.chunk_size)
+        };
         self.remaining -= length;
-        if self.remaining > 0 {
+        self.first_frame_sent = true;
+        if self.remaining > 0 && self.cancellation.is_none() {
             self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(10))));
         }
         Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![self.fill; length])))))
@@ -98,6 +117,14 @@ impl Body for ChunkBody {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::with_exact(u64::try_from(self.remaining).unwrap_or(u64::MAX))
+    }
+}
+
+impl Drop for ChunkBody {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.record_body_drop();
+        }
     }
 }
 
@@ -115,6 +142,7 @@ async fn spawn_endpoint(
     healthy: Arc<AtomicBool>,
     flaky: bool,
     payload_size: usize,
+    cancellation: Arc<CancellationBarrier>,
 ) -> Result<(SocketAddr, Fixture), SoakError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -133,10 +161,12 @@ async fn spawn_endpoint(
                     let Ok((stream, _)) = accepted else { break };
                     let healthy = Arc::clone(&healthy);
                     let attempts = Arc::clone(&attempts);
+                    let cancellation = Arc::clone(&cancellation);
                     connections.spawn(async move {
                         let service = service_fn(move |request: Request<Incoming>| {
                             let healthy = Arc::clone(&healthy);
                             let attempts = Arc::clone(&attempts);
+                            let cancellation = Arc::clone(&cancellation);
                             async move {
                                 if request.uri().path() == "/healthz" {
                                     let status = if healthy.load(Ordering::Relaxed) {
@@ -158,7 +188,12 @@ async fn spawn_endpoint(
                                 }
                                 Ok(response(
                                     StatusCode::OK,
-                                    ChunkBody::new(payload_size, if flaky { b'a' } else { b'b' })
+                                    ChunkBody::new(
+                                        payload_size,
+                                        if flaky { b'a' } else { b'b' },
+                                        (request.uri().path() == "/cancel")
+                                            .then_some(cancellation),
+                                    )
                                         .boxed_unsync(),
                                 ))
                             }
@@ -288,7 +323,9 @@ async fn request_http1(
     address: SocketAddr,
     config: Arc<ClientConfig>,
     cancel: bool,
+    cancellation: &CancellationBarrier,
 ) -> Result<RequestOutcome, SoakError> {
+    let cancellation_before = cancellation.dropped();
     let tls = connect_tls(address, config).await?;
     if tls.get_ref().1.alpn_protocol() != Some(b"http/1.1".as_slice()) {
         return Err(SoakError::message("HTTP/1 campaign negotiated wrong ALPN"));
@@ -300,7 +337,11 @@ async fn request_http1(
         let _ = connection.await;
     });
     let request = Request::builder()
-        .uri("/payload?stable=wire&order=preserved")
+        .uri(if cancel {
+            "/cancel?stable=wire&order=preserved"
+        } else {
+            "/payload?stable=wire&order=preserved"
+        })
         .header(header::HOST, "gateway.example.test")
         .body(Empty::<Bytes>::new())
         .map_err(|error| SoakError::message(format!("build HTTP/1 request: {error}")))?;
@@ -318,6 +359,9 @@ async fn request_http1(
     let outcome = read_or_cancel(response.into_body(), cancel).await?;
     drop(sender);
     driver.abort();
+    if cancel {
+        cancellation.wait_after(cancellation_before).await?;
+    }
     Ok(outcome)
 }
 
@@ -325,7 +369,9 @@ async fn request_http2(
     address: SocketAddr,
     config: Arc<ClientConfig>,
     cancel: bool,
+    cancellation: &CancellationBarrier,
 ) -> Result<RequestOutcome, SoakError> {
+    let cancellation_before = cancellation.dropped();
     let tls = connect_tls(address, config).await?;
     if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
         return Err(SoakError::message("HTTP/2 campaign negotiated wrong ALPN"));
@@ -337,7 +383,11 @@ async fn request_http2(
         let _ = connection.await;
     });
     let request = Request::builder()
-        .uri("https://gateway.example.test/payload?stable=wire&order=preserved")
+        .uri(if cancel {
+            "https://gateway.example.test/cancel?stable=wire&order=preserved"
+        } else {
+            "https://gateway.example.test/payload?stable=wire&order=preserved"
+        })
         .body(Empty::<Bytes>::new())
         .map_err(|error| SoakError::message(format!("build HTTP/2 request: {error}")))?;
     let response = sender
@@ -354,6 +404,9 @@ async fn request_http2(
     let outcome = read_or_cancel(response.into_body(), cancel).await?;
     drop(sender);
     driver.abort();
+    if cancel {
+        cancellation.wait_after(cancellation_before).await?;
+    }
     Ok(outcome)
 }
 
@@ -394,6 +447,7 @@ async fn request_worker(
     deadline: Instant,
     seed: u64,
     counters: Arc<Counters>,
+    cancellation: Arc<CancellationBarrier>,
 ) {
     let mut random = XorShift64::new(seed);
     while Instant::now() < deadline {
@@ -407,9 +461,9 @@ async fn request_worker(
             counters.http1.fetch_add(1, Ordering::Relaxed);
         }
         let request = if use_h2 {
-            request_http2(address, Arc::clone(&h2), cancel).await
+            request_http2(address, Arc::clone(&h2), cancel, &cancellation).await
         } else {
-            request_http1(address, Arc::clone(&h1), cancel).await
+            request_http1(address, Arc::clone(&h1), cancel, &cancellation).await
         };
         match request {
             Ok(outcome) => {
@@ -511,12 +565,19 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
     write_identity(directory.path(), &first_identity)?;
 
     let unstable_healthy = Arc::new(AtomicBool::new(true));
-    let (first, first_fixture) =
-        spawn_endpoint(Arc::clone(&unstable_healthy), true, arguments.payload_size).await?;
+    let cancellation = Arc::new(CancellationBarrier::default());
+    let (first, first_fixture) = spawn_endpoint(
+        Arc::clone(&unstable_healthy),
+        true,
+        arguments.payload_size,
+        Arc::clone(&cancellation),
+    )
+    .await?;
     let (second, second_fixture) = spawn_endpoint(
         Arc::new(AtomicBool::new(true)),
         false,
         arguments.payload_size,
+        Arc::clone(&cancellation),
     )
     .await?;
     let config = directory.path().join("oxidase.yaml");
@@ -550,8 +611,8 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
     let h2 = client_config(&[&first_identity, &second_identity], &[b"h2"])?;
 
     // Warm both protocol drivers and the upstream pools before recording a baseline.
-    let _ = request_http1(address, Arc::clone(&h1), false).await?;
-    let _ = request_http2(address, Arc::clone(&h2), false).await?;
+    let _ = request_http1(address, Arc::clone(&h1), false, &cancellation).await?;
+    let _ = request_http2(address, Arc::clone(&h2), false, &cancellation).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let monitor = ResourceMonitor::start();
@@ -583,6 +644,7 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
                     .unwrap_or(u64::MAX)
                     .wrapping_mul(0x9E37_79B9),
             Arc::clone(&counters),
+            Arc::clone(&cancellation),
         ));
     }
     while workers.join_next().await.is_some() {}

@@ -16,7 +16,7 @@ pub use compiler::{
     GatewaySummary, Http1Settings, Http2Settings, HttpListenerSpec, HttpVersion, ListenerLimits,
     ListenerProtocol, LoadBalancePolicy, PassiveHealthSpec, RetryBodyMode, RetryCause,
     RetryRequestBodySpec, RetrySpec, SecretSpec, SiteSpec, SniCertificateSpec, SniPattern,
-    StatusRange, TlsListenerSpec, TrustStoreSpec,
+    StatusRange, TlsListenerSpec, TrustStoreSpec, UpstreamTimeoutSpec,
 };
 pub use diagnostic::{CompileError, Diagnostic};
 pub use portable::{
@@ -29,3 +29,9 @@ pub use portable::{
 pub use source::{ConfigTestSource, ExplainRequestSource, TestExpectationSource};
 
 pub const API_VERSION: &str = "oxidase.dev/v1alpha1";
+/// Required Bundle capability for the phased upstream deadline contract.
+pub const UPSTREAM_DEADLINES_FEATURE: &str = "upstream-deadlines";
+/// Fixed, cross-platform ceiling for every new phased timeout. Legacy duration
+/// parsing remains unchanged; adapters fail closed if its deadline is impossible.
+pub const MAX_UPSTREAM_PHASE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);

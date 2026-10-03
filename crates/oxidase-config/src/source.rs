@@ -304,10 +304,26 @@ pub(crate) struct ClusterSource {
     #[serde(default)]
     pub limits: ClusterLimitsSource,
     pub tls: Option<ClusterTlsSource>,
+    pub connect_timeout: Option<String>,
+    pub response_timeout: Option<String>,
+    pub timeouts: Option<UpstreamTimeoutSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpstreamTimeoutSource {
     #[serde(default = "default_connect_timeout")]
-    pub connect_timeout: String,
+    pub connect: String,
+    #[serde(default = "default_connect_timeout")]
+    pub tls_handshake: String,
     #[serde(default = "default_response_timeout")]
-    pub response_timeout: String,
+    pub request_body_idle: String,
+    #[serde(default = "default_response_header_timeout")]
+    pub response_header: String,
+    #[serde(default = "default_response_timeout")]
+    pub response_body_idle: String,
+    #[serde(default = "default_pre_response_total_timeout")]
+    pub pre_response_total: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -554,6 +570,14 @@ fn default_connect_timeout() -> String {
 
 fn default_response_timeout() -> String {
     "30s".to_owned()
+}
+
+fn default_response_header_timeout() -> String {
+    "10s".to_owned()
+}
+
+fn default_pre_response_total_timeout() -> String {
+    "60s".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,16 +1,50 @@
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::crypto::ring::default_provider;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use crate::{ProcessObservation, ResourceObservation, SoakError};
+
+/// An acknowledgment from an actual upstream body adapter's Drop, not a
+/// synthetic cancellation metric or a client-side intention counter.
+#[derive(Default)]
+pub(crate) struct CancellationBarrier {
+    dropped: AtomicU64,
+    changed: Notify,
+}
+
+impl CancellationBarrier {
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_body_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_after(&self, before: u64) -> Result<(), SoakError> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.dropped() > before {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| SoakError::message("cancelled upstream body was not dropped"))
+    }
+}
 
 pub(crate) struct TestIdentity {
     pub certificate_pem: String,

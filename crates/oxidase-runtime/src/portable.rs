@@ -194,6 +194,22 @@ impl RuntimeSnapshot {
 }
 
 impl PortableRuntimePlanV1 {
+    /// Executable capabilities implied by the normalized plan, not DNS answers
+    /// or live Resource state. Loaders must require these in the manifest.
+    #[must_use]
+    pub fn required_features(&self) -> BTreeSet<String> {
+        let mut required = BTreeSet::from(["portable-runtime".to_owned()]);
+        if self
+            .gateway
+            .clusters
+            .values()
+            .any(|cluster| cluster.timeouts.is_some())
+        {
+            required.insert(oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned());
+        }
+        required
+    }
+
     /// Returns the exact content-key set consumed by compiled Site plans.
     #[must_use]
     pub fn asset_keys(&self) -> BTreeSet<String> {
@@ -445,7 +461,7 @@ impl PortableRuntimePlanV1 {
             resources,
             listeners: gateway_plan.listeners,
             tests: Vec::new(),
-            warnings: Vec::new(),
+            warnings: gateway_plan.warnings,
         };
         let prepared = PortablePreparedResources {
             dependencies,
@@ -678,6 +694,38 @@ listeners:
                 .nodes
                 .iter()
                 .any(|node| { node.source.file == Path::new("source/external/up-1/shared.yaml") })
+        );
+    }
+
+    #[test]
+    fn legacy_bundle_timing_warning_survives_source_free_preparation() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("oxidase.yaml");
+        let text = GATEWAY.replace("services:\n", "resources:\n  clusters:\n    api:\n      endpoints:\n        - http://127.0.0.1:3000\nservices:\n");
+        fs::write(&source, text).expect("write Gateway");
+        let gateway = Compiler::compile_path(&source).expect("legacy source compiles");
+        let snapshot = RuntimeSnapshot::prepare(gateway.clone()).expect("prepare source");
+        let export = snapshot
+            .export_portable(&gateway)
+            .expect("export legacy plan");
+        assert_eq!(
+            export.plan.required_features(),
+            BTreeSet::from(["portable-runtime".to_owned()])
+        );
+        let (rebuilt, _) = export
+            .plan
+            .prepare_with_assets(
+                ContentDigest::of_bytes(b"legacy-warning"),
+                directory.path(),
+                Vec::new(),
+                |_, _, _| unreachable!("fixture has no Assets"),
+                None,
+            )
+            .expect("source-free legacy preparation");
+        assert_eq!(rebuilt.preparation_warnings().len(), 1);
+        assert_eq!(
+            rebuilt.preparation_warnings()[0].code,
+            "resource.cluster_legacy_timeout"
         );
     }
 

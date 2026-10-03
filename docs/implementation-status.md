@@ -4,8 +4,8 @@ Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-secure-control-plane`
-- public starting point: v0.4 portable-Bundle merge `e018b2e`
+- active milestone branch: `feat/v0.4-upstream-transport-deadlines` (phase 6A)
+- public starting point: completed secure-control-plane merge `ebfb754`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -175,7 +175,7 @@ Last updated: 2026-10-03
   control of dangerous framing and hop-by-hop headers.
 - `oxidase serve` now runs the prepared gateway. Real loopback tests cover
   Respond/Redirect/Route/fallback, streaming asset range responses, and shutdown.
-- Phase 5 Proxy uses one long-lived Hyper client and connection pool for all
+- Phase 5 Proxy uses bounded long-lived Hyper clients and connection pools for all
   requests, streams downstream request and upstream response bodies, supports
   HTTP/HTTPS plus upstream HTTP/2 ALPN, and never collects the normal proxy path.
 - Proxy removes Connection-nominated and standard hop-by-hop headers, applies a
@@ -183,7 +183,7 @@ Last updated: 2026-10-03
   preserves raw path/query representation, enforces response-header and body-idle
   timeouts, and returns classified Failed outcomes.
 - Cluster source compiles `auto`, `http1`, or `h2` upstream protocol policy. The
-  server owns one long-lived pool for each policy: `auto` uses HTTPS ALPN and
+  server owns transport-identity-isolated long-lived pools: `auto` uses HTTPS ALPN and
   cleartext HTTP/1, `http1` forces HTTP/1.1, and `h2` requires TLS H2 or uses
   cleartext H2 prior knowledge. Protocol changes participate in Cluster identity.
 - HTTPS Clusters support system roots, a custom Trust Store, or their union; an
@@ -441,6 +441,38 @@ Last updated: 2026-10-03
   final-head and post-merge Hosted receipts; local evidence cannot substitute for
   those separate runs. Version remains `0.3.0-alpha.1`.
 
+## Phase 6A transport and deadline implementation
+
+- Static endpoints retain logical scheme/authority/base path independently of their
+  validated SocketAddr. Proxy and health use the same direct connector; no second
+  DNS lookup or fake pool-key Host is emitted. Effective TLS/Trust/client identity,
+  endpoint/address and protocol isolate bounded long-lived pools. Ordinary protocol
+  changes retire incompatible pools; trusted HTTP/1 Upgrade is an explicit override.
+- Declared `timeouts` compile six positive, at-most-24-hour durations and exact
+  source spans. One `pre_response_total` deadline covers queue, buffering, name
+  resolution, transport, upload and retries. Request body handoff and pool-ready
+  metadata are the observable boundaries, not claimed remote-delivery timestamps.
+  Early response heads remain concurrent with upload; body idle is cooperative
+  demand-relative, and post-head faults remain stream failures.
+- Native static-name work is coalesced, bounded to 32 admitted blocking jobs and
+  32 addresses per answer, and cache entries are capacity-bounded. Static freshness
+  and bounded error fallback do not claim DNS TTL/NXDOMAIN semantics. Cold address
+  fallback is explicit before body dispatch and shares one aggregate TCP budget;
+  the winning socket remains the actual pool target. Exact failed-Client retirement
+  permits a later request to reselect without retargeting an old stream.
+  Reconnect/preconnect quota and idle warm-socket lifetime are bounded.
+- Health has independent global/per-Cluster quotas of 64/32; quota waiting and
+  resolver failure do not become physical endpoint failure. Runtime status retry
+  reserves replacement admission before cancelling an original upload/response and
+  retains one Cluster permit. Foreign/cancelled/dropped reservations preserve RAII.
+- Legacy source/Bundle envelopes remain a distinct migration mode, and new Bundle
+  plans require `upstream-deadlines`. Operational addresses are not PublishedRuntime
+  ETags, RuntimeOrigin, Bundle content or publication authorization.
+- Focused transport, pool, health and reservation regressions were executed; exact
+  command results and separate final-head/main Hosted receipts belong to
+  `docs/verification/discovery-acceptance.md`. A/AAAA, SRV and Linux discovery
+  qualification are not marked complete by this 6A implementation.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
@@ -512,8 +544,11 @@ Last updated: 2026-10-03
   replay exists only through explicit bounded buffering. Configurable Forwarded
   trust policy is not implemented; the current secure default always replaces
   incoming forwarding metadata.
-- The response-header timeout currently bounds connect plus upload/header latency as
-  one deadline; per-phase connect/write timing is not separately observable yet.
+- Phased upstream limits use observable TCP/TLS, demanded request/response Body,
+  pool-ready dispatch and local EOS boundaries. They do not measure actual remote
+  byte receipt or a socket write-progress timeout. The separate legacy mode keeps
+  its attempt envelope; static native-name caching does not expose DNS record TTLs
+  or authoritative DNS response classes.
 - The adversarial streaming fixtures cover representative disconnect and timeout
   boundaries. Manual fuzz and soak tools are separate from ordinary CI; their
   existence is not evidence of a long-duration reliability campaign.
@@ -588,7 +623,7 @@ Last updated: 2026-10-03
 
 1. Preserve phase-five receipt, recovery, and audit contracts in future work;
    online reconciliation and multi-principal authorization remain separate design work.
-2. Treat DNS/SRV discovery and separate upstream phase timeouts as a separately
-   authorized later milestone.
+2. Finish the authorized phase 6B–6D DNS/SRV operational discovery and integration
+   qualification after 6A's transport/deadline PR and merged-main gates pass.
 3. Treat access logs/OpenTelemetry, packaging, and Linux qualification as separately
-   authorized later work; none is part of this control-plane completion.
+   authorized later work; none is part of phase 6A–6D.

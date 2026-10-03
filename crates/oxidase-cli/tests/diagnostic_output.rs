@@ -258,3 +258,134 @@ fn invalid_bundle_failure_is_one_valid_json_diagnostic_envelope() {
     assert_eq!(value["diagnostics"][0]["code"], "bundle.truncated");
     assert!(output.stderr.is_empty());
 }
+
+fn timeout_source(policy: &str) -> String {
+    // Unicode and structural-looking scalar contents precede the policy. Byte
+    // offsets must count UTF-8 and CRLF while columns count characters.
+    format!(
+        "{}resources:\n  clusters:\n    api:\n      endpoints: [http://127.0.0.1:3000]\n{policy}",
+        VALID_GATEWAY.replace("      text: ok", "      text: |\n        中文 &value *alias !tag {{ text }}\n        duplicate: literal\n        duplicate: still literal")
+    )
+    .replace('\n', "\r\n")
+}
+
+fn assert_scalar_value_span(span: &Value, source: &str, field: &str, value: &str) {
+    let marker = format!("{field}: {value}");
+    let start = source.find(&marker).expect("unique fixture field") + field.len() + 2;
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .expect("line prefix")
+        .chars()
+        .count()
+        + 1;
+    assert_eq!(span["file"], "oxidase.yaml");
+    assert_eq!(span["file_encoding"], "utf-8");
+    assert_eq!(span["start"]["byte"], start);
+    assert_eq!(span["end"]["byte"], start + value.len());
+    assert_eq!(span["start"]["line"], line);
+    assert_eq!(span["end"]["line"], line);
+    assert_eq!(span["start"]["column"], column);
+    assert_eq!(span["end"]["column"], column + value.chars().count());
+}
+
+#[test]
+fn legacy_timeout_migration_warnings_match_human_json_and_exact_crlf_spans() {
+    let directory = tempdir().expect("temporary directory exists");
+    let source = timeout_source("      connect_timeout: 2s\n      response_timeout: 7s\n");
+    fs::write(directory.path().join("oxidase.yaml"), &source).expect("legacy source writes");
+    let human = run(directory.path(), &["check", "oxidase.yaml"]);
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("is valid"));
+    let human_detail = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human_detail
+            .matches("warning[resource.cluster_legacy_timeout]")
+            .count(),
+        2
+    );
+    assert!(human_detail.contains("each attempt"));
+    assert!(human_detail.contains("pre_response_total"));
+
+    let args = ["check", "oxidase.yaml", "--diagnostic-format=json"];
+    let first = run(directory.path(), &args);
+    let second = run(directory.path(), &args);
+    assert!(first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    assert!(!first.stdout.contains(&0x1b));
+    let envelope = json(&first);
+    assert_envelope(&envelope);
+    let warnings = envelope["diagnostics"].as_array().expect("warning array");
+    assert_eq!(warnings.len(), 2);
+    for (warning, (field, value)) in warnings
+        .iter()
+        .zip([("connect_timeout", "2s"), ("response_timeout", "7s")])
+    {
+        assert_eq!(warning["code"], "resource.cluster_legacy_timeout");
+        assert_eq!(warning["severity"], "warning");
+        assert_eq!(
+            warning["primary"]["field_path"],
+            format!("resources.clusters.api.{field}")
+        );
+        assert_scalar_value_span(&warning["primary"], &source, field, value);
+        assert!(
+            warning["message"]
+                .as_str()
+                .expect("migration message")
+                .contains("each attempt")
+        );
+        assert!(
+            warning["help"]
+                .as_str()
+                .expect("migration help")
+                .contains("pre_response_total")
+        );
+    }
+}
+
+#[test]
+fn mixed_timeout_policy_reports_exact_primary_secondary_spans_in_both_formats() {
+    let directory = tempdir().expect("temporary directory exists");
+    let source = timeout_source(
+        "      response_timeout: 7s\n      timeouts:\n        response_header: 3s\n",
+    );
+    fs::write(directory.path().join("oxidase.yaml"), &source).expect("mixed source writes");
+    let human = run(directory.path(), &["check", "oxidase.yaml"]);
+    assert!(!human.status.success());
+    assert!(human.stdout.is_empty());
+    let human_detail = String::from_utf8_lossy(&human.stderr);
+    assert!(human_detail.contains("error[resource.cluster_timeout_conflict]"));
+    assert!(human_detail.contains("phased timing policy is declared here"));
+
+    let args = ["check", "oxidase.yaml", "--diagnostic-format=json"];
+    let first = run(directory.path(), &args);
+    let second = run(directory.path(), &args);
+    assert!(!first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    let envelope = json(&first);
+    assert_envelope(&envelope);
+    assert_eq!(envelope["diagnostics"].as_array().map(Vec::len), Some(1));
+    let error = &envelope["diagnostics"][0];
+    assert_eq!(error["code"], "resource.cluster_timeout_conflict");
+    assert_eq!(
+        error["primary"]["field_path"],
+        "resources.clusters.api.response_timeout"
+    );
+    assert_scalar_value_span(&error["primary"], &source, "response_timeout", "7s");
+    assert_eq!(error["labels"].as_array().map(Vec::len), Some(1));
+    let related = &error["labels"][0]["span"];
+    assert_eq!(related["field_path"], "resources.clusters.api.timeouts");
+    let start = source.find("timeouts:\r\n").expect("timeouts field exists");
+    assert_eq!(related["start"]["byte"], start);
+    assert_eq!(related["end"]["byte"], start + "timeouts".len());
+    assert!(
+        error["help"]
+            .as_str()
+            .expect("conflict help")
+            .contains("remove both legacy fields")
+    );
+}

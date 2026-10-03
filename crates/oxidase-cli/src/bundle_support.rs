@@ -191,7 +191,7 @@ pub(crate) fn build_bundle(
     );
     manifest
         .required_features
-        .insert("portable-runtime".to_owned());
+        .extend(exported.plan.required_features());
     manifest
         .sections
         .insert(RUNTIME_SECTION.to_owned(), runtime_section);
@@ -498,7 +498,16 @@ fn decode_runtime_plan(archive: &BundleArchive) -> Result<PortableRuntimePlanV1,
             ),
         });
     }
-    section.to_serde().map_err(Into::into)
+    let plan: PortableRuntimePlanV1 = section.to_serde()?;
+    for feature in plan.required_features() {
+        if !archive.manifest().required_features.contains(&feature) {
+            return Err(BundleCliError::Invalid {
+                code: "bundle.required_feature_missing",
+                message: format!("runtime plan requires manifest feature `{feature}`"),
+            });
+        }
+    }
+    Ok(plan)
 }
 
 fn resolve_asset(
@@ -1854,6 +1863,67 @@ listeners:
         let error = verify_bundle(&invalid_trust_bundle, &[], Some(directory.path()))
             .expect_err("CLI verification rejects invalid embedded public trust DER");
         assert_eq!(error.code(), "trust_store.certificate");
+    }
+
+    #[test]
+    fn phased_bundle_requires_declared_capability_in_verify_and_activation() {
+        let directory = tempdir().expect("root exists");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(&config,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      endpoints:\n        - http://127.0.0.1:3000\n      timeouts:\n        connect: 5s\nservices:\n  root:\n    type: respond\n    body:\n      text: ready\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      ref: root\n",
+        ).expect("Gateway writes");
+        let (gateway, snapshot) = prepare(&config);
+        let bundle = directory.path().join("phased.oxb");
+        build_bundle(&gateway, &snapshot, &bundle, directory.path()).expect("Bundle builds");
+        let archive =
+            BundleArchive::read_path(&bundle, &BundleLimits::default()).expect("Bundle reads");
+        assert!(
+            archive
+                .manifest()
+                .required_features
+                .contains(oxidase_config::UPSTREAM_DEADLINES_FEATURE)
+        );
+        let old_runtime = oxidase_bundle::BundleCapabilities {
+            runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+            supported_features: std::collections::BTreeSet::from(["portable-runtime".to_owned()]),
+            supported_sections: std::collections::BTreeMap::from([(
+                "runtime".to_owned(),
+                PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
+            )]),
+        };
+        assert!(archive.verify_capabilities(&old_runtime).is_err());
+        verify_bundle(&bundle, &[], Some(directory.path()))
+            .expect("capable verifier accepts timing");
+        let loaded = load_bundle_snapshot(&bundle, &[], true, Some(directory.path()))
+            .expect("phased activation succeeds");
+        assert!(
+            loaded.snapshot.resources.clusters[&ResourceId::new("cluster:api")]
+                .spec()
+                .timeouts
+                .is_some()
+        );
+
+        let mut manifest = archive.manifest().clone();
+        manifest
+            .required_features
+            .remove(oxidase_config::UPSTREAM_DEADLINES_FEATURE);
+        let stripped = directory.path().join("missing-feature.oxb");
+        BundleBuilder::new(manifest)
+            .write_atomic(&stripped)
+            .expect("structurally valid stripped Bundle");
+        assert_eq!(
+            verify_bundle(&stripped, &[], Some(directory.path()))
+                .expect_err("verify rejects stripped contract")
+                .code(),
+            "bundle.required_feature_missing"
+        );
+        assert_eq!(
+            load_bundle_snapshot(&stripped, &[], true, Some(directory.path()))
+                .err()
+                .expect("activation rejects stripped contract")
+                .code(),
+            "bundle.required_feature_missing"
+        );
     }
 
     #[test]

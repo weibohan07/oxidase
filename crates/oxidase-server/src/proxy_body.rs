@@ -7,10 +7,15 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt as _;
 use oxidase_runtime::{ClusterRequestPermit, PreparedCluster};
 
-use crate::body::{BoxError, GatewayRequestBody};
+use crate::body::{
+    BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBody, GatewayRequestBody,
+    timeout_proxy_request_body,
+};
 use crate::protocol::RequestTrailerGuard;
+use crate::upstream_timing::{AttemptLeaseGuard, LocalRequestFailure, RequestProgress};
 
 /// Marks an error produced while decoding the untrusted downstream request
 /// body. Keeping this provenance through Hyper's client error chain lets Proxy
@@ -58,6 +63,11 @@ pub(crate) enum ProxyRequestBody {
         data: Option<Bytes>,
         trailers: Option<HeaderMap>,
     },
+    Tracked {
+        body: GatewayBody,
+        progress: RequestProgress,
+        terminated: bool,
+    },
 }
 
 impl ProxyRequestBody {
@@ -76,6 +86,30 @@ impl ProxyRequestBody {
 
     pub(crate) const fn empty() -> Self {
         Self::Empty
+    }
+
+    /// Enables phased request-idle timing and local EOS/cancellation tracking.
+    /// An empty input remains allocation-free and never starts an idle timer.
+    pub(crate) fn with_progress(
+        self,
+        progress: RequestProgress,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
+        if self.is_end_stream() {
+            progress.mark_eos();
+            progress.upload_dropped();
+            return self;
+        }
+        let body = self.boxed_unsync();
+        let body = match timeout {
+            Some(timeout) => timeout_proxy_request_body(body, timeout),
+            None => body,
+        };
+        Self::Tracked {
+            body,
+            progress,
+            terminated: false,
+        }
     }
 }
 
@@ -128,6 +162,41 @@ impl Body for ProxyRequestBody {
                 }
                 Poll::Ready(None)
             }
+            Self::Tracked {
+                body,
+                progress,
+                terminated,
+            } => {
+                if *terminated {
+                    return Poll::Ready(None);
+                }
+                progress.register_upload_waker(context.waker());
+                if progress.upload_cancelled() {
+                    *terminated = true;
+                    return Poll::Ready(Some(Err(Box::new(ProxyUploadCancelled))));
+                }
+                match Pin::new(&mut *body).poll_frame(context) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        // Hyper can drop the body after its last frame without
+                        // polling None; report local EOS before handing it off.
+                        if frame.trailers_ref().is_some() || body.is_end_stream() {
+                            progress.mark_eos();
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        *terminated = true;
+                        progress.fail(local_body_failure(error.as_ref()));
+                        Poll::Ready(Some(Err(error)))
+                    }
+                    Poll::Ready(None) => {
+                        *terminated = true;
+                        progress.mark_eos();
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 
@@ -139,6 +208,9 @@ impl Body for ProxyRequestBody {
                 data.as_ref().is_none_or(Bytes::is_empty)
                     && trailers.as_ref().is_none_or(HeaderMap::is_empty)
             }
+            Self::Tracked {
+                body, terminated, ..
+            } => *terminated || body.is_end_stream(),
         }
     }
 
@@ -149,7 +221,53 @@ impl Body for ProxyRequestBody {
             Self::Replay { data, .. } => {
                 SizeHint::with_exact(data.as_ref().map_or(0, |data| data.len() as u64))
             }
+            Self::Tracked {
+                body, terminated, ..
+            } => {
+                if *terminated {
+                    SizeHint::with_exact(0)
+                } else {
+                    body.size_hint()
+                }
+            }
         }
+    }
+}
+
+impl Drop for ProxyRequestBody {
+    fn drop(&mut self) {
+        if let Self::Tracked { progress, .. } = self {
+            progress.upload_dropped();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProxyUploadCancelled;
+
+impl std::fmt::Display for ProxyUploadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("upstream request upload cancelled by response lifecycle")
+    }
+}
+
+impl std::error::Error for ProxyUploadCancelled {}
+
+fn local_body_failure(mut error: &(dyn std::error::Error + 'static)) -> LocalRequestFailure {
+    loop {
+        if error
+            .downcast_ref::<BodyIdleTimeout>()
+            .is_some_and(|timeout| timeout.direction() == BodyIdleDirection::Request)
+        {
+            return LocalRequestFailure::IdleTimeout;
+        }
+        if error.downcast_ref::<RequestBodyLimitExceeded>().is_some() {
+            return LocalRequestFailure::LimitExceeded;
+        }
+        let Some(source) = error.source() else {
+            return LocalRequestFailure::InvalidBody;
+        };
+        error = source;
     }
 }
 
@@ -266,12 +384,15 @@ pub(crate) struct ClusterResponseBody<B> {
     endpoint: Box<str>,
     permit: Option<ClusterRequestPermit>,
     outcome_recorded: bool,
+    request_progress: Option<RequestProgress>,
+    lease: Option<AttemptLeaseGuard>,
 }
 
 impl<B> ClusterResponseBody<B>
 where
     B: Body,
 {
+    #[cfg(test)]
     pub(crate) fn new(
         inner: B,
         cluster: Arc<PreparedCluster>,
@@ -285,6 +406,8 @@ where
             endpoint,
             permit: Some(permit),
             outcome_recorded,
+            request_progress: None,
+            lease: None,
         };
         if body.inner.is_end_stream() {
             body.finish(true);
@@ -292,9 +415,55 @@ where
         body
     }
 
+    #[cfg(test)]
+    fn new_with_progress(
+        inner: B,
+        cluster: Arc<PreparedCluster>,
+        permit: ClusterRequestPermit,
+        outcome_recorded: bool,
+        progress: RequestProgress,
+    ) -> Self {
+        match progress.attach_permit(permit) {
+            Ok(lease) => Self::new_with_lease(inner, cluster, lease, outcome_recorded),
+            Err(permit) => Self::new(inner, cluster, permit, outcome_recorded),
+        }
+    }
+
+    pub(crate) fn new_with_lease(
+        inner: B,
+        cluster: Arc<PreparedCluster>,
+        lease: AttemptLeaseGuard,
+        outcome_recorded: bool,
+    ) -> Self {
+        let endpoint = lease.endpoint().name().into();
+        let progress = lease.progress();
+        let mut body = Self {
+            inner: Box::pin(inner),
+            cluster,
+            endpoint,
+            permit: None,
+            outcome_recorded,
+            request_progress: Some(progress),
+            lease: Some(lease),
+        };
+        if body.inner.is_end_stream() {
+            body.finish(true);
+        }
+        body
+    }
+}
+
+impl<B> ClusterResponseBody<B> {
     fn finish(&mut self, succeeded: bool) {
         if !self.outcome_recorded {
-            if succeeded {
+            let local_failure = self
+                .request_progress
+                .as_ref()
+                .and_then(RequestProgress::local_failure);
+            if local_failure.is_some() {
+                // A post-head reset can be caused by a failed downstream
+                // upload. It is not evidence that the endpoint is unhealthy.
+            } else if succeeded {
                 self.cluster.record_passive_success(&self.endpoint);
             } else {
                 self.cluster
@@ -303,6 +472,16 @@ where
             self.outcome_recorded = true;
         }
         self.permit.take();
+        self.lease.take();
+    }
+}
+
+impl<B> Drop for ClusterResponseBody<B> {
+    fn drop(&mut self) {
+        // Cancellation does not constitute an endpoint failure. It still ends
+        // the response leg and wakes a pending upload so Hyper can cancel it.
+        self.permit.take();
+        self.lease.take();
     }
 }
 
@@ -348,13 +527,52 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
     use bytes::Bytes;
     use http::HeaderMap;
+    use http_body::{Body, Frame};
     use http_body_util::BodyExt as _;
 
-    use super::{ProxyRequestBody, RequestBodyLimitExceeded};
-    use crate::body::full_body;
+    use super::{ClusterResponseBody, ProxyRequestBody, RequestBodyLimitExceeded};
+    use crate::body::{BoxError, full_body};
     use crate::protocol::{RequestTrailerGuard, WireProtocol};
+    use crate::upstream_timing::{LocalRequestFailure, RequestProgress};
+
+    struct PendingUpload;
+
+    impl Body for PendingUpload {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Pending
+        }
+    }
+
+    async fn prepared_cluster() -> Arc<oxidase_runtime::PreparedCluster> {
+        let directory = tempfile::tempdir().expect("temporary fixture");
+        let source = directory.path().join("oxidase.yaml");
+        std::fs::write(&source, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    test:\n      endpoints: [http://127.0.0.1:12345]\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    service:\n      type: proxy\n      cluster: test\n").expect("fixture config");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&source).expect("fixture compiles"),
+        )
+        .expect("fixture prepares");
+        Arc::clone(
+            snapshot
+                .resources
+                .clusters
+                .values()
+                .next()
+                .expect("fixture cluster"),
+        )
+    }
 
     fn guard() -> RequestTrailerGuard {
         RequestTrailerGuard::from_request_headers(WireProtocol::Http2, &HeaderMap::new())
@@ -377,5 +595,213 @@ mod tests {
                 .await
                 .expect_err("body above the limit fails before forwarding that frame");
         assert!(error.downcast_ref::<RequestBodyLimitExceeded>().is_some());
+    }
+
+    #[tokio::test]
+    async fn reports_local_eos_before_hyper_drops_the_final_data_frame() {
+        let progress = RequestProgress::new(false);
+        let mut body =
+            ProxyRequestBody::streaming(full_body(Bytes::from_static(b"last")), guard(), None)
+                .with_progress(progress.clone(), None);
+        assert!(progress.eos_at().is_none());
+        assert_eq!(
+            body.frame()
+                .await
+                .expect("DATA")
+                .expect("valid DATA")
+                .data_ref(),
+            Some(&Bytes::from_static(b"last"))
+        );
+        assert!(
+            progress.eos_at().is_some(),
+            "last DATA is local EOS even without a subsequent poll"
+        );
+        assert!(body.is_end_stream());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_idle_error_keeps_downstream_provenance() {
+        let progress = RequestProgress::new(false);
+        let body = ProxyRequestBody::streaming(PendingUpload.boxed_unsync(), guard(), None)
+            .with_progress(progress.clone(), Some(Duration::from_secs(2)));
+        assert!(body.collect().await.is_err());
+        assert_eq!(
+            progress.local_failure(),
+            Some(LocalRequestFailure::IdleTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_completion_cancels_upload_and_holds_permit_until_upload_drop() {
+        let cluster = prepared_cluster().await;
+        let permit = cluster.acquire().await.expect("admitted");
+        let progress = RequestProgress::new(false);
+        let mut upload = ProxyRequestBody::streaming(PendingUpload.boxed_unsync(), guard(), None)
+            .with_progress(progress.clone(), None);
+        {
+            let next = upload.frame();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(&mut next).is_pending());
+        }
+        let body = ClusterResponseBody::new_with_progress(
+            full_body(Bytes::from_static(b"early")),
+            Arc::clone(&cluster),
+            permit,
+            false,
+            progress.clone(),
+        );
+        assert_eq!(
+            body.collect().await.expect("response completes").to_bytes(),
+            Bytes::from_static(b"early")
+        );
+        assert!(progress.upload_cancelled());
+        assert_eq!(
+            cluster.active_requests(),
+            1,
+            "request leg still owns admission"
+        );
+        assert!(upload.frame().await.expect("cancel frame").is_err());
+        drop(upload);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            cluster.status(std::time::Instant::now()).endpoints[0]
+                .runtime
+                .failures,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pre_head_owner_cancels_live_upload_before_releasing_admission() {
+        let cluster = prepared_cluster().await;
+        let permit = cluster.acquire().await.expect("admitted");
+        let progress = RequestProgress::new(false);
+        let lease = progress
+            .attach_permit(permit)
+            .unwrap_or_else(|_| panic!("fresh progress owns no permit"));
+        let mut upload = ProxyRequestBody::streaming(PendingUpload.boxed_unsync(), guard(), None)
+            .with_progress(progress.clone(), None);
+        {
+            let next = upload.frame();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(&mut next).is_pending());
+        }
+        drop(lease); // An outer Timeout wrapper or client drop before head.
+        assert_eq!(cluster.active_requests(), 1, "Hyper still owns upload");
+        assert!(upload.frame().await.expect("cancel error").is_err());
+        assert!(upload.frame().await.is_none(), "cancellation is terminal");
+        drop(upload);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            cluster.status(std::time::Instant::now()).endpoints[0]
+                .runtime
+                .failures,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn eos_does_not_allow_retry_to_take_a_still_owned_upload_permit() {
+        let cluster = prepared_cluster().await;
+        let permit = cluster.acquire().await.expect("admitted");
+        let progress = RequestProgress::new(false);
+        let mut lease = progress
+            .attach_permit(permit)
+            .unwrap_or_else(|_| panic!("fresh progress owns no permit"));
+        let mut upload =
+            ProxyRequestBody::streaming(full_body(Bytes::from_static(b"last")), guard(), None)
+                .with_progress(progress.clone(), None);
+        upload
+            .frame()
+            .await
+            .expect("last frame")
+            .expect("valid DATA");
+        assert!(progress.eos_at().is_some());
+        assert!(
+            lease.take_for_retry().is_none(),
+            "local EOS is not pipe termination"
+        );
+        drop(upload);
+        lease.wait_request_closed().await;
+        let permit = lease
+            .take_for_retry()
+            .expect("closed request permits retarget");
+        assert!(
+            lease.take_for_retry().is_none(),
+            "permit can only be moved once"
+        );
+        drop(lease);
+        assert_eq!(
+            cluster.active_requests(),
+            1,
+            "retarget keeps Cluster admission"
+        );
+        drop(permit);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn response_drop_cancels_upload_without_passive_failure() {
+        let cluster = prepared_cluster().await;
+        let permit = cluster.acquire().await.expect("admitted");
+        let progress = RequestProgress::new(false);
+        let upload = ProxyRequestBody::streaming(PendingUpload.boxed_unsync(), guard(), None)
+            .with_progress(progress.clone(), None);
+        let response = ClusterResponseBody::new_with_progress(
+            PendingUpload,
+            Arc::clone(&cluster),
+            permit,
+            false,
+            progress.clone(),
+        );
+        drop(response);
+        assert!(progress.upload_cancelled());
+        assert_eq!(cluster.active_requests(), 1);
+        drop(upload);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            cluster.status(std::time::Instant::now()).endpoints[0]
+                .runtime
+                .failures,
+            0
+        );
+    }
+
+    struct FailedResponse;
+
+    impl Body for FailedResponse {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Ready(Some(Err(Box::new(std::io::Error::other("fixture reset")))))
+        }
+    }
+
+    #[tokio::test]
+    async fn post_head_local_request_timeout_does_not_eject_endpoint() {
+        let cluster = prepared_cluster().await;
+        let permit = cluster.acquire().await.expect("admitted");
+        let progress = RequestProgress::new(false);
+        progress.fail(LocalRequestFailure::IdleTimeout);
+        progress.upload_dropped();
+        let response = ClusterResponseBody::new_with_progress(
+            FailedResponse,
+            Arc::clone(&cluster),
+            permit,
+            false,
+            progress,
+        );
+        assert!(response.collect().await.is_err());
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            cluster.status(std::time::Instant::now()).endpoints[0]
+                .runtime
+                .failures,
+            0
+        );
     }
 }

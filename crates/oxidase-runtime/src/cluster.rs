@@ -607,8 +607,15 @@ impl PreparedCluster {
         excluded: &BTreeSet<String>,
     ) -> Result<ClusterRequestPermit, ClusterAdmissionError> {
         let queue_timeout = self.spec.limits.queue_timeout;
-        let deadline =
-            (!queue_timeout.is_zero()).then(|| tokio::time::Instant::now() + queue_timeout);
+        let deadline = if queue_timeout.is_zero() {
+            None
+        } else {
+            Some(
+                tokio::time::Instant::now()
+                    .checked_add(queue_timeout)
+                    .ok_or(ClusterAdmissionError::Overloaded)?,
+            )
+        };
         let cluster = acquire_counter(
             Arc::clone(&self.runtime.admission),
             self.spec.limits.max_in_flight,
@@ -662,8 +669,14 @@ impl PreparedCluster {
         let mut excluded = excluded.clone();
         excluded.insert(current.endpoint.name().to_owned());
         let queue_timeout = self.spec.limits.queue_timeout;
-        let deadline =
-            (!queue_timeout.is_zero()).then(|| tokio::time::Instant::now() + queue_timeout);
+        let deadline = if queue_timeout.is_zero() {
+            None
+        } else {
+            let Some(deadline) = tokio::time::Instant::now().checked_add(queue_timeout) else {
+                return false;
+            };
+            Some(deadline)
+        };
 
         loop {
             let released = self.runtime.endpoint_released.notified();
@@ -682,6 +695,44 @@ impl PreparedCluster {
             };
             if tokio::time::timeout_at(deadline, released).await.is_err() {
                 return false;
+            }
+        }
+    }
+
+    /// Reserves a different endpoint without consuming a second Cluster slot
+    /// or changing the current attempt. This is the pre-cancellation boundary
+    /// for status retry: a caller may keep its original response untouched when
+    /// no replacement is admitted, and cancel the old upload only after it owns
+    /// a replacement reservation. Queue cancellation drops only this wait.
+    pub async fn reserve_retry_endpoint(
+        &self,
+        excluded: &BTreeSet<String>,
+        current_name: &str,
+    ) -> Option<ClusterEndpointReservation> {
+        let mut excluded = excluded.clone();
+        excluded.insert(current_name.to_owned());
+        let queue_timeout = self.spec.limits.queue_timeout;
+        let deadline = if queue_timeout.is_zero() {
+            None
+        } else {
+            Some(tokio::time::Instant::now().checked_add(queue_timeout)?)
+        };
+        loop {
+            let released = self.runtime.endpoint_released.notified();
+            match self.try_acquire_endpoint(&excluded, Instant::now()) {
+                EndpointAcquire::Acquired(endpoint, endpoint_permit) => {
+                    return Some(ClusterEndpointReservation {
+                        endpoint,
+                        endpoint_permit,
+                        cluster_counter: Arc::clone(&self.runtime.admission),
+                    });
+                }
+                EndpointAcquire::Unavailable => return None,
+                EndpointAcquire::Saturated => {}
+            }
+            let deadline = deadline?;
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return None;
             }
         }
     }
@@ -972,6 +1023,24 @@ enum EndpointAcquire {
     Saturated,
 }
 
+/// Opaque RAII admission for one replacement endpoint. It holds no additional
+/// Cluster permit and never changes an existing request until explicitly
+/// consumed through [`ClusterRequestPermit::retarget_reserved`].
+pub struct ClusterEndpointReservation {
+    endpoint: Arc<PreparedEndpoint>,
+    endpoint_permit: AdmissionPermit,
+    cluster_counter: Arc<AdmissionCounter>,
+}
+
+impl fmt::Debug for ClusterEndpointReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClusterEndpointReservation")
+            .field("endpoint", &self.endpoint.name())
+            .finish_non_exhaustive()
+    }
+}
+
 /// RAII request admission. It must live through the complete upstream body
 /// lifecycle so success, failure, cancellation, and timeout all release counts.
 pub struct ClusterRequestPermit {
@@ -993,6 +1062,20 @@ impl ClusterRequestPermit {
     #[must_use]
     pub fn endpoint(&self) -> &Arc<PreparedEndpoint> {
         &self.endpoint
+    }
+
+    /// Commits an already admitted replacement while preserving the single
+    /// Cluster permit. Call only after the old upload/attempt no longer uses
+    /// its endpoint. A reservation from another runtime admission owner is
+    /// rejected and released without touching this request.
+    pub fn retarget_reserved(&mut self, reservation: ClusterEndpointReservation) -> bool {
+        if !Arc::ptr_eq(&self._cluster.counter, &reservation.cluster_counter) {
+            return false;
+        }
+        let old_endpoint = std::mem::replace(&mut self._endpoint, reservation.endpoint_permit);
+        self.endpoint = reservation.endpoint;
+        drop(old_endpoint);
+        true
     }
 }
 
@@ -1225,6 +1308,7 @@ mod tests {
             },
             connect_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_secs(2),
+            timeouts: None,
             protocol_source: SourceSpan::synthetic("protocol"),
             source: SourceSpan::synthetic("cluster"),
         }
@@ -1649,6 +1733,162 @@ mod tests {
         drop(current);
     }
 
+    fn retry_reservation_cluster(queue_timeout: Duration) -> PreparedCluster {
+        let mut spec = cluster(
+            LoadBalancePolicy::RoundRobin,
+            vec![
+                endpoint("a", "http://a.test", 1),
+                endpoint("b", "http://b.test", 1),
+            ],
+        );
+        spec.limits.max_in_flight = 1;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        spec.limits.queue_timeout = queue_timeout;
+        PreparedCluster::prepare(spec, None).0
+    }
+
+    #[tokio::test]
+    async fn retry_reservation_precedes_cancellation_and_reuses_one_cluster_permit() {
+        let cluster = retry_reservation_cluster(Duration::ZERO);
+        let mut current = cluster.acquire().await.expect("current admitted");
+        let reservation = cluster
+            .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+            .await
+            .expect("other endpoint reserved despite cluster limit1");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(
+            current.endpoint().name(),
+            "a",
+            "reservation cannot mutate the original attempt"
+        );
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert!(current.retarget_reserved(reservation));
+        assert_eq!(current.endpoint().name(), "b");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        drop(current);
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_saturated_reservation_leaves_the_current_attempt_untouched() {
+        let cluster = retry_reservation_cluster(Duration::ZERO);
+        let current = cluster.acquire().await.expect("current admitted");
+        let saturated = cluster.endpoints[1]
+            .state
+            .admission
+            .try_acquire(1, None)
+            .expect("saturate replacement");
+        assert!(
+            cluster
+                .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+                .await
+                .is_none()
+        );
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        drop(saturated);
+        assert!(
+            cluster
+                .reserve_retry_endpoint(
+                    &BTreeSet::from(["b".to_owned()]),
+                    current.endpoint().name()
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        drop(current);
+    }
+
+    #[tokio::test]
+    async fn dropping_retry_reservation_releases_only_replacement_endpoint() {
+        let cluster = retry_reservation_cluster(Duration::ZERO);
+        let current = cluster.acquire().await.expect("current admitted");
+        let reservation = cluster
+            .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+            .await
+            .expect("replacement");
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        drop(reservation);
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert!(
+            cluster
+                .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            cluster.endpoints[1].active_requests(),
+            0,
+            "temporary successful reservation also releases on drop"
+        );
+        drop(current);
+    }
+
+    #[tokio::test]
+    async fn reservation_from_foreign_cluster_is_rejected_and_released() {
+        let cluster = retry_reservation_cluster(Duration::ZERO);
+        let foreign = retry_reservation_cluster(Duration::ZERO);
+        let mut current = cluster.acquire().await.expect("current admitted");
+        let reservation = foreign
+            .reserve_retry_endpoint(&BTreeSet::new(), "a")
+            .await
+            .expect("foreign reservation");
+        assert_eq!(foreign.endpoints[1].active_requests(), 1);
+        assert!(!current.retarget_reserved(reservation));
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(foreign.active_requests(), 0);
+        assert_eq!(foreign.endpoints[1].active_requests(), 0);
+        drop(current);
+    }
+
+    #[tokio::test]
+    async fn cancelled_retry_reservation_wait_keeps_original_permit_owned() {
+        let cluster = retry_reservation_cluster(Duration::from_secs(10));
+        let current = cluster.acquire().await.expect("current admitted");
+        let saturated = cluster.endpoints[1]
+            .state
+            .admission
+            .try_acquire(1, None)
+            .expect("saturate replacement");
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(10),
+            cluster.reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name()),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        drop(saturated);
+        assert!(
+            cluster
+                .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+                .await
+                .is_some(),
+            "cancelled queue wait does not consume replacement capacity"
+        );
+        drop(current);
+        assert_eq!(cluster.active_requests(), 0);
+        assert!(
+            cluster
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.active_requests() == 0)
+        );
+    }
+
     #[tokio::test]
     async fn endpoint_release_wakes_a_waiter_without_losing_notification() {
         let mut spec = cluster(
@@ -1672,6 +1912,37 @@ mod tests {
         drop(second);
         assert_eq!(cluster.active_requests(), 0);
         assert_eq!(cluster.endpoints[0].active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_legacy_queue_deadline_fails_closed_without_touching_current_admission()
+    {
+        let cluster = retry_reservation_cluster(Duration::ZERO);
+        let mut current = cluster.acquire().await.expect("original admission");
+        let mut spec = cluster.spec().clone();
+        spec.limits.queue_timeout = Duration::MAX;
+        let excessive = PreparedCluster::prepare(spec, Some(&cluster)).0;
+        assert!(matches!(
+            excessive.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        assert!(
+            !excessive
+                .retarget_excluding(&mut current, &BTreeSet::new())
+                .await
+        );
+        assert!(
+            excessive
+                .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
+                .await
+                .is_none()
+        );
+        assert_eq!(current.endpoint().name(), "a");
+        assert_eq!(cluster.active_requests(), 1);
+        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        drop(current);
+        assert_eq!(cluster.active_requests(), 0);
     }
 
     #[tokio::test]

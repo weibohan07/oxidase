@@ -69,6 +69,7 @@ fn cluster_spec(endpoints: Vec<ClusterEndpointSpec>) -> ClusterSpec {
         },
         connect_timeout: Duration::from_secs(1),
         response_timeout: Duration::from_secs(2),
+        timeouts: None,
         protocol_source: SourceSpan::synthetic("protocol"),
         source: SourceSpan::synthetic("cluster"),
     }

@@ -33,6 +33,7 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true
+tower-service.workspace = true
 tracing.workspace = true
 url.workspace = true
 
@@ -42,6 +43,7 @@ rustix = { workspace = true, features = ["process"] }
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

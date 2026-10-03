@@ -4,14 +4,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, header};
 use http_body_util::{BodyExt as _, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use oxidase_bundle::{BundleArchive, BundleBuilder, BundleLimits};
 use oxidase_config::Compiler;
+use oxidase_core::ResourceId;
 use oxidase_runtime::RuntimeSnapshot;
 use oxidase_server::{GatewayServer, RunningServer};
 use serde_json::Value;
@@ -111,9 +115,13 @@ impl Demo {
     }
 
     async fn bundle(&self, label: &str) -> (PathBuf, String) {
+        self.bundle_source(label, &data_source(label)).await
+    }
+
+    async fn bundle_source(&self, label: &str, contents: &str) -> (PathBuf, String) {
         let source = self.root.join(format!("{label}.yaml"));
         let output = self.root.join(format!("{label}.oxb"));
-        fs::write(&source, data_source(label)).expect("candidate source");
+        fs::write(&source, contents).expect("candidate source");
         let result = cli_json(vec![
             "bundle".to_owned(),
             "build".to_owned(),
@@ -176,16 +184,7 @@ fn utf8(path: &Path) -> String {
 
 async fn cli_json(args: Vec<String>) -> Value {
     let description = args.first().cloned().unwrap_or_default();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_oxidase"))
-            .arg("--diagnostic-format")
-            .arg("json")
-            .args(args)
-            .output()
-            .expect("actual CLI process runs")
-    })
-    .await
-    .expect("CLI process joins");
+    let output = cli_output(args).await;
     assert!(
         output.status.success(),
         "{description} failed: stdout={} stderr={}",
@@ -194,6 +193,180 @@ async fn cli_json(args: Vec<String>) -> Value {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("test-only-ctl-demo-token"));
     serde_json::from_slice(&output.stdout).expect("actual CLI stdout is one JSON document")
+}
+
+async fn cli_output(args: Vec<String>) -> Output {
+    tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_oxidase"))
+            .arg("--diagnostic-format")
+            .arg("json")
+            .args(args)
+            .output()
+            .expect("actual CLI process runs")
+    })
+    .await
+    .expect("CLI process joins")
+}
+
+#[tokio::test]
+async fn actual_signed_phased_bundle_preserves_all_deadlines_through_admin_activation() {
+    let demo = Demo::start(true).await;
+    let source = format!(
+        "{}resources:\n  clusters:\n    api:\n      endpoints: [http://127.0.0.1:3000]\n      timeouts:\n        connect: 1s\n        tls_handshake: 2s\n        request_body_idle: 3s\n        response_header: 4s\n        response_body_idle: 5s\n        pre_response_total: 6s\n",
+        data_source("phased")
+    );
+    let (file, digest) = demo.bundle_source("phased", &source).await;
+    let archive = BundleArchive::read_path(&file, &BundleLimits::default())
+        .expect("actual CLI-produced signed Bundle reads");
+    assert!(
+        archive
+            .manifest()
+            .required_features
+            .contains(oxidase_config::UPSTREAM_DEADLINES_FEATURE)
+    );
+    assert_eq!(archive.signatures().signatures.len(), 1);
+    cli_json(vec![
+        "bundle".to_owned(),
+        "verify".to_owned(),
+        utf8(&file),
+        "--key".to_owned(),
+        utf8(&demo.root.join("operator.pub")),
+        "--deployment-root".to_owned(),
+        utf8(&demo.root),
+    ])
+    .await;
+
+    let before = demo.running.reload_handle().published_runtime();
+    demo.ctl(&["stage".to_owned(), utf8(&file)]).await;
+    demo.ctl(&["validate".to_owned(), digest.clone()]).await;
+    let staged = demo.running.reload_handle().published_runtime();
+    assert!(Arc::ptr_eq(&before, &staged));
+    assert_eq!(demo.body().await, "initial");
+    demo.ctl(&["activate".to_owned(), digest.clone()]).await;
+    let current = demo.running.reload_handle().published_runtime();
+    assert_ne!(before.etag(), current.etag());
+    assert_eq!(current.runtime_revision, before.runtime_revision + 1);
+    assert_eq!(
+        current
+            .bundle_digest()
+            .expect("activated Bundle origin")
+            .to_string(),
+        digest
+    );
+    let cluster = current.snapshot.resources.clusters[&ResourceId::new("cluster:api")].spec();
+    let policy = cluster
+        .timeouts
+        .as_ref()
+        .expect("phased policy survives activation");
+    assert_eq!(policy.connect, Duration::from_secs(1));
+    assert_eq!(policy.tls_handshake, Duration::from_secs(2));
+    assert_eq!(policy.request_body_idle, Duration::from_secs(3));
+    assert_eq!(policy.response_header, Duration::from_secs(4));
+    assert_eq!(policy.response_body_idle, Duration::from_secs(5));
+    assert_eq!(policy.pre_response_total, Duration::from_secs(6));
+    assert_eq!(cluster.connect_timeout, policy.connect);
+    assert_eq!(cluster.response_timeout, policy.response_body_idle);
+    assert_eq!(demo.body().await, "phased");
+
+    // A valid trusted signature cannot conceal a missing behavioral capability.
+    // Stage may retain this structurally sound artifact; validate/activate must
+    // reject it before resource preparation or any published-state mutation.
+    let mut manifest = archive.manifest().clone();
+    manifest
+        .required_features
+        .remove(oxidase_config::UPSTREAM_DEADLINES_FEATURE);
+    let stripped = demo.root.join("missing-deadlines-feature.oxb");
+    BundleBuilder::new(manifest)
+        .write_atomic(&stripped)
+        .expect("capability-stripped fixture writes");
+    cli_json(vec![
+        "bundle".to_owned(),
+        "sign".to_owned(),
+        utf8(&stripped),
+        "--key".to_owned(),
+        utf8(&demo.signing_key),
+    ])
+    .await;
+    let stripped_archive = BundleArchive::read_path(&stripped, &BundleLimits::default())
+        .expect("trusted stripped fixture reads");
+    let stripped_digest = stripped_archive.content_digest().to_string();
+    demo.ctl(&["stage".to_owned(), utf8(&stripped)]).await;
+    for (operation, expected_code) in [
+        ("validate", "bundle.required_feature_missing"),
+        ("activate", "candidate.not_validated"),
+    ] {
+        let output = cli_output(demo.ctl_args(
+            &[operation.to_owned(), stripped_digest.clone()],
+            Some(&current.etag()),
+            Some(&format!("reject-undeclared-{operation}")),
+        ))
+        .await;
+        assert!(
+            !output.status.success(),
+            "{operation} must reject undeclared deadlines"
+        );
+        let error: Value = serde_json::from_slice(&output.stdout)
+            .expect("failed Admin operation remains one valid diagnostic document");
+        assert_eq!(error["diagnostics"][0]["code"], "ctl.admin_response");
+        assert!(
+            error["diagnostics"][0]["message"]
+                .as_str()
+                .expect("safe Admin rejection detail")
+                .contains(expected_code),
+            "{operation} rejection: {error}"
+        );
+        assert!(Arc::ptr_eq(
+            &current,
+            &demo.running.reload_handle().published_runtime()
+        ));
+    }
+    assert_eq!(demo.body().await, "phased");
+
+    let legacy_source = format!(
+        "{}resources:\n  clusters:\n    api:\n      endpoints: [http://127.0.0.1:3000]\n",
+        data_source("legacy")
+    );
+    let (legacy_file, legacy_digest) = demo.bundle_source("legacy", &legacy_source).await;
+    let legacy_archive = BundleArchive::read_path(&legacy_file, &BundleLimits::default())
+        .expect("legacy-shaped Bundle reads");
+    assert!(
+        !legacy_archive
+            .manifest()
+            .required_features
+            .contains(oxidase_config::UPSTREAM_DEADLINES_FEATURE)
+    );
+    let portable: oxidase_runtime::PortableRuntimePlanV1 =
+        legacy_archive.manifest().sections["runtime"]
+            .to_serde()
+            .expect("legacy portable runtime decodes");
+    assert!(portable.gateway.clusters["cluster:api"].timeouts.is_none());
+    let legacy_section = serde_json::to_value(&portable.gateway.clusters["cluster:api"])
+        .expect("legacy portable Cluster JSON encodes");
+    assert!(legacy_section.get("timeouts").is_none());
+    demo.ctl(&["stage".to_owned(), utf8(&legacy_file)]).await;
+    demo.ctl(&["validate".to_owned(), legacy_digest.clone()])
+        .await;
+    demo.ctl(&["activate".to_owned(), legacy_digest]).await;
+    let legacy = demo.running.reload_handle().published_runtime();
+    assert!(
+        legacy.snapshot.resources.clusters[&ResourceId::new("cluster:api")]
+            .spec()
+            .timeouts
+            .is_none()
+    );
+    assert!(
+        legacy
+            .snapshot
+            .preparation_warnings()
+            .iter()
+            .any(|warning| {
+                warning.code == "resource.cluster_legacy_timeout"
+                    && warning.severity == oxidase_core::DiagnosticSeverity::Warning
+                    && warning.message.contains("each attempt")
+            })
+    );
+    assert_eq!(demo.body().await, "legacy");
+    demo.running.shutdown().await.expect("phased demo shutdown");
 }
 
 #[tokio::test]
