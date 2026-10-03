@@ -15,7 +15,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use oxidase_bundle::{BundleCapabilities, BundleVerificationKey};
+use oxidase_bundle::BundleVerificationKey;
 use oxidase_config::{
     AdminListenSpec, Http1Settings, Http2Settings, HttpVersion, ListenerLimits, ListenerProtocol,
 };
@@ -24,9 +24,9 @@ use oxidase_core::{
 };
 use oxidase_runtime::{
     CandidateSignaturePolicy, CandidateStore, CandidateStoreLimits, CandidateWorkControl,
-    ClusterRuntimeStatus, Executor, OperationReceipt, PORTABLE_RUNTIME_PLAN_SCHEMA_V1,
-    PreparedListenerPlan, PreparedTlsListener, PublishedRuntime, ResourceReuse, RuntimeOrigin,
-    RuntimeSnapshot, ServingState, SnapshotStore, verified_client_metadata,
+    ClusterRuntimeStatus, Executor, OperationReceipt, PreparedListenerPlan, PreparedTlsListener,
+    PublishedRuntime, ResourceReuse, RuntimeOrigin, RuntimeSnapshot, ServingState, SnapshotStore,
+    verified_client_metadata,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -1004,14 +1004,7 @@ fn prepare_candidate_store(
         max_history_bytes: admin.history.max_bytes,
         ..CandidateStoreLimits::default()
     };
-    let capabilities = BundleCapabilities {
-        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
-        supported_features: BTreeSet::from(["portable-runtime".to_owned()]),
-        supported_sections: BTreeMap::from([(
-            "runtime".to_owned(),
-            PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
-        )]),
-    };
+    let capabilities = oxidase_runtime::bundle_runtime_capabilities();
     CandidateStore::open(
         admin.storage.directory.clone(),
         limits,

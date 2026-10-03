@@ -4,33 +4,31 @@
 //! [`ClusterHealthManager::activate_snapshot`] only after publishing a snapshot;
 //! failed candidates therefore cannot leak health-check tasks.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use bytes::{Buf, Bytes};
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt as _};
 use http::{Method, Request, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Empty};
-use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
-use oxidase_config::{ActiveHealthSpec, ClusterProtocol};
-use oxidase_core::ContentDigest;
+use oxidase_config::ActiveHealthSpec;
 use oxidase_runtime::{PreparedCluster, PreparedEndpoint, RuntimeSnapshot};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-const MAX_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
-const HEALTH_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-const HEALTH_POOL_MAX_IDLE_PER_HOST: usize = 8;
+use crate::static_targets::{StaticTargetCache, static_upstream_pool_observed};
+use crate::upstream_pool::BoundedPoolRegistry;
+use crate::upstream_transport::{TransportError, TransportErrorKind, TransportPhase};
 
-type HealthPool = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+const MAX_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const HEALTH_POOL_MAX_IDLE_PER_HOST: usize = 8;
+const MAX_CONCURRENT_HEALTH_PROBES: usize = 64;
+const MAX_CONCURRENT_CLUSTER_PROBES: usize = 32;
 
 /// Owns the long-lived health-check pools and all committed supervisor tasks.
 ///
@@ -86,6 +84,7 @@ impl ClusterHealthManager {
     /// Stops all health work and waits for task termination.
     pub(crate) async fn shutdown(&mut self) {
         let _ = self.shutdown.send(true);
+        self.client.admission.close();
         while self.tasks.join_next().await.is_some() {}
     }
 
@@ -102,131 +101,118 @@ impl ClusterHealthManager {
 impl Drop for ClusterHealthManager {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        self.client.admission.close();
         self.tasks.abort_all();
     }
 }
 
 struct HealthClient {
-    default_tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
-    pool_registry: Mutex<HealthPoolRegistry>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct HealthPoolKey {
-    connect_timeout: Duration,
-    tls_digest: Option<ContentDigest>,
-}
-
-#[derive(Default)]
-struct HealthPoolRegistry {
-    active: BTreeMap<HealthPoolKey, Arc<HealthPools>>,
-    cached: BTreeMap<HealthPoolKey, Weak<HealthPools>>,
-}
-
-struct HealthPools {
-    auto: HealthPool,
-    http1: HealthPool,
-    h2: HealthPool,
+    pool_registry: BoundedPoolRegistry<Empty<Bytes>>,
+    targets: StaticTargetCache,
+    admission: Semaphore,
+    #[cfg(test)]
+    peak_concurrency: AtomicU64,
 }
 
 impl HealthClient {
     fn new() -> Result<Self, String> {
         Ok(Self {
-            default_tls_config: Arc::new(cleartext_health_connector_tls_config()?),
-            pool_registry: Mutex::new(HealthPoolRegistry::default()),
+            pool_registry: BoundedPoolRegistry::new(1024),
+            targets: StaticTargetCache::new(1024),
+            admission: Semaphore::new(MAX_CONCURRENT_HEALTH_PROBES),
+            #[cfg(test)]
+            peak_concurrency: AtomicU64::new(0),
         })
     }
 
     fn reconcile_snapshot(&self, snapshot: &RuntimeSnapshot) {
-        let active = snapshot
-            .resources
-            .clusters
-            .values()
-            .filter(|cluster| cluster.spec().health.active.is_some())
-            .map(|cluster| (Self::pool_key(cluster), Arc::clone(cluster)))
-            .collect::<BTreeMap<_, _>>();
-        let mut registry = self
-            .pool_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.active.retain(|key, _| active.contains_key(key));
-        for (key, cluster) in active {
-            if registry.active.contains_key(&key) {
-                continue;
-            }
-            let pools = registry
-                .cached
-                .get(&key)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| self.build_pools(&cluster));
-            registry.cached.insert(key, Arc::downgrade(&pools));
-            registry.active.insert(key, pools);
-        }
-        let active_keys = registry.active.keys().copied().collect::<BTreeSet<_>>();
-        registry
-            .cached
-            .retain(|key, pools| active_keys.contains(key) || pools.strong_count() > 0);
-    }
-
-    fn pools(&self, cluster: &PreparedCluster) -> Arc<HealthPools> {
-        let key = Self::pool_key(cluster);
-        let mut registry = self
-            .pool_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pools) = registry.active.get(&key) {
-            return Arc::clone(pools);
-        }
-        if let Some(pools) = registry.cached.get(&key).and_then(Weak::upgrade) {
-            return pools;
-        }
-        let pools = self.build_pools(cluster);
-        registry.cached.insert(key, Arc::downgrade(&pools));
-        pools
-    }
-
-    fn pool_key(cluster: &PreparedCluster) -> HealthPoolKey {
-        HealthPoolKey {
-            connect_timeout: cluster.spec().connect_timeout,
-            tls_digest: cluster.upstream_tls().map(|tls| tls.digest()),
-        }
-    }
-
-    fn build_pools(&self, cluster: &PreparedCluster) -> Arc<HealthPools> {
-        let (tls_config, server_name) = cluster.upstream_tls().map_or_else(
-            || (Arc::clone(&self.default_tls_config), None),
-            |tls| (tls.client_config(), tls.server_name()),
-        );
-        Arc::new(HealthPools::new(
-            cluster.spec().connect_timeout,
-            tls_config.as_ref(),
-            server_name,
-        ))
+        self.pool_registry.reconcile_snapshot(snapshot);
+        self.targets.reconcile_snapshot(snapshot);
     }
 
     async fn probe(
         &self,
-        cluster: &PreparedCluster,
-        endpoint: &PreparedEndpoint,
+        cluster: &Arc<PreparedCluster>,
+        endpoint: &Arc<PreparedEndpoint>,
         plan: &ActiveHealthSpec,
-    ) -> bool {
-        let Some(uri) = health_uri(endpoint, &plan.path) else {
-            return false;
+    ) -> Option<bool> {
+        // Fair local health admission is independent of business permits. Its
+        // queue does not consume an endpoint's network deadline or count as a
+        // failed endpoint observation. A cancelled round drops these waits and
+        // all acquired permits without leaving per-endpoint tasks behind.
+        let Ok(_permit) = self.admission.acquire().await else {
+            return None;
         };
-        let Ok(request) = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .body(Empty::new())
-        else {
-            return false;
+        #[cfg(test)]
+        self.peak_concurrency.fetch_max(
+            (MAX_CONCURRENT_HEALTH_PROBES - self.admission.available_permits()) as u64,
+            Ordering::Relaxed,
+        );
+        let Some(deadline) = tokio::time::Instant::now().checked_add(plan.timeout) else {
+            return Some(false);
         };
-        tokio::time::timeout(plan.timeout, async {
-            let pools = self.pools(cluster);
-            let response = pools.pool(cluster.protocol()).request(request).await.ok()?;
+        let physical_ready = AtomicBool::new(false);
+        match tokio::time::timeout_at(deadline, async {
+            let pool = match static_upstream_pool_observed(
+                &self.pool_registry,
+                &self.targets,
+                cluster,
+                endpoint,
+                cluster.protocol(),
+                HEALTH_POOL_MAX_IDLE_PER_HOST,
+                &physical_ready,
+            )
+            .await
+            {
+                Ok(pool) => pool,
+                Err(error)
+                    if error.phase() == TransportPhase::Resolve
+                        || error.kind() == TransportErrorKind::ConnectionCapacity =>
+                {
+                    return None;
+                }
+                Err(_) => return Some(false),
+            };
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(health_uri(endpoint, &plan.path)?)
+                .body(Empty::new())
+                .ok()?;
+            // The probe has one independent total budget including resolution,
+            // transport, response head and bounded body discard. It never uses
+            // business retries or consumes business admission permits.
+            let response = match pool.request(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(transport) = find_transport_error(&error) {
+                        if transport.phase() == TransportPhase::Resolve
+                            || matches!(
+                                transport.kind(),
+                                TransportErrorKind::ConnectionCapacity
+                                    | TransportErrorKind::ResolutionCapacity
+                                    | TransportErrorKind::DeadlineOutOfRange
+                            )
+                        {
+                            return None;
+                        }
+                        if transport.phase() == TransportPhase::Connect
+                            && matches!(
+                                transport.kind(),
+                                TransportErrorKind::Io | TransportErrorKind::Timeout
+                            )
+                        {
+                            // A later probe may reselect among the same bounded
+                            // validated native answers, never retarget this
+                            // already-issued Client or retry this probe.
+                            self.pool_registry.retire_failed_pool(&pool);
+                        }
+                    }
+                    return Some(false);
+                }
+            };
             let status = response.status().as_u16();
-            let body_complete = discard_bounded_body(response.into_body()).await;
-            if !body_complete {
-                return None;
+            if !discard_bounded_body(response.into_body()).await {
+                return Some(false);
             }
             Some(
                 plan.healthy_statuses
@@ -235,97 +221,25 @@ impl HealthClient {
             )
         })
         .await
-        .ok()
-        .flatten()
-        .unwrap_or(false)
-    }
-}
-
-impl HealthPools {
-    fn new(
-        connect_timeout: Duration,
-        tls_config: &tokio_rustls::rustls::ClientConfig,
-        server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
-    ) -> Self {
-        let auto = build_health_connector(
-            connect_timeout,
-            tls_config,
-            server_name.clone(),
-            ClusterProtocol::Auto,
-        );
-        let http1 = build_health_connector(
-            connect_timeout,
-            tls_config,
-            server_name.clone(),
-            ClusterProtocol::Http1,
-        );
-        let h2 = build_health_connector(
-            connect_timeout,
-            tls_config,
-            server_name,
-            ClusterProtocol::H2,
-        );
-        Self {
-            auto: build_health_pool(auto, false),
-            http1: build_health_pool(http1, false),
-            h2: build_health_pool(h2, true),
-        }
-    }
-
-    fn pool(&self, protocol: ClusterProtocol) -> &HealthPool {
-        match protocol {
-            ClusterProtocol::Auto => &self.auto,
-            ClusterProtocol::Http1 => &self.http1,
-            ClusterProtocol::H2 => &self.h2,
+        {
+            Ok(outcome) => outcome,
+            Err(_) if physical_ready.load(Ordering::Acquire) => Some(false),
+            Err(_) => None,
         }
     }
 }
 
-fn cleartext_health_connector_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
-    use tokio_rustls::rustls::RootCertStore;
-    use tokio_rustls::rustls::crypto::ring::default_provider;
-
-    // Used only by HTTP-only clusters. HTTPS health checks always use the
-    // same prepared trust/client-identity policy as ordinary Proxy traffic.
-    let roots = RootCertStore::empty();
-    tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| format!("cannot enable safe health-check TLS versions: {error}"))
-        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
-}
-
-fn build_health_connector(
-    connect_timeout: Duration,
-    tls_config: &tokio_rustls::rustls::ClientConfig,
-    server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
-    protocol: ClusterProtocol,
-) -> HttpsConnector<HttpConnector> {
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    http.set_connect_timeout(Some(connect_timeout));
-    let builder = HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config.clone())
-        .https_or_http();
-    let builder = if let Some(server_name) = server_name {
-        builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
-    } else {
-        builder
-    };
-    match protocol {
-        ClusterProtocol::Auto => builder.enable_http1().enable_http2().wrap_connector(http),
-        ClusterProtocol::Http1 => builder.enable_http1().wrap_connector(http),
-        ClusterProtocol::H2 => builder.enable_http2().wrap_connector(http),
+fn find_transport_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a TransportError> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(transport) = error.downcast_ref::<TransportError>() {
+            return Some(transport);
+        }
+        source = error.source();
     }
-}
-
-fn build_health_pool(connector: HttpsConnector<HttpConnector>, http2_only: bool) -> HealthPool {
-    let mut builder = Client::builder(TokioExecutor::new());
-    builder
-        .pool_timer(TokioTimer::new())
-        .pool_idle_timeout(HEALTH_POOL_IDLE_TIMEOUT)
-        .pool_max_idle_per_host(HEALTH_POOL_MAX_IDLE_PER_HOST)
-        .http2_only(http2_only);
-    builder.build(connector)
+    None
 }
 
 fn health_uri(endpoint: &PreparedEndpoint, path_and_query: &str) -> Option<Uri> {
@@ -380,12 +294,28 @@ async fn run_cluster_supervisor(
             break;
         };
         let interval = plan.interval;
-        let probes = cluster
-            .endpoints()
-            .iter()
-            .map(|endpoint| client.probe(&cluster, endpoint, &plan));
-        let round = join_all(probes);
-        let outcomes = tokio::select! {
+        // Construct at most 32 futures for this resource instead of starting
+        // every endpoint at once. Completion advances the finite endpoint
+        // iterator, so a large set cannot starve behind a fixed first batch.
+        let round = async {
+            let mut probes = stream::iter(cluster.endpoints().iter().cloned())
+                .map(|endpoint| {
+                    let cluster = &cluster;
+                    let client = &client;
+                    let plan = &plan;
+                    async move {
+                        let outcome = client.probe(cluster, &endpoint, plan).await;
+                        (endpoint, outcome)
+                    }
+                })
+                .buffer_unordered(MAX_CONCURRENT_CLUSTER_PROBES);
+            while let Some((endpoint, outcome)) = probes.next().await {
+                if let Some(succeeded) = outcome {
+                    cluster.record_active_health(endpoint.name(), succeeded, Instant::now());
+                }
+            }
+        };
+        tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -393,11 +323,7 @@ async fn run_cluster_supervisor(
                 }
                 continue;
             }
-            outcomes = round => outcomes,
-        };
-        let observed_at = Instant::now();
-        for (endpoint, succeeded) in cluster.endpoints().iter().zip(outcomes) {
-            cluster.record_active_health(endpoint.name(), succeeded, observed_at);
+            () = round => {},
         }
         drop(cluster);
 
@@ -468,7 +394,10 @@ mod tests {
     use tokio::sync::watch;
     use tokio::task::{JoinHandle, JoinSet};
 
-    use super::{ClusterHealthManager, MAX_HEALTH_RESPONSE_BODY_BYTES, discard_bounded_body};
+    use super::{
+        ClusterHealthManager, MAX_CONCURRENT_CLUSTER_PROBES, MAX_CONCURRENT_HEALTH_PROBES,
+        MAX_HEALTH_RESPONSE_BODY_BYTES, discard_bounded_body,
+    };
 
     struct HealthFixture {
         address: std::net::SocketAddr,
@@ -476,6 +405,8 @@ mod tests {
         delay_ms: Arc<AtomicU64>,
         requests: Arc<AtomicU64>,
         accepts: Arc<AtomicU64>,
+        active_requests: Arc<AtomicU64>,
+        peak_requests: Arc<AtomicU64>,
         request_targets: Arc<Mutex<Vec<String>>>,
         shutdown: watch::Sender<bool>,
         task: JoinHandle<()>,
@@ -491,12 +422,16 @@ mod tests {
             let delay_ms = Arc::new(AtomicU64::new(0));
             let requests = Arc::new(AtomicU64::new(0));
             let accepts = Arc::new(AtomicU64::new(0));
+            let active_requests = Arc::new(AtomicU64::new(0));
+            let peak_requests = Arc::new(AtomicU64::new(0));
             let request_targets = Arc::new(Mutex::new(Vec::new()));
             let (shutdown, mut shutdown_receiver) = watch::channel(false);
             let task_status = Arc::clone(&status);
             let task_delay_ms = Arc::clone(&delay_ms);
             let task_requests = Arc::clone(&requests);
             let task_accepts = Arc::clone(&accepts);
+            let task_active_requests = Arc::clone(&active_requests);
+            let task_peak_requests = Arc::clone(&peak_requests);
             let task_targets = Arc::clone(&request_targets);
             let task = tokio::spawn(async move {
                 let mut connections = JoinSet::new();
@@ -518,6 +453,8 @@ mod tests {
                                 Arc::clone(&task_status),
                                 Arc::clone(&task_delay_ms),
                                 Arc::clone(&task_requests),
+                                Arc::clone(&task_active_requests),
+                                Arc::clone(&task_peak_requests),
                                 Arc::clone(&task_targets),
                             ));
                         }
@@ -534,6 +471,8 @@ mod tests {
                 delay_ms,
                 requests,
                 accepts,
+                active_requests,
+                peak_requests,
                 request_targets,
                 shutdown,
                 task,
@@ -562,15 +501,22 @@ mod tests {
         status: Arc<AtomicU16>,
         delay_ms: Arc<AtomicU64>,
         requests: Arc<AtomicU64>,
+        active_requests: Arc<AtomicU64>,
+        peak_requests: Arc<AtomicU64>,
         request_targets: Arc<Mutex<Vec<String>>>,
     ) {
         let service = service_fn(move |request: Request<Incoming>| {
             let status = Arc::clone(&status);
             let delay_ms = Arc::clone(&delay_ms);
             let requests = Arc::clone(&requests);
+            let active_requests = Arc::clone(&active_requests);
+            let peak_requests = Arc::clone(&peak_requests);
             let request_targets = Arc::clone(&request_targets);
             async move {
                 requests.fetch_add(1, Ordering::Relaxed);
+                let active = active_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                peak_requests.fetch_max(active, Ordering::Relaxed);
+                let _request_guard = FixtureRequestGuard(active_requests);
                 request_targets
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -589,6 +535,14 @@ mod tests {
         let _ = http1::Builder::new()
             .serve_connection(TokioIo::new(stream), service)
             .await;
+    }
+
+    struct FixtureRequestGuard(Arc<AtomicU64>);
+
+    impl Drop for FixtureRequestGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn compile_gateway(
@@ -800,6 +754,192 @@ listeners:
         .await;
         assert!(fixture.requests.load(Ordering::Relaxed) >= 1);
 
+        manager.shutdown().await;
+        fixture.shutdown().await;
+    }
+
+    fn prepare_many_clusters(
+        fixture: &HealthFixture,
+        clusters: usize,
+        endpoints: usize,
+    ) -> RuntimeSnapshot {
+        use std::fmt::Write as _;
+
+        let directory = TempDir::new().expect("temporary quota fixture");
+        let path = directory.path().join("gateway.yaml");
+        let mut text =
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n"
+                .to_owned();
+        for cluster in 0..clusters {
+            writeln!(text, "    api-{cluster}:\n      endpoints:").expect("String write");
+            for endpoint in 0..endpoints {
+                writeln!(
+                    text,
+                    "        - name: endpoint-{endpoint}\n          url: http://{}/base-{cluster}",
+                    fixture.address
+                )
+                .expect("String write");
+            }
+            text.push_str("      health:\n        active:\n          path: /healthz\n          interval: 10s\n          timeout: 5s\n          healthy_statuses: [200]\n          healthy_threshold: 1\n          unhealthy_threshold: 1\n");
+        }
+        text.push_str("listeners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n");
+        std::fs::write(&path, text).expect("quota fixture written");
+        RuntimeSnapshot::prepare(Compiler::compile_path(path).expect("quota fixture compiles"))
+            .expect("quota fixture prepares")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_rounds_enforce_global_and_per_cluster_quotas_without_starving_late_endpoints() {
+        for clusters in [1, 3] {
+            let fixture = HealthFixture::spawn(StatusCode::OK).await;
+            fixture.set_delay(Duration::from_millis(30));
+            let snapshot =
+                prepare_many_clusters(&fixture, clusters, MAX_CONCURRENT_CLUSTER_PROBES + 1);
+            let mut manager = ClusterHealthManager::new().expect("health manager");
+            assert_eq!(manager.activate_snapshot(&snapshot), clusters);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !snapshot.resources.clusters.values().all(|cluster| {
+                    cluster.endpoints().iter().all(|endpoint| {
+                        endpoint.health_state(Instant::now()) == EndpointHealthState::Healthy
+                    })
+                }) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("all endpoints, including after the first 32, get a healthy observation");
+            let cap = if clusters == 1 {
+                MAX_CONCURRENT_CLUSTER_PROBES
+            } else {
+                MAX_CONCURRENT_HEALTH_PROBES
+            } as u64;
+            let observed_peak = fixture.peak_requests.load(Ordering::Relaxed);
+            assert!(
+                observed_peak > 0 && observed_peak <= cap,
+                "actual HTTP probe concurrency {observed_peak} exceeds {cap}"
+            );
+            assert!(manager.client.peak_concurrency.load(Ordering::Relaxed) <= cap);
+            assert_eq!(
+                fixture.requests.load(Ordering::Relaxed),
+                (clusters * (MAX_CONCURRENT_CLUSTER_PROBES + 1)) as u64
+            );
+            assert_eq!(
+                manager.client.admission.available_permits(),
+                MAX_CONCURRENT_HEALTH_PROBES
+            );
+            manager.shutdown().await;
+            assert_eq!(manager.counters().active.load(Ordering::Relaxed), 0);
+            assert_eq!(fixture.active_requests.load(Ordering::Relaxed), 0);
+            fixture.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_admission_wait_is_not_an_endpoint_failure_and_shutdown_cancels_it() {
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let snapshot = prepare_snapshot(
+            &fixture,
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            1,
+            1,
+        );
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let mut manager = ClusterHealthManager::new().expect("health manager");
+        let client = Arc::clone(&manager.client);
+        let held = client
+            .admission
+            .acquire_many(MAX_CONCURRENT_HEALTH_PROBES as u32)
+            .await
+            .expect("hold all local health quota");
+        manager.activate_snapshot(&snapshot);
+        wait_until(|| manager.counters().started.load(Ordering::Relaxed) == 1).await;
+        // Deliberately longer than the endpoint's network timeout. Local quota
+        // waiting cannot falsely eject a healthy endpoint.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            cluster.endpoints()[0].health_state(Instant::now()),
+            EndpointHealthState::UnknownEligible
+        );
+        assert_eq!(fixture.requests.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown drops queued health futures cooperatively");
+        assert_eq!(manager.counters().active.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            cluster.endpoints()[0].health_state(Instant::now()),
+            EndpointHealthState::UnknownEligible
+        );
+        drop(held);
+        assert_eq!(
+            client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_resolution_failure_does_not_eject_a_previously_healthy_physical_endpoint() {
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let mut gateway = compile_gateway(
+            &fixture,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+            1,
+            1,
+        );
+        gateway
+            .resources
+            .clusters
+            .values_mut()
+            .next()
+            .expect("cluster source")
+            .endpoints[0]
+            .url = "http://unresolved.oxidase.invalid/"
+            .parse()
+            .expect("logical origin");
+        let snapshot =
+            RuntimeSnapshot::prepare(gateway).expect("native name policy prepares without DNS");
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let endpoint = cluster.endpoints()[0].name();
+        cluster.record_active_health(endpoint, true, Instant::now());
+        let calls = Arc::new(AtomicU64::new(0));
+        let lookup_calls = Arc::clone(&calls);
+        let mut manager = ClusterHealthManager::new().expect("manager");
+        Arc::get_mut(&mut manager.client)
+            .expect("sole bootstrap client owner")
+            .targets = crate::static_targets::StaticTargetCache::with_lookup(1024, move |_| {
+            lookup_calls.fetch_add(1, Ordering::Relaxed);
+            Err(crate::upstream_transport::TransportError::new(
+                crate::upstream_transport::TransportPhase::Resolve,
+                crate::upstream_transport::TransportErrorKind::Io,
+                Some(Box::new(std::io::Error::other("fixture DNS outage"))),
+            ))
+        });
+        manager.activate_snapshot(&snapshot);
+        wait_until(|| calls.load(Ordering::Relaxed) > 0).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            cluster.endpoints()[0].health_state(Instant::now()),
+            EndpointHealthState::Healthy
+        );
+        assert_eq!(
+            cluster.status(Instant::now()).endpoints[0]
+                .runtime
+                .active_health_failures,
+            0
+        );
+        assert_eq!(fixture.requests.load(Ordering::Relaxed), 0);
         manager.shutdown().await;
         fixture.shutdown().await;
     }

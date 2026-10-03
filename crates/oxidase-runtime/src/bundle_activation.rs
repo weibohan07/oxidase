@@ -102,7 +102,10 @@ pub struct PreparedBundleActivation {
 pub fn bundle_runtime_capabilities() -> BundleCapabilities {
     BundleCapabilities {
         runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
-        supported_features: BTreeSet::from(["portable-runtime".to_owned()]),
+        supported_features: BTreeSet::from([
+            "portable-runtime".to_owned(),
+            oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
+        ]),
         supported_sections: BTreeMap::from([(
             RUNTIME_SECTION.to_owned(),
             PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
@@ -206,7 +209,16 @@ fn decode_runtime_plan(
             format!("runtime section must be required schema `{PORTABLE_RUNTIME_PLAN_SCHEMA_V1}`"),
         ));
     }
-    section.to_serde().map_err(Into::into)
+    let plan: PortableRuntimePlanV1 = section.to_serde()?;
+    for feature in plan.required_features() {
+        if !archive.manifest().required_features.contains(&feature) {
+            return Err(invalid(
+                "bundle.required_feature_missing",
+                format!("runtime plan requires manifest feature `{feature}`"),
+            ));
+        }
+    }
+    Ok(plan)
 }
 
 struct CachedAssetResolver<'a> {
@@ -757,7 +769,10 @@ mod tests {
         let capabilities = bundle_runtime_capabilities();
         assert_eq!(
             capabilities.supported_features,
-            BTreeSet::from(["portable-runtime".to_owned()])
+            BTreeSet::from([
+                "portable-runtime".to_owned(),
+                oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
+            ])
         );
         assert_eq!(
             capabilities.supported_sections,

@@ -740,9 +740,10 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                     "activated Bundle content {} with {signature_summary}",
                     loaded.inspection.content_digest
                 ));
+                let warnings = loaded.snapshot.preparation_warnings().to_vec();
                 (
                     loaded.snapshot,
-                    Vec::new(),
+                    warnings,
                     oxidase_runtime::RuntimeOrigin::Bundle {
                         digest: loaded.inspection.content_digest.into(),
                     },

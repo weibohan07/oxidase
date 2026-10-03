@@ -57,7 +57,7 @@ pub use candidate::{
     SnapshotHistoryRecord, StageOutcome, validate_candidate_journal_bytes,
 };
 pub use cluster::{
-    ClusterAdmissionError, ClusterRequestPermit, ClusterRetryPermit, ClusterRuntimeStatus,
-    EndpointHealthState, EndpointRuntimeState, EndpointRuntimeStatus, EndpointStatusSnapshot,
-    PreparedCluster, PreparedEndpoint,
+    ClusterAdmissionError, ClusterEndpointReservation, ClusterRequestPermit, ClusterRetryPermit,
+    ClusterRuntimeStatus, EndpointHealthState, EndpointRuntimeState, EndpointRuntimeStatus,
+    EndpointStatusSnapshot, PreparedCluster, PreparedEndpoint,
 };

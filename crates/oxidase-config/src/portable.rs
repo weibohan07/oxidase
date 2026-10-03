@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use http::uri::PathAndQuery;
 use http::{Method, StatusCode};
-use oxidase_core::{ListenerId, ResourceId, ServiceId, SourceSpan};
+use oxidase_core::{Diagnostic, ListenerId, ResourceId, ServiceId, SourceSpan};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -26,6 +26,7 @@ use crate::compiler::{
     HttpListenerSpec, HttpVersion, ListenerLimits, ListenerProtocol, LoadBalancePolicy,
     PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec, RetrySpec, SecretSpec,
     SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec, TrustStoreSpec,
+    UpstreamTimeoutSpec,
 };
 
 pub const PORTABLE_GATEWAY_CONFIG_SCHEMA_V1: &str = "oxidase.gateway-config/v1";
@@ -150,6 +151,11 @@ impl PortableGatewayConfigV1 {
         for cluster in self.clusters.values_mut() {
             normalize_span(&mut cluster.protocol_source, source_root)?;
             normalize_span(&mut cluster.source, source_root)?;
+            if let Some(timeouts) = &mut cluster.timeouts {
+                for span in timeouts.source_spans_mut() {
+                    normalize_span(span, source_root)?;
+                }
+            }
             for endpoint in &mut cluster.endpoints {
                 normalize_span(&mut endpoint.name_source, source_root)?;
                 normalize_span(&mut endpoint.url_source, source_root)?;
@@ -281,6 +287,19 @@ impl PortableGatewayConfigV1 {
             listeners,
             site_ids,
             admin,
+            warnings: self
+                .clusters
+                .values()
+                .filter(|cluster| cluster.timeouts.is_none())
+                .map(|cluster| {
+                    Diagnostic::warning(
+                        "resource.cluster_legacy_timeout",
+                        "legacy Bundle timing is retained: admission and replay buffering precede a fresh connect+response timeout for each attempt; response_timeout also limits response-body idle",
+                        cluster.source.clone(),
+                    )
+                    .with_help("rebuild using `timeouts` to opt into independent phases and one absolute pre_response_total budget")
+                })
+                .collect(),
         })
     }
 
@@ -332,6 +351,11 @@ impl PortableGatewayConfigV1 {
                 &format!("clusters.{id}.protocol_source"),
             )?;
             check(&cluster.source, &format!("clusters.{id}.source"))?;
+            if let Some(timeouts) = &cluster.timeouts {
+                for (name, span) in timeouts.source_spans() {
+                    check(span, &format!("clusters.{id}.timeouts.{name}"))?;
+                }
+            }
             for (index, endpoint) in cluster.endpoints.iter().enumerate() {
                 for (name, span) in [
                     ("name", &endpoint.name_source),
@@ -494,6 +518,8 @@ pub struct PortableGatewayPlanV1 {
     pub admin: Option<AdminSpec>,
     /// Site IDs whose separately decoded Site sections must be supplied.
     pub site_ids: Vec<ResourceId>,
+    /// Compatibility diagnostics reconstructed without reading source YAML.
+    pub warnings: Vec<Diagnostic>,
 }
 
 impl PortableGatewayPlanV1 {
@@ -570,6 +596,14 @@ impl PortableDurationV1 {
         let duration = Duration::new(self.seconds, self.nanoseconds);
         if duration.is_zero() && !allow_zero {
             return Err(invalid(field, "duration must be greater than zero"));
+        }
+        Ok(duration)
+    }
+
+    fn compile_upstream_phase(&self, field: &str) -> Result<Duration, PortableConfigError> {
+        let duration = self.compile(field, false)?;
+        if duration > crate::MAX_UPSTREAM_PHASE_TIMEOUT {
+            return Err(invalid(field, "phased timeout must not exceed 24 hours"));
         }
         Ok(duration)
     }
@@ -1544,6 +1578,8 @@ pub struct PortableClusterV1 {
     pub tls: Option<PortableClusterTlsV1>,
     pub connect_timeout: PortableDurationV1,
     pub response_timeout: PortableDurationV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<PortableUpstreamTimeoutV1>,
     pub protocol_source: SourceSpan,
     pub source: SourceSpan,
 }
@@ -1564,6 +1600,10 @@ impl PortableClusterV1 {
             tls: source.tls.as_ref().map(PortableClusterTlsV1::from_compiled),
             connect_timeout: PortableDurationV1::from_duration(source.connect_timeout),
             response_timeout: PortableDurationV1::from_duration(source.response_timeout),
+            timeouts: source
+                .timeouts
+                .as_ref()
+                .map(PortableUpstreamTimeoutV1::from_compiled),
             protocol_source: source.protocol_source.clone(),
             source: source.source.clone(),
         }
@@ -1631,6 +1671,33 @@ impl PortableClusterV1 {
             .as_ref()
             .map(|tls| tls.compile(resources, &endpoints))
             .transpose()?;
+        let connect_timeout = self
+            .connect_timeout
+            .compile("clusters.connect_timeout", false)?;
+        let response_timeout = self
+            .response_timeout
+            .compile("clusters.response_timeout", false)?;
+        let timeouts = self
+            .timeouts
+            .as_ref()
+            .map(PortableUpstreamTimeoutV1::compile)
+            .transpose()?;
+        // These v1 compatibility fields remain in the transport shape, but
+        // cannot carry a conflicting inert value beside the explicit contract.
+        if let Some(policy) = &timeouts {
+            if connect_timeout != policy.connect {
+                return Err(invalid(
+                    "clusters.connect_timeout",
+                    "compatibility value must equal timeouts.connect",
+                ));
+            }
+            if response_timeout != policy.response_body_idle {
+                return Err(invalid(
+                    "clusters.response_timeout",
+                    "compatibility value must equal timeouts.response_body_idle",
+                ));
+            }
+        }
         Ok(ClusterSpec {
             id,
             protocol,
@@ -1640,15 +1707,104 @@ impl PortableClusterV1 {
             retry: self.retry.compile()?,
             limits: self.limits.compile()?,
             tls,
-            connect_timeout: self
-                .connect_timeout
-                .compile("clusters.connect_timeout", false)?,
-            response_timeout: self
-                .response_timeout
-                .compile("clusters.response_timeout", false)?,
+            connect_timeout,
+            response_timeout,
+            timeouts,
             protocol_source: self.protocol_source.clone(),
             source: self.source.clone(),
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableUpstreamTimeoutV1 {
+    pub connect: PortableDurationV1,
+    pub tls_handshake: PortableDurationV1,
+    pub request_body_idle: PortableDurationV1,
+    pub response_header: PortableDurationV1,
+    pub response_body_idle: PortableDurationV1,
+    pub pre_response_total: PortableDurationV1,
+    pub connect_source: SourceSpan,
+    pub tls_handshake_source: SourceSpan,
+    pub request_body_idle_source: SourceSpan,
+    pub response_header_source: SourceSpan,
+    pub response_body_idle_source: SourceSpan,
+    pub pre_response_total_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+impl PortableUpstreamTimeoutV1 {
+    fn from_compiled(source: &UpstreamTimeoutSpec) -> Self {
+        Self {
+            connect: PortableDurationV1::from_duration(source.connect),
+            tls_handshake: PortableDurationV1::from_duration(source.tls_handshake),
+            request_body_idle: PortableDurationV1::from_duration(source.request_body_idle),
+            response_header: PortableDurationV1::from_duration(source.response_header),
+            response_body_idle: PortableDurationV1::from_duration(source.response_body_idle),
+            pre_response_total: PortableDurationV1::from_duration(source.pre_response_total),
+            connect_source: source.connect_source.clone(),
+            tls_handshake_source: source.tls_handshake_source.clone(),
+            request_body_idle_source: source.request_body_idle_source.clone(),
+            response_header_source: source.response_header_source.clone(),
+            response_body_idle_source: source.response_body_idle_source.clone(),
+            pre_response_total_source: source.pre_response_total_source.clone(),
+            source: source.source.clone(),
+        }
+    }
+
+    fn compile(&self) -> Result<UpstreamTimeoutSpec, PortableConfigError> {
+        Ok(UpstreamTimeoutSpec {
+            connect: self
+                .connect
+                .compile_upstream_phase("clusters.timeouts.connect")?,
+            tls_handshake: self
+                .tls_handshake
+                .compile_upstream_phase("clusters.timeouts.tls_handshake")?,
+            request_body_idle: self
+                .request_body_idle
+                .compile_upstream_phase("clusters.timeouts.request_body_idle")?,
+            response_header: self
+                .response_header
+                .compile_upstream_phase("clusters.timeouts.response_header")?,
+            response_body_idle: self
+                .response_body_idle
+                .compile_upstream_phase("clusters.timeouts.response_body_idle")?,
+            pre_response_total: self
+                .pre_response_total
+                .compile_upstream_phase("clusters.timeouts.pre_response_total")?,
+            connect_source: self.connect_source.clone(),
+            tls_handshake_source: self.tls_handshake_source.clone(),
+            request_body_idle_source: self.request_body_idle_source.clone(),
+            response_header_source: self.response_header_source.clone(),
+            response_body_idle_source: self.response_body_idle_source.clone(),
+            pre_response_total_source: self.pre_response_total_source.clone(),
+            source: self.source.clone(),
+        })
+    }
+
+    fn source_spans_mut(&mut self) -> [&mut SourceSpan; 7] {
+        [
+            &mut self.connect_source,
+            &mut self.tls_handshake_source,
+            &mut self.request_body_idle_source,
+            &mut self.response_header_source,
+            &mut self.response_body_idle_source,
+            &mut self.pre_response_total_source,
+            &mut self.source,
+        ]
+    }
+
+    fn source_spans(&self) -> [(&str, &SourceSpan); 7] {
+        [
+            ("connect", &self.connect_source),
+            ("tls_handshake", &self.tls_handshake_source),
+            ("request_body_idle", &self.request_body_idle_source),
+            ("response_header", &self.response_header_source),
+            ("response_body_idle", &self.response_body_idle_source),
+            ("pre_response_total", &self.pre_response_total_source),
+            ("source", &self.source),
+        ]
     }
 }
 
@@ -3077,6 +3233,159 @@ listeners:
         let expected = plan.site_ids.iter().cloned().collect::<BTreeSet<_>>();
         plan.validate_site_sections(&expected)
             .expect("matching Site sections validate");
+    }
+
+    #[test]
+    fn portable_timeouts_preserve_legacy_shape_and_reconstruct_phased_spans() {
+        let (directory, gateway) = compiled_gateway();
+        let portable = PortableGatewayConfigV1::from_compiled(&gateway).expect("legacy export");
+        let encoded = serde_json::to_value(&portable).expect("legacy encodes");
+        assert!(encoded["clusters"]["cluster:api"].get("timeouts").is_none());
+        let decoded: PortableGatewayConfigV1 =
+            serde_json::from_value(encoded).expect("old shape decodes");
+        let legacy = decoded
+            .compile_at(directory.path())
+            .expect("old shape compiles");
+        assert!(
+            legacy.resources.clusters[&ResourceId::new("cluster:api")]
+                .timeouts
+                .is_none()
+        );
+        assert_eq!(legacy.warnings.len(), 1);
+        assert_eq!(legacy.warnings[0].code, "resource.cluster_legacy_timeout");
+
+        let source = fs::read_to_string(&gateway.source).expect("read fixture source").replace(
+            "      connect_timeout: 2s\n      response_timeout: 10s\n",
+            "      timeouts:\n        connect: 2s\n        tls_handshake: 3s\n        request_body_idle: 4s\n        response_header: 5s\n        response_body_idle: 6s\n        pre_response_total: 7s\n",
+        );
+        fs::write(&gateway.source, source).expect("write phased source");
+        let gateway = Compiler::compile_path(&gateway.source).expect("phased compile");
+        let portable = PortableGatewayConfigV1::from_compiled(&gateway).expect("phased export");
+        let bytes = serde_json::to_vec(&portable).expect("phased encodes");
+        let decoded: PortableGatewayConfigV1 =
+            serde_json::from_slice(&bytes).expect("phased decodes");
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&decoded).expect("deterministic reencoding")
+        );
+        let phased = decoded
+            .compile_at(directory.path())
+            .expect("phased reconstructs");
+        assert!(phased.warnings.is_empty());
+        let timing = phased.resources.clusters[&ResourceId::new("cluster:api")]
+            .timeouts
+            .as_ref()
+            .expect("phased policy");
+        assert_eq!(timing.pre_response_total, std::time::Duration::from_secs(7));
+        assert_eq!(timing.tls_handshake, std::time::Duration::from_secs(3));
+        assert_eq!(
+            timing.response_header_source.field_path,
+            "resources.clusters.api.timeouts.response_header"
+        );
+        assert!(!timing.response_header_source.file.is_absolute());
+
+        let mut bad = decoded.clone();
+        bad.clusters
+            .get_mut("cluster:api")
+            .expect("cluster")
+            .timeouts
+            .as_mut()
+            .expect("timeouts")
+            .pre_response_total = PortableDurationV1 {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        assert_invalid_field(
+            bad.compile_at(directory.path()),
+            "clusters.timeouts.pre_response_total",
+        );
+        let mut bad = decoded.clone();
+        bad.clusters
+            .get_mut("cluster:api")
+            .expect("cluster")
+            .timeouts
+            .as_mut()
+            .expect("timeouts")
+            .tls_handshake
+            .nanoseconds = 1_000_000_000;
+        assert_invalid_field(
+            bad.compile_at(directory.path()),
+            "clusters.timeouts.tls_handshake",
+        );
+        let mut bad = decoded;
+        bad.clusters
+            .get_mut("cluster:api")
+            .expect("cluster")
+            .connect_timeout
+            .seconds += 1;
+        assert_invalid_field(bad.compile_at(directory.path()), "clusters.connect_timeout");
+    }
+
+    #[test]
+    fn portable_phased_ceiling_rejects_one_nanosecond_and_unrepresentable_deadlines() {
+        let duration = PortableDurationV1 {
+            seconds: 1,
+            nanoseconds: 0,
+        };
+        let source = SourceSpan::synthetic("timeouts");
+        let baseline = PortableUpstreamTimeoutV1 {
+            connect: duration.clone(),
+            tls_handshake: duration.clone(),
+            request_body_idle: duration.clone(),
+            response_header: duration.clone(),
+            response_body_idle: duration.clone(),
+            pre_response_total: duration,
+            connect_source: source.clone(),
+            tls_handshake_source: source.clone(),
+            request_body_idle_source: source.clone(),
+            response_header_source: source.clone(),
+            response_body_idle_source: source.clone(),
+            pre_response_total_source: source.clone(),
+            source,
+        };
+        for name in [
+            "connect",
+            "tls_handshake",
+            "request_body_idle",
+            "response_header",
+            "response_body_idle",
+            "pre_response_total",
+        ] {
+            for (seconds, nanoseconds, valid) in
+                [(86400, 0, true), (86400, 1, false), (u64::MAX, 0, false)]
+            {
+                let mut policy = baseline.clone();
+                let field = match name {
+                    "connect" => &mut policy.connect,
+                    "tls_handshake" => &mut policy.tls_handshake,
+                    "request_body_idle" => &mut policy.request_body_idle,
+                    "response_header" => &mut policy.response_header,
+                    "response_body_idle" => &mut policy.response_body_idle,
+                    "pre_response_total" => &mut policy.pre_response_total,
+                    _ => unreachable!("closed field corpus"),
+                };
+                *field = PortableDurationV1 {
+                    seconds,
+                    nanoseconds,
+                };
+                let result = policy.compile();
+                if valid {
+                    result.expect("exact 24h phased ceiling compiles");
+                } else {
+                    assert!(
+                        matches!(result, Err(PortableConfigError::Invalid { field, .. }) if field == format!("clusters.timeouts.{name}"))
+                    );
+                }
+            }
+        }
+        assert!(
+            PortableDurationV1 {
+                seconds: 86401,
+                nanoseconds: 0
+            }
+            .compile("legacy", false)
+            .is_ok()
+        );
     }
 
     #[test]

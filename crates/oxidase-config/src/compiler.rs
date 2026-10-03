@@ -363,7 +363,27 @@ pub struct ClusterSpec {
     pub tls: Option<ClusterTlsSpec>,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    /// None retains the published legacy per-attempt/response-body contract.
+    pub timeouts: Option<UpstreamTimeoutSpec>,
     pub protocol_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+/// Explicit, independently observed upstream timing policy.
+#[derive(Debug, Clone)]
+pub struct UpstreamTimeoutSpec {
+    pub connect: Duration,
+    pub tls_handshake: Duration,
+    pub request_body_idle: Duration,
+    pub response_header: Duration,
+    pub response_body_idle: Duration,
+    pub pre_response_total: Duration,
+    pub connect_source: SourceSpan,
+    pub tls_handshake_source: SourceSpan,
+    pub request_body_idle_source: SourceSpan,
+    pub response_header_source: SourceSpan,
+    pub response_body_idle_source: SourceSpan,
+    pub pre_response_total_source: SourceSpan,
     pub source: SourceSpan,
 }
 
@@ -2235,6 +2255,8 @@ fn compile_resources(
         let health = compile_cluster_health(located)?;
         let retry = compile_retry(located, &mut warnings)?;
         let limits = compile_cluster_limits(located)?;
+        let (connect_timeout, response_timeout, timeouts) =
+            compile_cluster_timeouts(located, &mut warnings)?;
         let tls = located
             .value
             .tls
@@ -2253,14 +2275,9 @@ fn compile_resources(
                 retry,
                 limits,
                 tls,
-                connect_timeout: parse_duration(
-                    &located.value.connect_timeout,
-                    &located.span_at(&format!("{}.connect_timeout", located.field_path)),
-                )?,
-                response_timeout: parse_duration(
-                    &located.value.response_timeout,
-                    &located.span_at(&format!("{}.response_timeout", located.field_path)),
-                )?,
+                connect_timeout,
+                response_timeout,
+                timeouts,
                 protocol_source,
                 source: located.span(),
             },
@@ -3695,6 +3712,132 @@ fn error_class(source: ErrorClassSource) -> ErrorClass {
 
 fn parse_duration(source: &str, source_span: &SourceSpan) -> Result<Duration, CompileError> {
     parse_duration_with_zero_policy(source, source_span, false)
+}
+
+fn parse_upstream_phase_duration(
+    source: &str,
+    source_span: &SourceSpan,
+) -> Result<Duration, CompileError> {
+    let duration = parse_duration(source, source_span)?;
+    if duration > crate::MAX_UPSTREAM_PHASE_TIMEOUT {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_timeout_limit",
+                "phased timeout must not exceed 24 hours",
+                source_span.clone(),
+            )
+            .with_help("use a positive duration no greater than 86400s; retries share the configured pre_response_total deadline"),
+        ));
+    }
+    Ok(duration)
+}
+
+fn compile_cluster_timeouts(
+    located: &Located<ClusterSource>,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<(Duration, Duration, Option<UpstreamTimeoutSpec>), CompileError> {
+    let source = &located.value;
+    let declared = |name: &str| {
+        located
+            .spans
+            .get(&format!("{}.{}", located.field_path, name))
+            .is_some()
+    };
+    if source.timeouts.is_none() && declared("timeouts") {
+        return Err(semantic_error_at(
+            "resource.cluster_timeouts_shape",
+            "timeouts must be a non-null timing policy mapping",
+            located.span_at(&format!("{}.timeouts", located.field_path)),
+        ));
+    }
+    if let Some(timeouts) = &source.timeouts {
+        for (name, legacy) in [
+            ("connect_timeout", &source.connect_timeout),
+            ("response_timeout", &source.response_timeout),
+        ] {
+            if legacy.is_some() || declared(name) {
+                return Err(CompileError::one(
+                    Diagnostic::new(
+                        "resource.cluster_timeout_conflict",
+                        "legacy timeout fields cannot be combined with `timeouts`",
+                        located.span_at(&format!("{}.{}", located.field_path, name)),
+                    )
+                    .with_label(
+                        "phased timing policy is declared here",
+                        located.span_at(&format!("{}.timeouts", located.field_path)),
+                    )
+                    .with_help(
+                        "remove both legacy fields and configure all desired timing in `timeouts`",
+                    ),
+                ));
+            }
+        }
+        let span = |name: &str| located.span_at(&format!("{}.timeouts.{name}", located.field_path));
+        let policy = UpstreamTimeoutSpec {
+            connect: parse_upstream_phase_duration(&timeouts.connect, &span("connect"))?,
+            tls_handshake: parse_upstream_phase_duration(
+                &timeouts.tls_handshake,
+                &span("tls_handshake"),
+            )?,
+            request_body_idle: parse_upstream_phase_duration(
+                &timeouts.request_body_idle,
+                &span("request_body_idle"),
+            )?,
+            response_header: parse_upstream_phase_duration(
+                &timeouts.response_header,
+                &span("response_header"),
+            )?,
+            response_body_idle: parse_upstream_phase_duration(
+                &timeouts.response_body_idle,
+                &span("response_body_idle"),
+            )?,
+            pre_response_total: parse_upstream_phase_duration(
+                &timeouts.pre_response_total,
+                &span("pre_response_total"),
+            )?,
+            connect_source: span("connect"),
+            tls_handshake_source: span("tls_handshake"),
+            request_body_idle_source: span("request_body_idle"),
+            response_header_source: span("response_header"),
+            response_body_idle_source: span("response_body_idle"),
+            pre_response_total_source: span("pre_response_total"),
+            source: located.span_at(&format!("{}.timeouts", located.field_path)),
+        };
+        return Ok((policy.connect, policy.response_body_idle, Some(policy)));
+    }
+    for (name, value) in [
+        ("connect_timeout", &source.connect_timeout),
+        ("response_timeout", &source.response_timeout),
+    ] {
+        if value.is_none() && declared(name) {
+            return Err(semantic_error_at(
+                "config.duration",
+                "legacy timeout must be a non-null duration",
+                located.span_at(&format!("{}.{}", located.field_path, name)),
+            ));
+        }
+        if value.is_some() {
+            warnings.push(
+                Diagnostic::warning(
+                    "resource.cluster_legacy_timeout",
+                    "legacy timeout behavior is retained: admission and replay buffering precede a fresh connect+response timeout for each attempt; response_timeout also limits response-body idle",
+                    located.span_at(&format!("{}.{}", located.field_path, name)),
+                )
+                .with_help("migrate to `timeouts` for separate phase limits and one absolute pre_response_total budget across admission, upload and retries"),
+            );
+        }
+    }
+    Ok((
+        parse_duration(
+            source.connect_timeout.as_deref().unwrap_or("5s"),
+            &located.span_at(&format!("{}.connect_timeout", located.field_path)),
+        )?,
+        parse_duration(
+            source.response_timeout.as_deref().unwrap_or("30s"),
+            &located.span_at(&format!("{}.response_timeout", located.field_path)),
+        )?,
+        None,
+    ))
 }
 
 fn parse_nonnegative_duration(
@@ -5307,6 +5450,162 @@ listeners:
         assert_eq!(
             gateway.summary().clusters[0].protocol,
             super::ClusterProtocol::Auto
+        );
+    }
+
+    fn timeout_gateway_source(policy: &str) -> String {
+        format!(
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\n# Unicode 前置文字\nresources:\n  clusters:\n    api:\n      endpoints:\n        - http://127.0.0.1:3000\n{policy}listeners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n"
+        )
+    }
+
+    #[test]
+    fn phased_upstream_defaults_and_exact_spans_do_not_expose_discovery() {
+        let source = timeout_gateway_source("      timeouts:\n        connect: 15ms\n")
+            .replace('\n', "\r\n");
+        let (_directory, path) = write_config(&source);
+        let gateway = Compiler::compile_path(path).expect("phased timing compiles");
+        let cluster = &gateway.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")];
+        let timing = cluster.timeouts.as_ref().expect("explicit timing policy");
+        assert_eq!(timing.connect, std::time::Duration::from_millis(15));
+        assert_eq!(timing.tls_handshake, std::time::Duration::from_secs(5));
+        assert_eq!(timing.request_body_idle, std::time::Duration::from_secs(30));
+        assert_eq!(timing.response_header, std::time::Duration::from_secs(10));
+        assert_eq!(
+            timing.response_body_idle,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            timing.pre_response_total,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            timing.connect_source.field_path,
+            "resources.clusters.api.timeouts.connect"
+        );
+        assert_eq!(timing.connect_source.line, 10);
+        assert!(timing.connect_source.end_byte > timing.connect_source.start_byte);
+        assert!(gateway.warnings.is_empty());
+
+        let (_directory, path) = write_config(&timeout_gateway_source(
+            "      discovery:\n        dns:\n          name: unimplemented.test\n",
+        ));
+        let error = Compiler::compile_path(path).expect_err("6A must not expose inert discovery");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+        assert!(error.to_string().contains("discovery"));
+    }
+
+    #[test]
+    fn legacy_upstream_contract_and_precise_migration_warnings_are_preserved() {
+        let (_directory, path) = write_config(&timeout_gateway_source(
+            "      connect_timeout: 2s\n      response_timeout: 7s\n",
+        ));
+        let gateway = Compiler::compile_path(path).expect("legacy timing still compiles");
+        let cluster = &gateway.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")];
+        assert!(cluster.timeouts.is_none());
+        assert_eq!(cluster.connect_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(cluster.response_timeout, std::time::Duration::from_secs(7));
+        assert_eq!(gateway.warnings.len(), 2);
+        assert_eq!(gateway.warnings[0].code, "resource.cluster_legacy_timeout");
+        assert_eq!(
+            gateway.warnings[0].primary.field_path,
+            "resources.clusters.api.connect_timeout"
+        );
+        assert_eq!(
+            gateway.warnings[1].primary.field_path,
+            "resources.clusters.api.response_timeout"
+        );
+        assert!(gateway.warnings[0].message.contains("each attempt"));
+    }
+
+    #[test]
+    fn phased_upstream_rejects_each_legacy_field_and_invalid_duration_at_its_span() {
+        for legacy in ["connect_timeout", "response_timeout"] {
+            for value in ["1s", "null"] {
+                let (_directory, path) = write_config(&timeout_gateway_source(&format!(
+                    "      {legacy}: {value}\n      timeouts:\n        connect: 5s\n"
+                )));
+                let error = Compiler::compile_path(path).expect_err("mixed forms are ambiguous");
+                let diagnostic = &error.diagnostics[0];
+                assert_eq!(diagnostic.code, "resource.cluster_timeout_conflict");
+                assert_eq!(
+                    diagnostic.primary.field_path,
+                    format!("resources.clusters.api.{legacy}")
+                );
+                assert_eq!(diagnostic.labels.len(), 1);
+            }
+        }
+        for name in ["timeouts", "connect_timeout", "response_timeout"] {
+            let (_directory, path) =
+                write_config(&timeout_gateway_source(&format!("      {name}: null\n")));
+            let error = Compiler::compile_path(path).expect_err("null is not an absent policy");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path,
+                format!("resources.clusters.api.{name}")
+            );
+        }
+        for name in [
+            "connect",
+            "tls_handshake",
+            "request_body_idle",
+            "response_header",
+            "response_body_idle",
+            "pre_response_total",
+        ] {
+            for invalid in ["0ms", "18446744073709551615m", "never"] {
+                let (_directory, path) = write_config(&timeout_gateway_source(&format!(
+                    "      timeouts:\n        {name}: {invalid}\n"
+                )));
+                let error =
+                    Compiler::compile_path(path).expect_err("invalid timer must fail compilation");
+                assert_eq!(error.diagnostics[0].code, "config.duration");
+                assert_eq!(
+                    error.diagnostics[0].primary.field_path,
+                    format!("resources.clusters.api.timeouts.{name}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phased_timeout_ceiling_is_exact_and_does_not_change_legacy_durations() {
+        for name in [
+            "connect",
+            "tls_handshake",
+            "request_body_idle",
+            "response_header",
+            "response_body_idle",
+            "pre_response_total",
+        ] {
+            let (_directory, path) = write_config(&timeout_gateway_source(&format!(
+                "      timeouts:\n        {name}: 86400s\n"
+            )));
+            Compiler::compile_path(path).expect("exact 24h phased ceiling compiles");
+            let (_directory, path) = write_config(&timeout_gateway_source(&format!(
+                "      timeouts:\n        {name}: 86400001ms\n"
+            )));
+            let error = Compiler::compile_path(path).expect_err("24h plus one millisecond fails");
+            assert_eq!(error.diagnostics[0].code, "resource.cluster_timeout_limit");
+            assert_eq!(
+                error.diagnostics[0].primary.field_path,
+                format!("resources.clusters.api.timeouts.{name}")
+            );
+            assert_eq!(error.diagnostics[0].primary.line, 10);
+        }
+        let (_directory, path) = write_config(&timeout_gateway_source(
+            "      connect_timeout: 86401s\n      response_timeout: 86401s\n",
+        ));
+        let gateway =
+            Compiler::compile_path(path).expect("legacy parse retains valid long durations");
+        let cluster = &gateway.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")];
+        assert!(cluster.timeouts.is_none());
+        assert_eq!(
+            cluster.connect_timeout,
+            std::time::Duration::from_secs(86401)
+        );
+        assert_eq!(
+            cluster.response_timeout,
+            std::time::Duration::from_secs(86401)
         );
     }
 

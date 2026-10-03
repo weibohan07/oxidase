@@ -12,7 +12,11 @@ mod protocol;
 mod proxy_body;
 mod response;
 mod server;
+mod static_targets;
 mod upgrade;
+mod upstream_pool;
+mod upstream_timing;
+mod upstream_transport;
 
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]

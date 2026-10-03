@@ -1,7 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error as _;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, Weak};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,13 +7,11 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt, StreamBody};
-use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::client::legacy::connect::capture_connection;
 use oxidase_config::{ClusterProtocol, RetryBodyMode, RetryCause, RetrySpec};
 use oxidase_core::{
-    ContentDigest, ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
+    ErrorClass, RequestFrame, ResourceId, ResponseHead, ServiceError, ServiceOutcome,
 };
 use oxidase_runtime::{
     BoxLeafFuture, ClusterAdmissionError, ClusterRetryPermit, ConcurrencyPermit,
@@ -29,7 +25,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::body::{
     BodyIdleDirection, BodyIdleTimeout, BoxError, GatewayBody, GatewayBodyPlan, GatewayRequestBody,
-    timeout_upstream_response_body,
+    timeout_proxy_request_body, timeout_upstream_response_body,
 };
 use crate::metrics::Metrics;
 use crate::protocol::{
@@ -40,7 +36,17 @@ use crate::proxy_body::{
     BufferRequestError, ClusterResponseBody, DownstreamRequestBodyError, ProxyRequestBody,
     ReplayBody, RequestBodyLimitExceeded, buffer_for_replay,
 };
+use crate::static_targets::{StaticTargetCache, static_upstream_pool};
 use crate::upgrade::GatewayRequestPayload;
+use crate::upstream_pool::BoundedPoolRegistry;
+use crate::upstream_timing::{
+    ConnectingAdmissionError, DispatchRetirementBudget, LocalRequestFailure, PreResponseBudget,
+    RequestProgress, TimeoutPhase, await_response_head,
+};
+use crate::upstream_transport::{
+    DirectConnector, LogicalOrigin, TransportError, TransportErrorKind, TransportPhase,
+    TransportTimeouts,
+};
 
 pub(crate) struct HyperLeaves {
     snapshot: Arc<RuntimeSnapshot>,
@@ -63,29 +69,12 @@ impl HyperLeaves {
 }
 
 pub(crate) struct ProxyClient {
-    default_tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
-    pool_registry: Mutex<ProxyPoolRegistry>,
+    pool_registry: BoundedPoolRegistry<ProxyRequestBody>,
+    static_targets: StaticTargetCache,
+    connecting: DispatchRetirementBudget,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ProxyPoolKey {
-    connect_timeout: Duration,
-    tls_digest: Option<ContentDigest>,
-}
-
-#[derive(Default)]
-struct ProxyPoolRegistry {
-    active: BTreeMap<ProxyPoolKey, Arc<ProxyPools>>,
-    cached: BTreeMap<ProxyPoolKey, Weak<ProxyPools>>,
-}
-
-struct ProxyPools {
-    auto: ProxyPool,
-    http1: ProxyPool,
-    h2: ProxyPool,
-}
-
-type ProxyPool = Client<HttpsConnector<HttpConnector>, ProxyRequestBody>;
+type ProxyPool = Client<DirectConnector, ProxyRequestBody>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyPoolKind {
@@ -122,29 +111,56 @@ impl AttemptBody {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptFailure {
+    Resolution,
+    LocalOverload,
     Connect,
+    ConnectTimeout,
+    Tls,
+    TlsTimeout,
     HeaderTimeout,
+    Total,
+    InvalidTransport,
     RefusedStream,
     Reset,
     Protocol,
 }
 
 impl AttemptFailure {
+    const fn timeout_phase(self) -> Option<TimeoutPhase> {
+        match self {
+            Self::ConnectTimeout => Some(TimeoutPhase::Connect),
+            Self::TlsTimeout => Some(TimeoutPhase::Tls),
+            Self::HeaderTimeout => Some(TimeoutPhase::ResponseHeader),
+            Self::Total => Some(TimeoutPhase::Total),
+            _ => None,
+        }
+    }
     const fn retry_cause(self) -> Option<RetryCause> {
         match self {
-            Self::Connect => Some(RetryCause::ConnectFailure),
+            Self::Connect | Self::ConnectTimeout | Self::TlsTimeout => {
+                Some(RetryCause::ConnectFailure)
+            }
             Self::HeaderTimeout => Some(RetryCause::ResponseHeaderTimeout),
             Self::RefusedStream => Some(RetryCause::RefusedStream),
             Self::Reset => Some(RetryCause::Reset),
-            Self::Protocol => None,
+            Self::Resolution
+            | Self::LocalOverload
+            | Self::Protocol
+            | Self::Tls
+            | Self::Total
+            | Self::InvalidTransport => None,
         }
     }
 
     const fn error_class(self) -> ErrorClass {
         match self {
-            Self::Connect => ErrorClass::UpstreamConnect,
-            Self::HeaderTimeout => ErrorClass::Timeout,
+            Self::Resolution | Self::Connect | Self::Tls => ErrorClass::UpstreamConnect,
+            Self::LocalOverload => ErrorClass::UpstreamOverloaded,
+            Self::HeaderTimeout | Self::ConnectTimeout | Self::TlsTimeout | Self::Total => {
+                ErrorClass::Timeout
+            }
             Self::RefusedStream | Self::Reset | Self::Protocol => ErrorClass::UpstreamProtocol,
+            Self::InvalidTransport => ErrorClass::InvalidState,
         }
     }
 }
@@ -168,161 +184,45 @@ impl ProxyPoolKind {
             Self::H2 => WireProtocol::Http2,
         }
     }
-}
 
-fn cleartext_connector_tls_config() -> Result<tokio_rustls::rustls::ClientConfig, String> {
-    use tokio_rustls::rustls::RootCertStore;
-    use tokio_rustls::rustls::crypto::ring::default_provider;
-
-    // This connector configuration is used only for clusters whose prepared
-    // endpoint set is entirely cleartext HTTP. Every HTTPS cluster carries a
-    // `PreparedUpstreamTls` built from its explicit/default trust policy. An
-    // empty root set therefore avoids reading host trust merely to serve an
-    // HTTP-only configuration without weakening any TLS request.
-    let roots = RootCertStore::empty();
-    tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| format!("cannot enable safe upstream TLS versions: {error}"))
-        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+    const fn protocol(self) -> ClusterProtocol {
+        match self {
+            Self::Auto => ClusterProtocol::Auto,
+            Self::Http1 => ClusterProtocol::Http1,
+            Self::H2 => ClusterProtocol::H2,
+        }
+    }
 }
 
 impl ProxyClient {
     pub(crate) fn new() -> Result<Self, String> {
-        let default_tls_config = Arc::new(cleartext_connector_tls_config()?);
         Ok(Self {
-            default_tls_config,
-            pool_registry: Mutex::new(ProxyPoolRegistry::default()),
+            pool_registry: BoundedPoolRegistry::new(1024),
+            static_targets: StaticTargetCache::new(1024),
+            connecting: DispatchRetirementBudget::new(1024),
         })
     }
 
     pub(crate) fn reconcile_snapshot(&self, snapshot: &RuntimeSnapshot) {
-        let active = snapshot
-            .resources
-            .clusters
-            .values()
-            .map(|cluster| (Self::pool_key(cluster), Arc::clone(cluster)))
-            .collect::<BTreeMap<_, _>>();
-        let mut registry = self
-            .pool_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.active.retain(|key, _| active.contains_key(key));
-        for (key, cluster) in active {
-            if registry.active.contains_key(&key) {
-                continue;
-            }
-            let pools = registry
-                .cached
-                .get(&key)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| self.build_pools(&cluster));
-            registry.cached.insert(key, Arc::downgrade(&pools));
-            registry.active.insert(key, pools);
-        }
-        let active_keys = registry.active.keys().copied().collect::<BTreeSet<_>>();
-        registry
-            .cached
-            .retain(|key, pools| active_keys.contains(key) || pools.strong_count() > 0);
+        self.pool_registry.reconcile_snapshot(snapshot);
+        self.static_targets.reconcile_snapshot(snapshot);
     }
 
-    fn pools(&self, cluster: &Arc<PreparedCluster>) -> Arc<ProxyPools> {
-        let key = Self::pool_key(cluster);
-        let mut registry = self
-            .pool_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pools) = registry.active.get(&key) {
-            return Arc::clone(pools);
-        }
-        if let Some(pools) = registry.cached.get(&key).and_then(Weak::upgrade) {
-            return pools;
-        }
-        // A request pinned to a retired snapshot can first reach Proxy after a
-        // reload. Keep only a weak cache entry so that old transport policy is
-        // released with the pinned request rather than retained indefinitely.
-        let pools = self.build_pools(cluster);
-        registry.cached.insert(key, Arc::downgrade(&pools));
-        pools
-    }
-
-    fn pool_key(cluster: &PreparedCluster) -> ProxyPoolKey {
-        ProxyPoolKey {
-            connect_timeout: cluster.spec().connect_timeout,
-            tls_digest: cluster.upstream_tls().map(|tls| tls.digest()),
-        }
-    }
-
-    fn build_pools(&self, cluster: &PreparedCluster) -> Arc<ProxyPools> {
-        let (tls_config, server_name) = cluster.upstream_tls().map_or_else(
-            || (Arc::clone(&self.default_tls_config), None),
-            |tls| (tls.client_config(), tls.server_name()),
-        );
-        Arc::new(ProxyPools::new(
-            cluster.spec().connect_timeout,
-            tls_config.as_ref(),
-            server_name,
-        ))
-    }
-}
-
-impl ProxyPools {
-    fn new(
-        connect_timeout: Duration,
-        tls_config: &tokio_rustls::rustls::ClientConfig,
-        server_name: Option<tokio_rustls::rustls::pki_types::ServerName<'static>>,
-    ) -> Self {
-        let mut auto_http = HttpConnector::new();
-        auto_http.enforce_http(false);
-        auto_http.set_connect_timeout(Some(connect_timeout));
-        let auto_builder = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config.clone())
-            .https_or_http();
-        let auto_builder = if let Some(server_name) = server_name.clone() {
-            auto_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
-        } else {
-            auto_builder
-        };
-        let auto_connector = auto_builder
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(auto_http);
-        let mut http1_http = HttpConnector::new();
-        http1_http.enforce_http(false);
-        http1_http.set_connect_timeout(Some(connect_timeout));
-        let http1_builder = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config.clone())
-            .https_or_http();
-        let http1_builder = if let Some(server_name) = server_name.clone() {
-            http1_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
-        } else {
-            http1_builder
-        };
-        let http1_connector = http1_builder.enable_http1().wrap_connector(http1_http);
-        let mut h2_http = HttpConnector::new();
-        h2_http.enforce_http(false);
-        h2_http.set_connect_timeout(Some(connect_timeout));
-        let h2_builder = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config.clone())
-            .https_or_http();
-        let h2_builder = if let Some(server_name) = server_name {
-            h2_builder.with_server_name_resolver(FixedServerNameResolver::new(server_name))
-        } else {
-            h2_builder
-        };
-        let h2_connector = h2_builder.enable_http2().wrap_connector(h2_http);
-        Self {
-            auto: build_proxy_pool(auto_connector, false),
-            http1: build_proxy_pool(http1_connector, false),
-            h2: build_proxy_pool(h2_connector, true),
-        }
-    }
-
-    fn pool(&self, kind: ProxyPoolKind) -> &ProxyPool {
-        match kind {
-            ProxyPoolKind::Auto => &self.auto,
-            ProxyPoolKind::Http1 => &self.http1,
-            ProxyPoolKind::H2 => &self.h2,
-        }
+    async fn pool(
+        &self,
+        cluster: &Arc<PreparedCluster>,
+        endpoint: &oxidase_runtime::PreparedEndpoint,
+        kind: ProxyPoolKind,
+    ) -> Result<Arc<ProxyPool>, TransportError> {
+        static_upstream_pool(
+            &self.pool_registry,
+            &self.static_targets,
+            cluster,
+            endpoint,
+            kind.protocol(),
+            32,
+        )
+        .await
     }
 }
 
@@ -334,6 +234,7 @@ impl ProxyClient {
         body: &mut Option<GatewayRequestPayload>,
         snapshot: &Arc<RuntimeSnapshot>,
         max_request_body_bytes: Option<u64>,
+        metrics: &Arc<Metrics>,
     ) -> ServiceOutcome<GatewayBodyPlan> {
         let Some(cluster) = snapshot.resources.clusters.get(cluster_id).cloned() else {
             return ServiceOutcome::Failed(ServiceError::new(
@@ -347,333 +248,632 @@ impl ProxyClient {
                 "Proxy request body is unavailable",
             ));
         }
-        let mut permit = match cluster.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                cluster.record_admission_failure(error);
-                return admission_failure(&cluster, error);
-            }
-        };
-        let configured_pool = ProxyPoolKind::for_cluster(cluster.protocol());
-        let pools = self.pools(&cluster);
-        let Some(payload) = body.take() else {
-            return ServiceOutcome::Failed(ServiceError::new(
-                ErrorClass::BodyUnavailable,
-                "Proxy request body is unavailable",
-            ));
-        };
-        let (incoming, mut pending_upgrade, request_trailer_guard) = payload.into_parts();
-        let retry = &cluster.spec().retry;
-        let retry_method = pending_upgrade.is_none()
-            && retry.max_attempts > 1
-            && retry
-                .methods
-                .iter()
-                .any(|method| method == request.method());
-        let incoming_is_empty = incoming.is_end_stream();
-        let request_trailer_guard = request_trailer_guard.for_upstream(
-            if pending_upgrade.is_some() {
-                ProxyPoolKind::Http1
-            } else {
-                configured_pool
-            }
-            .request_wire_protocol(),
-        );
-        let mut attempt_body = if retry_method && incoming_is_empty {
-            AttemptBody::Empty
-        } else if retry_method && retry.request_body.mode == RetryBodyMode::Buffer {
-            let replay_limit = max_request_body_bytes
-                .map_or(retry.request_body.max_bytes, |limit| {
-                    limit.min(retry.request_body.max_bytes)
-                });
-            match buffer_for_replay(incoming, replay_limit, &request_trailer_guard).await {
-                Ok(body) => AttemptBody::Replay(body),
-                Err(BufferRequestError::LimitExceeded) => {
-                    return ServiceOutcome::Handled(ResponseHead::new(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        GatewayBodyPlan::Bytes(Bytes::from_static(b"Payload Too Large")),
-                    ));
-                }
-                Err(error) => {
-                    if error_chain_contains_request_body_idle_timeout(&error) {
-                        return ServiceOutcome::Handled(ResponseHead::new(
-                            StatusCode::REQUEST_TIMEOUT,
-                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
-                        ));
-                    }
-                    if error_chain_contains_request_validation(&error) {
-                        return ServiceOutcome::Handled(ResponseHead::new(
-                            StatusCode::BAD_REQUEST,
-                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
-                        ));
-                    }
-                    return ServiceOutcome::Failed(ServiceError::new(
-                        ErrorClass::BodyUnavailable,
-                        format!("request body cannot be replayed safely: {error}"),
-                    ));
-                }
-            }
-        } else {
-            AttemptBody::Streaming(Some(incoming))
-        };
-        let timeout = cluster
+        let total = cluster
             .spec()
-            .connect_timeout
-            .checked_add(cluster.spec().response_timeout)
-            .unwrap_or(cluster.spec().response_timeout);
-        let max_attempts = if retry_method && attempt_body.replayable() {
-            retry.max_attempts
-        } else {
-            1
-        };
-        let mut attempt = 0_u32;
-        let mut tried = BTreeSet::new();
-        let mut retry_permit: Option<ClusterRetryPermit> = None;
-
-        loop {
-            attempt = attempt.saturating_add(1);
-            let endpoint = Arc::clone(permit.endpoint());
-            let uri = match upstream_uri(endpoint.url(), request.path_and_query()) {
-                Ok(uri) => uri,
-                Err(error) => return ServiceOutcome::Failed(error),
+            .timeouts
+            .as_ref()
+            .map(|timeouts| PreResponseBudget::new(timeouts.pre_response_total));
+        let work = async {
+            let mut permit = match cluster.acquire().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    cluster.record_admission_failure(error);
+                    if error == ClusterAdmissionError::Overloaded
+                        && !cluster.spec().limits.queue_timeout.is_zero()
+                    {
+                        metrics.record_upstream_timeout(TimeoutPhase::Queue);
+                    }
+                    return admission_failure(&cluster, error);
+                }
             };
-            // Upgrade is an HTTP/1 connection capability even when the
-            // Cluster's ordinary traffic policy is auto or H2.
-            let pool_kind = if pending_upgrade.is_some() {
-                ProxyPoolKind::Http1
-            } else {
-                configured_pool
-            };
-            let Some(request_body) =
-                attempt_body.next(&request_trailer_guard, max_request_body_bytes)
-            else {
+            let configured_pool = ProxyPoolKind::for_cluster(cluster.protocol());
+            let Some(payload) = body.take() else {
                 return ServiceOutcome::Failed(ServiceError::new(
                     ErrorClass::BodyUnavailable,
-                    "Proxy request body is not replayable for another attempt",
+                    "Proxy request body is unavailable",
                 ));
             };
-            let mut upstream = Request::new(request_body);
-            *upstream.method_mut() = request.method().clone();
-            *upstream.uri_mut() = uri;
-            *upstream.headers_mut() = request.effective_headers().clone();
-            if sanitize_runtime_headers(upstream.headers_mut(), pool_kind.request_wire_protocol())
-                .is_err()
-            {
-                return ServiceOutcome::Failed(ServiceError::new(
-                    ErrorClass::InvalidState,
-                    "request contains invalid connection-specific metadata",
-                ));
-            }
-            if let Some(declaration) = request_trailer_guard.forwarded_declaration() {
-                upstream.headers_mut().insert(header::TRAILER, declaration);
-            }
-            if let Some(upgrade) = &pending_upgrade {
-                upstream
-                    .headers_mut()
-                    .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-                upstream
-                    .headers_mut()
-                    .insert(header::UPGRADE, upgrade.protocol_header_value());
-            }
-            apply_forwarding_headers(upstream.headers_mut(), request, endpoint.url());
-
-            let response =
-                tokio::time::timeout(timeout, pools.pool(pool_kind).request(upstream)).await;
-            retry_permit.take();
-            let mut response = match response {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    if error_chain_contains_request_body_limit(&error) {
+            let (incoming, mut pending_upgrade, request_trailer_guard) = payload.into_parts();
+            let retry = &cluster.spec().retry;
+            let retry_method = pending_upgrade.is_none()
+                && retry.max_attempts > 1
+                && retry
+                    .methods
+                    .iter()
+                    .any(|method| method == request.method());
+            let incoming_is_empty = incoming.is_end_stream();
+            let request_trailer_guard = request_trailer_guard.for_upstream(
+                if pending_upgrade.is_some() {
+                    ProxyPoolKind::Http1
+                } else {
+                    configured_pool
+                }
+                .request_wire_protocol(),
+            );
+            let mut attempt_body = if retry_method && incoming_is_empty {
+                AttemptBody::Empty
+            } else if retry_method && retry.request_body.mode == RetryBodyMode::Buffer {
+                let replay_limit = max_request_body_bytes
+                    .map_or(retry.request_body.max_bytes, |limit| {
+                        limit.min(retry.request_body.max_bytes)
+                    });
+                let incoming = if let Some(timeouts) = &cluster.spec().timeouts {
+                    GatewayRequestBody::from(timeout_proxy_request_body(
+                        incoming.boxed_unsync(),
+                        timeouts.request_body_idle,
+                    ))
+                } else {
+                    incoming
+                };
+                match buffer_for_replay(incoming, replay_limit, &request_trailer_guard).await {
+                    Ok(body) => AttemptBody::Replay(body),
+                    Err(BufferRequestError::LimitExceeded) => {
                         return ServiceOutcome::Handled(ResponseHead::new(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             GatewayBodyPlan::Bytes(Bytes::from_static(b"Payload Too Large")),
                         ));
                     }
-                    if error_chain_contains_request_body_idle_timeout(&error) {
-                        return ServiceOutcome::Handled(ResponseHead::new(
-                            StatusCode::REQUEST_TIMEOUT,
-                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
+                    Err(error) => {
+                        if error_chain_contains_request_body_idle_timeout(&error) {
+                            metrics.record_upstream_timeout(TimeoutPhase::RequestBody);
+                            return ServiceOutcome::Handled(ResponseHead::new(
+                                StatusCode::REQUEST_TIMEOUT,
+                                GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
+                            ));
+                        }
+                        if error_chain_contains_request_validation(&error) {
+                            return ServiceOutcome::Handled(ResponseHead::new(
+                                StatusCode::BAD_REQUEST,
+                                GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
+                            ));
+                        }
+                        return ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::BodyUnavailable,
+                            format!("request body cannot be replayed safely: {error}"),
                         ));
                     }
-                    if error_chain_contains_request_validation(&error) {
-                        return ServiceOutcome::Handled(ResponseHead::new(
-                            StatusCode::BAD_REQUEST,
-                            GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
-                        ));
-                    }
-                    let failure = classify_proxy_error(&error);
-                    cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
-                    let detail =
-                        format!("upstream request to `{}` failed: {error}", endpoint.name());
-                    if retry_allows_failure(retry, failure) {
-                        if attempt < max_attempts
-                            && let Some(storm_permit) = cluster.try_acquire_retry()
-                        {
-                            tried.insert(endpoint.name().to_owned());
-                            drop(permit);
-                            match cluster.acquire_excluding(&tried).await {
-                                Ok(next) => {
-                                    permit = next;
-                                    retry_permit = Some(storm_permit);
-                                    cluster.record_retry_attempt();
-                                    continue;
-                                }
-                                Err(_) => drop(storm_permit),
-                            }
-                        }
-                        cluster.record_retry_exhausted();
-                    }
-                    return ServiceOutcome::Failed(ServiceError::new(
-                        failure.error_class(),
-                        detail,
-                    ));
                 }
-                Err(_) => {
-                    let failure = AttemptFailure::HeaderTimeout;
-                    cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
-                    let detail = format!(
-                        "upstream `{}` did not produce response headers in {timeout:?}",
-                        endpoint.name()
-                    );
-                    if retry_allows_failure(retry, failure) {
-                        if attempt < max_attempts
-                            && let Some(storm_permit) = cluster.try_acquire_retry()
-                        {
-                            tried.insert(endpoint.name().to_owned());
-                            drop(permit);
-                            match cluster.acquire_excluding(&tried).await {
-                                Ok(next) => {
-                                    permit = next;
-                                    retry_permit = Some(storm_permit);
-                                    cluster.record_retry_attempt();
-                                    continue;
-                                }
-                                Err(_) => drop(storm_permit),
-                            }
-                        }
-                        cluster.record_retry_exhausted();
-                    }
-                    return ServiceOutcome::Failed(ServiceError::new(
-                        failure.error_class(),
-                        detail,
-                    ));
-                }
+            } else {
+                AttemptBody::Streaming(Some(incoming))
             };
-
-            if retry_allows_status(retry, response.status()) {
-                if attempt < max_attempts
-                    && let Some(storm_permit) = cluster.try_acquire_retry()
-                {
-                    let previous_endpoint = endpoint.name().to_owned();
-                    tried.insert(previous_endpoint.clone());
-                    if cluster.retarget_excluding(&mut permit, &tried).await {
-                        if response.status().is_server_error() {
-                            cluster.record_passive_failure(
-                                &previous_endpoint,
-                                std::time::Instant::now(),
-                            );
-                        }
-                        drop(response);
-                        retry_permit = Some(storm_permit);
-                        cluster.record_retry_attempt();
-                        continue;
+            let timeout = cluster
+                .spec()
+                .connect_timeout
+                .checked_add(cluster.spec().response_timeout)
+                .unwrap_or(cluster.spec().response_timeout);
+            let max_attempts = if retry_method && attempt_body.replayable() {
+                retry.max_attempts
+            } else {
+                1
+            };
+            let mut attempt = 0_u32;
+            let mut tried = BTreeSet::new();
+            let mut retry_permit: Option<ClusterRetryPermit> = None;
+            let aggregate_legacy = timeout
+                .checked_mul(max_attempts)
+                .and_then(|duration| {
+                    cluster
+                        .spec()
+                        .limits
+                        .queue_timeout
+                        .checked_mul(max_attempts.saturating_sub(1))
+                        .and_then(|queue| duration.checked_add(queue))
+                })
+                .unwrap_or(Duration::MAX);
+            let budget = total.unwrap_or_else(|| PreResponseBudget::new(aggregate_legacy));
+            let attempts = async {
+                loop {
+                    if budget.expired() {
+                        return timeout_failure(metrics, TimeoutPhase::Total);
                     }
-                    drop(storm_permit);
-                }
-                cluster.record_retry_exhausted();
-            }
-
-            if let Some(pending_upgrade) = pending_upgrade.take() {
-                if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-                    let upstream_upgrade = hyper::upgrade::on(&mut response);
-                    let plan = match pending_upgrade
-                        .bind(snapshot.clone())
-                        .accept(&response, upstream_upgrade)
-                    {
-                        Ok(plan) => plan,
-                        Err(error) => {
-                            cluster
-                                .record_passive_failure(endpoint.name(), std::time::Instant::now());
+                    attempt = attempt.saturating_add(1);
+                    let endpoint = Arc::clone(permit.endpoint());
+                    let uri = match upstream_uri(endpoint.url(), request.path_and_query()) {
+                        Ok(uri) => uri,
+                        Err(error) => return ServiceOutcome::Failed(error),
+                    };
+                    // Upgrade is an HTTP/1 connection capability even when the
+                    // Cluster's ordinary traffic policy is auto or H2.
+                    let pool_kind = if pending_upgrade.is_some() {
+                        ProxyPoolKind::Http1
+                    } else {
+                        configured_pool
+                    };
+                    let Some(request_body) =
+                        attempt_body.next(&request_trailer_guard, max_request_body_bytes)
+                    else {
+                        return ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::BodyUnavailable,
+                            "Proxy request body is not replayable for another attempt",
+                        ));
+                    };
+                    let progress = RequestProgress::new(request_body.is_end_stream());
+                    progress.set_timeout_metrics(Arc::clone(metrics));
+                    let request_body = request_body.with_progress(
+                        progress.clone(),
+                        cluster
+                            .spec()
+                            .timeouts
+                            .as_ref()
+                            .map(|timeouts| timeouts.request_body_idle),
+                    );
+                    let mut lease = match progress.attach_permit(permit) {
+                        Ok(lease) => lease,
+                        Err(_) => {
                             return ServiceOutcome::Failed(ServiceError::new(
-                                ErrorClass::UpstreamProtocol,
-                                format!("upstream Upgrade handshake is invalid: {error}"),
+                                ErrorClass::InvalidState,
+                                "upstream attempt admission cannot be attached",
                             ));
                         }
                     };
-                    let (mut parts, _body) = response.into_parts();
-                    if sanitize_runtime_headers(&mut parts.headers, WireProtocol::Http1).is_err() {
+                    debug_assert!(Arc::ptr_eq(lease.endpoint(), &endpoint));
+                    let mut upstream = Request::new(request_body);
+                    *upstream.method_mut() = request.method().clone();
+                    *upstream.uri_mut() = uri;
+                    *upstream.headers_mut() = request.effective_headers().clone();
+                    if sanitize_runtime_headers(
+                        upstream.headers_mut(),
+                        pool_kind.request_wire_protocol(),
+                    )
+                    .is_err()
+                    {
+                        return ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::InvalidState,
+                            "request contains invalid connection-specific metadata",
+                        ));
+                    }
+                    if let Some(declaration) = request_trailer_guard.forwarded_declaration() {
+                        upstream.headers_mut().insert(header::TRAILER, declaration);
+                    }
+                    if let Some(upgrade) = &pending_upgrade {
+                        upstream
+                            .headers_mut()
+                            .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+                        upstream
+                            .headers_mut()
+                            .insert(header::UPGRADE, upgrade.protocol_header_value());
+                    }
+                    apply_forwarding_headers(upstream.headers_mut(), request, endpoint.url());
+                    let captured = capture_connection(&mut upstream);
+                    progress.capture_transport(captured.clone(), pool_kind == ProxyPoolKind::H2);
+                    // Legacy dispatch time included hostname resolution. Carry
+                    // the same absolute attempt bound through checkout and head.
+                    let legacy_deadline = cluster.spec().timeouts.is_none().then(|| {
+                        tokio::time::Instant::now()
+                            .checked_add(timeout)
+                            .unwrap_or_else(tokio::time::Instant::now)
+                    });
+                    let acquired_pool = if let Some(deadline) = legacy_deadline {
+                        tokio::time::timeout_at(deadline, self.pool(&cluster, &endpoint, pool_kind))
+                            .await
+                            .ok()
+                    } else {
+                        Some(self.pool(&cluster, &endpoint, pool_kind).await)
+                    };
+                    let mut attempt_pool = None;
+                    let response = if let Some(Ok(pool)) = acquired_pool {
+                        attempt_pool = Some(Arc::clone(&pool));
+                        let transport = TransportTimeouts::for_cluster(&cluster);
+                        let connecting_cap = transport
+                            .connect
+                            .checked_add(transport.tls_handshake)
+                            .and_then(|duration| {
+                                duration.checked_add(
+                                    cluster
+                                        .spec()
+                                        .timeouts
+                                        .as_ref()
+                                        .map_or(cluster.spec().response_timeout, |timeouts| {
+                                            timeouts.response_header
+                                        }),
+                                )
+                            })
+                            .unwrap_or(Duration::MAX);
+                        let dispatch = match self.connecting.protect(
+                            pool.request(upstream),
+                            captured.clone(),
+                            progress.clone(),
+                            connecting_cap,
+                        ) {
+                            Ok(dispatch) => dispatch,
+                            Err(error) => {
+                                if error == ConnectingAdmissionError::Overloaded {
+                                    cluster.record_admission_failure(
+                                        ClusterAdmissionError::Overloaded,
+                                    );
+                                }
+                                return ServiceOutcome::Failed(ServiceError::new(
+                                    if error == ConnectingAdmissionError::InvalidDeadline {
+                                        ErrorClass::InvalidState
+                                    } else {
+                                        ErrorClass::UpstreamOverloaded
+                                    },
+                                    error.to_string(),
+                                ));
+                            }
+                        };
+                        if let Some(timeouts) = &cluster.spec().timeouts {
+                            await_response_head(
+                                dispatch,
+                                captured,
+                                &progress,
+                                timeouts.response_header,
+                                &budget,
+                            )
+                            .await
+                            .map(|result| result.map_err(|error| Box::new(error) as BoxError))
+                            .map_err(|error| {
+                                if error.phase() == TimeoutPhase::Total {
+                                    AttemptFailure::Total
+                                } else {
+                                    AttemptFailure::HeaderTimeout
+                                }
+                            })
+                        } else {
+                            let deadline =
+                                legacy_deadline.unwrap_or_else(tokio::time::Instant::now);
+                            tokio::time::timeout_at(deadline, dispatch)
+                                .await
+                                .map(|result| result.map_err(|error| Box::new(error) as BoxError))
+                                .map_err(|_| AttemptFailure::HeaderTimeout)
+                        }
+                    } else {
+                        // The adapter has not been dispatched: dropping it also
+                        // acknowledges upload closure before retry can transfer.
+                        drop(upstream);
+                        match acquired_pool {
+                            Some(Err(error)) => Ok(Err(Box::new(error) as BoxError)),
+                            _ => Err(AttemptFailure::HeaderTimeout),
+                        }
+                    };
+                    retry_permit.take();
+                    let mut response = match response {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => {
+                            // H2 can expose a stream reset instead of the original
+                            // upload error. Preserve the adapter's local provenance
+                            // before classifying the transport or penalizing upstream.
+                            if let Some(failure) = progress.local_failure() {
+                                return match failure {
+                                    LocalRequestFailure::IdleTimeout => {
+                                        ServiceOutcome::Handled(ResponseHead::new(
+                                            StatusCode::REQUEST_TIMEOUT,
+                                            GatewayBodyPlan::Bytes(Bytes::from_static(
+                                                b"Request Timeout",
+                                            )),
+                                        ))
+                                    }
+                                    LocalRequestFailure::LimitExceeded => {
+                                        ServiceOutcome::Handled(ResponseHead::new(
+                                            StatusCode::PAYLOAD_TOO_LARGE,
+                                            GatewayBodyPlan::Bytes(Bytes::from_static(
+                                                b"Payload Too Large",
+                                            )),
+                                        ))
+                                    }
+                                    LocalRequestFailure::InvalidBody => {
+                                        ServiceOutcome::Handled(ResponseHead::new(
+                                            StatusCode::BAD_REQUEST,
+                                            GatewayBodyPlan::Bytes(Bytes::from_static(
+                                                b"Bad Request",
+                                            )),
+                                        ))
+                                    }
+                                    LocalRequestFailure::Cancelled => {
+                                        ServiceOutcome::Failed(ServiceError::new(
+                                            ErrorClass::BodyUnavailable,
+                                            "downstream request upload was cancelled",
+                                        ))
+                                    }
+                                };
+                            }
+                            if error_chain_contains_request_body_limit(error.as_ref()) {
+                                return ServiceOutcome::Handled(ResponseHead::new(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    GatewayBodyPlan::Bytes(Bytes::from_static(
+                                        b"Payload Too Large",
+                                    )),
+                                ));
+                            }
+                            if error_chain_contains_request_body_idle_timeout(error.as_ref()) {
+                                return ServiceOutcome::Handled(ResponseHead::new(
+                                    StatusCode::REQUEST_TIMEOUT,
+                                    GatewayBodyPlan::Bytes(Bytes::from_static(b"Request Timeout")),
+                                ));
+                            }
+                            if error_chain_contains_request_validation(error.as_ref()) {
+                                return ServiceOutcome::Handled(ResponseHead::new(
+                                    StatusCode::BAD_REQUEST,
+                                    GatewayBodyPlan::Bytes(Bytes::from_static(b"Bad Request")),
+                                ));
+                            }
+                            let failure = classify_proxy_error(error.as_ref());
+                            if matches!(
+                                failure,
+                                AttemptFailure::Connect | AttemptFailure::ConnectTimeout
+                            ) && let Some(pool) = &attempt_pool
+                            {
+                                self.pool_registry.retire_failed_pool(pool);
+                            }
+                            if let Some(phase) = failure.timeout_phase() {
+                                metrics.record_upstream_timeout(phase);
+                            }
+                            if failure == AttemptFailure::LocalOverload {
+                                cluster.record_admission_failure(ClusterAdmissionError::Overloaded);
+                            }
+                            if !matches!(
+                                failure,
+                                AttemptFailure::InvalidTransport
+                                    | AttemptFailure::Resolution
+                                    | AttemptFailure::LocalOverload
+                            ) {
+                                cluster.record_passive_failure(
+                                    endpoint.name(),
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            let detail = format!(
+                                "upstream request to `{}` failed: {error}",
+                                endpoint.name()
+                            );
+                            if retry_allows_failure(retry, failure) {
+                                if attempt < max_attempts
+                                    && let Some(storm_permit) = cluster.try_acquire_retry()
+                                {
+                                    tried.insert(endpoint.name().to_owned());
+                                    lease.cancel_upload();
+                                    lease.wait_request_closed().await;
+                                    let Some(previous) = lease.take_for_retry() else {
+                                        return ServiceOutcome::Failed(ServiceError::new(
+                                            ErrorClass::InvalidState,
+                                            "closed retry upload did not return admission",
+                                        ));
+                                    };
+                                    drop(previous);
+                                    match cluster.acquire_excluding(&tried).await {
+                                        Ok(next) => {
+                                            permit = next;
+                                            retry_permit = Some(storm_permit);
+                                            cluster.record_retry_attempt();
+                                            continue;
+                                        }
+                                        Err(_) => drop(storm_permit),
+                                    }
+                                }
+                                cluster.record_retry_exhausted();
+                            }
+                            return ServiceOutcome::Failed(ServiceError::new(
+                                failure.error_class(),
+                                detail,
+                            ));
+                        }
+                        Err(failure) => {
+                            if failure == AttemptFailure::Total {
+                                return timeout_failure(metrics, TimeoutPhase::Total);
+                            }
+                            metrics.record_upstream_timeout(TimeoutPhase::ResponseHeader);
+                            cluster
+                                .record_passive_failure(endpoint.name(), std::time::Instant::now());
+                            let header_bound = cluster
+                                .spec()
+                                .timeouts
+                                .as_ref()
+                                .map_or(timeout, |timeouts| timeouts.response_header);
+                            let detail = format!(
+                                "upstream `{}` did not produce response headers in {header_bound:?}",
+                                endpoint.name()
+                            );
+                            if retry_allows_failure(retry, failure) {
+                                if attempt < max_attempts
+                                    && let Some(storm_permit) = cluster.try_acquire_retry()
+                                {
+                                    tried.insert(endpoint.name().to_owned());
+                                    lease.cancel_upload();
+                                    lease.wait_request_closed().await;
+                                    let Some(previous) = lease.take_for_retry() else {
+                                        return ServiceOutcome::Failed(ServiceError::new(
+                                            ErrorClass::InvalidState,
+                                            "closed retry upload did not return admission",
+                                        ));
+                                    };
+                                    drop(previous);
+                                    match cluster.acquire_excluding(&tried).await {
+                                        Ok(next) => {
+                                            permit = next;
+                                            retry_permit = Some(storm_permit);
+                                            cluster.record_retry_attempt();
+                                            continue;
+                                        }
+                                        Err(_) => drop(storm_permit),
+                                    }
+                                }
+                                cluster.record_retry_exhausted();
+                            }
+                            return ServiceOutcome::Failed(ServiceError::new(
+                                failure.error_class(),
+                                detail,
+                            ));
+                        }
+                    };
+
+                    if retry_allows_status(retry, response.status()) {
+                        if attempt < max_attempts
+                            && let Some(storm_permit) = cluster.try_acquire_retry()
+                        {
+                            let previous_endpoint = endpoint.name().to_owned();
+                            tried.insert(previous_endpoint.clone());
+                            // Preserve the original response unless a replacement is
+                            // already admitted. A replay upload can still be in Hyper
+                            // after an early head; wait for its actual adapter to close
+                            // before transferring the single Cluster admission slot.
+                            if let Some(reservation) = cluster
+                                .reserve_retry_endpoint(&tried, &previous_endpoint)
+                                .await
+                            {
+                                lease.cancel_upload();
+                                lease.wait_request_closed().await;
+                                let Some(previous) = lease.take_for_retry() else {
+                                    return ServiceOutcome::Failed(ServiceError::new(
+                                        ErrorClass::InvalidState,
+                                        "status retry upload did not close",
+                                    ));
+                                };
+                                permit = previous;
+                                if !permit.retarget_reserved(reservation) {
+                                    return ServiceOutcome::Failed(ServiceError::new(
+                                        ErrorClass::InvalidState,
+                                        "status retry admission belongs to a different Cluster",
+                                    ));
+                                }
+                                if response.status().is_server_error() {
+                                    cluster.record_passive_failure(
+                                        &previous_endpoint,
+                                        std::time::Instant::now(),
+                                    );
+                                }
+                                drop(response);
+                                retry_permit = Some(storm_permit);
+                                cluster.record_retry_attempt();
+                                continue;
+                            }
+                            drop(storm_permit);
+                        }
+                        cluster.record_retry_exhausted();
+                    }
+
+                    if let Some(pending_upgrade) = pending_upgrade.take() {
+                        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                            let upstream_upgrade = hyper::upgrade::on(&mut response);
+                            let plan = match pending_upgrade
+                                .bind(snapshot.clone())
+                                .accept(&response, upstream_upgrade)
+                            {
+                                Ok(plan) => plan,
+                                Err(error) => {
+                                    cluster.record_passive_failure(
+                                        endpoint.name(),
+                                        std::time::Instant::now(),
+                                    );
+                                    return ServiceOutcome::Failed(ServiceError::new(
+                                        ErrorClass::UpstreamProtocol,
+                                        format!("upstream Upgrade handshake is invalid: {error}"),
+                                    ));
+                                }
+                            };
+                            let (mut parts, _body) = response.into_parts();
+                            if sanitize_runtime_headers(&mut parts.headers, WireProtocol::Http1)
+                                .is_err()
+                            {
+                                cluster.record_passive_failure(
+                                    endpoint.name(),
+                                    std::time::Instant::now(),
+                                );
+                                return ServiceOutcome::Failed(ServiceError::new(
+                                    ErrorClass::UpstreamProtocol,
+                                    "upstream Upgrade response has invalid connection metadata",
+                                ));
+                            }
+                            cluster.record_passive_success(endpoint.name());
+                            let Some(permit) = lease.take_for_retry() else {
+                                return ServiceOutcome::Failed(ServiceError::new(
+                                    ErrorClass::InvalidState,
+                                    "Upgrade request upload is not closed",
+                                ));
+                            };
+                            let plan = plan.retain_cluster_permit(Arc::clone(&cluster), permit);
+                            return ServiceOutcome::Handled(ResponseHead {
+                                status: StatusCode::SWITCHING_PROTOCOLS,
+                                headers: parts.headers,
+                                body: GatewayBodyPlan::TrustedUpgrade(plan),
+                            });
+                        }
+                    } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                         cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
                         return ServiceOutcome::Failed(ServiceError::new(
                             ErrorClass::UpstreamProtocol,
-                            "upstream Upgrade response has invalid connection metadata",
+                            "upstream returned an unsolicited 101 response",
                         ));
                     }
-                    cluster.record_passive_success(endpoint.name());
-                    let plan = plan.retain_cluster_permit(Arc::clone(&cluster), permit);
+
+                    let downstream_protocol =
+                        response_wire_protocol(request.original().http_version);
+                    let accepts_http1_trailers = downstream_protocol == WireProtocol::Http1
+                        && http1_accepts_trailers(&request.original().headers);
+                    let trailer_guard = TrailerGuard::from_response_headers(
+                        downstream_protocol,
+                        accepts_http1_trailers,
+                        response.headers(),
+                    );
+                    let (mut parts, body) = response.into_parts();
+                    if sanitize_runtime_headers(
+                        &mut parts.headers,
+                        response_wire_protocol(parts.version),
+                    )
+                    .is_err()
+                    {
+                        cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
+                        return ServiceOutcome::Failed(ServiceError::new(
+                            ErrorClass::UpstreamProtocol,
+                            "upstream response contains invalid connection-specific metadata",
+                        ));
+                    }
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    let outcome_recorded = parts.status.is_server_error();
+                    if outcome_recorded {
+                        cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
+                    }
+                    let body = if request.method() == Method::HEAD {
+                        if !outcome_recorded {
+                            cluster.record_passive_success(endpoint.name());
+                        }
+                        drop(lease);
+                        GatewayBodyPlan::Head {
+                            representation_length: None,
+                        }
+                    } else {
+                        let idle = cluster
+                            .spec()
+                            .timeouts
+                            .as_ref()
+                            .map_or(cluster.spec().response_timeout, |timeouts| {
+                                timeouts.response_body_idle
+                            });
+                        let body = timeout_upstream_response_body(body, idle);
+                        GatewayBodyPlan::Stream {
+                            body: PhaseMetricsBody::new(
+                                ClusterResponseBody::new_with_lease(
+                                    body,
+                                    Arc::clone(&cluster),
+                                    lease,
+                                    outcome_recorded,
+                                ),
+                                Arc::clone(metrics),
+                                attempt_pool,
+                            )
+                            .boxed_unsync(),
+                            known_length: None,
+                            trailer_guard: Some(trailer_guard),
+                        }
+                    };
                     return ServiceOutcome::Handled(ResponseHead {
-                        status: StatusCode::SWITCHING_PROTOCOLS,
+                        status: parts.status,
                         headers: parts.headers,
-                        body: GatewayBodyPlan::TrustedUpgrade(plan),
+                        body,
                     });
                 }
-            } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-                cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
-                return ServiceOutcome::Failed(ServiceError::new(
-                    ErrorClass::UpstreamProtocol,
-                    "upstream returned an unsolicited 101 response",
-                ));
-            }
-
-            let downstream_protocol = response_wire_protocol(request.original().http_version);
-            let accepts_http1_trailers = downstream_protocol == WireProtocol::Http1
-                && http1_accepts_trailers(&request.original().headers);
-            let trailer_guard = TrailerGuard::from_response_headers(
-                downstream_protocol,
-                accepts_http1_trailers,
-                response.headers(),
-            );
-            let (mut parts, body) = response.into_parts();
-            if sanitize_runtime_headers(&mut parts.headers, response_wire_protocol(parts.version))
-                .is_err()
-            {
-                cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
-                return ServiceOutcome::Failed(ServiceError::new(
-                    ErrorClass::UpstreamProtocol,
-                    "upstream response contains invalid connection-specific metadata",
-                ));
-            }
-            parts.headers.remove(header::CONTENT_LENGTH);
-            let outcome_recorded = parts.status.is_server_error();
-            if outcome_recorded {
-                cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
-            }
-            let body = if request.method() == Method::HEAD {
-                if !outcome_recorded {
-                    cluster.record_passive_success(endpoint.name());
-                }
-                drop(permit);
-                GatewayBodyPlan::Head {
-                    representation_length: None,
-                }
-            } else {
-                let body = timeout_upstream_response_body(body, cluster.spec().response_timeout);
-                GatewayBodyPlan::Stream {
-                    body: ClusterResponseBody::new(
-                        body,
-                        Arc::clone(&cluster),
-                        permit,
-                        outcome_recorded,
-                    )
-                    .boxed_unsync(),
-                    known_length: None,
-                    trailer_guard: Some(trailer_guard),
-                }
             };
-            return ServiceOutcome::Handled(ResponseHead {
-                status: parts.status,
-                headers: parts.headers,
-                body,
-            });
+            match budget.run(TimeoutPhase::ResponseHeader, attempts).await {
+                Ok(outcome) => outcome,
+                Err(_) => timeout_failure(metrics, TimeoutPhase::Total),
+            }
+        };
+        if let Some(budget) = total {
+            match budget.run(TimeoutPhase::Queue, work).await {
+                Ok(outcome) => outcome,
+                Err(_) => timeout_failure(metrics, TimeoutPhase::Total),
+            }
+        } else {
+            work.await
         }
     }
 }
@@ -714,12 +914,31 @@ pub(crate) fn retry_allows_status(retry: &RetrySpec, status: StatusCode) -> bool
         .any(|range| range.contains(status.as_u16()))
 }
 
-fn classify_proxy_error(error: &hyper_util::client::legacy::Error) -> AttemptFailure {
-    if error.is_connect() {
-        return AttemptFailure::Connect;
-    }
-    let mut source = error.source();
+fn classify_proxy_error(error: &(dyn std::error::Error + 'static)) -> AttemptFailure {
+    let mut source = Some(error);
+    let mut connect = false;
     while let Some(error) = source {
+        connect |= error
+            .downcast_ref::<hyper_util::client::legacy::Error>()
+            .is_some_and(hyper_util::client::legacy::Error::is_connect);
+        if let Some(error) = error.downcast_ref::<TransportError>() {
+            if matches!(
+                error.kind(),
+                TransportErrorKind::ConnectionCapacity | TransportErrorKind::ResolutionCapacity
+            ) {
+                return AttemptFailure::LocalOverload;
+            }
+            if error.kind() == TransportErrorKind::DeadlineOutOfRange {
+                return AttemptFailure::InvalidTransport;
+            }
+            return match (error.phase(), error.is_timeout()) {
+                (TransportPhase::Resolve, _) => AttemptFailure::Resolution,
+                (TransportPhase::Tls, true) => AttemptFailure::TlsTimeout,
+                (TransportPhase::Tls, false) => AttemptFailure::Tls,
+                (_, true) => AttemptFailure::ConnectTimeout,
+                (_, false) => AttemptFailure::Connect,
+            };
+        }
         if let Some(error) = error.downcast_ref::<h2::Error>() {
             return match error.reason() {
                 Some(h2::Reason::REFUSED_STREAM) => AttemptFailure::RefusedStream,
@@ -729,7 +948,83 @@ fn classify_proxy_error(error: &hyper_util::client::legacy::Error) -> AttemptFai
         }
         source = error.source();
     }
-    AttemptFailure::Protocol
+    if connect {
+        AttemptFailure::Connect
+    } else {
+        AttemptFailure::Protocol
+    }
+}
+
+fn timeout_failure(metrics: &Metrics, phase: TimeoutPhase) -> ServiceOutcome<GatewayBodyPlan> {
+    metrics.record_upstream_timeout(phase);
+    ServiceOutcome::Failed(ServiceError::new(
+        ErrorClass::Timeout,
+        format!("upstream {} deadline expired", phase.as_str()),
+    ))
+}
+
+struct PhaseMetricsBody<B> {
+    inner: std::pin::Pin<Box<B>>,
+    metrics: Arc<Metrics>,
+    recorded: bool,
+    // Registry retirement must not terminate an already-issued H2 stream.
+    _pool: Option<Arc<ProxyPool>>,
+}
+
+impl<B> PhaseMetricsBody<B> {
+    fn new(inner: B, metrics: Arc<Metrics>, pool: Option<Arc<ProxyPool>>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            metrics,
+            recorded: false,
+            _pool: pool,
+        }
+    }
+}
+
+impl<B> http_body::Body for PhaseMetricsBody<B>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self.inner.as_mut().poll_frame(cx) {
+            std::task::Poll::Ready(Some(Err(error))) => {
+                let error = error.into();
+                let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+                while let Some(current) = cause {
+                    if current
+                        .downcast_ref::<BodyIdleTimeout>()
+                        .is_some_and(|timeout| {
+                            timeout.direction() == BodyIdleDirection::UpstreamResponse
+                        })
+                        && !self.recorded
+                    {
+                        self.recorded = true;
+                        self.metrics
+                            .record_upstream_timeout(TimeoutPhase::ResponseBody);
+                        break;
+                    }
+                    cause = current.source();
+                }
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(Some(Ok(frame))) => std::task::Poll::Ready(Some(Ok(frame))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn error_chain_contains_request_validation(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -770,16 +1065,6 @@ fn error_chain_contains_request_body_idle_timeout(
         current = error.source();
     }
     false
-}
-
-fn build_proxy_pool(connector: HttpsConnector<HttpConnector>, http2_only: bool) -> ProxyPool {
-    let mut builder = Client::builder(TokioExecutor::new());
-    builder
-        .pool_timer(TokioTimer::new())
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(32);
-    builder.http2_only(http2_only);
-    builder.build(connector)
 }
 
 fn response_wire_protocol(version: Version) -> WireProtocol {
@@ -845,6 +1130,7 @@ impl LeafExecutor<GatewayRequestPayload, GatewayBodyPlan> for HyperLeaves {
             body,
             &self.snapshot,
             max_request_body_bytes,
+            &self.metrics,
         ))
     }
 
@@ -866,43 +1152,20 @@ impl LeafExecutor<GatewayRequestPayload, GatewayBodyPlan> for HyperLeaves {
 }
 
 fn upstream_uri(endpoint: &url::Url, request_path: &str) -> Result<Uri, ServiceError> {
-    let host = endpoint.host_str().ok_or_else(|| {
-        ServiceError::new(ErrorClass::InvalidState, "cluster endpoint has no host")
-    })?;
-    let authority_host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    };
-    let authority = endpoint.port().map_or(authority_host.clone(), |port| {
-        format!("{authority_host}:{port}")
-    });
-    let base_path = endpoint.path().trim_end_matches('/');
-    let request_path = request_path.strip_prefix('/').unwrap_or(request_path);
-    let path = if base_path.is_empty() {
-        format!("/{request_path}")
-    } else {
-        format!("{base_path}/{request_path}")
-    };
-    Uri::from_str(&format!("{}://{authority}{path}", endpoint.scheme())).map_err(|error| {
-        ServiceError::new(
-            ErrorClass::InvalidState,
-            format!("cannot construct upstream URI: {error}"),
-        )
-    })
+    LogicalOrigin::from_url(endpoint)
+        .and_then(|origin| origin.request_uri(request_path))
+        .map_err(|error| {
+            ServiceError::new(
+                ErrorClass::InvalidState,
+                format!("cannot construct upstream URI: {error}"),
+            )
+        })
 }
 
 fn apply_forwarding_headers(headers: &mut HeaderMap, request: &RequestFrame, endpoint: &url::Url) {
-    let host = endpoint.host_str().unwrap_or_default();
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    };
-    let target_authority = endpoint
-        .port()
-        .map_or(host.clone(), |port| format!("{host}:{port}"));
-    if let Ok(value) = HeaderValue::from_str(&target_authority) {
+    if let Ok(origin) = LogicalOrigin::from_url(endpoint)
+        && let Ok(value) = HeaderValue::from_str(origin.authority().as_str())
+    {
         headers.insert(header::HOST, value);
     }
     let peer_ip = request

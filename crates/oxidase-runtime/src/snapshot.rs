@@ -152,7 +152,14 @@ impl RuntimeSnapshot {
         if let Some(portable) = portable {
             dependencies.extend(portable.dependencies.iter().cloned());
         }
-        let mut preparation_warnings = Vec::new();
+        // Source callers already render compiler warnings separately. Portable
+        // preparation has no source compilation boundary, so retain its loader
+        // compatibility warnings with the snapshot's preparation diagnostics.
+        let mut preparation_warnings = if portable.is_some() {
+            gateway.warnings.clone()
+        } else {
+            Vec::new()
+        };
         let mut sensitive_dependencies = gateway
             .resources
             .secrets
@@ -1005,6 +1012,29 @@ fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
     );
     hash.field_u128("connect_timeout_ns", source.connect_timeout.as_nanos());
     hash.field_u128("response_timeout_ns", source.response_timeout.as_nanos());
+    if let Some(timeouts) = &source.timeouts {
+        hash.field_bytes("timeout_contract", b"phased/v1")
+            .field_u128("phased_connect_ns", timeouts.connect.as_nanos())
+            .field_u128("phased_tls_handshake_ns", timeouts.tls_handshake.as_nanos())
+            .field_u128(
+                "phased_request_body_idle_ns",
+                timeouts.request_body_idle.as_nanos(),
+            )
+            .field_u128(
+                "phased_response_header_ns",
+                timeouts.response_header.as_nanos(),
+            )
+            .field_u128(
+                "phased_response_body_idle_ns",
+                timeouts.response_body_idle.as_nanos(),
+            )
+            .field_u128(
+                "phased_pre_response_total_ns",
+                timeouts.pre_response_total.as_nanos(),
+            );
+    } else {
+        hash.field_bytes("timeout_contract", b"legacy/v1");
+    }
     hash.finish()
 }
 
@@ -1497,6 +1527,7 @@ listeners:
             tls: None,
             connect_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_secs(2),
+            timeouts: None,
             protocol_source: SourceSpan::synthetic("clusters.api.protocol"),
             source: SourceSpan::synthetic("clusters.api"),
         };
@@ -1529,6 +1560,50 @@ listeners:
         let mut limits = first.clone();
         limits.limits.max_in_flight = 7;
         assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&limits));
+
+        let source = SourceSpan::synthetic("clusters.api.timeouts");
+        let mut phased = first.clone();
+        phased.timeouts = Some(oxidase_config::UpstreamTimeoutSpec {
+            connect: first.connect_timeout,
+            tls_handshake: Duration::from_secs(5),
+            request_body_idle: Duration::from_secs(30),
+            response_header: Duration::from_secs(10),
+            response_body_idle: first.response_timeout,
+            pre_response_total: Duration::from_secs(60),
+            connect_source: source.clone(),
+            tls_handshake_source: source.clone(),
+            request_body_idle_source: source.clone(),
+            response_header_source: source.clone(),
+            response_body_idle_source: source.clone(),
+            pre_response_total_source: source.clone(),
+            source,
+        });
+        assert_ne!(cluster_fingerprint(&first), cluster_fingerprint(&phased));
+        let changed: [fn(&mut oxidase_config::UpstreamTimeoutSpec); 6] = [
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.connect += Duration::from_millis(1)
+            },
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.tls_handshake += Duration::from_millis(1)
+            },
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.request_body_idle += Duration::from_millis(1)
+            },
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.response_header += Duration::from_millis(1)
+            },
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.response_body_idle += Duration::from_millis(1)
+            },
+            |timeouts: &mut oxidase_config::UpstreamTimeoutSpec| {
+                timeouts.pre_response_total += Duration::from_millis(1)
+            },
+        ];
+        for change in changed {
+            let mut other = phased.clone();
+            change(other.timeouts.as_mut().expect("timing policy"));
+            assert_ne!(cluster_fingerprint(&phased), cluster_fingerprint(&other));
+        }
     }
 
     #[test]
