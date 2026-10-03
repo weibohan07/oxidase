@@ -14,7 +14,7 @@ use serde::{Serialize, Serializer};
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
-use crate::regular_file::{RegularFileOpenError, open_regular_file};
+use crate::regular_file::{RegularFileOpenError, SensitiveFileIdentity, open_regular_file};
 
 /// Opaque Secret material owned by a prepared runtime snapshot.
 ///
@@ -81,6 +81,7 @@ pub struct PreparedSecret {
     bytes: SecretBytes,
     fingerprint: ContentDigest,
     version_token: ContentDigest,
+    sensitive_file: SensitiveFileIdentity,
 }
 
 impl PreparedSecret {
@@ -130,6 +131,7 @@ impl PreparedSecret {
                 bytes: SecretBytes::new(bytes),
                 fingerprint,
                 version_token: ContentDigest::of_bytes(random_token),
+                sensitive_file: SensitiveFileIdentity::from_opened(&source.file, &metadata),
             },
             warnings,
         })
@@ -143,6 +145,18 @@ impl PreparedSecret {
     #[must_use]
     pub fn constant_time_eq(&self, candidate: &[u8]) -> bool {
         self.bytes.constant_time_eq(candidate)
+    }
+
+    #[must_use]
+    pub fn sensitive_file_identity(&self) -> SensitiveFileIdentity {
+        self.sensitive_file.clone()
+    }
+
+    /// Parse the separate Admin credential contract without changing this Secret.
+    pub fn admin_bearer_token(
+        &self,
+    ) -> Result<crate::AdminBearerToken, crate::AdminBearerTokenError> {
+        crate::AdminBearerToken::parse_file_bytes(&self.bytes.0.0)
     }
 
     pub(crate) const fn fingerprint(&self) -> ContentDigest {

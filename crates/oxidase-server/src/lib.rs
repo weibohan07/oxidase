@@ -1,6 +1,7 @@
 //! Hyper-based listener and proxy data plane.
 
 mod admin;
+mod admin_audit;
 mod body;
 mod cluster_health;
 mod connection;

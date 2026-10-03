@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,8 +19,8 @@ use oxidase_core::{ContentDigest, ContentHasher};
 use oxidase_site::{AssetSource, PortableSiteError};
 
 use crate::{
-    MAX_PRIVATE_KEY_BYTES, PORTABLE_RUNTIME_PLAN_SCHEMA_V1, PortableRuntimeError,
-    PortableRuntimePlanV1, ResourceReuse, RuntimeSnapshot,
+    CandidateWorkControl, MAX_PRIVATE_KEY_BYTES, PORTABLE_RUNTIME_PLAN_SCHEMA_V1,
+    PortableRuntimeError, PortableRuntimePlanV1, ResourceReuse, RuntimeSnapshot,
 };
 
 const RUNTIME_SECTION: &str = "runtime";
@@ -122,9 +121,32 @@ pub fn prepare_bundle_archive(
     deployment_root: &Path,
     previous: Option<&RuntimeSnapshot>,
 ) -> Result<PreparedBundleActivation, BundleActivationError> {
+    prepare_bundle_archive_controlled(
+        archive,
+        bundle_path,
+        deployment_root,
+        previous,
+        &CandidateWorkControl::default(),
+    )
+}
+
+/// Cooperative preparation for the single bounded management worker. The
+/// caller keeps its admission permit inside that worker until this returns.
+/// Cancellation is checked before/after decoding and at every Asset boundary;
+/// external representation hashing/copying checks at most every 64 KiB.
+pub fn prepare_bundle_archive_controlled(
+    archive: &BundleArchive,
+    bundle_path: &Path,
+    deployment_root: &Path,
+    previous: Option<&RuntimeSnapshot>,
+    control: &CandidateWorkControl,
+) -> Result<PreparedBundleActivation, BundleActivationError> {
+    checkpoint(control)?;
     archive.verify()?;
     archive.verify_capabilities(&bundle_runtime_capabilities())?;
+    checkpoint(control)?;
     let plan = decode_runtime_plan(archive)?;
+    checkpoint(control)?;
     validate_sensitive_references(archive.manifest(), &plan)?;
     validate_asset_set(archive.manifest(), &plan)?;
     validate_deployment_root(deployment_root)?;
@@ -137,8 +159,13 @@ pub fn prepare_bundle_archive(
     })?);
     let display_path = Arc::new(bundle_path.to_path_buf());
     let dependencies = runtime_dependencies(bundle_path, archive.manifest(), deployment_root)?;
-    let mut resolver =
-        CachedAssetResolver::new(archive, &pinned_file, &display_path, deployment_root);
+    let mut resolver = CachedAssetResolver::new(
+        archive,
+        &pinned_file,
+        &display_path,
+        deployment_root,
+        control,
+    );
     let identity: ContentDigest = archive.content_digest().into();
     let (snapshot, reuse) = plan.prepare_with_assets(
         identity,
@@ -147,7 +174,17 @@ pub fn prepare_bundle_archive(
         |key, digest, length| resolver.resolve(key, digest, length),
         previous,
     )?;
+    checkpoint(control)?;
     Ok(PreparedBundleActivation { snapshot, reuse })
+}
+
+fn checkpoint(control: &CandidateWorkControl) -> Result<(), BundleActivationError> {
+    control.checkpoint().map_err(|error| {
+        invalid(
+            error.code(),
+            "Bundle preparation was cancelled or its deadline elapsed",
+        )
+    })
 }
 
 fn decode_runtime_plan(
@@ -177,6 +214,7 @@ struct CachedAssetResolver<'a> {
     pinned_file: &'a Arc<File>,
     display_path: &'a Arc<PathBuf>,
     deployment_root: &'a Path,
+    control: &'a CandidateWorkControl,
     cache: BTreeMap<String, (ContentDigest, u64, AssetSource)>,
 }
 
@@ -186,12 +224,14 @@ impl<'a> CachedAssetResolver<'a> {
         pinned_file: &'a Arc<File>,
         display_path: &'a Arc<PathBuf>,
         deployment_root: &'a Path,
+        control: &'a CandidateWorkControl,
     ) -> Self {
         Self {
             archive,
             pinned_file,
             display_path,
             deployment_root,
+            control,
             cache: BTreeMap::new(),
         }
     }
@@ -202,6 +242,9 @@ impl<'a> CachedAssetResolver<'a> {
         digest: ContentDigest,
         length: u64,
     ) -> Result<AssetSource, PortableSiteError> {
+        checkpoint(self.control).map_err(|error| {
+            PortableSiteError::asset_resolution_with_code(error.code(), error.message())
+        })?;
         if let Some((cached_digest, cached_length, source)) = self.cache.get(key) {
             if *cached_digest != digest || *cached_length != length {
                 return Err(PortableSiteError::asset_resolution(format!(
@@ -270,9 +313,10 @@ fn resolve_asset(
                     PortableSiteError::asset_resolution_with_code(error.code(), error.message())
                 },
             )?;
-            let (file, origin) = verify_external_asset(&path, digest, length).map_err(|error| {
-                PortableSiteError::asset_resolution_with_code(error.code(), error.message())
-            })?;
+            let (file, origin) = verify_external_asset(&path, digest, length, resolver.control)
+                .map_err(|error| {
+                    PortableSiteError::asset_resolution_with_code(error.code(), error.message())
+                })?;
             Ok(AssetSource::pinned_with_origin(file, origin, path, 0))
         }
     }
@@ -458,7 +502,9 @@ fn verify_external_asset(
     path: &Path,
     expected_digest: ContentDigest,
     expected_length: u64,
+    control: &CandidateWorkControl,
 ) -> Result<(File, File), BundleActivationError> {
+    checkpoint(control)?;
     let mut pinned = tempfile::NamedTempFile::new().map_err(|error| BundleActivationError::Io {
         code: "bundle.asset_reference_io",
         message: format!("cannot create immutable external Asset backing: {error}"),
@@ -468,7 +514,9 @@ fn verify_external_asset(
         expected_digest,
         expected_length,
         Some(pinned.as_file_mut()),
+        control,
     )?;
+    checkpoint(control)?;
     pinned
         .as_file()
         .sync_data()
@@ -481,6 +529,7 @@ fn verify_external_asset(
         message: format!("cannot open immutable external Asset backing: {error}"),
     })?;
     drop(pinned);
+    checkpoint(control)?;
     Ok((immutable, origin))
 }
 
@@ -489,6 +538,7 @@ fn copy_and_verify_external_asset(
     expected_digest: ContentDigest,
     expected_length: u64,
     immutable_copy: Option<&mut File>,
+    control: &CandidateWorkControl,
 ) -> Result<File, BundleActivationError> {
     let file = open_external_asset(path).map_err(|error| BundleActivationError::Io {
         code: "bundle.asset_reference_io",
@@ -504,6 +554,7 @@ fn copy_and_verify_external_asset(
         expected_digest,
         expected_length,
         immutable_copy,
+        control,
     )
 }
 
@@ -512,7 +563,8 @@ fn copy_and_verify_opened_external_asset(
     metadata: std::fs::Metadata,
     expected_digest: ContentDigest,
     expected_length: u64,
-    mut immutable_copy: Option<&mut File>,
+    immutable_copy: Option<&mut File>,
+    control: &CandidateWorkControl,
 ) -> Result<File, BundleActivationError> {
     if !metadata.is_file() || metadata.len() != expected_length {
         return Err(invalid(
@@ -520,10 +572,39 @@ fn copy_and_verify_opened_external_asset(
             "external Bundle Asset is not a regular file of the declared length",
         ));
     }
+    copy_and_hash(
+        &mut file,
+        immutable_copy,
+        expected_digest,
+        expected_length,
+        control,
+    )?;
+    checkpoint(control)?;
+    let after = file.metadata().map_err(|error| BundleActivationError::Io {
+        code: "bundle.asset_reference_io",
+        message: format!("cannot revalidate external Bundle Asset handle: {error}"),
+    })?;
+    if !after.is_file() || after.len() != expected_length {
+        return Err(invalid(
+            "bundle.asset_reference_mismatch",
+            "external Bundle Asset changed while being verified",
+        ));
+    }
+    Ok(file)
+}
+
+fn copy_and_hash<R: std::io::Read, W: std::io::Write>(
+    file: &mut R,
+    mut immutable_copy: Option<&mut W>,
+    expected_digest: ContentDigest,
+    expected_length: u64,
+    control: &CandidateWorkControl,
+) -> Result<(), BundleActivationError> {
     let mut hasher = ContentHasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut length = 0_u64;
     loop {
+        checkpoint(control)?;
         let read = file
             .read(&mut buffer)
             .map_err(|error| BundleActivationError::Io {
@@ -532,6 +613,13 @@ fn copy_and_verify_opened_external_asset(
             })?;
         if read == 0 {
             break;
+        }
+        checkpoint(control)?;
+        if length.saturating_add(read as u64) > expected_length {
+            return Err(invalid(
+                "bundle.asset_reference_mismatch",
+                "external Bundle Asset grew beyond the declared length",
+            ));
         }
         if let Some(copy) = immutable_copy.as_deref_mut() {
             copy.write_all(&buffer[..read])
@@ -554,17 +642,8 @@ fn copy_and_verify_opened_external_asset(
             "external Bundle Asset content digest does not match the manifest",
         ));
     }
-    let after = file.metadata().map_err(|error| BundleActivationError::Io {
-        code: "bundle.asset_reference_io",
-        message: format!("cannot revalidate external Bundle Asset handle: {error}"),
-    })?;
-    if !after.is_file() || after.len() != expected_length {
-        return Err(invalid(
-            "bundle.asset_reference_mismatch",
-            "external Bundle Asset changed while being verified",
-        ));
-    }
-    Ok(file)
+    checkpoint(control)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -710,5 +789,87 @@ mod tests {
         let error = prepare_bundle_archive(&archive, &bundle, directory.path(), None)
             .expect_err("missing runtime section is rejected");
         assert_eq!(error.code(), "bundle.runtime_section_missing");
+    }
+
+    #[test]
+    fn external_copy_stops_at_the_next_chunk_after_cancellation() {
+        struct CancellingWriter {
+            bytes: Vec<u8>,
+            control: crate::CandidateWorkControl,
+        }
+        impl std::io::Write for CancellingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                self.control.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = vec![b'a'; 128 * 1024];
+        let control = crate::CandidateWorkControl::default();
+        let mut writer = CancellingWriter {
+            bytes: Vec::new(),
+            control: control.clone(),
+        };
+        let error = super::copy_and_hash(
+            &mut std::io::Cursor::new(&bytes),
+            Some(&mut writer),
+            oxidase_core::ContentDigest::of_bytes(&bytes),
+            bytes.len() as u64,
+            &control,
+        )
+        .expect_err("cancelled worker does not finish the second chunk");
+        assert_eq!(error.code(), "candidate.cancelled");
+        assert_eq!(writer.bytes.len(), 64 * 1024);
+    }
+
+    #[test]
+    fn external_copy_exact_length_and_expired_deadline_are_checked_before_io() {
+        let bytes = vec![b'a'; 64 * 1024];
+        let mut output = Vec::new();
+        super::copy_and_hash(
+            &mut std::io::Cursor::new(&bytes),
+            Some(&mut output),
+            oxidase_core::ContentDigest::of_bytes(&bytes),
+            bytes.len() as u64,
+            &crate::CandidateWorkControl::default(),
+        )
+        .expect("exactly one chunk is valid");
+        assert_eq!(output, bytes);
+
+        struct NoIo;
+        impl std::io::Read for NoIo {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("expired preparation must not read");
+            }
+        }
+        let expired = crate::CandidateWorkControl::with_deadline(std::time::Instant::now());
+        let error = super::copy_and_hash::<_, Vec<u8>>(
+            &mut NoIo,
+            None,
+            oxidase_core::ContentDigest::of_bytes([]),
+            0,
+            &expired,
+        )
+        .expect_err("deadline equality is already expired");
+        assert_eq!(error.code(), "candidate.deadline");
+    }
+
+    #[test]
+    fn external_copy_never_spools_bytes_above_declared_capacity() {
+        let bytes = vec![b'a'; 64 * 1024 + 1];
+        let mut output = Vec::new();
+        let error = super::copy_and_hash(
+            &mut std::io::Cursor::new(&bytes),
+            Some(&mut output),
+            oxidase_core::ContentDigest::of_bytes(&bytes),
+            64 * 1024,
+            &crate::CandidateWorkControl::default(),
+        )
+        .expect_err("growth is rejected before writing an over-limit chunk");
+        assert_eq!(error.code(), "bundle.asset_reference_mismatch");
+        assert_eq!(output.len(), 64 * 1024);
     }
 }

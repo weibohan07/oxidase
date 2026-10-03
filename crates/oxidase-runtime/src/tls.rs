@@ -23,7 +23,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 
-use crate::regular_file::{RegularFileOpenError, open_regular_file};
+use crate::regular_file::{RegularFileOpenError, SensitiveFileIdentity, open_regular_file};
 use crate::trust::PreparedTrustStore;
 
 const MAX_CLIENT_IDENTITY_SAN_COUNT: usize = 64;
@@ -118,6 +118,7 @@ pub struct PreparedCertificate {
     pub digest: ContentDigest,
     certified_key: Arc<CertifiedKey>,
     cert_chain_source: SourceSpan,
+    sensitive_file: SensitiveFileIdentity,
 }
 
 impl PreparedCertificate {
@@ -176,7 +177,7 @@ impl PreparedCertificate {
     ) -> Result<Self, CertificatePreparationFailure> {
         validate_public_certificates(&certificates, source)?;
 
-        let private_key_pem = read_regular_file(
+        let (private_key_pem, sensitive_file) = read_regular_file_with_identity(
             &source.private_key,
             &source.private_key_source,
             CertificateFileKind::PrivateKey,
@@ -241,6 +242,7 @@ impl PreparedCertificate {
             digest: digest.finish(),
             certified_key: Arc::new(certified_key),
             cert_chain_source: source.cert_chain_source.clone(),
+            sensitive_file,
         })
     }
 
@@ -248,6 +250,11 @@ impl PreparedCertificate {
     #[must_use]
     pub fn certificate_count(&self) -> usize {
         self.certified_key.cert.len()
+    }
+
+    #[must_use]
+    pub fn sensitive_file_identity(&self) -> SensitiveFileIdentity {
+        self.sensitive_file.clone()
     }
 
     /// Copies only the public DER certificate chain for a portable Bundle.
@@ -1071,6 +1078,14 @@ fn read_regular_file(
     source: &SourceSpan,
     kind: CertificateFileKind,
 ) -> Result<Vec<u8>, CertificatePreparationFailure> {
+    read_regular_file_with_identity(path, source, kind).map(|(bytes, _)| bytes)
+}
+
+fn read_regular_file_with_identity(
+    path: &Path,
+    source: &SourceSpan,
+    kind: CertificateFileKind,
+) -> Result<(Vec<u8>, SensitiveFileIdentity), CertificatePreparationFailure> {
     let (file, metadata) =
         open_regular_file(path).map_err(|error| certificate_open_failure(source, kind, error))?;
     let limit = match kind {
@@ -1101,7 +1116,7 @@ fn read_regular_file(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         return Err(certificate_too_large(source, kind, limit));
     }
-    Ok(bytes)
+    Ok((bytes, SensitiveFileIdentity::from_opened(path, &metadata)))
 }
 
 fn certificate_too_large(

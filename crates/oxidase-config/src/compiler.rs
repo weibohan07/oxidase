@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -747,12 +748,22 @@ pub struct Compiler;
 
 impl Compiler {
     pub fn compile_path(path: impl AsRef<Path>) -> Result<CompiledGateway, CompileError> {
+        Self::compile_path_controlled(path, || Ok(()))
+    }
+
+    /// Cooperative source preparation. The callback is checked before each
+    /// imported document and read chunk; no runtime implementation enters IR.
+    pub fn compile_path_controlled(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Result<(), CompileError>,
+    ) -> Result<CompiledGateway, CompileError> {
         let requested = path.as_ref();
+        checkpoint()?;
         let path = canonical_input(requested).map_err(|error| {
             error.with_discovered_dependencies(candidate_dependencies(requested))
         })?;
         let mut loader = Loader::default();
-        if let Err(error) = loader.load(&path) {
+        if let Err(error) = loader.load(&path, &mut checkpoint) {
             return Err(error.with_discovered_dependencies(loader.discovered_dependencies()));
         }
         let discovered_dependencies = loader.discovered_dependencies();
@@ -762,6 +773,7 @@ impl Compiler {
         discovered_dependencies.sort();
         discovered_dependencies.dedup();
         let result = (|| {
+            checkpoint()?;
             validate_document_identity(&merged)?;
             let bundle = compile_bundle(&merged)?;
             let (resources, mut warnings) = compile_resources(&merged)?;
@@ -771,6 +783,7 @@ impl Compiler {
             let mut builder = ProgramBuilder::new(&merged, &resources);
             let listeners = builder.compile_listeners()?;
             builder.compile_all_named()?;
+            checkpoint()?;
             let graph = Arc::new(ServiceGraph::new(builder.nodes));
             for listener in &listeners {
                 ServiceProgram::new(listener.service.clone(), Arc::clone(&graph))
@@ -830,6 +843,58 @@ fn canonical_input(path: &Path) -> Result<PathBuf, CompileError> {
             span(path, ""),
         ))
     })
+}
+
+fn read_config_source_controlled(
+    path: &Path,
+    checkpoint: &mut dyn FnMut() -> Result<(), CompileError>,
+) -> Result<String, CompileError> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let failure = |code, message| CompileError::one(Diagnostic::new(code, message, span(path, "")));
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(
+            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+        );
+    }
+    checkpoint()?;
+    let mut file = options
+        .open(path)
+        .map_err(|_| failure("config.read", "cannot open configuration source"))?;
+    if !file
+        .metadata()
+        .map_err(|_| failure("config.read", "cannot inspect configuration source"))?
+        .is_file()
+    {
+        return Err(failure(
+            "config.read",
+            "configuration source must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        checkpoint()?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| failure("config.read", "cannot read configuration source"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAX_BYTES {
+            return Err(failure(
+                "config.source_limit",
+                "configuration document exceeds 16 MiB",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    checkpoint()?;
+    String::from_utf8(bytes)
+        .map_err(|_| failure("config.read", "configuration source must be UTF-8"))
 }
 
 fn candidate_dependencies(path: &Path) -> Vec<PathBuf> {
@@ -918,9 +983,21 @@ struct Loader {
 }
 
 impl Loader {
-    fn load(&mut self, path: &Path) -> Result<(), CompileError> {
+    fn load(
+        &mut self,
+        path: &Path,
+        checkpoint: &mut dyn FnMut() -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
         self.discovered_dependencies
             .extend(candidate_dependencies(path));
+        checkpoint()?;
+        if self.stack.len() >= 128 || self.documents.len() >= 4096 {
+            return Err(CompileError::one(Diagnostic::new(
+                "config.source_limit",
+                "configuration import depth/count exceeds the bounded source limit",
+                span(path, "imports"),
+            )));
+        }
         if let Some(position) = self.stack.iter().position(|candidate| candidate == path) {
             let chain = self.import_chain[position..].to_vec();
             let primary = chain
@@ -940,14 +1017,9 @@ impl Loader {
         if self.loaded.contains(path) {
             return Ok(());
         }
-        let source = fs::read_to_string(path).map_err(|error| {
-            CompileError::one(Diagnostic::new(
-                "config.read",
-                format!("cannot read configuration: {error}"),
-                span(path, ""),
-            ))
-        })?;
+        let source = read_config_source_controlled(path, checkpoint)?;
         let document: SourceDocument<GatewaySource> = parse_yaml_document(path, &source, "")?;
+        checkpoint()?;
 
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -973,7 +1045,7 @@ impl Loader {
                 )
             })?;
             self.import_chain.push(reference);
-            let result = self.load(&import);
+            let result = self.load(&import, checkpoint);
             self.import_chain.pop();
             result?;
         }
@@ -4598,6 +4670,67 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{CompiledResources, Compiler, MergedSource, ProgramBuilder};
+
+    #[test]
+    fn controlled_source_reads_stop_before_the_next_chunk_and_keep_dependencies() {
+        let directory = tempdir().expect("test directory");
+        let path = directory.path().join("source.yaml");
+        fs::write(&path, "# comment\n".repeat(32 * 1024)).expect("large source text");
+        let mut checks = 0;
+        let error = Compiler::compile_path_controlled(&path, || {
+            checks += 1;
+            if checks == 5 {
+                Err(super::CompileError::one(super::Diagnostic::new(
+                    "candidate.cancelled",
+                    "test cancellation",
+                    SourceSpan::synthetic("source"),
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("cancel before parsing the complete file");
+        assert_eq!(checks, 5);
+        assert_eq!(error.diagnostics[0].code, "candidate.cancelled");
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&path.canonicalize().expect("canonical source"))
+        );
+    }
+
+    #[test]
+    fn source_document_size_and_regular_file_bounds_are_enforced() {
+        let directory = tempdir().expect("test directory");
+        let path = directory.path().join("large.yaml");
+        let file = fs::File::create(&path).expect("test file");
+        file.set_len(16 * 1024 * 1024 + 1).expect("sparse fixture");
+        assert_eq!(
+            Compiler::compile_path(&path)
+                .expect_err("too large")
+                .diagnostics[0]
+                .code,
+            "config.source_limit"
+        );
+        #[cfg(unix)]
+        {
+            let pipe = directory.path().join("source.fifo");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&pipe)
+                    .status()
+                    .expect("POSIX test FIFO fixture")
+                    .success()
+            );
+            assert_eq!(
+                Compiler::compile_path(&pipe)
+                    .expect_err("never block waiting for FIFO data")
+                    .diagnostics[0]
+                    .code,
+                "config.read"
+            );
+        }
+    }
 
     fn write_config(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary directory is available");

@@ -201,12 +201,20 @@ impl SiteCompiler {
         root: impl AsRef<Path>,
         manifest: impl AsRef<Path>,
     ) -> Result<SiteSourceIndex, SiteCompileFailure> {
+        Self::scan_controlled(root, manifest, || Ok(()))
+    }
+
+    pub fn scan_controlled(
+        root: impl AsRef<Path>,
+        manifest: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Result<(), SiteCompileError>,
+    ) -> Result<SiteSourceIndex, SiteCompileFailure> {
         let root = root.as_ref().to_path_buf();
         let manifest = manifest.as_ref().to_path_buf();
         let mut dependencies = Vec::new();
         track_candidate(&mut dependencies, &root);
         track_candidate(&mut dependencies, &manifest);
-        scan_site_source(&root, &manifest, &mut dependencies).map_err(|error| {
+        scan_site_source(&root, &manifest, &mut dependencies, &mut checkpoint).map_err(|error| {
             normalize_paths(&mut dependencies);
             SiteCompileFailure::new(error, dependencies)
         })
@@ -236,8 +244,26 @@ impl SiteCompiler {
         inputs: BTreeMap<String, Value>,
         input_spans: BTreeMap<String, SourceSpan>,
     ) -> Result<SiteSnapshot, SiteCompileFailure> {
+        Self::compile_indexed_with_input_spans_controlled(id, index, inputs, input_spans, || Ok(()))
+    }
+
+    pub fn compile_indexed_with_input_spans_controlled(
+        id: ResourceId,
+        index: &SiteSourceIndex,
+        inputs: BTreeMap<String, Value>,
+        input_spans: BTreeMap<String, SourceSpan>,
+        mut checkpoint: impl FnMut() -> Result<(), SiteCompileError>,
+    ) -> Result<SiteSnapshot, SiteCompileFailure> {
         let mut dependencies = index.dependencies.clone();
-        Self::compile_inner(id, index, inputs, &input_spans, &mut dependencies).map_err(|error| {
+        Self::compile_inner(
+            id,
+            index,
+            inputs,
+            &input_spans,
+            &mut dependencies,
+            &mut checkpoint,
+        )
+        .map_err(|error| {
             normalize_paths(&mut dependencies);
             SiteCompileFailure::new(error, dependencies)
         })
@@ -249,12 +275,14 @@ impl SiteCompiler {
         inputs: BTreeMap<String, Value>,
         input_spans: &BTreeMap<String, SourceSpan>,
         dependencies: &mut Vec<PathBuf>,
+        checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
     ) -> Result<SiteSnapshot, SiteCompileError> {
         let root = &index.root;
         let manifest = &index.manifest;
         let source = &index.source;
         let files = &index.files;
         let manifest_locator = SourceLocator::new(manifest, index.spans(manifest));
+        checkpoint()?;
         validate_manifest(manifest_locator, source, &inputs, input_spans)?;
         let deny_patterns = compile_deny_patterns(manifest_locator, &source.visibility.deny)?;
         let limits = compile_limits(manifest_locator, source)?;
@@ -293,10 +321,11 @@ impl SiteCompiler {
             root,
             files,
             &template_roots,
-            source.templates.default_output,
-            source.templates.default_autoescape,
+            &source.templates,
             dependencies,
+            checkpoint,
         )?;
+        checkpoint()?;
         track_template_dependencies(root, &templates, dependencies);
         validate_template_graph(&templates)?;
 
@@ -308,6 +337,7 @@ impl SiteCompiler {
         let mut backing_assets = BTreeSet::new();
         let mut entries = BTreeMap::new();
         for oxr in &oxr_files {
+            checkpoint()?;
             let relative = oxr
                 .strip_prefix(root)
                 .map_err(|_| SiteCompileError::UnsafePath {
@@ -324,6 +354,7 @@ impl SiteCompiler {
                 backing_assets.insert(backing);
             }
             insert_with_index_aliases(&mut entries, logical_path, plan, source)?;
+            checkpoint()?;
         }
 
         let precompressed = precompressed_paths(files, source);
@@ -332,6 +363,7 @@ impl SiteCompiler {
                 && !backing_assets.contains(*path)
                 && !precompressed.contains(*path)
         }) {
+            checkpoint()?;
             let relative = asset
                 .strip_prefix(root)
                 .map_err(|_| SiteCompileError::UnsafePath {
@@ -353,8 +385,10 @@ impl SiteCompiler {
             };
             insert_with_index_aliases(&mut entries, logical_path, plan, source)?;
             track_site_dependency(dependencies, asset, root);
+            checkpoint()?;
         }
         validate_template_graph(&templates)?;
+        checkpoint()?;
 
         let error_404 = source
             .errors
@@ -392,6 +426,7 @@ impl SiteCompiler {
             .transpose()?;
 
         normalize_paths(dependencies);
+        checkpoint()?;
         Ok(SiteSnapshot {
             id,
             root: root.clone(),
@@ -421,7 +456,9 @@ fn scan_site_source(
     root: &Path,
     manifest: &Path,
     dependencies: &mut Vec<PathBuf>,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
 ) -> Result<SiteSourceIndex, SiteCompileError> {
+    checkpoint()?;
     let root = root
         .canonicalize()
         .map_err(|error| SiteCompileError::io(root, error))?;
@@ -437,7 +474,8 @@ fn scan_site_source(
         });
     }
 
-    let manifest_entry = read_site_source_entry(&manifest, &manifest, SiteSourceKind::Manifest)?;
+    let manifest_entry =
+        read_site_source_entry(&manifest, &manifest, SiteSourceKind::Manifest, checkpoint)?;
     let manifest_text = manifest_entry
         .text
         .as_deref()
@@ -449,6 +487,7 @@ fn scan_site_source(
         (0, 0),
         manifest_entry.spans.as_deref(),
     )?;
+    checkpoint()?;
     if source.oxista != SITE_API_VERSION {
         return Err(manifest_locator.error(
             "site.version",
@@ -467,11 +506,13 @@ fn scan_site_source(
         &template_roots,
         &deny_patterns,
         dependencies,
+        checkpoint,
     )?;
     let mut files = collection.files;
     files.sort();
     files.dedup();
     for path in &files {
+        checkpoint()?;
         track_site_dependency(dependencies, path, &root);
     }
     for (link, target) in &collection.symlinks {
@@ -491,7 +532,8 @@ fn scan_site_source(
         if entries.contains_key(path) {
             continue;
         }
-        let entry = read_site_source_entry(path, path, site_source_kind(path, &manifest))?;
+        let entry =
+            read_site_source_entry(path, path, site_source_kind(path, &manifest), checkpoint)?;
         #[cfg(test)]
         {
             *file_reads.entry(path.clone()).or_default() += 1;
@@ -517,6 +559,7 @@ fn scan_site_source(
     );
     digest.field_u64("file_count", files.len() as u64);
     for path in &files {
+        checkpoint()?;
         let entry = entries
             .get(path)
             .expect("every collected file has an indexed entry");
@@ -551,6 +594,7 @@ fn scan_site_source(
             .field_bytes("target", relative_source_name(&target, &root).as_bytes());
     }
     normalize_paths(dependencies);
+    checkpoint()?;
 
     Ok(SiteSourceIndex {
         root,
@@ -570,7 +614,9 @@ fn read_site_source_entry(
     source_path: &Path,
     canonical_path: &Path,
     kind: SiteSourceKind,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
 ) -> Result<SiteSourceEntry, SiteCompileError> {
+    checkpoint()?;
     let metadata = canonical_path
         .metadata()
         .map_err(|error| SiteCompileError::io(source_path, error))?;
@@ -580,23 +626,60 @@ fn read_site_source_entry(
             "indexed Site source is not a regular file",
         ));
     }
+    let retain_text = kind != SiteSourceKind::Asset;
+    const MAX_TEXT_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+    if retain_text && metadata.len() > MAX_TEXT_SOURCE_BYTES {
+        return Err(SourceLocator::new(source_path, None).error(
+            "site.source_too_large",
+            "source",
+            "Oxista text source exceeds the 16 MiB preparation limit",
+        ));
+    }
+    checkpoint()?;
+    #[cfg(unix)]
+    let mut file = {
+        let descriptor = rustix::fs::open(
+            canonical_path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| {
+            SiteCompileError::io(
+                source_path,
+                std::io::Error::from_raw_os_error(error.raw_os_error()),
+            )
+        })?;
+        fs::File::from(descriptor)
+    };
+    #[cfg(not(unix))]
     let mut file =
         fs::File::open(canonical_path).map_err(|error| SiteCompileError::io(source_path, error))?;
-    let retain_text = kind != SiteSourceKind::Asset;
+    let opened = file
+        .metadata()
+        .map_err(|error| SiteCompileError::io(source_path, error))?;
+    if !opened.is_file() || !same_site_file_metadata(&metadata, &opened) {
+        return Err(SiteCompileError::source(
+            source_path,
+            "Site source changed before it could be read",
+        ));
+    }
     let mut text_bytes = retain_text.then(|| Vec::with_capacity(metadata.len() as usize));
-    let mut hasher = ContentHasher::new();
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| SiteCompileError::io(source_path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        if let Some(text) = &mut text_bytes {
-            text.extend_from_slice(&buffer[..read]);
-        }
+    let digest = hash_site_reader(
+        &mut file,
+        source_path,
+        metadata.len(),
+        &mut text_bytes,
+        checkpoint,
+    )?;
+    checkpoint()?;
+    let after = file
+        .metadata()
+        .map_err(|error| SiteCompileError::io(source_path, error))?;
+    if !same_site_file_metadata(&opened, &after) {
+        return Err(SiteCompileError::source(
+            source_path,
+            "Site source changed while being read",
+        ));
     }
     let text = text_bytes
         .map(|bytes| {
@@ -630,16 +713,75 @@ fn read_site_source_entry(
         }
         _ => None,
     };
+    checkpoint()?;
     Ok(SiteSourceEntry {
         source_path: source_path.to_path_buf(),
         canonical_path: canonical_path.to_path_buf(),
         kind,
         length: metadata.len(),
         modified: metadata.modified().ok(),
-        digest: hasher.finish(),
+        digest,
         text,
         spans,
     })
+}
+
+fn same_site_file_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
+}
+
+fn hash_site_reader(
+    reader: &mut impl Read,
+    source_path: &Path,
+    expected_length: u64,
+    text: &mut Option<Vec<u8>>,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
+) -> Result<ContentDigest, SiteCompileError> {
+    let mut hasher = ContentHasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut length = 0_u64;
+    loop {
+        checkpoint()?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| SiteCompileError::io(source_path, error))?;
+        if read == 0 {
+            break;
+        }
+        length = length.checked_add(read as u64).ok_or_else(|| {
+            SiteCompileError::source(source_path, "Site source length overflowed")
+        })?;
+        if length > expected_length {
+            return Err(SiteCompileError::source(
+                source_path,
+                "Site source grew during preparation",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        if let Some(text) = text {
+            text.extend_from_slice(&buffer[..read]);
+        }
+        checkpoint()?;
+    }
+    if length != expected_length {
+        return Err(SiteCompileError::source(
+            source_path,
+            "Site source shrank during preparation",
+        ));
+    }
+    Ok(hasher.finish())
 }
 
 fn site_source_kind(path: &Path, manifest: &Path) -> SiteSourceKind {
@@ -1070,12 +1212,14 @@ fn collect_files(
     template_roots: &[PathBuf],
     deny_patterns: &[DenyPattern],
     dependencies: &mut Vec<PathBuf>,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
 ) -> Result<CollectedFiles, SiteCompileError> {
     let mut files = Vec::new();
     let mut symlinks = Vec::new();
     let mut directories = BTreeSet::new();
     let mut entries = WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = entries.next() {
+        checkpoint()?;
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -1101,7 +1245,7 @@ fn collect_files(
             && !is_template_scan_path(entry.path(), template_roots)
             && denied_by_visibility(relative, source, deny_patterns, true)
         {
-            validate_pruned_subtree_symlinks(entry.path(), source, root)?;
+            validate_pruned_subtree_symlinks(entry.path(), source, root, checkpoint)?;
             entries.skip_current_dir();
             continue;
         }
@@ -1131,8 +1275,10 @@ fn validate_pruned_subtree_symlinks(
     directory: &Path,
     source: &ManifestSource,
     root: &Path,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
 ) -> Result<(), SiteCompileError> {
     for entry in WalkDir::new(directory).follow_links(false).min_depth(1) {
+        checkpoint()?;
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -1202,12 +1348,13 @@ fn compile_templates(
     root: &Path,
     files: &[PathBuf],
     template_roots: &[PathBuf],
-    default_output: OutputSource,
-    default_autoescape: Option<crate::source::AutoescapeSource>,
+    defaults: &crate::source::TemplatesSource,
     dependencies: &mut Vec<PathBuf>,
+    checkpoint: &mut dyn FnMut() -> Result<(), SiteCompileError>,
 ) -> Result<BTreeMap<String, CompiledOxt>, SiteCompileError> {
     let mut templates = BTreeMap::new();
     for path in files.iter().filter(|path| has_extension(path, "oxt")) {
+        checkpoint()?;
         if !template_roots
             .iter()
             .any(|template_root| path.starts_with(template_root))
@@ -1254,8 +1401,8 @@ fn compile_templates(
             index.spans(path),
             body,
             (body_offset, body_line_offset),
-            default_output,
-            default_autoescape,
+            defaults.default_output,
+            defaults.default_autoescape,
         )?;
         if templates.insert(name.clone(), template).is_some() {
             return Err(locator.error(
@@ -1265,6 +1412,7 @@ fn compile_templates(
             ));
         }
         dependencies.push(path.clone());
+        checkpoint()?;
     }
     Ok(templates)
 }
@@ -2466,8 +2614,173 @@ mod tests {
     use oxidase_core::{RequestFrame, RequestMetadata, ResourceId, Value};
     use tempfile::tempdir;
 
-    use super::{SiteCompiler, SiteSourceKind, compile_deny_pattern};
-    use crate::{PreparedSiteBody, SiteError, TemplateArgumentError};
+    use super::{
+        SiteCompiler, SiteSourceKind, compile_deny_pattern, hash_site_reader,
+        read_site_source_entry,
+    };
+    use crate::{PreparedSiteBody, SiteCompileError, SiteError, TemplateArgumentError};
+
+    #[test]
+    fn controlled_hash_stops_after_the_first_chunk() {
+        let length = 3 * 64 * 1024;
+        let mut reader = std::io::Cursor::new(vec![0x5a; length]);
+        let mut text = Some(Vec::new());
+        let mut checkpoints = 0;
+        let error = hash_site_reader(
+            &mut reader,
+            std::path::Path::new("large.oxt"),
+            length as u64,
+            &mut text,
+            &mut || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err(SiteCompileError::Interrupted {
+                        code: "candidate.cancelled",
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("cancellation after one chunk must stop hashing");
+        assert!(matches!(
+            error,
+            SiteCompileError::Interrupted {
+                code: "candidate.cancelled"
+            }
+        ));
+        assert_eq!(reader.position(), 64 * 1024);
+        assert_eq!(text.expect("text is retained").len(), 64 * 1024);
+    }
+
+    #[test]
+    fn controlled_scan_retains_interruption_and_discovered_dependencies() {
+        let (_directory, root) = write_site();
+        let manifest = root.join("site.oxsite");
+        let failure = SiteCompiler::scan_controlled(&root, &manifest, || {
+            Err(SiteCompileError::Interrupted {
+                code: "candidate.deadline",
+            })
+        })
+        .expect_err("an elapsed deadline must stop before scanning");
+        assert!(matches!(
+            *failure.error,
+            SiteCompileError::Interrupted {
+                code: "candidate.deadline"
+            }
+        ));
+        assert_eq!(failure.diagnostics[0].code, "candidate.deadline");
+        assert!(failure.discovered_dependencies.contains(&root));
+        assert!(failure.discovered_dependencies.contains(&manifest));
+    }
+
+    #[test]
+    fn controlled_compilation_propagates_interruption_at_every_boundary() {
+        let (_directory, root) = write_site();
+        let index = SiteCompiler::scan(&root, root.join("site.oxsite")).expect("fixture scans");
+        let inputs = BTreeMap::from([(
+            "canonical_origin".to_owned(),
+            Value::from("https://example.com"),
+        )]);
+        let mut boundary_count = 0;
+        SiteCompiler::compile_indexed_with_input_spans_controlled(
+            ResourceId::new("site:web"),
+            &index,
+            inputs.clone(),
+            BTreeMap::new(),
+            || {
+                boundary_count += 1;
+                Ok(())
+            },
+        )
+        .expect("uninterrupted fixture compiles");
+        assert!(
+            boundary_count > 10,
+            "fixture crosses template, OXR, and asset boundaries"
+        );
+        for stop_at in 1..=boundary_count {
+            let mut checkpoint_count = 0;
+            let failure = SiteCompiler::compile_indexed_with_input_spans_controlled(
+                ResourceId::new("site:web"),
+                &index,
+                inputs.clone(),
+                BTreeMap::new(),
+                || {
+                    checkpoint_count += 1;
+                    if checkpoint_count == stop_at {
+                        Err(SiteCompileError::Interrupted {
+                            code: "candidate.cancelled",
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("each cancellation checkpoint must return before publication");
+            assert!(matches!(
+                *failure.error,
+                SiteCompileError::Interrupted {
+                    code: "candidate.cancelled"
+                }
+            ));
+            assert_eq!(checkpoint_count, stop_at);
+        }
+    }
+
+    #[test]
+    fn text_sources_are_bounded_while_larger_assets_remain_streamed() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = directory.path().join("large.bin");
+        let length = 16 * 1024 * 1024 + 1;
+        fs::File::create(&path)
+            .expect("large file can be created")
+            .set_len(length)
+            .expect("sparse test file can be sized");
+        for kind in [
+            SiteSourceKind::Manifest,
+            SiteSourceKind::Response,
+            SiteSourceKind::Template,
+        ] {
+            let error = read_site_source_entry(&path, &path, kind, &mut || Ok(()))
+                .expect_err("every Oxista text kind has a 16 MiB bound");
+            assert_eq!(error.diagnostic().code, "site.source_too_large");
+        }
+        let asset = read_site_source_entry(&path, &path, SiteSourceKind::Asset, &mut || Ok(()))
+            .expect("an asset larger than the text bound can be hashed");
+        assert_eq!(asset.length, length);
+        assert!(asset.text.is_none(), "asset bytes must not be collected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_replacement_between_metadata_and_open_is_rejected() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = directory.path().join("swapped.oxt");
+        fs::write(&path, b"initial").expect("regular file can be created");
+        let mut checkpoints = 0;
+        let error = read_site_source_entry(&path, &path, SiteSourceKind::Template, &mut || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                fs::remove_file(&path).expect("test regular file can be removed");
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(&path)
+                        .status()
+                        .expect("POSIX mkfifo is available")
+                        .success(),
+                    "test FIFO replacement can be created",
+                );
+            }
+            Ok(())
+        })
+        .expect_err("a FIFO replacement must return without a writer");
+        assert_eq!(error.diagnostic().code, "site.source");
+        assert!(
+            error
+                .to_string()
+                .contains("changed before it could be read")
+        );
+    }
 
     fn write_site() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary site directory is available");
