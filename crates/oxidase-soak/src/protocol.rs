@@ -30,7 +30,8 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::common::{
-    Fixture, ResourceMonitor, TestIdentity, XorShift64, client_config, identity, write_identity,
+    CancellationBarrier, Fixture, ResourceMonitor, TestIdentity, XorShift64, client_config,
+    identity, write_identity,
 };
 use crate::{Arguments, CampaignParameters, CampaignSummary, SoakError};
 
@@ -52,10 +53,14 @@ struct GrpcBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,
     trailer_delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    cancellation: Option<Arc<CancellationBarrier>>,
 }
 
 impl GrpcBody {
-    fn new(payload_size: usize) -> Result<Self, SoakError> {
+    fn new(
+        payload_size: usize,
+        cancellation: Option<Arc<CancellationBarrier>>,
+    ) -> Result<Self, SoakError> {
         let message_length = u32::try_from(payload_size).map_err(|_| {
             SoakError::message("protocol payload_size exceeds the gRPC u32 message limit")
         })?;
@@ -70,6 +75,7 @@ impl GrpcBody {
             data: Some(data.freeze()),
             trailers: Some(trailers),
             trailer_delay: None,
+            cancellation,
         })
     }
 }
@@ -83,8 +89,17 @@ impl Body for GrpcBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if let Some(data) = self.data.take() {
-            self.trailer_delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(10))));
+            if self.cancellation.is_none() {
+                self.trailer_delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(10))));
+            }
             return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        // A cancellation request must still be live when the client reads its
+        // first DATA frame. A small timer is not a barrier: a fast peer can
+        // consume trailers/EOS before the client gets scheduled. Keep this
+        // fixture stream pending until a real RST_STREAM/drop ends it.
+        if self.cancellation.is_some() {
+            return Poll::Pending;
         }
         if let Some(delay) = &mut self.trailer_delay {
             if delay.as_mut().poll(context).is_pending() {
@@ -109,11 +124,21 @@ impl Body for GrpcBody {
     }
 }
 
+impl Drop for GrpcBody {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.record_body_drop();
+        }
+    }
+}
+
 fn boxed_full(bytes: impl Into<Bytes>) -> FixtureBody {
     Full::new(bytes.into()).boxed_unsync()
 }
 
-async fn spawn_grpc_upstream(payload_size: usize) -> Result<(SocketAddr, Fixture), SoakError> {
+async fn spawn_grpc_upstream(
+    payload_size: usize,
+) -> Result<(SocketAddr, Fixture, Arc<CancellationBarrier>), SoakError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| SoakError::message(format!("bind gRPC fixture: {error}")))?;
@@ -121,6 +146,8 @@ async fn spawn_grpc_upstream(payload_size: usize) -> Result<(SocketAddr, Fixture
         .local_addr()
         .map_err(|error| SoakError::message(format!("read gRPC fixture address: {error}")))?;
     let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let cancellation = Arc::new(CancellationBarrier::default());
+    let fixture_cancellation = Arc::clone(&cancellation);
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -128,28 +155,36 @@ async fn spawn_grpc_upstream(payload_size: usize) -> Result<(SocketAddr, Fixture
                 _ = &mut shutdown_receiver => break,
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { break };
+                    let cancellation = Arc::clone(&fixture_cancellation);
                     connections.spawn(async move {
-                        let service = service_fn(move |request: Request<Incoming>| async move {
-                            let is_grpc = request
-                                .headers()
-                                .get(header::CONTENT_TYPE)
-                                .is_some_and(|value| value.as_bytes().starts_with(b"application/grpc"));
-                            let _ = request.into_body().collect().await;
-                            if !is_grpc {
-                                let mut response = Response::new(boxed_full("not grpc"));
-                                *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
-                                return Ok::<_, Infallible>(response);
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let cancellation = Arc::clone(&cancellation);
+                            async move {
+                                let hold_for_cancellation = request.uri().path() == "/soak.Service/Cancel";
+                                let is_grpc = request
+                                    .headers()
+                                    .get(header::CONTENT_TYPE)
+                                    .is_some_and(|value| value.as_bytes().starts_with(b"application/grpc"));
+                                let _ = request.into_body().collect().await;
+                                if !is_grpc {
+                                    let mut response = Response::new(boxed_full("not grpc"));
+                                    *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+                                    return Ok::<_, Infallible>(response);
+                                }
+                                let body = match GrpcBody::new(
+                                    payload_size,
+                                    hold_for_cancellation.then_some(cancellation),
+                                ) {
+                                    Ok(body) => body.boxed_unsync(),
+                                    Err(_) => boxed_full(Bytes::new()),
+                                };
+                                let mut response = Response::new(body);
+                                response.headers_mut().insert(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_static("application/grpc"),
+                                );
+                                Ok(response)
                             }
-                            let body = match GrpcBody::new(payload_size) {
-                                Ok(body) => body.boxed_unsync(),
-                                Err(_) => boxed_full(Bytes::new()),
-                            };
-                            let mut response = Response::new(body);
-                            response.headers_mut().insert(
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_static("application/grpc"),
-                            );
-                            Ok(response)
                         });
                         let _ = server_http2::Builder::new(TokioExecutor::new())
                             .serve_connection(TokioIo::new(stream), service)
@@ -161,7 +196,7 @@ async fn spawn_grpc_upstream(payload_size: usize) -> Result<(SocketAddr, Fixture
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     });
-    Ok((address, Fixture::new(shutdown, task)))
+    Ok((address, Fixture::new(shutdown, task), cancellation))
 }
 
 async fn read_http1_head<I>(io: &mut I) -> Result<String, SoakError>
@@ -329,10 +364,15 @@ async fn connect_tls(
 struct GrpcClient {
     sender: client_http2::SendRequest<Full<Bytes>>,
     driver: tokio::task::JoinHandle<()>,
+    cancellation: Arc<CancellationBarrier>,
 }
 
 impl GrpcClient {
-    async fn connect(address: SocketAddr, config: Arc<ClientConfig>) -> Result<Self, SoakError> {
+    async fn connect(
+        address: SocketAddr,
+        config: Arc<ClientConfig>,
+        cancellation: Arc<CancellationBarrier>,
+    ) -> Result<Self, SoakError> {
         let tls = connect_tls(address, config).await?;
         if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
             return Err(SoakError::message("gRPC campaign negotiated wrong ALPN"));
@@ -343,7 +383,11 @@ impl GrpcClient {
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Self { sender, driver })
+        Ok(Self {
+            sender,
+            driver,
+            cancellation,
+        })
     }
 
     async fn request(
@@ -357,9 +401,14 @@ impl GrpcClient {
         message.put_u8(0);
         message.put_u32(message_length);
         message.resize(payload_size.saturating_add(5), b'q');
+        let cancellation_before = self.cancellation.dropped();
         let request = Request::builder()
             .method("POST")
-            .uri("https://gateway.example.test/soak.Service/Stream")
+            .uri(if cancel {
+                "https://gateway.example.test/soak.Service/Cancel"
+            } else {
+                "https://gateway.example.test/soak.Service/Stream"
+            })
             .header(header::CONTENT_TYPE, "application/grpc")
             .header(header::TE, "trailers")
             .body(Full::new(message.freeze()))
@@ -386,6 +435,7 @@ impl GrpcClient {
                 bytes = bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
                 if cancel {
                     drop(body);
+                    self.cancellation.wait_after(cancellation_before).await?;
                     return Ok((bytes, true));
                 }
             }
@@ -464,6 +514,7 @@ struct WorkerPlan {
     deadline: Instant,
     seed: u64,
     counters: Arc<Counters>,
+    cancellation: Arc<CancellationBarrier>,
 }
 
 async fn worker(plan: WorkerPlan) {
@@ -479,9 +530,13 @@ async fn worker(plan: WorkerPlan) {
             let cancel = grpc_cancellation_pending || value.is_multiple_of(17);
             grpc_cancellation_pending = false;
             if grpc_client.is_none() || grpc_requests_on_connection >= 128 {
-                grpc_client = GrpcClient::connect(plan.grpc_address, Arc::clone(&plan.h2))
-                    .await
-                    .ok();
+                grpc_client = GrpcClient::connect(
+                    plan.grpc_address,
+                    Arc::clone(&plan.h2),
+                    Arc::clone(&plan.cancellation),
+                )
+                .await
+                .ok();
                 grpc_requests_on_connection = 0;
             }
             let result = match &mut grpc_client {
@@ -613,7 +668,8 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
         .map_err(|error| SoakError::message(format!("create protocol directory: {error}")))?;
     write_identity(directory.path(), &first_identity)?;
 
-    let (grpc_upstream, grpc_fixture) = spawn_grpc_upstream(arguments.payload_size).await?;
+    let (grpc_upstream, grpc_fixture, cancellation) =
+        spawn_grpc_upstream(arguments.payload_size).await?;
     let (websocket_upstream, websocket_fixture) = spawn_websocket_upstream().await?;
     let config = directory.path().join("oxidase.yaml");
     write_gateway(&config, grpc_upstream, websocket_upstream, 0).await?;
@@ -651,7 +707,8 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
     let h1 = client_config(&[&first_identity, &second_identity], &[b"http/1.1"])?;
 
     // Warm both bridges before recording the resource baseline.
-    let mut warmup_grpc = GrpcClient::connect(grpc_address, Arc::clone(&h2)).await?;
+    let mut warmup_grpc =
+        GrpcClient::connect(grpc_address, Arc::clone(&h2), Arc::clone(&cancellation)).await?;
     let _ = warmup_grpc.request(arguments.payload_size, false).await?;
     drop(warmup_grpc);
     let _ = websocket_request(websocket_address, Arc::clone(&h1), arguments.payload_size).await?;
@@ -686,6 +743,7 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
                     .unwrap_or(u64::MAX)
                     .wrapping_mul(0xD1B5_4A32),
             counters: Arc::clone(&counters),
+            cancellation: Arc::clone(&cancellation),
         }));
     }
     while workers.join_next().await.is_some() {}
@@ -719,4 +777,76 @@ pub(crate) async fn run(arguments: Arguments) -> Result<CampaignSummary, SoakErr
         websocket_tunnels: counters.websocket.load(Ordering::Relaxed),
         process,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grpc_first_frame_cancellation_drops_live_body_and_records_cancelled() {
+        let identity = identity().expect("test-only identity");
+        let directory = tempdir().expect("fixture directory");
+        write_identity(directory.path(), &identity).expect("write test identity");
+        let (upstream, upstream_fixture, cancellation) =
+            spawn_grpc_upstream(2 * 1024).await.expect("gRPC fixture");
+        let (websocket, websocket_fixture) =
+            spawn_websocket_upstream().await.expect("Upgrade fixture");
+        let config = directory.path().join("oxidase.yaml");
+        write_gateway(&config, upstream, websocket, 0)
+            .await
+            .expect("fixture config");
+        let snapshot =
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("fixture compiles"))
+                .expect("fixture prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin address"))
+            .await
+            .expect("admin binds")
+            .spawn();
+        let address = running
+            .local_addresses()
+            .iter()
+            .find(|(name, _)| name == "grpc")
+            .map(|(_, address)| *address)
+            .expect("gRPC listener");
+        let admin = running.admin_address().expect("admin listener");
+        let h2 = client_config(&[&identity], &[b"h2"]).expect("client config");
+        let mut client = GrpcClient::connect(address, h2, Arc::clone(&cancellation))
+            .await
+            .expect("client connects");
+
+        assert_eq!(cancellation.dropped(), 0);
+        assert_eq!(body_cancellations(admin).await.expect("initial metrics"), 0);
+        let (bytes, cancelled) = client
+            .request(2 * 1024, true)
+            .await
+            .expect("cancel after receiving real DATA");
+        assert!(bytes > 0, "cancellation follows a delivered DATA frame");
+        assert!(cancelled);
+        assert_eq!(cancellation.dropped(), 1, "actual upstream body dropped");
+        assert_eq!(
+            body_cancellations(admin)
+                .await
+                .expect("cancellation metrics"),
+            1,
+            "gateway records cancelled, not completed or timeout"
+        );
+
+        let (bytes, cancelled) = client
+            .request(2 * 1024, false)
+            .await
+            .expect("same H2 connection still preserves gRPC trailers");
+        assert_eq!(bytes, 2 * 1024 + 5);
+        assert!(!cancelled);
+        assert_eq!(cancellation.dropped(), 1);
+        assert_eq!(body_cancellations(admin).await.expect("final metrics"), 1);
+
+        drop(client);
+        running.shutdown().await.expect("gateway shutdown");
+        upstream_fixture.shutdown().await;
+        websocket_fixture.shutdown().await;
+    }
 }
