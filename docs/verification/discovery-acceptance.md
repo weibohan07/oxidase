@@ -57,6 +57,34 @@ secure-admin check/test), retained in
 test-token permission warnings are not silently removed. The recorded manual
 benchmark/fuzz/Linux qualification limitations remain separate from these gates.
 
+## 6C executable contract (final gates tracked separately)
+
+Draft [PR #18](https://github.com/weibohan07/oxidase/pull/18) starts at protected
+main `890a802dd74e58de8bf3e316422e771f59172621`. Its ADR/receipt-only head
+`3999ec6c9f4b08dc79ce113c057dfe957e4d5462` passed run `37140254523`; that is not
+an implementation-head acceptance run. The following rows describe executable
+local contracts, with final-head and merged-main Hosted receipts recorded separately.
+
+| ID | Contract | Executable regression | Local evidence |
+| --- | --- | --- | --- |
+| DS-20 | Separate SRV name grammar, no fixed port/null loophole, precise spans | config `tests/srv_discovery.rs` plus portable reconstruction tests | stable/MSRV config suites PASS 96 tests each |
+| DS-21 | Required SRV/base-DNS/deadline capabilities; offline source-free signed validation | actual CLI `tests/srv_discovery_offline.rs` | stable/MSRV PASS 2/2 each; real subprocess UDP/TCP query count remains zero |
+| DS-22 | Priority before admission/retry exclusion; target weight before address LB | runtime `srv_weight_is_per_logical_target_not_amplified_by_address_count`, `srv_lowest_healthy_priority_is_not_bypassed_by_saturation_or_retry_exclusion`; wire `srv_health_priority_and_admission_cannot_send_saturated_primary_traffic_to_backup` | runtime and actual health/H2 fixtures PASS |
+| DS-23 | Complete zero-inclusive u16 weighting, all-zero eligible selection, seeded reproducibility | runtime discovery weighted-selection tests and SRV resolver records | deterministic boundary/distribution tests PASS; no weight-sized array |
+| DS-24 | One absolute whole-round deadline, bounded/coalesced target families; completed partial results survive | resolver `srv_whole_round_timeout_preserves_fast_target_and_releases_single_global_slot` | one-slot real DNS fixture PASS, fast A retained despite AAAA/other-target timeout |
+| DS-25 | Independent SRV/address/CNAME original lifetimes and separate stale authority | runtime `srv_and_address_expiry_each_require_their_own_stale_authority`, `srv_zero_ttl_and_duplicate_zero_ttl_never_seed_stale`; resolver CNAME test | identified component-authority bug fixed with public-API regressions |
+| DS-26 | Negative SOA and failure memo do not slide or grow with target churn | resolver negative/backoff/churn tests; manager `srv_refresh_uses_original_component_expiry_and_target_negative_deadline` | bounded owner-local failure memo and scheduling PASS; no positive-IP memo cache |
+| DS-27 | Dot withdrawal/NXDOMAIN fence, conflicting records fail closed, observable aggregate limits | resolver dot/target-NXDOMAIN/record-byte-name quota tests; runtime received-round quota tests | resolver stable/MSRV PASS 25/25; opaque discarded Hickory bytes are not claimed observable |
+| DS-28 | Weight-only pool reuse; withdrawn member gets no new stream while issued trailers finish | wire `srv_weight_only_reuses_pool_but_withdrawal_and_new_target_do_not_reuse_it`; runtime remove/readd and policy-replacement admission tests | actual H2 pool reuse/withdrawal PASS; held physical counter survives policy replacement |
+| DS-29 | DNS port is actual socket; logical Host/base/raw query/TLS identity remain fixed; no publisher/metric-label authority | wire `srv_actual_socket_preserves_fixed_tls_name_and_rejects_an_untrusted_replacement` and both other SRV wire tests | trusted exact SNI observed, untrusted replacement fails before HTTP dispatch; exact PublishedRuntime Arc unchanged |
+
+The five-test real A/AAAA+SRV DNS/TLS/H2 wire suite passed on stable and Rust
+1.88. Stable was repeated 20 times serially, every run PASS 5/5. These are bounded
+macOS regression executions, not a Linux qualification campaign. Source and
+runtime libraries keep DNS generation out of Bundle/config identity and out of
+fifth-stage publication authority. Phase-6D signed Admin races, restart, fuzz and
+Linux process-level qualification are not implied by this table.
+
 ## 6A executable contract and intermediate evidence
 
 These local results describe the tested implementation, not final-head Hosted

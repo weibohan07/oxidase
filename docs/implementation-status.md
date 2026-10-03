@@ -4,7 +4,7 @@ Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-dns-address-discovery` (phase 6B)
+- active milestone branch: `feat/v0.4-dns-srv-discovery` (phase 6C)
 - public starting point: completed secure-control-plane merge `ebfb754`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
@@ -503,20 +503,44 @@ Last updated: 2026-10-03
 - SRV and the 6D Linux/fuzz integration campaign are not qualified by this stage.
   Local and Hosted evidence remains separate in the phase-six acceptance ledger.
 
+## Phase 6C grouped SRV operational discovery
+
+- `record: srv` accepts a canonical `_service._tcp.hostname.` query name and
+  forbids a configured port, including null. SRV Bundle plans additionally require
+  `dns-srv-discovery`; older A/AAAA portable integer ports remain compatible.
+- Selection first finds the lowest currently health-eligible SRV priority, then
+  chooses a logical target using full 0..65535 weights, and only then applies the
+  existing address-level load balancer. Extra target addresses do not multiply
+  its weight. Admission saturation and retry exclusions cannot promote traffic to
+  a higher priority while a lower priority remains health-eligible.
+- SRV, address and CNAME expiries are independently authorized before intersection.
+  Partial results keep their original receive-time deadlines. Target negatives use
+  bounded, non-sliding owner-local SOA/backoff memoization; positive IP answers are
+  not cached by that memo. Dot withdrawal skips address lookup and never uses stale.
+- Weight/priority-only updates retain physical incarnation, health and pool identity.
+  Withdrawal forbids new leases, but issued gRPC/H2 bodies can finish. A replacement
+  address is dialed directly with the same logical Host/base/raw query and configured
+  verification/SNI name; an untrusted replacement fails TLS before HTTP dispatch.
+- Actual Rust DNS/TLS/H2 fixtures cover primary failure/recovery, admission overload,
+  weight-only pool reuse, dot withdrawal, target rotation and fixed TLS identity.
+  CLI check/build/sign/verify execute without DNS, including source-free capability
+  rejection. Exact final-head Hosted gates and Linux/fuzz qualification are separate
+  ledger entries, not implied by these focused tests.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
   state.
 - Cleartext h2c, ACME, OCSP stapling, user-configurable TLS cipher suites, HTTP/3,
   HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
-- SRV Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
+- WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
 - Online Admin transport/credential/permission reconfiguration, a multi-user role
   platform, distributed control-plane transactions, and online ambiguous-journal
   reconciliation are not implemented. Bootstrap changes and uncertain-intent
   reconciliation use the documented explicit restart procedure.
-- SRV discovery and integration qualification remain authorized later phase-six
-  sub-stages. Standard access-log/OpenTelemetry export and deployment/release
+- Integration qualification remains the authorized phase 6D sub-stage.
+  Standard access-log/OpenTelemetry export and deployment/release
   packaging are outside this task.
 
 ## Known limitations
@@ -569,7 +593,7 @@ Last updated: 2026-10-03
   policy, or automatic certificate issuance. SNI wildcards match exactly one
   left-most DNS label and must appear literally in the selected leaf certificate
   subjectAltName.
-- Cluster endpoints may be static or bounded A/AAAA discovery; SRV, DNSSEC,
+- Cluster endpoints may be static or bounded A/AAAA/SRV discovery; DNSSEC,
   DoH/DoT, service registries, cross-process health consensus, hedging, and arbitrary
   retry scripting are not implemented. Retry never occurs after a downstream response head and request-body
   replay exists only through explicit bounded buffering. Configurable Forwarded

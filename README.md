@@ -50,7 +50,10 @@ explicit capability. See [upstream timeouts](docs/configuration/upstream-timeout
 Phase 6B adds bounded operational A/AAAA discovery with record-specific TTLs,
 finite stale-on-transient-error reuse and direct dialing of approved addresses.
 DNS changes do not publish configuration, alter Admin ETags or restore drained
-traffic. SRV remains rejected until its separate stage. See
+traffic. Phase 6C adds bounded SRV target groups: lowest health-eligible priority
+first, full 16-bit zero-inclusive weights, then address selection within the
+chosen target. SRV changes neither HTTP authority nor TLS verification/SNI;
+removal prevents new pool leases while issued streams may finish. See
 [discovery](docs/configuration/discovery.md) and the
 [actual acceptance ledger](docs/verification/discovery-acceptance.md).
 OpenTelemetry and packaging remain outside this task. This is not a
