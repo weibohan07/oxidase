@@ -18,7 +18,7 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 
 | Stage | Implementation | Local / Hosted / campaign evidence |
 | --- | --- | --- |
-| 6A transport identity/deadlines | implementation locally verified; protected delivery pending | nine frozen local gates PASS; final-head PR and merged-main Hosted acceptance pending |
+| 6A transport identity/deadlines | cancellation fixture repaired and locally verified; not merged | post-fix nine gates PASS; old PR run `37129738230` FAIL; repaired-head and merged-main Hosted acceptance pending |
 | 6B A/AAAA discovery | not implemented by this branch | NOT RUN |
 | 6C SRV discovery | not implemented by this branch | NOT RUN |
 | 6D integration/qualification | not implemented by this branch | NOT RUN |
@@ -27,19 +27,73 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 
 These local results describe the tested implementation, not final-head Hosted
 acceptance. The Draft's design-only head `53a1b14` passed PR run `37122950253`;
-that run must not be used to qualify the later implementation.
+that run must not be used to qualify the later implementation. The later
+implementation head `b105021` has an actual failed Hosted run, recorded below.
+
+### Actual PR 16 Hosted failure
+
+Implementation/documentation head `b105021` ran
+[GitHub Actions run `37129738230`](https://github.com/weibohan07/oxidase/actions/runs/37129738230).
+Both `MSRV 1.88` and `Stable workspace` FAIL at the existing `oxidase-soak`
+`tests::protocol_campaign_exercises_grpc_and_upgrade` smoke test,
+`crates/oxidase-soak/src/lib.rs:311`: `summary.body_cancellations > 0` was false.
+This is the only reported failing test in those two jobs; the new 6A CLI and wire
+regressions before it actually passed in both jobs. That run's overall gate is
+FAIL, not partially green acceptance. The PR has not been merged; the repaired
+final head needs its own Hosted run.
+
+Raw failing job output is retained in
+`artifacts/discovery-6a-pr16-37129738230-failure.log.gz`. The local nine-gate PASS
+on macOS remains valid historical evidence but does not prove Linux Hosted PASS.
+No old green run, local result, or design-only check substitutes for the repaired
+final head's required checks and the eventual independent main push run.
+
+The fixture diagnosis is a cancellation-versus-completion race: its 10 ms
+trailer/EOS path can complete before the client's intended drop on Linux. The
+repair is committed as `f0237648d3759f60c84b5ecf6edf8915056c8c2f`
+(`fix(soak): synchronize observed streaming cancellations`): hold the cancellation
+path open, acknowledge the actual upstream body Drop, and assert the cancellation
+metric delta. The existing cancellation assertion remains intact, not weakened,
+ignored or skipped. Local repaired-source verification is recorded below;
+new-head Hosted results are still PENDING.
+
+### Verified local Hosted-failure repair
+
+The repaired source is frozen at `f0237648d3759f60c84b5ecf6edf8915056c8c2f`.
+Its sequential post-fix gate run exited 0: all nine commands in the local-gate
+table below were rerun and PASS, including both complete workspace test runs
+under stable and Rust 1.88, locked Clippy/docs/release and locked fuzz-bin compile.
+Raw output is retained separately from the original run in
+`artifacts/discovery-6a-post-hosted-fix-gates.log.gz`.
+
+`protocol::tests::grpc_first_frame_cancellation_drops_live_body_and_records_cancelled`
+uses an actual TLS/H2 request, holds the live upstream trailer/EOS path open,
+drops the downstream body, waits for the real upstream body Drop acknowledgement,
+and asserts exactly one cancellation metric increment. A normal gRPC/trailer
+request then succeeds on the same H2 connection without another cancellation.
+The combined fixture also acknowledges actual dropped upstream body ownership.
+
+The seven-test `oxidase-soak` library suite was actually repeated 20 times on
+stable and 20 times on Rust 1.88: every run passes 7/7, with no failures or ignored
+tests. Both the original combined/protocol smoke assertions and the new live-body
+regression execute. Raw repeated-run evidence is retained in
+`artifacts/discovery-6a-soak-cancellation-stable-20.log.gz` and
+`artifacts/discovery-6a-soak-cancellation-msrv-20.log.gz`.
+These are bounded local regressions, not a Linux qualification or fuzz campaign.
+The repaired final PR-head required checks and eventual merged-main push CI
+remain PENDING; the old failed run is preserved rather than reclassified.
 
 | ID | Requirement / implementation | Executable regression | Actual result |
 | --- | --- | --- | --- |
-| DS-01 | Logical authority/base path stays separate from fixed physical dial | `upstream_transport::tests::fixed_dial_target_never_resolves_the_logical_name_again`; `upstream_transport::tests::tls_uses_fixed_logical_sni_and_proves_h2_alpn_and_actual_peer`; wire `ipv6_authority_base_path_and_raw_query_survive_direct_dial_and_pool_reuse` | frozen local gates PASS; final-head Hosted pending |
-| DS-02 | Pool keys isolate address, authority, protocol and TLS security policy | `every_origin_dial_protocol_and_security_boundary_has_a_distinct_pool`; `strong_pool_entries_are_bounded_idle_lru_is_reclaimed_and_active_arc_survives`; `retirement_removes_all_cached_keys_without_pinning_resource_or_existing_client`; wire `custom_ca_and_fixed_server_name_succeed_and_policy_reload_does_not_reuse_pool` | frozen local gates PASS; final-head Hosted pending |
-| DS-03 | One absolute pre-head deadline spans queue, replay buffering and all retries | wire `three_response_head_attempts_share_one_absolute_total_budget`; `total_deadline_caps_admission_queue_without_consuming_another_attempt`; `total_deadline_caps_explicit_bounded_replay_buffer_before_dispatch`; unit `repeated_attempts_do_not_renew_the_absolute_budget` | frozen local gates PASS; final-head Hosted pending |
-| DS-04 | Demand-relative idle timers do not charge unpolled backpressure | `idle_time_starts_with_first_body_demand_and_terminates_once`; `returning_data_suspends_idle_time_during_send_backpressure`; wire `progress_upload_does_not_start_response_header_timer_until_local_eos`; `response_body_idle_failure_preserves_sent_200_and_releases_permits` | frozen local gates PASS; final-head Hosted pending |
-| DS-05 | Response head can arrive before upload EOS | wire `http1_early_200_and_413_do_not_wait_for_upload_eos`; `h2_early_200_and_413_do_not_wait_for_upload_eos`; `h2_flow_blocked_upload_is_cancelled_without_killing_sibling_streams` | frozen local gates PASS; final-head Hosted pending |
-| DS-06 | Cancellation releases two-leg admission, preserves sibling H2 streams and bounds retired connecting work | `response_completion_cancels_upload_and_holds_permit_until_upload_drop`; `retry_reservation_precedes_cancellation_and_reuses_one_cluster_permit`; `status_retry_without_reserved_alternative_preserves_original_stream`; `cancelling_cold_h2_connecting_owner_preserves_a_valid_waiter`; `cancelled_connecting_work_is_bounded_and_cannot_renew_its_cap`; `dropping_retirement_owner_stops_outstanding_cleanup_tasks`; `dropping_an_unpolled_dispatch_cannot_start_a_cancelled_request` | frozen local gates PASS; final-head Hosted pending |
-| DS-07 | Downstream upload fault is not a passive endpoint failure | wire `downstream_upload_idle_timeout_is_408_without_passive_endpoint_failure` (actual HTTP/1 and TLS/H2); `post_head_local_request_timeout_does_not_eject_endpoint`; `request_idle_telemetry_records_only_the_first_local_fault` | frozen local gates PASS; final-head Hosted pending |
-| DS-08 | Legacy YAML/Bundle semantics remain explicit; new policies require capability | `legacy_upstream_contract_and_precise_migration_warnings_are_preserved`; `portable_timeouts_preserve_legacy_shape_and_reconstruct_phased_spans`; `phased_bundle_requires_declared_capability_in_verify_and_activation`; actual CLI `actual_signed_phased_bundle_preserves_all_deadlines_through_admin_activation`; `legacy_timeout_migration_warnings_match_human_json_and_exact_crlf_spans`; `mixed_timeout_policy_reports_exact_primary_secondary_spans_in_both_formats` | frozen local gates PASS; final-head Hosted pending |
-| DS-09 | Health probes use the same identity boundary with independent timeout/quota | `health_timeout_is_independent_and_records_failure`; `health_rounds_enforce_global_and_per_cluster_quotas_without_starving_late_endpoints`; `local_health_admission_wait_is_not_an_endpoint_failure_and_shutdown_cancels_it`; wire `required_upstream_client_certificate_is_used_by_proxy_and_active_health` | frozen local gates PASS; final-head Hosted pending |
+| DS-01 | Logical authority/base path stays separate from fixed physical dial | `upstream_transport::tests::fixed_dial_target_never_resolves_the_logical_name_again`; `upstream_transport::tests::tls_uses_fixed_logical_sni_and_proves_h2_alpn_and_actual_peer`; wire `ipv6_authority_base_path_and_raw_query_survive_direct_dial_and_pool_reuse` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-02 | Pool keys isolate address, authority, protocol and TLS security policy | `every_origin_dial_protocol_and_security_boundary_has_a_distinct_pool`; `strong_pool_entries_are_bounded_idle_lru_is_reclaimed_and_active_arc_survives`; `retirement_removes_all_cached_keys_without_pinning_resource_or_existing_client`; wire `custom_ca_and_fixed_server_name_succeed_and_policy_reload_does_not_reuse_pool` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-03 | One absolute pre-head deadline spans queue, replay buffering and all retries | wire `three_response_head_attempts_share_one_absolute_total_budget`; `total_deadline_caps_admission_queue_without_consuming_another_attempt`; `total_deadline_caps_explicit_bounded_replay_buffer_before_dispatch`; unit `repeated_attempts_do_not_renew_the_absolute_budget` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-04 | Demand-relative idle timers do not charge unpolled backpressure | `idle_time_starts_with_first_body_demand_and_terminates_once`; `returning_data_suspends_idle_time_during_send_backpressure`; wire `progress_upload_does_not_start_response_header_timer_until_local_eos`; `response_body_idle_failure_preserves_sent_200_and_releases_permits` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-05 | Response head can arrive before upload EOS | wire `http1_early_200_and_413_do_not_wait_for_upload_eos`; `h2_early_200_and_413_do_not_wait_for_upload_eos`; `h2_flow_blocked_upload_is_cancelled_without_killing_sibling_streams` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-06 | Cancellation releases two-leg admission, preserves sibling H2 streams and bounds retired connecting work | `response_completion_cancels_upload_and_holds_permit_until_upload_drop`; `retry_reservation_precedes_cancellation_and_reuses_one_cluster_permit`; `status_retry_without_reserved_alternative_preserves_original_stream`; `cancelling_cold_h2_connecting_owner_preserves_a_valid_waiter`; `cancelled_connecting_work_is_bounded_and_cannot_renew_its_cap`; `dropping_retirement_owner_stops_outstanding_cleanup_tasks`; `dropping_an_unpolled_dispatch_cannot_start_a_cancelled_request` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-07 | Downstream upload fault is not a passive endpoint failure | wire `downstream_upload_idle_timeout_is_408_without_passive_endpoint_failure` (actual HTTP/1 and TLS/H2); `post_head_local_request_timeout_does_not_eject_endpoint`; `request_idle_telemetry_records_only_the_first_local_fault` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-08 | Legacy YAML/Bundle semantics remain explicit; new policies require capability | `legacy_upstream_contract_and_precise_migration_warnings_are_preserved`; `portable_timeouts_preserve_legacy_shape_and_reconstruct_phased_spans`; `phased_bundle_requires_declared_capability_in_verify_and_activation`; actual CLI `actual_signed_phased_bundle_preserves_all_deadlines_through_admin_activation`; `legacy_timeout_migration_warnings_match_human_json_and_exact_crlf_spans`; `mixed_timeout_policy_reports_exact_primary_secondary_spans_in_both_formats` | post-fix local gates PASS; repaired-head Hosted pending |
+| DS-09 | Health probes use the same identity boundary with independent timeout/quota | `health_timeout_is_independent_and_records_failure`; `health_rounds_enforce_global_and_per_cluster_quotas_without_starving_late_endpoints`; `local_health_admission_wait_is_not_an_endpoint_failure_and_shutdown_cancels_it`; wire `required_upstream_client_certificate_is_used_by_proxy_and_active_health` | post-fix local gates PASS; repaired-head Hosted pending |
 
 The wire test names above belong to
 `crates/oxidase-server/tests/upstream_deadlines.rs`, except the custom-CA and
@@ -48,7 +102,7 @@ fixtures, ephemeral local sockets and test-only certificate material; ordinary P
 streaming. Three retry attempts are counted on actual upstream fixtures and
 share one absolute total budget; this is not an absolute throughput benchmark.
 
-### Focused executions and final source freeze
+### Focused executions and historical macOS source freeze
 
 - `cargo test -p oxidase-server --test upstream_deadlines --locked`: PASS 11/11.
   `cargo +1.88.0 test -p oxidase-server --test upstream_deadlines --locked`:
@@ -68,17 +122,21 @@ share one absolute total budget; this is not an absolute throughput benchmark.
   pass 29 tests; one existing ignored manual benchmark was not run.
   Replacement-endpoint reservation regressions pass 5/5.
 
-The final source freeze reruns every workspace test under stable and Rust 1.88,
+The macOS source freeze reran every workspace test under stable and Rust 1.88,
 including the actual CLI and wire suites above. Earlier focused receipts remain
-historical evidence; the frozen run is the local release gate, not Hosted CI.
+historical evidence; that frozen run was a local release gate, not Hosted CI or
+validation of the later Linux fixture repair. The independent repaired-source
+gate receipt above supersedes it for local acceptance only.
 
-### Frozen local gates
+### Historical frozen local gates (macOS)
 
 The sequential frozen-source run completed with exit status 0. The tested source
 is committed as `44489c5` (`feat(proxy): enforce transport identity and absolute
 upstream deadlines`). All nine gates below PASS; full output is retained in
-`artifacts/discovery-6a-local-gates.log.gz`. Subsequent changes are
-documentation-only. Final PR-head and merged-main Hosted receipts are pending.
+`artifacts/discovery-6a-local-gates.log.gz`. The following `b105021` documentation
+head failed Hosted run `37129738230`; the later `f023764` repair has its own fresh
+nine-gate PASS receipt above. Repaired final PR-head and merged-main Hosted
+receipts are pending.
 
 | Actual command | Local result |
 | --- | --- |
