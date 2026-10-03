@@ -24,7 +24,7 @@ The strict `timeouts` policy has positive durations:
 
 | Field | Default | Observable start → end |
 | --- | --- | --- |
-| connect | 5s | actual new SocketAddr TCP dial → connected socket |
+| connect | 5s | aggregate cold validated-address selection, or fixed-target reconnect → TCP completion |
 | tls_handshake | 5s | TCP completion → authenticated TLS/ALPN completion |
 | request_body_idle | 30s | demanded request body Pending → DATA/trailers/EOS/error |
 | response_header | 10s | pool-ready dispatch for empty input, or local input EOS → head |
@@ -59,6 +59,18 @@ remain stream errors/reset, never another head or retry. Total expiry, downstrea
 fault and cancellation do not manufacture endpoint passive failures. TCP/TLS/head
 failure retries still require explicit method, cause, replay, attempts, untried
 endpoint and retry-storm admission. Certificate failure never downgrades trust.
+
+A status retry reserves a replacement endpoint while holding the original attempt
+and one Cluster permit. Only admitted replacement allows cancellation and closure
+of the old upload before permit retargeting. If no replacement can be admitted,
+the original response/upload remain untouched. Reservation drop, cancellation or
+a foreign Cluster reservation cannot mutate the original admission.
+
+Cold TCP address attempts consume one aggregate connect deadline. The temporarily
+remaining TCP duration is restored to the configured connector policy before pool
+storage; TLS has its own immutable limit. All transport and queue deadline
+arithmetic is checked, so an unrepresentable legacy duration fails closed rather
+than panicking or becoming an infinite deadline.
 
 An old portable plan without `timeouts` reconstructs legacy mode. New phased
 plans declare required feature `upstream-deadlines`; missing capability declarations

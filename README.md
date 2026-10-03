@@ -42,8 +42,13 @@ Admin credentials and static permissions remain one fixed bootstrap; changing it
 requires restart. See [Admin API](docs/admin-api.md),
 [recovery contract](docs/control-plane-recovery.md), and the
 [test-only example](examples/secure-admin-gateway/README.md).
-The workspace remains `0.3.0-alpha.1`; DNS discovery, OpenTelemetry, and packaging
-are not part of this phase. This is not a production-readiness claim.
+The workspace remains `0.3.0-alpha.1`. Phase 6A separates logical HTTP/TLS identity
+from the physical dial and pool identity, and adds six phased upstream timeouts
+with one absolute pre-response budget across queue, upload and retries. Legacy
+timing is retained with migration warnings; new Bundle semantics require an
+explicit capability. See [upstream timeouts](docs/configuration/upstream-timeouts.md).
+DNS discovery is not yet exposed by 6A; OpenTelemetry and packaging remain outside
+this task. This is not a production-readiness claim.
 
 The runnable inbound data plane supports cleartext HTTP/1.1 plus HTTPS over TLS
 1.2/1.3 with ALPN-selected HTTP/1.1 or HTTP/2. Every current Service node runs on

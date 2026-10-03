@@ -37,8 +37,11 @@ manager 仲裁，使用进程 epoch/revision ETag。发布后的持久化故障�
 `recovery_required`，不会假称运行版本未变化。管理凭据与静态权限属于独立、固定的
 bootstrap，修改时需重启。详见[管理 API](docs/admin-api.md)、
 [恢复契约](docs/control-plane-recovery.md)和[仅测试示例](examples/secure-admin-gateway/README.md)。
-workspace 仍为 `0.3.0-alpha.1`；本阶段不包含 DNS discovery、OpenTelemetry 或打包，
-也不代表 production-ready。
+workspace 仍为 `0.3.0-alpha.1`。第六阶段 6A 分离 HTTP/TLS 逻辑身份、实际拨号地址
+和连接池身份，增加六项分阶段上游 timeout；queue、上传与所有 retry 共用一个绝对
+pre-response 期限。旧计时模式保留并给出迁移 warning，新 Bundle 语义须声明 capability。
+详见[上游超时](docs/configuration/upstream-timeouts.md)。6A 尚未开放 DNS discovery；
+OpenTelemetry 与打包不在本任务范围内，也不代表 production-ready。
 
 当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1
 或 HTTP/2 的 HTTPS；所有现有 Service 节点均可在选定协议上运行。Proxy 继续通过

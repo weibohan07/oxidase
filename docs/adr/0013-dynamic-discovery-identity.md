@@ -32,6 +32,27 @@ Bounded pool retention and weak resource ownership prevent a permanently growing
 generation-key cache. A removed-then-added discovered endpoint gets a fresh
 incarnation; an old callback cannot mutate or reactivate the new member.
 
+For 6A static native names, a bounded 1,024-entry cache coalesces resolution and
+admits at most 32 actual blocking jobs. Native answers contain at most 32 validated
+targets, are fresh for 90 seconds, and may survive native I/O/no-address failure
+for another fixed 90 seconds with five-second failure suppression. Invalid or
+oversized answers do not use stale fallback. This is not an authoritative DNS TTL
+or NXDOMAIN contract. Dynamic supervisors must use their own record observations.
+
+Before cold dispatch, eligible existing pools are preferred. One aggregate TCP
+budget tries bounded validated addresses sequentially; TLS authentication or ALPN
+failure stops, without another address or trust downgrade. The winning socket is
+handed to Hyper exactly once and unused warm IO expires after 90 seconds. A shared
+1,024-slot gate bounds preconnection and reconnect, charged once per physical work.
+Each stored Client remains fixed to its one target. A typed TCP reconnect failure
+retires only the exact failed Client so a later request may reselect; issued streams
+retain their own Client and no payload is silently replayed.
+
+Active health uses this connector/cache policy under independent total timeout and
+fair global/per-Cluster limits of 64/32. Resolver failure and local admission are
+not physical endpoint failures. Queued health waits and rounds are cooperatively
+cancelled, with no task per configured endpoint.
+
 ## Operational membership (6B/6C)
 
 Prepare validates only static discovery/resolver policy. Commit starts one bounded
