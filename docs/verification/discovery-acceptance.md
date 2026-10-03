@@ -18,12 +18,25 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 
 | Stage | Implementation | Local / Hosted / campaign evidence |
 | --- | --- | --- |
-| 6A transport identity/deadlines | cancellation fixture repaired and locally verified; not merged | post-fix nine gates PASS; old PR run `37129738230` FAIL; repaired-head and merged-main Hosted acceptance pending |
-| 6B A/AAAA discovery | not implemented by this branch | NOT RUN |
+| 6A transport identity/deadlines | normally merged through protected PR #16 | final head `39caf68` PR run `37131533884` PASS; merged main `aaece2a` push run `37131852985` PASS |
+| 6B A/AAAA discovery | in progress from protected main `aaece2a` | no final-head implementation/Hosted acceptance yet |
 | 6C SRV discovery | not implemented by this branch | NOT RUN |
 | 6D integration/qualification | not implemented by this branch | NOT RUN |
 
-## 6A executable contract
+## Protected 6A delivery receipt
+
+PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without
+an administrator override. Base: `ebfb7549bf9c1ddd91384cf85cff4098982b8acf`;
+final head: `39caf6874be5acef42ec442f44fcc46974ec0d97`;
+merge: `aaece2a0c263ce58e3ba7d398a33c11892186316`.
+The exact final-head [PR run](https://github.com/weibohan07/oxidase/actions/runs/37131533884)
+and independent merged-main [push run](https://github.com/weibohan07/oxidase/actions/runs/37131852985)
+both completed successfully with all four required jobs: MSRV 1.88, Stable
+workspace, Dependency policy and Fuzz harness compile smoke. Main remained strict,
+with force pushes/deletion disabled. Earlier failed/local-only receipts below
+remain history, not the final acceptance record.
+
+## 6A executable contract and intermediate evidence
 
 These local results describe the tested implementation, not final-head Hosted
 acceptance. The Draft's design-only head `53a1b14` passed PR run `37122950253`;
@@ -39,8 +52,8 @@ Both `MSRV 1.88` and `Stable workspace` FAIL at the existing `oxidase-soak`
 `crates/oxidase-soak/src/lib.rs:311`: `summary.body_cancellations > 0` was false.
 This is the only reported failing test in those two jobs; the new 6A CLI and wire
 regressions before it actually passed in both jobs. That run's overall gate is
-FAIL, not partially green acceptance. The PR has not been merged; the repaired
-final head needs its own Hosted run.
+FAIL, not partially green acceptance. At that point the PR had not been merged;
+the repaired final head subsequently passed its own run as recorded above.
 
 Raw failing job output is retained in
 `artifacts/discovery-6a-pr16-37129738230-failure.log.gz`. The local nine-gate PASS
