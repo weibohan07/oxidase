@@ -995,7 +995,20 @@ async fn rejects_closed_stream_reuse_and_non_terminating_trailer_headers_after_q
 #[tokio::test]
 async fn stream_window_overflow_returns_flow_control_error() {
     let identity = identity(&["gateway.example.test"]);
-    let gateway = start_gateway(&identity, 16, 64 * 1024).await;
+    // Keep the stream open while sending invalid WINDOW_UPDATE frames. A fast
+    // Respond service can close it first, after which late updates may legally
+    // be ignored; that was a scheduling race rather than conformance evidence.
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("held upstream binds");
+    let address = upstream.local_addr().expect("ephemeral upstream address");
+    let upstream_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = upstream.accept().await {
+            held.push(stream);
+        }
+    });
+    let gateway = start_blocking_proxy_gateway(&identity, address, 16).await;
     let config = client_config(&identity, &[b"h2"], true);
     let mut client = RawH2::connect(gateway.address, "gateway.example.test", config).await;
     client
@@ -1026,6 +1039,8 @@ async fn stream_window_overflow_returns_flow_control_error() {
         .shutdown()
         .await
         .expect("gateway shuts down");
+    upstream_task.abort();
+    let _ = upstream_task.await;
 }
 
 #[tokio::test]
