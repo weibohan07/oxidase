@@ -334,8 +334,11 @@ arbitrary Header key, shared cross-process limiter, or distributed quota.
 
 A Cluster's upstream protocol is `auto`, `http1`, or `h2`. `auto` uses HTTPS ALPN
 and cleartext HTTP/1; `http1` forces HTTP/1.1; `h2` requires H2 over TLS and uses H2
-prior knowledge for a cleartext upstream. The server owns one reusable pool for
-each policy. A transparent gRPC route therefore uses an H2 downstream and a Proxy
+prior knowledge for a cleartext upstream. The server retains bounded reusable
+pools for the complete physical transport identity, including the validated
+address, logical origin, protocol and prepared TLS policy; it never constructs a
+client for each request. A transparent gRPC route therefore uses an H2 downstream
+and a Proxy
 whose Cluster is explicitly `protocol: h2`; Oxidase forwards DATA and terminal
 trailers without parsing protobuf, changing gRPC message frames, or translating
 `grpc-status` into the HTTP status.
@@ -393,12 +396,91 @@ retry amplification from creating another queue. See
 
 Compatible endpoint health/counter state is reused across reload only when Cluster
 ID, endpoint name, canonical URL, upstream protocol, and the complete health policy
-match. A health-policy change creates a new health generation so a supervisor held
-by an old pinned snapshot cannot write the new policy's state. The endpoint admission
+match. A health-policy change creates a new health generation so a late callback
+from the old owner cannot write the new policy's state. The endpoint admission
 counter remains shared across that generation boundary, so old requests continue to
 count toward the new per-endpoint limit. Candidate prepare does not start a
-supervisor. Removed Cluster supervisors stop after old pinned snapshots release
-them; URL/protocol changes receive fresh endpoint and admission state.
+supervisor. The manager explicitly retires removed/replaced supervisors even while
+an old stream pins its snapshot; that stream retains only what its issued attempt
+needs. URL/protocol changes receive fresh endpoint/health identity. For dynamic
+members, outstanding physical admission remains counted across remove/re-add or
+policy replacement for the same SocketAddr; a fresh incarnation cannot bypass a
+still-held limit by forgetting old work.
+
+### Upstream transport and deadlines
+
+Use a Cluster `timeouts` block for `connect`, `tls_handshake`,
+`request_body_idle`, `response_header`, `response_body_idle`, and
+`pre_response_total`. Each duration is positive and no longer than 24 hours. The
+total begins at Proxy entry, before admission or explicit replay buffering, and
+ends at the final chosen response head. Every retry, DNS generation change,
+address fallback, queue wait, upload and handshake consumes the same absolute
+monotonic total; an intermediate status selected for retry does not reset it.
+
+Body idle clocks measure a demanded body poll that remains Pending, not a body
+that is unpolled under backpressure. Early upstream responses are polled alongside
+uploads. Before a final head, local upload idle can return safe 408 and an upstream
+head/total timeout safe 504. After a head, failure terminates/resets the stream and
+is recorded as a body failure; it cannot replace the sent status with 504. gRPC and
+Upgrade lifetimes retain their existing body/tunnel admission and drain ownership.
+
+Old static `connect_timeout` / `response_timeout` inputs remain explicit legacy
+mode and produce migration warnings. They cannot be combined with `timeouts`.
+Discovery uses phased defaults even when the block is omitted and rejects the
+legacy fields, rather than presenting legacy timing as the new contract. See
+[upstream transport and deadlines](configuration/upstream-timeouts.md).
+
+### A/AAAA and SRV discovery
+
+Choose exactly one static endpoint list or `discovery.dns` policy. A/AAAA has an
+explicit physical port; SRV supplies target/port/priority/weight and omits that
+field. Both keep a fixed `origin`, authentication name, Trust Store/client
+certificate, protocol, address policy and bounded resolver settings. An answer
+cannot choose a new Host/H2 authority, TLS SNI or Secret. The connector connects to
+the lease's approved SocketAddr without a second name lookup. Health checks obey
+the same address/security boundary with their own probe quotas and timeout.
+
+DNS owners start only after normal commit. Preparation, `check`, Explain, Bundle
+build/verify and candidate validation do not send DNS queries or start refresh
+tasks. They validate fixed local resolver inputs; a failed candidate cannot leave
+a supervisor behind. Cold or expired membership fails that Cluster with safe
+503, without changing the existing Running/readiness definition.
+
+Families retain original absolute expirations, including CNAME bounds. TTL zero
+does not create reusable fresh membership. NXDOMAIN withdraws the name, NODATA
+withdraws only its family, and SRV target `.` withdraws the service. Only the closed
+timeout/network/SERVFAIL/REFUSED allowlist can retain previously approved members
+until their original expiry plus the configured finite `stale_if_error`; repeated
+failure never slides that bound. Unsafe, malformed and over-limit results do not
+revive withdrawn addresses. SRV service and target-family expiration/stale
+authority are checked independently and intersected.
+
+SRV chooses the lowest health-eligible priority and applies target weights before
+the existing address-level load-balancing policy. Admission saturation is not
+health failure and cannot silently promote a backup priority. Resolver work,
+negative/failure memos, member tables, held-admission tombstones and transport
+caches are bounded; adding a current-member limit alone would not bound churn.
+Retired idle resources are pruned while issued bodies/streams retain completion
+ownership. See [the discovery contract](configuration/discovery.md).
+
+Discovery generation is operational Resource state, not configuration
+publication. Refresh does not change PublishedRuntime ETag, revision,
+RuntimeOrigin, ConfigVersion, Bundle digest, CandidateStore current/history,
+permissions or recovery-required fencing. Existing last-known-good Running
+resources may continue authorized refresh after a post-commit accounting failure;
+this never clears the fence or performs a new publication. Drain retires owners
+and fences late callbacks. A normal explicit activation/reload can resume a fresh
+cold owner; a DNS completion cannot reopen traffic or restore Source authority.
+
+Removed members issue no new leases and cannot supply new H2 streams from an old
+pool. Already issued streams/tunnels may complete. Owner/session checks reject
+late answers and old health callbacks after replacement, drain or resume. Bundle
+load/restart is cold: no serialized answer or yesterday's expiration is trusted.
+The process-separated local example and Linux procedure are in
+[`examples/dynamic-discovery-gateway`](../examples/dynamic-discovery-gateway/) and
+[discovery qualification](verification/discovery-qualification.md). Actual
+campaign/Hosted results are recorded separately in
+[the acceptance ledger](verification/discovery-acceptance.md).
 
 ## Asset request order
 
@@ -476,13 +558,19 @@ Dropping an unfinished tunnel guard records `cancelled`, so a drain-time abort d
 not leak the active gauge. Upgrade protocol values and WebSocket application data
 are never labels.
 
-Cluster telemetry uses only configured `cluster`/`endpoint` names and fixed
+Static Cluster telemetry uses only configured `cluster`/`endpoint` names and fixed
 protocol, policy, health, and result enums. It includes selection, active requests,
 success/failure, health checks/transitions, passive ejection, retry, and admission
 series. The JSON admin view contains the same conservative names and counters plus
 last transition/ejection remaining. Neither endpoint origins nor request data,
 credentials, certificate material, paths, queries, client addresses, or error
 strings are returned or used as labels.
+
+Dynamic discovery skips per-observed-endpoint metric labels and aggregates by
+configured Cluster and closed family/result/phase enums. IPs, SRV targets,
+generation and error text are not labels. The authenticated `/api/v1/clusters`
+view adds bounded discovery policy/status, eligibility, expirations, generation
+and fixed error codes; it has no DNS-cache mutation or publication authority.
 
 Protection wrappers export
 `oxidase_governance_total{kind,name,result}`. `kind` is one of the three compiled

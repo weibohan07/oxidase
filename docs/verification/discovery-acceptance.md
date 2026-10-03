@@ -23,6 +23,42 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 | 6C SRV discovery | normally merged through protected PR #18 | final head `b27974a` PR run `37143336854` PASS; merged main `a1a06b0` push run `37143737883` PASS |
 | 6D integration/qualification | in progress from protected main `a1a06b0` | final-head integration/Hosted/fuzz/Linux acceptance not yet recorded |
 
+## 6D integration contract
+
+Draft [PR #19](https://github.com/weibohan07/oxidase/pull/19) starts from protected
+main `a1a06b0d89fa8303233ac31a46be86dce747d397`. Its receipt-only foundation is
+not the final implementation gate. The following tests use actual CLI operations,
+local DNS replies, physical TCP/TLS peers and bounded child processes; neither
+DNS reconciliation nor the qualification controller obtains publication authority.
+
+| ID | Contract | Executable regression | Evidence boundary |
+| --- | --- | --- | --- |
+| DS-30 | Source → signed Bundle A → B → rollback A → Source retains CAS and origin semantics | CLI `signed_dns_publications_preserve_cas_fence_late_owners_and_resume_only_explicitly` | stable/Rust 1.88 repeated local PASS; final Hosted run recorded separately |
+| DS-31 | A received late answer cannot revive a retired/drained owner | the same CLI test gates a real positive DNS response, retires the owner, then observes the successful-send acknowledgement | no fixed-sleep or query-intention substitute for the controlled receive/retirement race |
+| DS-32 | Post-publication persistence failure and dropped caller retain the recovery fence while DNS changes operational membership | server `published_runtime_survives_caller_cancellation_and_completion_storage_failure` | actual journal fault injection, A→B and exact PublishedRuntime identity assertions PASS on stable/Rust 1.88 |
+| DS-33 | A source-free signed Bundle process restart starts cold, then dials the new DNS address | CLI `actual_signed_bundle_process_restart_starts_cold_and_uses_new_dns_not_old_packed_ips` | actual child kill/restart with removed YAML; generation-zero/unavailable before released DNS, then new IPv6 peer |
+| DS-34 | Retry across a new SRV generation never refreshes a logical request's total deadline | wire `retry_across_a_new_srv_generation_keeps_the_original_total_deadline` | three actual H2 peers; original total timeout, bounded attempts and released permits PASS on stable/Rust 1.88 |
+| DS-35 | Stateful fuzzing reaches production membership, selection, expiry, replacement and cancellation rather than parser rejection alone | `discovery_runtime` driver and deterministic seed tests | compiled and seed tests PASS; real ASan campaign is a separate receipt |
+| DS-36 | Source-free policy fuzzing validates all six deadlines and required capabilities before activation | `portable_discovery` driver and deterministic seed tests | locked compile/MSRV PASS; real ASan campaign is a separate receipt |
+| DS-37 | Gateway, DNS, upstream and load controller are distinct processes; resource samples belong to the gateway PID | validation-only `oxidase-discovery-soak` | Linux `/proc/<gateway_pid>` campaign required; missing measurements remain null |
+| DS-38 | Normal and cancelled gRPC DATA, terminal trailers and held Upgrade traffic have different, observable lifecycles | process campaign's incremental byte validation, upstream Drop acknowledgement and gateway metric delta | ordinary short smoke is not the protocol campaign or a long-term guarantee |
+| DS-39 | Warm-up, steady load, DNS/publication churn and cooldown retain original logs, samples and failures | manual `discovery-qualification` workflow | final-head required checks, manual Linux campaign and merged-main push checks are independent evidence |
+| DS-40 | Explain exposes fixed discovery/address policy and all six phased deadlines without predicting live IPs | CLI `actual_explain_describes_both_discovery_policies_and_phased_budget_without_dns` | actual A/AAAA+SRV CLI processes and local UDP/TCP no-query observations; static legacy description stays explicit |
+
+The signed-Admin race and restart pair passed three serial runs on stable and
+three on Rust 1.88. The six-test DNS/TLS/H2 wire suite and recovery-fault test also
+passed on both toolchains. An initial fixture-token permission warning exposed a
+test-envelope assumption; test-only token/signing files now have Unix mode 0600.
+The deadline fixture initially exhausted two distinct members before reaching
+the total deadline; its corrected three-peer test preserves the original timeout
+assertion. These failures were not interpreted as passing production evidence.
+
+The separate-process tool rejects reused output directories, checks actual opaque
+gRPC bytes and trailers, and distinguishes completed responses from intentional
+cancellation. Ordinary smoke, fuzz campaigns, Linux curves and final Hosted
+receipts are reported separately below when executed; a workflow definition does
+not qualify them.
+
 ## Protected 6A delivery receipt
 
 PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without

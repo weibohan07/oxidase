@@ -1,0 +1,4 @@
+method: GET
+scheme: https
+host: rsa.example.test
+path: /items?b=2&a=1

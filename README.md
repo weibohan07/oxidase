@@ -56,6 +56,11 @@ chosen target. SRV changes neither HTTP authority nor TLS verification/SNI;
 removal prevents new pool leases while issued streams may finish. See
 [discovery](docs/configuration/discovery.md) and the
 [actual acceptance ledger](docs/verification/discovery-acceptance.md).
+Phase 6D adds actual signed-Admin/DNS races, durable-completion fault injection,
+source-free process restart and a validation-only separated-process campaign tool.
+See the [qualification procedure](docs/verification/discovery-qualification.md)
+for PID-attributed Linux measurements; local smoke, executed campaigns and final
+Hosted checks remain distinct evidence.
 OpenTelemetry and packaging remain outside this task. This is not a
 production-readiness claim.
 

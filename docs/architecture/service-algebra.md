@@ -135,6 +135,30 @@ method/cause/body contract; it never turns into `Declined`. Exhausting eligible
 endpoints yields `Failed(UpstreamUnavailable)`, while admission exhaustion yields
 `Failed(UpstreamOverloaded)`.
 
+Static or DNS/SRV membership remains state of the prepared Cluster Resource, not
+a new Service type, hidden Route or mutable ServiceGraph. A request pins one
+program/security/timing policy; its attempts can choose from the current eligible
+members of that committed Resource without republishing configuration. Membership
+withdrawal and new lease issuance share a linearization boundary. Existing issued
+attempts may finish, but no new request/stream may borrow a removed member's old
+pool. A validated numeric DialTarget fixes the socket actually connected while
+logical origin, HTTP authority, TLS identity and Trust policy remain configured.
+
+Phased Proxy timing carries one absolute `pre_response_total` deadline from leaf
+entry before admission and replay through the final chosen response head. Queue,
+TCP/TLS, upload, retries and DNS generations cannot replenish it. Demand-relative
+upload/body idle clocks remain separate; a post-head failure terminates the body
+instead of rewriting the already handled status. An upstream retry preserves the
+same outcome algebra and never converts irreversible input into `Declined`.
+
+Discovery owners activate only at the existing manager's commit and cannot mutate
+PublishedRuntime ETag, revision, RuntimeOrigin, CandidateStore, permissions or
+recovery state. Retirement/drain fences callbacks and stops future lease issuance
+without requiring a held stream to retain the obsolete whole supervisor. Bundles
+carry compiled discovery policy and capabilities, never live observed membership.
+These are transport/Resource contracts of the one data plane, not a second
+executor or control-plane publisher.
+
 Predicates in v0.3 inspect only the request head. A body-consuming Service marks the
 body irreversible; Fallback after such a candidate remains rejected. Explicit
 bounded Proxy replay is scoped to retries inside that Proxy leaf and does not make

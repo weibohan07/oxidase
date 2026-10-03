@@ -1,0 +1,47 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  certificates:
+    ingress:
+      # TEST-ONLY, publicly known files. Never use this key in production.
+      cert_chain: certs/test-only-rsa-ca.pem
+      private_key: certs/test-only-rsa-key.pem
+  trust_stores:
+    fixture:
+      # Trust Stores accept only PEM certificate sections, not comment lines.
+      ca_bundle: certs/test-only-rsa-ca.pem
+
+services:
+  public:
+    type: observe
+    name: dynamic-gateway
+    service:
+      type: proxy
+      cluster: api
+
+listeners:
+  - name: public-https
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+      handshake_timeout: 5s
+    http:
+      versions: [h2, http1]
+    service:
+      ref: public
+
+tests:
+  - name: discovery is a cluster policy, not an offline endpoint selection
+    listener: public-https
+    request:
+      method: GET
+      scheme: https
+      host: rsa.example.test
+      path: /items?b=2&a=1
+    expect:
+      service: public
+      cluster: api
+      cluster_protocol: h2
+      load_balance: round_robin

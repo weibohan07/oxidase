@@ -1,0 +1,69 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports:
+  - common.yaml
+
+resources:
+  clusters:
+    api:
+      protocol: h2
+      discovery:
+        dns:
+          name: _https._tcp.api.discovery.test
+          record: srv
+          # No port field: each validated SRV record supplies the physical port.
+          origin: https://rsa.example.test:8443/base/
+          resolver:
+            nameservers: ["127.0.0.1:53530"]
+            query_timeout: 1s
+          refresh:
+            min_interval: 200ms
+            max_interval: 2s
+            jitter_percent: 10
+            stale_if_error: 2s
+          limits:
+            max_endpoints: 16
+            max_targets: 8
+          address_policy:
+            allow_private: true
+            allow_loopback: true
+            allow_link_local: false
+      tls:
+        server_name: rsa.example.test
+        trust:
+          system_roots: false
+          trust_store: fixture
+      load_balance:
+        # Applies within one SRV target, not across target priorities/weights.
+        policy: round_robin
+      health:
+        active:
+          path: /healthz
+          interval: 500ms
+          timeout: 1s
+          healthy_statuses: ["200-299"]
+          healthy_threshold: 1
+          unhealthy_threshold: 2
+        passive:
+          consecutive_failures: 2
+          eject_for: 2s
+      retry:
+        max_attempts: 2
+        methods: [GET, HEAD]
+        retry_on: [connect_failure, response_header_timeout, refused_stream, reset]
+        statuses: [503]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 8
+      limits:
+        max_in_flight: 64
+        max_in_flight_per_endpoint: 32
+        queue_timeout: 20ms
+      timeouts:
+        connect: 5s
+        tls_handshake: 5s
+        request_body_idle: 30s
+        response_header: 10s
+        response_body_idle: 30s
+        pre_response_total: 20s

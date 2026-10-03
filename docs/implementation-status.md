@@ -527,6 +527,29 @@ Last updated: 2026-10-03
   rejection. Exact final-head Hosted gates and Linux/fuzz qualification are separate
   ledger entries, not implied by these focused tests.
 
+## Phase 6D integration and qualification
+
+- Actual CLI signed-Bundle stage/validate/CAS activation, rollback, source reload
+  and drain tests run beside controlled local DNS replies. A successful DNS send
+  is explicitly ordered around owner retirement; late observations cannot revive
+  a retired owner or change PublishedRuntime ETag/origin/readiness.
+- Fault injection after publication combines a dropped caller, failed durable
+  completion record and real A→B membership changes. DNS cannot clear the existing
+  recovery fence or become a second publisher. Actual source-free signed-Bundle
+  child restart starts cold rather than restoring old observed IPs.
+- A three-peer H2 regression changes SRV membership between retries while keeping
+  one original total deadline; permits return to zero. Property fuzz drivers reach
+  production membership and reference-free portable preparation, not merely serde
+  parsing. Compiling drivers is not recorded as an executed fuzz campaign.
+- The validation-only process tool starts the real CLI gateway separately from
+  its DNS/upstream fixtures and load controller. Linux samples use the gateway
+  PID, with separate warm-up/steady/cooldown phases and null for unavailable
+  counters. It validates opaque gRPC DATA/trailers, cancellation acknowledgements,
+  held Upgrade traffic and signed publication without changing the Admin model.
+- Exact test results, actual ASan/Linux campaigns and independent final-head/main
+  Hosted gates are maintained in `docs/verification/discovery-acceptance.md`.
+  Current in-progress campaign work is not a production-readiness claim.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
@@ -652,8 +675,9 @@ Last updated: 2026-10-03
 
 ## Validation boundary
 
-- Hosted delivery evidence is commit-specific and recorded on PR #15, with the
-  acceptance matrix separating local commands and actual fuzz from those checks.
+- Hosted delivery evidence is commit-specific: phase five is recorded on PR #15;
+  phase-six PR #16–#19 receipts live in the discovery acceptance ledger. Its
+  matrix separates local commands, actual fuzz/Linux campaigns and Hosted checks.
 - Every milestone PR is required to pass the locked Rust 1.88 check/test, stable
   fmt/Clippy/test/doc/release-build, cargo-deny, and fuzz compile jobs before normal
   protected-main merge. Evidence is commit-specific; a green older workflow is not
@@ -678,7 +702,9 @@ Last updated: 2026-10-03
 
 1. Preserve phase-five receipt, recovery, and audit contracts in future work;
    online reconciliation and multi-principal authorization remain separate design work.
-2. Finish the authorized phase 6B–6D DNS/SRV operational discovery and integration
-   qualification after 6A's transport/deadline PR and merged-main gates pass.
-3. Treat access logs/OpenTelemetry, packaging, and Linux qualification as separately
-   authorized later work; none is part of phase 6A–6D.
+2. Keep discovery policy, operational membership and publication authority separate;
+   larger discovery or protocol changes require their own bounded regression and
+   process-qualification evidence.
+3. Access logs/OpenTelemetry, deployment/release packaging and the broader phase-seven
+   production-foundation campaign require separate authorization. The bounded
+   phase-six DNS/protocol Linux campaign does not implement those capabilities.
