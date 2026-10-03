@@ -146,7 +146,9 @@ jobs:
             --output discovery-results/discovery \
             > discovery-results/discovery-command.log 2>&1
       - name: H2 gRPC Upgrade, signed Bundle and drain campaign
-        if: always()
+        # Retain independent protocol evidence after a discovery failure, but
+        # never start another long campaign after an explicit cancellation.
+        if: ${{ !cancelled() }}
         run: |
           target/release/oxidase-discovery-soak run \
             --gateway target/release/oxidase --campaign protocol \
