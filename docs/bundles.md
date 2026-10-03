@@ -238,6 +238,42 @@ those copies remain allocated for the snapshot lifetime. Production activation
 should still store artifacts by immutable content digest for auditability and
 cleanup.
 
+### Discovery and transport policy
+
+The portable Gateway section preserves phased `timeouts`, fixed logical `origin`,
+DNS record/name/port policy, resolver settings, address policy, refresh bounds and
+resource quotas. A/AAAA keeps a numeric physical port; SRV omits the field and
+obtains each target's port from the answer. SRV null is not equivalent to omission.
+TLS verification/SNI, Trust Stores and client-certificate references remain the
+existing prepared authentication policy; DNS data cannot override them.
+
+A phased deadline plan requires `upstream-deadlines`. A/AAAA discovery additionally
+requires `dns-address-discovery`; SRV also requires `dns-srv-discovery`. The loader
+rejects an unsupported feature and rejects a discovery plan whose declaration was
+stripped, even if its canonical digest was recomputed. Existing static artifacts
+continue through the legacy path; existing A/AAAA numeric-port encoding remains
+compatible. Inspect reports configured policy, not an invented current endpoint.
+
+Bundle build, offline verification and candidate validation do not send DNS
+questions or activate discovery/health tasks. Preparation validates local resolver
+inputs and freezes them for the committed owner. Normal commit alone activates
+refresh. Actual answer records, expiration timestamps, generation, health,
+admission counters, pools and supervisors are neither manifest data nor content
+identity. A signed Bundle cannot upload supposedly trusted live DNS state.
+
+Bundle startup or process restart therefore begins cold. A proxy can return safe
+503 until the new owner receives an eligible answer; it cannot reuse the IPs from
+a prior process or extend an old TTL. YAML and its corresponding Bundle execute
+the same address/security policy and approved-address connector. Subsequent DNS
+membership changes leave Bundle digest, ConfigVersion, PublishedRuntime ETag and
+RuntimeOrigin untouched. Source/Bundle activation, rollback, drain and durable
+recovery remain the existing manager's operations, never DNS callback authority.
+
+See [the local fixture example](../examples/dynamic-discovery-gateway/) and
+[the discovery contract](configuration/discovery.md). Executed qualification and
+final-head Hosted checks have separate entries in
+[the acceptance ledger](verification/discovery-acceptance.md).
+
 ## Limits and untrusted input
 
 A Bundle must be treated as untrusted input even when it has a familiar filename.

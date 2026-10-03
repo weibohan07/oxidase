@@ -63,6 +63,23 @@ cannot reclaim Source authority after Bundle activation or reopen a drained runt
 `reload-source` uses the retained explicit Source startup path; Bundle-only startup
 returns `admin.source_unavailable` instead of guessing a YAML path.
 
+DNS generation is a separate operational Cluster identity, not another runtime
+revision. Authorized discovery refresh never changes ETag, RuntimeOrigin, serving
+state, ConfigVersion, permissions, CandidateStore history, an operation receipt or
+durable recovery fencing. A conditional activation using an unchanged runtime
+ETag does not become stale merely because an A/AAAA or SRV answer changed.
+
+The manager retires replaced/removed discovery owners at normal publication and
+fences their late callbacks. Old issued streams keep their completion resources,
+not permission to publish an old resolver result. Drain retires owners even when
+old requests still pin a snapshot; a completed query cannot reopen a Listener.
+Explicit permitted activation, rollback or Source reload can resume traffic via
+normal prepare/commit and a fresh cold owner, preserving their existing final CAS.
+If last-known-good is still Running after a post-commit persistence/audit failure,
+its authorized operational refresh may continue, but cannot clear recovery-required
+or restore protected mutation admission. Restart never trusts serialized live DNS
+answers.
+
 ## Routes and permissions
 
 | Method | Route | Permission |
@@ -98,6 +115,14 @@ artifact. Rollback verifies and prepares again, validating current external Secr
 private-key, and reference-Asset files; it cannot resurrect old credential bytes.
 `admin.bundle_trust.deployment_root` resolves relative references and is not a
 filesystem sandbox for trusted signed Bundles' explicit absolute references.
+
+`GET /api/v1/clusters` adds bounded discovery policy and observed status, including
+resolution state, generation, eligibility, expirations/next refresh and fixed
+error codes. This uses the same authenticated `read` permission; it is not a
+DNS-cache write interface. Dynamic IPs, SRV targets, generation and error messages
+are not metric labels. Explain and Bundle inspection show compiled policy and
+explicitly leave actual endpoint choice to runtime state. None of these views
+becomes a second publication authority.
 
 ## Receipts, execution, and recovery
 

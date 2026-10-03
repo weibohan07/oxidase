@@ -46,7 +46,12 @@ DNS 更新不发布配置、不改变 Admin ETag，也不能恢复 drain 后的�
 选择：先选健康可用的最低 priority，再按完整 16 位权重选择 target，最后选择其地址。
 SRV 不改变 HTTP authority 或 TLS 验证/SNI 身份；移除成员后不再发新 lease，已开始的流可完成。
 详见[动态发现](docs/configuration/discovery.md)和
-[实际验收记录](docs/verification/discovery-acceptance.md)。OpenTelemetry 与打包不在本任务
+[实际验收记录](docs/verification/discovery-acceptance.md)。6D 增加真实签名 Admin/DNS 竞争、
+持久记录故障注入、无源码进程重启，以及独立进程资格工具。
+[资格流程](docs/verification/discovery-qualification.md)按网关 PID 观测 Linux 资源；
+本地 smoke、实际 campaign 与最终 Hosted 门禁仍分别记录。两项 ASan 各实际运行 61 秒，
+Linux discovery / protocol 分别实际负载 10 / 2 分钟；原始 PID 曲线、RSS 正漂移和不可观测
+计数都保留，不声称无泄漏或完全收敛。OpenTelemetry 与打包不在本任务
 范围内，也不代表 production-ready。
 
 当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1

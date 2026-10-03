@@ -1082,7 +1082,54 @@ struct ClusterPlanDescription {
     health: ClusterHealthDescription,
     retry: ClusterRetryDescription,
     limits: ClusterLimitsDescription,
+    timing: ClusterTimingDescription,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<ClusterDiscoveryDescription>,
     endpoint_selection: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ClusterTimingDescription {
+    Legacy {
+        connect_seconds: f64,
+        response_seconds: f64,
+    },
+    Phased {
+        connect_seconds: f64,
+        tls_handshake_seconds: f64,
+        request_body_idle_seconds: f64,
+        response_header_seconds: f64,
+        response_body_idle_seconds: f64,
+        pre_response_total_seconds: f64,
+        retries_share_total: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterDiscoveryDescription {
+    name: String,
+    record: &'static str,
+    origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    resolver_source: &'static str,
+    resolver_query_timeout_seconds: f64,
+    min_refresh_seconds: f64,
+    max_refresh_seconds: f64,
+    jitter_percent: u8,
+    stale_if_error_seconds: f64,
+    max_endpoints: u16,
+    max_targets: u16,
+    address_policy: DiscoveryAddressPolicyDescription,
+    observed_addresses: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiscoveryAddressPolicyDescription {
+    allow_private: bool,
+    allow_loopback: bool,
+    allow_link_local: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1179,6 +1226,47 @@ fn describe_cluster_plan(cluster: &oxidase_runtime::PreparedCluster) -> ClusterP
             max_in_flight: spec.limits.max_in_flight,
             max_in_flight_per_endpoint: spec.limits.max_in_flight_per_endpoint,
         },
+        timing: spec.timeouts.as_ref().map_or_else(
+            || ClusterTimingDescription::Legacy {
+                connect_seconds: spec.connect_timeout.as_secs_f64(),
+                response_seconds: spec.response_timeout.as_secs_f64(),
+            },
+            |timeouts| ClusterTimingDescription::Phased {
+                connect_seconds: timeouts.connect.as_secs_f64(),
+                tls_handshake_seconds: timeouts.tls_handshake.as_secs_f64(),
+                request_body_idle_seconds: timeouts.request_body_idle.as_secs_f64(),
+                response_header_seconds: timeouts.response_header.as_secs_f64(),
+                response_body_idle_seconds: timeouts.response_body_idle.as_secs_f64(),
+                pre_response_total_seconds: timeouts.pre_response_total.as_secs_f64(),
+                retries_share_total: true,
+            },
+        ),
+        discovery: spec
+            .discovery
+            .as_ref()
+            .map(|dns| ClusterDiscoveryDescription {
+                name: dns.name.clone(),
+                record: dns.record.as_str(),
+                origin: dns.origin.to_string(),
+                port: dns.port,
+                resolver_source: match dns.resolver.source {
+                    oxidase_config::DnsResolverSource::System => "system",
+                    oxidase_config::DnsResolverSource::NameServers(_) => "nameservers",
+                },
+                resolver_query_timeout_seconds: dns.resolver.query_timeout.as_secs_f64(),
+                min_refresh_seconds: dns.refresh.min_interval.as_secs_f64(),
+                max_refresh_seconds: dns.refresh.max_interval.as_secs_f64(),
+                jitter_percent: dns.refresh.jitter_percent,
+                stale_if_error_seconds: dns.refresh.stale_if_error.as_secs_f64(),
+                max_endpoints: dns.limits.max_endpoints,
+                max_targets: dns.limits.max_targets,
+                address_policy: DiscoveryAddressPolicyDescription {
+                    allow_private: dns.address_policy.allow_private,
+                    allow_loopback: dns.address_policy.allow_loopback,
+                    allow_link_local: dns.address_policy.allow_link_local,
+                },
+                observed_addresses: "not resolved by offline explain",
+            }),
         endpoint_selection: "actual endpoint selection is runtime state dependent",
     }
 }
@@ -1813,6 +1901,8 @@ listeners:
         assert_eq!(json["body"]["cluster"]["protocol"], "h2");
         assert_eq!(json["body"]["cluster"]["load_balance"], "least_requests");
         assert_eq!(json["body"]["cluster"]["endpoint_count"], 2);
+        assert_eq!(json["body"]["cluster"]["timing"]["mode"], "legacy");
+        assert!(json["body"]["cluster"].get("discovery").is_none());
         assert_eq!(
             json["body"]["cluster"]["health"]["active"]["healthy_statuses"],
             serde_json::json!(["200-299"])

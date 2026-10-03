@@ -114,6 +114,9 @@ impl Upstream {
                                     }
                                     heads.fetch_add(1, Ordering::Relaxed);
                                     let _ = events.try_send(Head { authority, path: path.clone() });
+                                    if path.starts_with("/base/delayed") {
+                                        tokio::time::sleep(Duration::from_millis(800)).await;
+                                    }
                                     let body: FixtureBody = if path.starts_with("/base/hold") {
                                         HeldBody::new(marker, release).boxed_unsync()
                                     } else {
@@ -243,6 +246,7 @@ impl Gateway {
             "http",
             "",
             None,
+            None,
         )
         .await
     }
@@ -258,6 +262,7 @@ impl Gateway {
             },
             policy,
             upstream_ca,
+            None,
         )
         .await
     }
@@ -268,6 +273,7 @@ impl Gateway {
         scheme: &str,
         policy: &str,
         upstream_ca: Option<&str>,
+        deadlines: Option<(&str, &str)>,
     ) -> Self {
         let directory = tempfile::tempdir().expect("test-only source directory");
         let generated =
@@ -288,6 +294,7 @@ impl Gateway {
         } else {
             ("", "")
         };
+        let (response_header, pre_response_total) = deadlines.unwrap_or(("2s", "5s"));
         let source = format!(
             r#"api_version: oxidase.dev/v1alpha1
 kind: gateway
@@ -323,9 +330,9 @@ resources:
         connect: 1s
         tls_handshake: 1s
         request_body_idle: 2s
-        response_header: 2s
+        response_header: {response_header}
         response_body_idle: 5s
-        pre_response_total: 5s
+        pre_response_total: {pre_response_total}
 services:
   root:
     type: proxy
@@ -609,6 +616,13 @@ async fn dns_rotation_moves_new_h2_stream_to_b_while_old_a_stream_finishes_with_
     assert!(
         fixture.counts.udp.load(Ordering::Acquire) >= 2,
         "real numeric fixture queries occurred"
+    );
+    assert!(fixture.counts.responses_for("endpoint.example.invalid.") >= 2);
+    assert!(
+        fixture
+            .counts
+            .responses_for_type("endpoint.example.invalid.", RecordType::A)
+            >= 1
     );
     let current = gateway.running.reload_handle().published_runtime();
     assert!(
@@ -1161,5 +1175,133 @@ async fn srv_actual_socket_preserves_fixed_tls_name_and_rejects_an_untrusted_rep
         "old authenticated H2 pool cannot bypass new target"
     );
     drop(client);
+    gateway.running.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn retry_across_a_new_srv_generation_keeps_the_original_total_deadline() {
+    let mut first = Upstream::start("127.0.0.1:0".parse().expect("bind"), "A")
+        .await
+        .expect("A");
+    let mut second = Upstream::start("127.0.0.1:0".parse().expect("bind"), "B")
+        .await
+        .expect("B");
+    let mut third = Upstream::start("127.0.0.1:0".parse().expect("bind"), "C")
+        .await
+        .expect("C");
+    let first_port = first.address.port();
+    let second_port = second.address.port();
+    let third_port = third.address.port();
+    let state = Arc::new(AtomicU8::new(0));
+    let mode = Arc::clone(&state);
+    let fixture = DnsFixture::start(move |question, _| {
+        if question.query_type() == RecordType::SRV {
+            let (target, port) = match mode.load(Ordering::Acquire) {
+                0 => ("first.example.invalid.", first_port),
+                1 => ("second.example.invalid.", second_port),
+                _ => ("third.example.invalid.", third_port),
+            };
+            FixtureReply::answers(vec![srv_record(question, target, port, 0, 1)])
+        } else if question.query_type() == RecordType::A {
+            FixtureReply::answers(vec![dns_record(
+                question,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                2,
+            )])
+        } else {
+            FixtureReply::answers(Vec::new())
+        }
+    })
+    .await;
+    let gateway = Gateway::start_policy(fixture.address,
+        "name: _http._tcp.service.example.invalid\n          record: srv", "http",
+        "      retry:\n        max_attempts: 8\n        methods: [GET]\n        retry_on: [response_header_timeout]\n        max_concurrent_retries: 4\n",
+        None, Some(("200ms", "450ms"))).await;
+    wait_priority(&gateway, 0).await;
+    let publication = gateway.running.reload_handle().published_runtime();
+    let generation = gateway
+        .cluster
+        .discovery_status()
+        .expect("status")
+        .generation;
+    let mut client = gateway.client().await;
+    let pending = tokio::spawn(async move {
+        let response = client.request("/delayed?wire=%2f&x=1&x=2").await;
+        (
+            response.status(),
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("safe timeout body")
+                .to_bytes(),
+        )
+    });
+    let head = first.head().await;
+    assert_eq!(head.authority, "logical.example.invalid:8123");
+    assert_eq!(head.path, "/base/delayed?wire=%2f&x=1&x=2");
+    state.store(1, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !gateway
+            .cluster
+            .endpoints()
+            .first()
+            .is_some_and(|endpoint| endpoint.dial_target().expect("target").port() == second_port)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("generation changes before retry");
+    let head = second.head().await;
+    assert_eq!(head.authority, "logical.example.invalid:8123");
+    assert_eq!(head.path, "/base/delayed?wire=%2f&x=1&x=2");
+    // The retry policy deliberately never repeats a tried member. Supply a
+    // third real incarnation before B's header deadline so the terminal cause
+    // measures the original total budget, not two-member history exhaustion.
+    state.store(2, Ordering::Release);
+    let head = third.head().await;
+    assert_eq!(head.authority, "logical.example.invalid:8123");
+    assert_eq!(head.path, "/base/delayed?wire=%2f&x=1&x=2");
+    let (status, body) = pending.await.expect("request task");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(!String::from_utf8_lossy(&body).contains("second.example"));
+    assert!(
+        gateway
+            .cluster
+            .discovery_status()
+            .expect("status")
+            .generation
+            > generation
+    );
+    let attempts = first.heads.load(Ordering::Acquire)
+        + second.heads.load(Ordering::Acquire)
+        + third.heads.load(Ordering::Acquire);
+    assert!(
+        (3..8).contains(&attempts),
+        "total budget terminates before configured attempt exhaustion"
+    );
+    let metrics = gateway.metrics().await;
+    assert!(
+        metrics.contains("oxidase_upstream_timeouts_total{phase=\"total\"} 1\n"),
+        "the terminal cause is the first logical total deadline, not a fresh per-retry head timer: {metrics}"
+    );
+    assert!(Arc::ptr_eq(
+        &publication,
+        &gateway.running.reload_handle().published_runtime()
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while gateway.cluster.active_requests() != 0
+            || gateway
+                .cluster
+                .endpoints()
+                .iter()
+                .any(|endpoint| endpoint.active_requests() != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("deadline releases cluster and endpoint permits");
     gateway.running.shutdown().await.expect("shutdown");
 }

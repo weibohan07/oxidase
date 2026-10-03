@@ -146,12 +146,36 @@ The same prepared TLS policy is used by Proxy requests and active health checks.
 The Cluster's existing `auto`, `http1`, or `h2` protocol policy still determines the
 upstream HTTP connection behavior.
 
+### Discovery does not select authentication identity
+
+An A/AAAA or SRV Cluster declares one fixed `discovery.dns.origin`. If its scheme
+is HTTPS, that origin's host is the default verification name; an explicit
+`tls.server_name` overrides it by the same existing policy. Neither an IP answer,
+SRV target/port nor a CNAME becomes the HTTP Host/H2 authority, SNI, verification
+name, Trust Store or client certificate. Preparation validates TLS policy even
+when the discovery member set is cold and empty. The approved numeric DialTarget
+is the address actually connected; the connector does not resolve the logical
+name a second time. See [the DNS policy](discovery.md).
+
+When private discovery addresses are intended, enable only the necessary address
+classes. Loopback and link-local are denied by default; the self-contained local
+fixture example explicitly enables loopback and uses a test-only trust anchor.
+DNS reachability failure is not a TLS verification bypass and does not authorize a
+new identity. Probe and retry attempts retain the fixed prepared TLS policy.
+
 ### Pool identity and reload
 
 Proxy and health-check pool keys include a digest of the effective upstream TLS
 policy. That digest includes the accepted system roots, custom Trust Store,
 client-certificate public chain, fixed verification name, and Cluster identity.
 A change to any of these cannot reuse an incompatible connection pool.
+
+Physical address, port, logical origin, protocol, phased TCP/TLS policy and member
+incarnation also participate in transport identity. Order/TTL changes can preserve
+a compatible member, while remove/re-add creates a fresh incarnation. New requests
+cannot borrow a removed member's old H2 connection even if it still serves an
+already issued stream. DNS refresh does not change configuration publication,
+authentication policy or Admin ETag.
 
 New snapshot work uses the new pool. Work pinned to an older snapshot may complete
 on the old pool, after which weakly retained incompatible pools can be released.

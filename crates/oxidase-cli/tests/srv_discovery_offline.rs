@@ -96,6 +96,79 @@ fn test_only_keys(root: &Path) {
 }
 
 #[test]
+fn actual_explain_describes_both_discovery_policies_and_phased_budget_without_dns() {
+    let observation = DnsObservation::bind();
+    let directory = tempdir().expect("offline explain root");
+    fs::write(
+        directory.path().join("request.yaml"),
+        "method: GET\nscheme: http\nhost: public.example.test\npath: /data?b=2&a=1&a=3\n",
+    )
+    .expect("symbolic request");
+    for record in ["srv", "a_aaaa"] {
+        let mut source = gateway(observation.address).replace(
+            "type: respond\n    body:\n      text: ready",
+            "type: proxy\n    cluster: api",
+        );
+        if record == "a_aaaa" {
+            source = source
+                .replace(
+                    "_HTTPS._TCP.UNREACHABLE.EXAMPLE.TEST.",
+                    "UNREACHABLE.EXAMPLE.TEST.",
+                )
+                .replace("record: srv", "record: a_aaaa\n          port: 8444");
+        }
+        fs::write(directory.path().join("oxidase.yaml"), source).expect("offline policy");
+        let output = observation.success(
+            directory.path(),
+            &["explain", "oxidase.yaml", "--request", "request.yaml"],
+        );
+        let cluster = &output["body"]["cluster"];
+        assert_eq!(cluster["endpoint_count"], 0);
+        assert_eq!(cluster["discovery"]["record"], record);
+        assert_eq!(
+            cluster["discovery"]["origin"],
+            "http://fixed-origin.example.test:8080/base/"
+        );
+        assert_eq!(cluster["discovery"]["resolver_source"], "nameservers");
+        assert_eq!(
+            cluster["discovery"]["address_policy"]["allow_loopback"],
+            false
+        );
+        assert_eq!(
+            cluster["discovery"]["observed_addresses"],
+            "not resolved by offline explain"
+        );
+        assert_eq!(cluster["timing"]["mode"], "phased");
+        assert_eq!(cluster["timing"]["retries_share_total"], true);
+        for phase in [
+            "connect_seconds",
+            "tls_handshake_seconds",
+            "request_body_idle_seconds",
+            "response_header_seconds",
+            "response_body_idle_seconds",
+            "pre_response_total_seconds",
+        ] {
+            assert!(
+                cluster["timing"][phase]
+                    .as_f64()
+                    .is_some_and(|value| value > 0.)
+            );
+        }
+        assert_eq!(
+            cluster["discovery"].get("port").and_then(Value::as_u64),
+            (record == "a_aaaa").then_some(8444)
+        );
+        assert_eq!(
+            cluster["endpoint_selection"],
+            "actual endpoint selection is runtime state dependent"
+        );
+        for field in ["generation", "answers", "expires_at"] {
+            assert!(cluster["discovery"].get(field).is_none());
+        }
+    }
+}
+
+#[test]
 fn actual_srv_check_build_sign_and_source_free_verify_never_query_dns() {
     let observation = DnsObservation::bind();
     let directory = tempdir().expect("deployment root");

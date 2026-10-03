@@ -6,6 +6,7 @@
 
 mod combined;
 mod common;
+pub mod process_campaign;
 mod protocol;
 
 use std::fmt;

@@ -46,6 +46,7 @@ rustls-pki-types.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+hickory-resolver.workspace = true
 rcgen.workspace = true
 
 [lints]

@@ -1,0 +1,222 @@
+{
+  "activations": 13,
+  "bytes": 33662004,
+  "cancelled_responses": 539,
+  "dns": {
+    "a_queries": 76,
+    "aaaa_queries": 82,
+    "cname_answers": 10,
+    "nodata_answers": 42,
+    "nxdomain_answers": 4,
+    "ok": true,
+    "queries": 251,
+    "reversed_srv_answers": 8,
+    "server_failure_answers": 3,
+    "srv_queries": 93,
+    "successful_response_writes": 251,
+    "tcp_queries": 36,
+    "truncated_udp_answers": 36,
+    "ttl_zero_answers": 18,
+    "udp_queries": 215,
+    "withdraw_answers": 5
+  },
+  "drained_runtime": {
+    "bundle_digest": "c9a3e54d041c29fea37ebd82adb117dffa230c49915d7d809d218773dd17d77d",
+    "cluster_count": 1,
+    "config_version": "v2-sha256-b77f1e2c4a9f4541c7484a0c120fada3e610a127c2d3772b11a1a8104ee252e4",
+    "etag": "\"runtime-7b7a8d13655847ed812f04df753a5f521dce9170928c3ce83c5b9bfc64e34bd4-26\"",
+    "listener_count": 1,
+    "origin": {
+      "digest": "c9a3e54d041c29fea37ebd82adb117dffa230c49915d7d809d218773dd17d77d",
+      "kind": "bundle"
+    },
+    "runtime_revision": 26,
+    "schema_version": "oxidase.admin/v1",
+    "serving_state": "drained",
+    "site_count": 0
+  },
+  "elapsed_ms": 38356,
+  "expected_unavailable": 7699,
+  "final_sample": {
+    "active_connections": 0,
+    "active_health_failures": 0,
+    "active_health_successes": 0,
+    "active_requests": 0,
+    "active_streams": 0,
+    "active_tunnels": 0,
+    "cluster_permits": 0,
+    "discovery_tasks": 0,
+    "dns_queries": 83,
+    "elapsed_ms": 38335,
+    "endpoints": 0,
+    "gateway_pid": 63821,
+    "health_tasks": null,
+    "health_transitions": 0,
+    "old_snapshots": null,
+    "open_fds": null,
+    "os_threads": null,
+    "phase": "cooldown",
+    "pools": null,
+    "retired_admission_counters": 0,
+    "retry_attempts": 0,
+    "retry_permits": 0,
+    "rss_kib": null
+  },
+  "fixture_request_read_delay_ms": 0,
+  "fixture_request_stream_window": null,
+  "gateway_exited": true,
+  "grpc_attempted": 16311,
+  "grpc_cancelled": 539,
+  "grpc_completed": 8073,
+  "initial_runtime": {
+    "bundle_digest": null,
+    "cluster_count": 1,
+    "config_version": "v2-sha256-9762ccc7b026f0a63e928a17eb16c40c5d19195758f20543a4834959e9784876",
+    "etag": "\"runtime-7b7a8d13655847ed812f04df753a5f521dce9170928c3ce83c5b9bfc64e34bd4-1\"",
+    "listener_count": 1,
+    "origin": {
+      "kind": "source"
+    },
+    "runtime_revision": 1,
+    "schema_version": "oxidase.admin/v1",
+    "serving_state": "running",
+    "site_count": 0
+  },
+  "observed_coverage": {
+    "active_health_failures_max_observed": 8,
+    "active_health_successes_max_observed": 49,
+    "full_control_cycle": true,
+    "health_transitions_max_observed": 3,
+    "retry_attempts_max_observed": 0,
+    "wire_counts": {
+      "a_queries": 76,
+      "aaaa_queries": 82,
+      "cname_answers": 10,
+      "nodata_answers": 42,
+      "nxdomain_answers": 4,
+      "ok": true,
+      "queries": 251,
+      "reversed_srv_answers": 8,
+      "server_failure_answers": 3,
+      "srv_queries": 93,
+      "successful_response_writes": 251,
+      "tcp_queries": 36,
+      "truncated_udp_answers": 36,
+      "ttl_zero_answers": 18,
+      "udp_queries": 215,
+      "withdraw_answers": 5
+    }
+  },
+  "open_fds": {
+    "baseline_after_warmup": null,
+    "final_live": null,
+    "peak": null,
+    "steady_slope_per_second": null
+  },
+  "parameters": {
+    "campaign": "protocol",
+    "concurrency": 4,
+    "cooldown_ms": 2000,
+    "duration_ms": 35000,
+    "payload_size": 4096,
+    "reload_interval_ms": 1000,
+    "sample_interval_ms": 250,
+    "seed": 600602,
+    "warmup_ms": 1000
+  },
+  "pids": {
+    "dns": 63820,
+    "gateway": 63821,
+    "generator": 63818,
+    "upstream": 63819
+  },
+  "post_exit_fds": null,
+  "post_exit_rss": null,
+  "requests": 16311,
+  "result": "pass",
+  "retained_stream_proof": {
+    "after_activate": {
+      "bundle_digest": "c9a3e54d041c29fea37ebd82adb117dffa230c49915d7d809d218773dd17d77d",
+      "cluster_count": 1,
+      "config_version": "v2-sha256-b77f1e2c4a9f4541c7484a0c120fada3e610a127c2d3772b11a1a8104ee252e4",
+      "etag": "\"runtime-7b7a8d13655847ed812f04df753a5f521dce9170928c3ce83c5b9bfc64e34bd4-3\"",
+      "listener_count": 1,
+      "origin": {
+        "digest": "c9a3e54d041c29fea37ebd82adb117dffa230c49915d7d809d218773dd17d77d",
+        "kind": "bundle"
+      },
+      "runtime_revision": 3,
+      "schema_version": "oxidase.admin/v1",
+      "serving_state": "running",
+      "site_count": 0
+    },
+    "after_dns": {
+      "bundle_digest": "491765ab0d9a96aa5d69e3b8467609703304a575c94119cc9d46fadacadcf7cd",
+      "cluster_count": 1,
+      "config_version": "v2-sha256-571d91ac8749d2bca482ce0d3ebf922aa704ba48719e7c1bc71d07536f129e77",
+      "etag": "\"runtime-7b7a8d13655847ed812f04df753a5f521dce9170928c3ce83c5b9bfc64e34bd4-2\"",
+      "listener_count": 1,
+      "origin": {
+        "digest": "491765ab0d9a96aa5d69e3b8467609703304a575c94119cc9d46fadacadcf7cd",
+        "kind": "bundle"
+      },
+      "runtime_revision": 2,
+      "schema_version": "oxidase.admin/v1",
+      "serving_state": "running",
+      "site_count": 0
+    },
+    "fixture_unreleased_body_drop_delta": 1,
+    "gateway_cancelled_termination_delta": 1,
+    "grpc_status_trailer": true,
+    "held_h2_grpc_completed": true,
+    "opaque_grpc_bytes_verified": true,
+    "successful_new_b_streams": 8,
+    "unchanged_dns_runtime": {
+      "bundle_digest": "491765ab0d9a96aa5d69e3b8467609703304a575c94119cc9d46fadacadcf7cd",
+      "cluster_count": 1,
+      "config_version": "v2-sha256-571d91ac8749d2bca482ce0d3ebf922aa704ba48719e7c1bc71d07536f129e77",
+      "etag": "\"runtime-7b7a8d13655847ed812f04df753a5f521dce9170928c3ce83c5b9bfc64e34bd4-2\"",
+      "listener_count": 1,
+      "origin": {
+        "digest": "491765ab0d9a96aa5d69e3b8467609703304a575c94119cc9d46fadacadcf7cd",
+        "kind": "bundle"
+      },
+      "runtime_revision": 2,
+      "schema_version": "oxidase.admin/v1",
+      "serving_state": "running",
+      "site_count": 0
+    },
+    "upgrade_across_withdrawal_and_publication": true,
+    "withdrawn_endpoint_new_streams": 0
+  },
+  "rollbacks": 11,
+  "rss_kib": {
+    "baseline_after_warmup": null,
+    "final_live": null,
+    "peak": null,
+    "steady_slope_per_second": null
+  },
+  "schema_version": "oxidase.discovery-soak/v1",
+  "success": 8073,
+  "unexpected_errors": 0,
+  "unexpected_samples": [],
+  "upgrade_errors": 0,
+  "upgrade_tunnels": 12,
+  "upgrade_unavailable": 10,
+  "upstream": {
+    "active_tunnels": 0,
+    "body_drops": 540,
+    "connections": 54,
+    "health_failure_replies": 34,
+    "health_success_replies": 168,
+    "ok": true,
+    "request_body_errors": 0,
+    "request_content_faults": 0,
+    "request_faults": 0,
+    "request_timeouts": 0,
+    "requests": 8645,
+    "retries": 0,
+    "retryable_status_replies": 0
+  },
+  "worker_errors": 0
+}

@@ -1,0 +1,81 @@
+{
+  "schema_version": "oxidase.fuzz-campaign/v1",
+  "environment": "local macOS aarch64; offline, no network fixture",
+  "target": "portable_discovery",
+  "expected_commit": "9812a2db26d3f973e74cdae4c6eab7f13a9833b7",
+  "sanitizer": "address",
+  "profile": "dev with debug assertions and overflow checks",
+  "seed": 600402,
+  "requested_seconds": 60,
+  "timeout_seconds_per_input": 10,
+  "rss_limit_mib": 2048,
+  "max_len": 32768,
+  "command": [
+    "cargo",
+    "+nightly",
+    "fuzz",
+    "run",
+    "portable_discovery",
+    "--dev",
+    "--sanitizer",
+    "address",
+    "/private/tmp/oxidase-6d-asan-portable-9812a2d/corpus",
+    "--",
+    "-max_total_time=60",
+    "-seed=600402",
+    "-timeout=10",
+    "-rss_limit_mb=2048",
+    "-max_len=32768",
+    "-print_final_stats=1",
+    "-artifact_prefix=/private/tmp/oxidase-6d-asan-portable-9812a2d/artifacts/"
+  ],
+  "environment_variables": {
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "before": {
+    "commit": "9812a2db26d3f973e74cdae4c6eab7f13a9833b7",
+    "dirty": [],
+    "source": {
+      "sha256": "d62be291a05d5913479cdea658d35c18f1f677caa18e406f511de31036d350a5",
+      "files": 164
+    },
+    "fuzz_lock_sha256": "edef369e965e9c9aa28f3d864ae31fd4b27a3220698a1f62ec1e4b49846cda28",
+    "root_lock_sha256": "d34a3181122dbb34e9aaf65c9b0fb3d0d671cd9f4067b8028d178bddf85f41ac"
+  },
+  "versions": {
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "nightly_cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)",
+    "nightly_rustc": "rustc 1.100.0-nightly (fd7ed57df 2026-08-29)",
+    "operating_system": "Darwin arm64"
+  },
+  "started_at": "2026-10-03T19:35:21.199Z",
+  "initial_corpus_files": 2,
+  "finished_at": "2026-10-03T19:36:29.143Z",
+  "process_wall_seconds": 67.940836417,
+  "actual_fuzz_seconds": 61,
+  "executions": 238,
+  "peak_rss_mib": 445,
+  "new_corpus_units_added": 61,
+  "final_corpus_files": 59,
+  "exit_code": 0,
+  "signal": null,
+  "crash": false,
+  "timeout": false,
+  "oom": false,
+  "artifacts": [],
+  "log_sha256": "9105c062d3b9d4838cc95731d8c4b1789306deac030c4c5c3b7cbd6ab3734fd2",
+  "after": {
+    "commit": "9812a2db26d3f973e74cdae4c6eab7f13a9833b7",
+    "dirty": [],
+    "source": {
+      "sha256": "d62be291a05d5913479cdea658d35c18f1f677caa18e406f511de31036d350a5",
+      "files": 164
+    },
+    "fuzz_lock_sha256": "edef369e965e9c9aa28f3d864ae31fd4b27a3220698a1f62ec1e4b49846cda28",
+    "root_lock_sha256": "d34a3181122dbb34e9aaf65c9b0fb3d0d671cd9f4067b8028d178bddf85f41ac"
+  },
+  "source_unchanged": true,
+  "lockfiles_unchanged": true,
+  "exact_commit_unchanged": true,
+  "result": "PASS"
+}

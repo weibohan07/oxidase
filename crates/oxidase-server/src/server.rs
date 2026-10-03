@@ -8038,6 +8038,28 @@ listeners:
             audit: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         write_respond_gateway(&config, "published", None);
+        let dns_mode = Arc::new(AtomicUsize::new(0));
+        let fixture_mode = Arc::clone(&dns_mode);
+        let dns = crate::dns_test_fixture::DnsFixture::start(move |question, _| {
+            use hickory_resolver::proto::op::ResponseCode;
+            use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata::A};
+            if question.query_type() != RecordType::A {
+                return crate::dns_test_fixture::FixtureReply::code(ResponseCode::NoError);
+            }
+            let last = if fixture_mode.load(Ordering::Acquire) == 0 {
+                1
+            } else {
+                2
+            };
+            crate::dns_test_fixture::FixtureReply::answers(vec![Record::from_rdata(
+                question.name().clone(),
+                2,
+                RData::A(A(std::net::Ipv4Addr::new(127, 0, 0, last))),
+            )])
+        })
+        .await;
+        let source = fs::read_to_string(&config).expect("published source");
+        fs::write(&config, format!("{source}resources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: recovery.example.invalid\n          port: 9\n          origin: http://fixed.example.invalid/base\n          resolver:\n            nameservers: [\"{}\"]\n            query_timeout: 500ms\n          refresh:\n            min_interval: 10ms\n            max_interval: 50ms\n            jitter_percent: 0\n          address_policy:\n            allow_loopback: true\n", dns.address)).expect("dynamic candidate source");
         let prepared = prepare();
         let metrics = std::sync::Arc::new(Metrics::default());
         let proxy = std::sync::Arc::new(ProxyClient::new().expect("proxy prepares"));
@@ -8091,6 +8113,75 @@ listeners:
             Some(store.published().runtime_revision)
         );
         assert!(candidates.ensure_mutations_allowed().is_err());
+        let recovery_publication = store.published();
+        let cluster = Arc::clone(
+            recovery_publication
+                .snapshot
+                .resources
+                .clusters
+                .values()
+                .next()
+                .expect("discovery cluster"),
+        );
+        for expected in [1, 2] {
+            if expected == 2 {
+                dns_mode.store(1, Ordering::Release);
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if cluster.endpoints().first().is_some_and(|endpoint| {
+                        endpoint.dial_target().is_some_and(|target| {
+                            target.ip()
+                                == std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                    127, 0, 0, expected,
+                                ))
+                        })
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect(
+                "authorized LKG operational refresh continues despite durable recovery fencing",
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&recovery_publication, &store.published()),
+            "DNS cannot publish a new revision to clear recovery"
+        );
+        assert_eq!(
+            recovery_publication.origin,
+            oxidase_runtime::RuntimeOrigin::Source
+        );
+        assert_eq!(
+            recovery_publication.serving_state,
+            oxidase_runtime::ServingState::Running
+        );
+        assert!(
+            candidates.ensure_mutations_allowed().is_err(),
+            "refresh cannot restore publication authority"
+        );
+        assert_eq!(
+            candidates
+                .operation(&receipt.operation_id)
+                .expect("durable operation")
+                .phase,
+            oxidase_runtime::OperationPhase::RecoveryRequired
+        );
+        assert!(
+            dns.counts.udp.load(Ordering::Relaxed) >= 4,
+            "both real DNS observations occurred"
+        );
+        assert_eq!(dns.counts.tcp.load(Ordering::Relaxed), 0);
+        assert!(dns.counts.responses_for("recovery.example.invalid.") >= 4);
+        assert!(
+            dns.counts.responses_for_type(
+                "recovery.example.invalid.",
+                hickory_resolver::proto::rr::RecordType::A
+            ) >= 2
+        );
         assert!(
             request(report.local_addresses[0].1, "/", "")
                 .await
@@ -8098,6 +8189,16 @@ listeners:
         );
         super::stop_all_listeners(&mut listeners).await;
         health.shutdown().await;
+        discovery.shutdown().await;
+        assert!(
+            cluster.endpoints().is_empty(),
+            "shutdown retires operational membership even while old publication is pinned"
+        );
+        assert!(
+            metrics
+                .render_prometheus_for(&store.pin())
+                .contains("oxidase_discovery_active_supervisors 0\n")
+        );
     }
 
     #[tokio::test]
