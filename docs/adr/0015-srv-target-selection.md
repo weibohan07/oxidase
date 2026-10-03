@@ -80,6 +80,19 @@ from another target; pending work at the single round deadline becomes an explic
 bounded timeout and is cancelled. An already-expired result stays expired. Whole
 service lookup failure is distinct from an individual target failure.
 
+A valid service RRset with an independently failed target/family remains a
+positive partial round for scheduling and metrics. Only rejection of the complete
+positive input enters whole-service failure backoff. Original positive deadlines
+and the earliest target retry deadline still bound the next refresh.
+
+The owner-local target failure memo contains at most two family entries per
+configured target cap and is pruned on target withdrawal. Negative SOA/CNAME
+expiry is retained as an original observation, but query suppression is capped
+at `max_interval` just like whole-service negative scheduling. Re-reading the
+memo does not slide either deadline. This deliberate early requery ceiling avoids
+a one-day target outage under a sixty-second configured refresh maximum; it
+neither extends positive freshness nor authorizes stale data.
+
 ## Resolver work and observation
 
 The pinned raw Hickory pool remains the only DNS wire implementation. The full

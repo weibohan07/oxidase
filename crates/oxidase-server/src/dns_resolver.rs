@@ -52,7 +52,9 @@ pub(crate) struct ResolvedSrv {
 
 struct TargetFailureMemo {
     observation: DnsObservation,
+    /// Operational query suppression, capped by the resource refresh policy.
     not_before: Instant,
+    /// Original SOA/CNAME negative expiration; never rebased by a cache read.
     retry_after: Option<Instant>,
     failures: u8,
 }
@@ -531,6 +533,7 @@ impl DnsResolver {
                 .retry_after
                 .filter(|expiry| *expiry > now)
                 .unwrap_or(now + delay)
+                .min(now + spec.refresh.max_interval)
         } else {
             now + delay
         };
@@ -539,7 +542,7 @@ impl DnsResolver {
             TargetFailureMemo {
                 observation: result.observation.clone(),
                 not_before,
-                retry_after: Some(not_before),
+                retry_after: result.retry_after,
                 failures,
             },
         );
@@ -2039,6 +2042,91 @@ mod tests {
         assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 7);
     }
 
+    #[tokio::test]
+    async fn srv_negative_target_refresh_ceiling_recovers_before_long_soa_expiry_without_sliding() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let handler_mode = Arc::clone(&mode);
+        let fixture = DnsFixture::start(move |question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "recovering.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    60,
+                )]);
+            }
+            if handler_mode.load(Ordering::Relaxed) == 0 {
+                let mut reply = FixtureReply::code(ResponseCode::NoError);
+                reply.authorities.push(soa("oxidase.invalid", 60, 60));
+                return reply;
+            }
+            FixtureReply::answers(vec![address_record(
+                question.name(),
+                if question.query_type() == RecordType::A {
+                    "192.0.2.40"
+                } else {
+                    "2001:db8::40"
+                },
+                60,
+            )])
+        })
+        .await;
+        let mut policy = srv_spec(fixture.address);
+        // Test-adjusted monotonic bounds avoid a multi-second sleep; the
+        // compiler's production refresh constraints are tested separately.
+        policy.refresh.min_interval = Duration::from_millis(5);
+        policy.refresh.max_interval = Duration::from_millis(50);
+        let client = resolver(&policy);
+        let before = Instant::now();
+        let initial = client.resolve_srv_with_schedule(&policy).await;
+        let first = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), (value.not_before, value.retry_after)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 3);
+        assert_eq!(first.len(), 2);
+        for (not_before, received_expiry) in first.values() {
+            assert!(*not_before <= Instant::now() + Duration::from_millis(50));
+            assert!(
+                received_expiry.is_some_and(|expiry| expiry >= before + Duration::from_secs(60)),
+                "the raw negative TTL remains distinct from the operational ceiling"
+            );
+        }
+        assert_eq!(
+            initial.retry_after,
+            first.values().map(|value| value.0).min()
+        );
+        let cached = client.resolve_srv_with_schedule(&policy).await;
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 4);
+        let unchanged = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), (value.not_before, value.retry_after)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(first, unchanged, "neither deadline slides on a cache hit");
+        assert_eq!(cached.retry_after, initial.retry_after);
+        mode.store(1, Ordering::Relaxed);
+        let ceiling = first.values().map(|value| value.0).max().expect("ceiling");
+        tokio::time::sleep_until(ceiling + Duration::from_millis(5)).await;
+        let (_, recovered) = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 7);
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .iter()
+                .all(|family| matches!(family.observation, DnsObservation::Positive { .. })),
+            "both address families can recover before the original60s SOA expiry"
+        );
+        assert!(client.target_failures.lock().expect("memo").is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn srv_failure_memo_has_bounded_non_sliding_backoff_and_positive_recovery() {
         let mut policy = srv_spec("127.0.0.1:5300".parse().expect("numeric resolver"));
@@ -2057,15 +2145,24 @@ mod tests {
             let first = client
                 .cached_target_failure(target, DnsFamily::A)
                 .expect("memo");
-            assert_eq!(
-                first.retry_after,
-                Some(before + Duration::from_secs(seconds))
+            let suppressed_until = client.target_failures.lock().expect("memo")
+                [&(target.to_owned(), false)]
+                .not_before;
+            assert_eq!(suppressed_until, before + Duration::from_secs(seconds));
+            assert!(
+                first.retry_after.is_none(),
+                "transient errors have no SOA expiry"
             );
             tokio::time::advance(Duration::from_millis(100)).await;
             let repeated = client
                 .cached_target_failure(target, DnsFamily::A)
                 .expect("memo");
             assert_eq!(first.retry_after, repeated.retry_after);
+            assert_eq!(
+                client.target_failures.lock().expect("memo")[&(target.to_owned(), false)]
+                    .not_before,
+                suppressed_until
+            );
             tokio::time::advance(Duration::from_secs(seconds)).await;
             assert!(client.cached_target_failure(target, DnsFamily::A).is_none());
         }

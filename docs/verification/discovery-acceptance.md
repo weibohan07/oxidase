@@ -73,7 +73,7 @@ local contracts, with final-head and merged-main Hosted receipts recorded separa
 | DS-23 | Complete zero-inclusive u16 weighting, all-zero eligible selection, seeded reproducibility | runtime discovery weighted-selection tests and SRV resolver records | deterministic boundary/distribution tests PASS; no weight-sized array |
 | DS-24 | One absolute whole-round deadline, bounded/coalesced target families; completed partial results survive | resolver `srv_whole_round_timeout_preserves_fast_target_and_releases_single_global_slot` | one-slot real DNS fixture PASS, fast A retained despite AAAA/other-target timeout |
 | DS-25 | Independent SRV/address/CNAME original lifetimes and separate stale authority | runtime `srv_and_address_expiry_each_require_their_own_stale_authority`, `srv_zero_ttl_and_duplicate_zero_ttl_never_seed_stale`; resolver CNAME test | identified component-authority bug fixed with public-API regressions |
-| DS-26 | Negative SOA and failure memo do not slide or grow with target churn | resolver negative/backoff/churn tests; manager `srv_refresh_uses_original_component_expiry_and_target_negative_deadline` | bounded owner-local failure memo and scheduling PASS; no positive-IP memo cache |
+| DS-26 | Negative SOA and failure memo do not slide, exceed configured query ceiling or grow with target churn | resolver `srv_negative_target_refresh_ceiling_recovers_before_long_soa_expiry_without_sliding`, negative/backoff/churn tests; manager `srv_refresh_uses_original_component_expiry_and_target_negative_deadline` | bounded owner-local failure memo and scheduling PASS; no positive-IP memo cache |
 | DS-27 | Dot withdrawal/NXDOMAIN fence, conflicting records fail closed, observable aggregate limits | resolver dot/target-NXDOMAIN/record-byte-name quota tests; runtime received-round quota tests | resolver stable/MSRV PASS 25/25; opaque discarded Hickory bytes are not claimed observable |
 | DS-28 | Weight-only pool reuse; withdrawn member gets no new stream while issued trailers finish | wire `srv_weight_only_reuses_pool_but_withdrawal_and_new_target_do_not_reuse_it`; runtime remove/readd and policy-replacement admission tests | actual H2 pool reuse/withdrawal PASS; held physical counter survives policy replacement |
 | DS-29 | DNS port is actual socket; logical Host/base/raw query/TLS identity remain fixed; no publisher/metric-label authority | wire `srv_actual_socket_preserves_fixed_tls_name_and_rejects_an_untrusted_replacement` and both other SRV wire tests | trusted exact SNI observed, untrusted replacement fails before HTTP dispatch; exact PublishedRuntime Arc unchanged |
@@ -84,6 +84,20 @@ macOS regression executions, not a Linux qualification campaign. Source and
 runtime libraries keep DNS generation out of Bundle/config identity and out of
 fifth-stage publication authority. Phase-6D signed Admin races, restart, fuzz and
 Linux process-level qualification are not implied by this table.
+
+Frozen intermediate implementation/documentation head `3c031c8` passed all nine
+locked local gates, including stable/MSRV workspace tests, denied-warning docs
+and Clippy, release build, unchanged cargo-deny policy and fuzz-bin compilation.
+The independent audit then identified excessive target-negative suppression under
+a long SOA TTL. Its scheduling-ceiling repair requires a fresh complete gate and
+its own exact final-head Hosted acceptance; the intermediate green is not used
+to qualify that repair.
+
+The ceiling repair's focused resolver suite passes 26/26 on stable and Rust1.88;
+all server targets/features also pass Clippy with warnings denied. Raw receipts
+are retained in `artifacts/discovery-6c-negative-ceiling-{stable,msrv,clippy}.log.gz`.
+It preserves the raw 60-second SOA expiry while actual local DNS target questions
+resume after the configured test ceiling. Separate final gates remain mandatory.
 
 ## 6A executable contract and intermediate evidence
 

@@ -140,6 +140,12 @@ lifetime bounds where applicable. Failure backoff and response-order changes do
 not renew positive or stale deadlines. A query is coalesced per committed owner,
 not multiplied by concurrent business requests.
 
+For SRV target families, a bounded owner-local negative/failure memo avoids
+repeating target questions on every short-lived SRV refresh. Negative suppression
+is capped by `max_interval`, preserving the original SOA/CNAME expiry separately;
+memo reads cannot slide the retry deadline. Only a newly received answer can
+replace that observation. Positive address bytes are not stored in this memo.
+
 REFUSED is treated as temporary refusal by the configured resolver, not as
 authoritative name withdrawal. This project allowlist only retains previously
 approved addresses under the unchanged address/identity policy and original
