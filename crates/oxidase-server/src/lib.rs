@@ -1,5 +1,6 @@
 //! Hyper-based listener and proxy data plane.
 
+mod admin;
 mod body;
 mod cluster_health;
 mod connection;
@@ -19,7 +20,8 @@ pub mod fuzzing;
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
 pub use metrics::Metrics;
 pub use server::{
-    GatewayServer, ReloadError, ReloadHandle, ReloadReport, RunningServer, ServerError,
+    AdminEndpoint, GatewayServer, ReloadError, ReloadHandle, ReloadReport, RunningServer,
+    ServerError,
 };
 
 pub const DATA_PLANE: &str = "hyper";

@@ -21,6 +21,7 @@ hyper-rustls.workspace = true
 hyper-util.workspace = true
 httpdate.workspace = true
 oxidase-core = { path = "../oxidase-core" }
+oxidase-bundle = { path = "../oxidase-bundle" }
 oxidase-config = { path = "../oxidase-config" }
 oxidase-runtime = { path = "../oxidase-runtime" }
 oxidase-site = { path = "../oxidase-site" }
@@ -28,6 +29,7 @@ rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true

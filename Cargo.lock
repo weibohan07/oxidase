@@ -1089,6 +1089,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "oxidase-bundle",
  "oxidase-config",
  "oxidase-core",
  "oxidase-runtime",

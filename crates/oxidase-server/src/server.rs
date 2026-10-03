@@ -10,26 +10,36 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use oxidase_config::{Http1Settings, Http2Settings, HttpVersion, ListenerLimits, ListenerProtocol};
+use oxidase_bundle::{BundleCapabilities, BundleVerificationKey};
+use oxidase_config::{
+    AdminAuthMode, AdminListenSpec, Http1Settings, Http2Settings, HttpVersion, ListenerLimits,
+    ListenerProtocol,
+};
 use oxidase_core::{
     Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan, TlsConnectionMetadata,
 };
 use oxidase_runtime::{
-    ClusterRuntimeStatus, Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot,
-    SnapshotStore, verified_client_metadata,
+    CandidateSignaturePolicy, CandidateStore, CandidateStoreLimits, ClusterRuntimeStatus, Executor,
+    PORTABLE_RUNTIME_PLAN_SCHEMA_V1, PreparedListenerPlan, PreparedTlsListener, ResourceReuse,
+    RuntimeSnapshot, SnapshotStore, verified_client_metadata,
 };
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
+use crate::admin::{
+    AdminPeerIdentity, AdminSecurityPolicy, DEFAULT_ADMIN_REQUEST_BODY_BYTES, classify_admin_route,
+    validate_mutation_headers,
+};
 use crate::body::{
     DownstreamTimeoutSignal, GatewayBody, GatewayBodyPlan,
     instrument_response_body_with_snapshot_timeout, timeout_request_body,
@@ -59,6 +69,7 @@ const DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 const HTTP1_REQUEST_LINE_AND_FRAMING_ALLOWANCE: usize = 1024;
 const MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER: usize = 128;
 const MAX_CONCURRENT_ADMIN_CONNECTIONS: usize = 256;
+const ADMIN_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
     http1_builder_with_limits(
@@ -102,9 +113,42 @@ pub struct GatewayServer {
 }
 
 struct BoundAdmin {
-    listener: TcpListener,
-    local_address: SocketAddr,
+    transport: BoundAdminTransport,
+    endpoint: AdminEndpoint,
+    security: Arc<AdminSecurityPolicy>,
+    tls: Option<PreparedTlsListener>,
+    candidates: Option<Arc<CandidateStore>>,
+    candidate_upload_directory: Option<PathBuf>,
+    candidate_deployment_root: Option<PathBuf>,
+    max_candidate_bytes: u64,
 }
+
+#[derive(Clone)]
+struct AdminControlPlane {
+    candidates: Arc<CandidateStore>,
+    reload: ReloadHandle,
+    upload_directory: PathBuf,
+    deployment_root: PathBuf,
+    max_candidate_bytes: u64,
+    mutation_gate: Arc<Semaphore>,
+}
+
+enum BoundAdminTransport {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(crate::admin::unix_socket::BoundUnixAdmin),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminEndpoint {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+trait AdminIo: AsyncRead + AsyncWrite {}
+impl<T> AdminIo for T where T: AsyncRead + AsyncWrite {}
+type BoxAdminIo = Box<dyn AdminIo + Unpin + Send + 'static>;
 
 struct ActiveListener {
     configured_address: SocketAddr,
@@ -130,7 +174,11 @@ enum Control {
     Reload {
         snapshot: Box<RuntimeSnapshot>,
         reuse: ResourceReuse,
+        expected_version: Option<String>,
         response: oneshot::Sender<Result<ReloadReport, ServerError>>,
+    },
+    Drain {
+        response: oneshot::Sender<()>,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -174,6 +222,7 @@ impl GatewayServer {
                 local_address,
             });
         }
+        let admin = bind_configured_admin(&snapshot).await?;
         let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
         proxy.reconcile_snapshot(&snapshot);
         let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
@@ -183,12 +232,23 @@ impl GatewayServer {
             health,
             metrics: Arc::new(Metrics::default()),
             listeners,
-            admin: None,
+            admin,
             drain_timeout: Duration::from_secs(10),
         })
     }
 
     pub async fn with_admin_listener(mut self, bind: SocketAddr) -> Result<Self, ServerError> {
+        if self.admin.is_some() {
+            return Err(ServerError::AdminConfiguration(
+                "the snapshot already defines an administration listener".to_owned(),
+            ));
+        }
+        if !bind.ip().is_loopback() {
+            return Err(ServerError::AdminConfiguration(
+                "the legacy unauthenticated administration listener is restricted to loopback"
+                    .to_owned(),
+            ));
+        }
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|source| ServerError::Bind {
@@ -205,15 +265,64 @@ impl GatewayServer {
                 source,
             })?;
         self.admin = Some(BoundAdmin {
-            listener,
-            local_address,
+            transport: BoundAdminTransport::Tcp(listener),
+            endpoint: AdminEndpoint::Tcp(local_address),
+            security: Arc::new(AdminSecurityPolicy::legacy_loopback_read_only()),
+            tls: None,
+            candidates: None,
+            candidate_upload_directory: None,
+            candidate_deployment_root: None,
+            max_candidate_bytes: DEFAULT_ADMIN_REQUEST_BODY_BYTES,
+        });
+        Ok(self)
+    }
+
+    /// Enables the explicit development-only Unix administration transport.
+    /// Production configuration should use the top-level authenticated
+    /// `admin` block, which is prepared automatically with the snapshot.
+    #[cfg(unix)]
+    pub fn with_admin_unix_listener(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        mode: u32,
+    ) -> Result<Self, ServerError> {
+        if self.admin.is_some() {
+            return Err(ServerError::AdminConfiguration(
+                "the snapshot already defines an administration listener".to_owned(),
+            ));
+        }
+        let listener = crate::admin::unix_socket::BoundUnixAdmin::bind(path.as_ref(), mode)
+            .map_err(|source| ServerError::AdminUnixBind {
+                path: path.as_ref().to_path_buf(),
+                source_span: Box::new(SourceSpan::synthetic("serve.admin_unix")),
+                source,
+            })?;
+        let endpoint = AdminEndpoint::Unix(listener.path().to_path_buf());
+        self.admin = Some(BoundAdmin {
+            transport: BoundAdminTransport::Unix(listener),
+            endpoint,
+            security: Arc::new(AdminSecurityPolicy::legacy_loopback_read_only()),
+            tls: None,
+            candidates: None,
+            candidate_upload_directory: None,
+            candidate_deployment_root: None,
+            max_candidate_bytes: DEFAULT_ADMIN_REQUEST_BODY_BYTES,
         });
         Ok(self)
     }
 
     #[must_use]
     pub fn admin_address(&self) -> Option<SocketAddr> {
-        self.admin.as_ref().map(|admin| admin.local_address)
+        self.admin.as_ref().and_then(|admin| match admin.endpoint {
+            AdminEndpoint::Tcp(address) => Some(address),
+            #[cfg(unix)]
+            AdminEndpoint::Unix(_) => None,
+        })
+    }
+
+    #[must_use]
+    pub fn admin_endpoint(&self) -> Option<&AdminEndpoint> {
+        self.admin.as_ref().map(|admin| &admin.endpoint)
     }
 
     #[must_use]
@@ -232,6 +341,7 @@ impl GatewayServer {
     pub fn spawn(self) -> RunningServer {
         let addresses = self.local_addresses();
         let admin_address = self.admin_address();
+        let admin_endpoint = self.admin_endpoint().cloned();
         let store = self.store.clone();
         let metrics = self.metrics.clone();
         let reload_dependencies = Arc::new(Mutex::new(ReloadDependencyState::new(
@@ -239,21 +349,23 @@ impl GatewayServer {
         )));
         let compile_gate = Arc::new(Semaphore::new(1));
         let (control, receiver) = mpsc::channel(8);
-        let task = tokio::spawn(self.run(receiver));
+        let reload = ReloadHandle {
+            store,
+            metrics,
+            control: control.clone(),
+            dependencies: reload_dependencies,
+            compile_gate,
+            #[cfg(test)]
+            preparation_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            preparation_started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let task = tokio::spawn(self.run(receiver, reload.clone()));
         RunningServer {
             addresses,
-            reload: ReloadHandle {
-                store,
-                metrics,
-                control: control.clone(),
-                dependencies: reload_dependencies,
-                compile_gate,
-                #[cfg(test)]
-                preparation_delay: Arc::new(Mutex::new(None)),
-                #[cfg(test)]
-                preparation_started: Arc::new(tokio::sync::Notify::new()),
-            },
+            reload,
             admin_address,
+            admin_endpoint,
             control,
             task,
         }
@@ -268,7 +380,11 @@ impl GatewayServer {
         running.shutdown().await
     }
 
-    async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Result<(), ServerError> {
+    async fn run(
+        mut self,
+        mut control: mpsc::Receiver<Control>,
+        reload: ReloadHandle,
+    ) -> Result<(), ServerError> {
         self.health.activate_snapshot(&self.store.pin());
         let (completion_sender, mut completions) = mpsc::unbounded_channel();
         let mut listeners = BTreeMap::new();
@@ -295,6 +411,7 @@ impl GatewayServer {
                 self.store.clone(),
                 self.metrics.clone(),
                 self.drain_timeout,
+                reload,
             )
         });
 
@@ -302,7 +419,7 @@ impl GatewayServer {
             tokio::select! {
                 command = control.recv() => {
                     match command {
-                        Some(Control::Reload { snapshot, reuse, response }) => {
+                        Some(Control::Reload { snapshot, reuse, expected_version, response }) => {
                             let environment = ReloadEnvironment {
                                 store: &self.store,
                                 proxy: &self.proxy,
@@ -311,13 +428,21 @@ impl GatewayServer {
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
                             };
-                            let result = apply_reload(
-                                *snapshot,
-                                reuse,
-                                &mut listeners,
-                                &mut generation,
-                                environment,
-                            ).await;
+                            let actual_version = self.store.pin().config_version.to_string();
+                            let result = if expected_version
+                                .as_ref()
+                                .is_some_and(|expected| expected != &actual_version)
+                            {
+                                Err(ServerError::PreconditionFailed)
+                            } else {
+                                apply_reload(
+                                    *snapshot,
+                                    reuse,
+                                    &mut listeners,
+                                    &mut generation,
+                                    environment,
+                                ).await
+                            };
                             let _ = response.send(result);
                         }
                         Some(Control::Shutdown { response }) => {
@@ -326,6 +451,11 @@ impl GatewayServer {
                             self.health.shutdown().await;
                             let _ = response.send(());
                             return Ok(());
+                        }
+                        Some(Control::Drain { response }) => {
+                            stop_all_listeners(&mut listeners).await;
+                            self.health.shutdown().await;
+                            let _ = response.send(());
                         }
                         None => {
                             stop_all_listeners(&mut listeners).await;
@@ -357,9 +487,177 @@ impl GatewayServer {
     }
 }
 
+async fn bind_configured_admin(
+    snapshot: &RuntimeSnapshot,
+) -> Result<Option<BoundAdmin>, ServerError> {
+    let Some(admin) = snapshot.admin.as_ref() else {
+        return Ok(None);
+    };
+    let permissions = crate::admin::AdminPermissions {
+        read: admin.permissions.read,
+        stage: admin.permissions.stage,
+        activate: admin.permissions.activate,
+        rollback: admin.permissions.rollback,
+        drain: admin.permissions.drain,
+        reload_source: admin.permissions.reload_source,
+    };
+    let authentication = match admin.auth.mode {
+        AdminAuthMode::UnsafeNone => crate::admin::AdminAuthentication::UnsafeDevelopment,
+        AdminAuthMode::Bearer => crate::admin::AdminAuthentication::Bearer(
+            admin.auth.token_secret.clone().ok_or_else(|| {
+                ServerError::AdminConfiguration(
+                    "compiled bearer authentication has no Secret reference".to_owned(),
+                )
+            })?,
+        ),
+        AdminAuthMode::Mtls => crate::admin::AdminAuthentication::Mtls,
+        AdminAuthMode::BearerAndMtls => crate::admin::AdminAuthentication::BearerAndMtls(
+            admin.auth.token_secret.clone().ok_or_else(|| {
+                ServerError::AdminConfiguration(
+                    "compiled bearer+mTLS authentication has no Secret reference".to_owned(),
+                )
+            })?,
+        ),
+    };
+    let security = Arc::new(AdminSecurityPolicy {
+        authentication,
+        permissions,
+    });
+    let candidates = prepare_candidate_store(admin)?;
+    match &admin.listen {
+        AdminListenSpec::Https(https) => {
+            let tls = PreparedTlsListener::prepare_admin(
+                https,
+                &snapshot.resources.certificates,
+                &snapshot.resources.trust_stores,
+            )
+            .map_err(ServerError::AdminPreparation)?;
+            let listener =
+                TcpListener::bind(https.bind)
+                    .await
+                    .map_err(|source| ServerError::Bind {
+                        listener: "@admin".to_owned(),
+                        address: https.bind,
+                        source_span: Box::new(https.bind_source.clone()),
+                        source,
+                    })?;
+            let local_address =
+                listener
+                    .local_addr()
+                    .map_err(|source| ServerError::LocalAddress {
+                        listener: "@admin".to_owned(),
+                        source_span: Box::new(https.bind_source.clone()),
+                        source,
+                    })?;
+            Ok(Some(BoundAdmin {
+                transport: BoundAdminTransport::Tcp(listener),
+                endpoint: AdminEndpoint::Tcp(local_address),
+                security,
+                tls: Some(tls),
+                candidates,
+                candidate_upload_directory: Some(admin.storage.directory.clone()),
+                candidate_deployment_root: Some(admin.bundle_trust.deployment_root.clone()),
+                max_candidate_bytes: admin.candidates.max_candidate_bytes,
+            }))
+        }
+        AdminListenSpec::Unix(unix) => {
+            #[cfg(unix)]
+            {
+                let listener =
+                    crate::admin::unix_socket::BoundUnixAdmin::bind(&unix.path, unix.mode)
+                        .map_err(|source| ServerError::AdminUnixBind {
+                            path: unix.path.clone(),
+                            source_span: Box::new(unix.source.clone()),
+                            source,
+                        })?;
+                let endpoint = AdminEndpoint::Unix(listener.path().to_path_buf());
+                Ok(Some(BoundAdmin {
+                    transport: BoundAdminTransport::Unix(listener),
+                    endpoint,
+                    security,
+                    tls: None,
+                    candidates,
+                    candidate_upload_directory: Some(admin.storage.directory.clone()),
+                    candidate_deployment_root: Some(admin.bundle_trust.deployment_root.clone()),
+                    max_candidate_bytes: admin.candidates.max_candidate_bytes,
+                }))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = unix;
+                Err(ServerError::AdminConfiguration(
+                    "Unix administration sockets are unavailable on this platform".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn prepare_candidate_store(
+    admin: &oxidase_config::AdminSpec,
+) -> Result<Option<Arc<CandidateStore>>, ServerError> {
+    if !(admin.permissions.stage || admin.permissions.activate || admin.permissions.rollback) {
+        return Ok(None);
+    }
+    let trusted_keys = admin
+        .bundle_trust
+        .verification_keys
+        .iter()
+        .zip(&admin.bundle_trust.verification_key_sources)
+        .map(|(path, source)| {
+            BundleVerificationKey::read_file(path).map_err(|error| {
+                ServerError::AdminPreparation(Box::new(Diagnostic::new(
+                    error.code(),
+                    "cannot load an admin Bundle verification key",
+                    source.clone(),
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let limits = CandidateStoreLimits {
+        max_candidates: usize::try_from(admin.candidates.max_count).map_err(|_| {
+            ServerError::AdminConfiguration(
+                "admin candidate count exceeds this platform's address space".to_owned(),
+            )
+        })?,
+        max_total_bytes: admin.candidates.max_bytes,
+        max_candidate_bytes: admin.candidates.max_candidate_bytes,
+        max_history_snapshots: usize::try_from(admin.history.max_snapshots).map_err(|_| {
+            ServerError::AdminConfiguration(
+                "admin history count exceeds this platform's address space".to_owned(),
+            )
+        })?,
+        max_history_bytes: admin.history.max_bytes,
+        ..CandidateStoreLimits::default()
+    };
+    let capabilities = BundleCapabilities {
+        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+        supported_features: BTreeSet::from(["portable-runtime".to_owned()]),
+        supported_sections: BTreeMap::from([(
+            "runtime".to_owned(),
+            PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
+        )]),
+    };
+    CandidateStore::open(
+        admin.storage.directory.clone(),
+        limits,
+        CandidateSignaturePolicy::require_trusted(trusted_keys),
+        capabilities,
+    )
+    .map(Some)
+    .map_err(|error| {
+        ServerError::AdminPreparation(Box::new(Diagnostic::new(
+            error.code(),
+            "cannot prepare the bounded admin candidate store",
+            admin.storage.source.clone(),
+        )))
+    })
+}
+
 pub struct RunningServer {
     addresses: Vec<(String, SocketAddr)>,
     admin_address: Option<SocketAddr>,
+    admin_endpoint: Option<AdminEndpoint>,
     reload: ReloadHandle,
     control: mpsc::Sender<Control>,
     task: JoinHandle<Result<(), ServerError>>,
@@ -374,6 +672,11 @@ impl RunningServer {
     #[must_use]
     pub const fn admin_address(&self) -> Option<SocketAddr> {
         self.admin_address
+    }
+
+    #[must_use]
+    pub fn admin_endpoint(&self) -> Option<&AdminEndpoint> {
+        self.admin_endpoint.as_ref()
     }
 
     #[must_use]
@@ -422,6 +725,37 @@ impl ReloadHandle {
         let result = self.reload_path_inner(path.as_ref()).await;
         self.metrics.record_reload(result.is_ok());
         result
+    }
+
+    async fn drain_data_plane(&self) -> Result<(), ServerError> {
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Drain { response })
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
+        received.await.map_err(|_| ServerError::ControlClosed)
+    }
+
+    async fn activate_prepared(
+        &self,
+        snapshot: RuntimeSnapshot,
+        reuse: ResourceReuse,
+        expected_version: String,
+    ) -> Result<ReloadReport, ServerError> {
+        let published_dependencies = snapshot.dependencies.clone();
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Reload {
+                snapshot: Box::new(snapshot),
+                reuse,
+                expected_version: Some(expected_version),
+                response,
+            })
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
+        let report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        self.record_published_dependencies(published_dependencies);
+        Ok(report)
     }
 
     async fn reload_path_inner(&self, path: &std::path::Path) -> Result<ReloadReport, ServerError> {
@@ -491,6 +825,7 @@ impl ReloadHandle {
             .send(Control::Reload {
                 snapshot: Box::new(snapshot),
                 reuse,
+                expected_version: None,
                 response,
             })
             .await
@@ -807,10 +1142,27 @@ fn start_admin_listener(
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
     drain_timeout: Duration,
+    reload: ReloadHandle,
 ) -> ActiveAdmin {
+    let control_plane = admin
+        .candidates
+        .as_ref()
+        .zip(admin.candidate_upload_directory.as_ref())
+        .zip(admin.candidate_deployment_root.as_ref())
+        .map(
+            |((candidates, upload_directory), deployment_root)| AdminControlPlane {
+                candidates: candidates.clone(),
+                reload,
+                upload_directory: upload_directory.clone(),
+                deployment_root: deployment_root.clone(),
+                max_candidate_bytes: admin.max_candidate_bytes,
+                mutation_gate: Arc::new(Semaphore::new(1)),
+            },
+        );
     let (shutdown, receiver) = watch::channel(false);
     let task = tokio::spawn(run_admin_listener(
         admin,
+        control_plane,
         store,
         metrics,
         receiver,
@@ -828,6 +1180,7 @@ async fn stop_admin_listener(admin: &mut Option<ActiveAdmin>) {
 
 async fn run_admin_listener(
     admin: BoundAdmin,
+    control_plane: Option<AdminControlPlane>,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
     mut shutdown: watch::Receiver<bool>,
@@ -844,8 +1197,8 @@ async fn run_admin_listener(
                     break;
                 }
             }
-            accepted = admin.listener.accept() => {
-                let Ok((stream, _)) = accepted else {
+            accepted = admin.accept() => {
+                let Ok(stream) = accepted else {
                     tracing::error!("admin listener failed while accepting a connection");
                     break;
                 };
@@ -859,6 +1212,9 @@ async fn run_admin_listener(
                 };
                 let store = store.clone();
                 let metrics = metrics.clone();
+                let security = admin.security.clone();
+                let tls = admin.tls.clone();
+                let control_plane = control_plane.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     let _permit = permit;
@@ -866,6 +1222,9 @@ async fn run_admin_listener(
                         stream,
                         store,
                         metrics,
+                        security,
+                        tls,
+                        control_plane,
                         connection_shutdown,
                     ).await;
                 });
@@ -888,14 +1247,98 @@ async fn run_admin_listener(
     }
 }
 
+impl BoundAdmin {
+    async fn accept(&self) -> std::io::Result<BoxAdminIo> {
+        match &self.transport {
+            BoundAdminTransport::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
+            #[cfg(unix)]
+            BoundAdminTransport::Unix(listener) => {
+                let (stream, _) = listener.listener().accept().await?;
+                Ok(Box::new(stream))
+            }
+        }
+    }
+}
+
 async fn serve_admin_connection(
-    stream: TcpStream,
+    stream: BoxAdminIo,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    tls: Option<PreparedTlsListener>,
+    control_plane: Option<AdminControlPlane>,
+    shutdown: watch::Receiver<bool>,
+) {
+    if let Some(tls) = tls {
+        let acceptor = TlsAcceptor::from(tls.server_config);
+        let accepted = tokio::time::timeout(tls.handshake_timeout, acceptor.accept(stream)).await;
+        let stream = match accepted {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "admin TLS handshake failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("admin TLS handshake timed out");
+                return;
+            }
+        };
+        let client = match verified_client_metadata(stream.get_ref().1.peer_certificates()) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "verified admin client metadata is invalid");
+                return;
+            }
+        };
+        let peer = AdminPeerIdentity {
+            verified_client_sha256: client.verified.then_some(client.sha256).flatten(),
+        };
+        serve_admin_http(
+            Box::new(stream),
+            store,
+            metrics,
+            security,
+            peer,
+            control_plane,
+            shutdown,
+        )
+        .await;
+        return;
+    }
+    serve_admin_http(
+        stream,
+        store,
+        metrics,
+        security,
+        AdminPeerIdentity::default(),
+        control_plane,
+        shutdown,
+    )
+    .await;
+}
+
+async fn serve_admin_http(
+    stream: BoxAdminIo,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    peer: AdminPeerIdentity,
+    control_plane: Option<AdminControlPlane>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let service =
-        service_fn(move |request| handle_admin_request(request, store.clone(), metrics.clone()));
+    let service = service_fn(move |request| {
+        handle_admin_request(
+            request,
+            store.clone(),
+            metrics.clone(),
+            security.clone(),
+            peer.clone(),
+            control_plane.clone(),
+        )
+    });
     let connection = http1_builder(DEFAULT_HTTP1_HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
@@ -915,15 +1358,74 @@ async fn handle_admin_request(
     request: Request<Incoming>,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    peer: AdminPeerIdentity,
+    control_plane: Option<AdminControlPlane>,
 ) -> Result<Response<GatewayBody>, Infallible> {
     let method = request.method().clone();
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    let Some(route) = classify_admin_route(request.method(), request.uri().path()) else {
+        let known_read_path = matches!(
+            request.uri().path(),
+            "/health/live"
+                | "/health/ready"
+                | "/metrics"
+                | "/api/v1/clusters"
+                | "/api/v1/runtime"
+                | "/api/v1/snapshots/current"
+                | "/api/v1/snapshots"
+        );
         return Ok(admin_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+            if known_read_path {
+                StatusCode::METHOD_NOT_ALLOWED
+            } else {
+                StatusCode::NOT_FOUND
+            },
             "text/plain; charset=utf-8",
-            Bytes::from_static(b"Method Not Allowed"),
+            Bytes::from_static(if known_read_path {
+                b"Method Not Allowed"
+            } else {
+                b"Not Found"
+            }),
             &method,
         ));
+    };
+    let snapshot = store.pin();
+    let principal = match security.authorize(request.headers(), &peer, &snapshot, route.permission)
+    {
+        Ok(principal) => principal,
+        Err(error) => return Ok(admin_security_response(error, &method)),
+    };
+    tracing::debug!(
+        admin_authentication = principal.authentication_kind(),
+        admin_principal = principal.audit_id(),
+        admin_permission = route.permission.as_str(),
+        "administration request authorized"
+    );
+    if route.mutation {
+        let max_body_bytes = snapshot
+            .admin
+            .as_ref()
+            .map_or(DEFAULT_ADMIN_REQUEST_BODY_BYTES, |admin| {
+                admin.candidates.max_candidate_bytes
+            });
+        if let Some(content_type) = route.content_type
+            && let Err(error) = validate_mutation_headers(
+                request.headers(),
+                content_type,
+                snapshot.config_version.as_str(),
+                max_body_bytes,
+            )
+        {
+            return Ok(admin_security_response(error, &method));
+        }
+        let Some(control_plane) = control_plane else {
+            return Ok(admin_code_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin.control_unavailable",
+                &method,
+            ));
+        };
+        return Ok(handle_admin_mutation(request, principal, control_plane).await);
     }
     let response = match request.uri().path() {
         "/health/live" => admin_response(
@@ -951,7 +1453,11 @@ async fn handle_admin_request(
             Bytes::from(metrics.render_prometheus_for(&store.pin())),
             &method,
         ),
-        "/api/v1/clusters" => cluster_admin_response(&store.pin(), &method),
+        "/api/v1/clusters" => cluster_admin_response(&snapshot, &method),
+        "/api/v1/runtime" | "/api/v1/snapshots/current" => {
+            current_runtime_admin_response(&snapshot, &method)
+        }
+        "/api/v1/snapshots" => snapshot_list_admin_response(&snapshot, &method),
         _ => admin_response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -960,6 +1466,628 @@ async fn handle_admin_request(
         ),
     };
     Ok(response)
+}
+
+async fn handle_admin_mutation(
+    request: Request<Incoming>,
+    principal: crate::admin::AdminPrincipal,
+    control: AdminControlPlane,
+) -> Response<GatewayBody> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let request_id = format!("admin-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let idempotency_key = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let expected_version = request
+        .headers()
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix('"'))
+        .and_then(|value| value.strip_suffix('"'))
+        .map(str::to_owned);
+    let context = oxidase_runtime::CandidateOperationContext {
+        request_id,
+        principal: format!(
+            "{}:{}",
+            principal.authentication_kind(),
+            principal.audit_id()
+        ),
+        // The handler already checked the live SnapshotStore immediately
+        // before acquiring the global mutation gate. Activation repeats that
+        // check before publication; CandidateStore's durable current value may
+        // legitimately be empty when the process booted from YAML.
+        if_match: None,
+        idempotency_key,
+    };
+    let permit = match tokio::time::timeout(
+        ADMIN_MUTATION_TIMEOUT,
+        control.mutation_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return admin_code_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin.mutation_busy",
+                &method,
+            );
+        }
+    };
+    if expected_version.as_deref()
+        != Some(control.reload.current_snapshot().config_version.as_str())
+    {
+        drop(permit);
+        return admin_code_response(
+            StatusCode::PRECONDITION_FAILED,
+            "admin.precondition_failed",
+            &method,
+        );
+    }
+    let response = if path == "/api/v1/candidates" {
+        stage_admin_candidate(request.into_body(), &control, context, &method).await
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/candidates/", "validate") {
+        if let Err(error) = consume_admin_json_body(request.into_body()).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            validate_admin_candidate(digest, &control, &context, &method).await
+        }
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/candidates/", "activate") {
+        if let Err(error) = consume_admin_json_body(request.into_body()).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            activate_admin_candidate(
+                digest,
+                &control,
+                &context,
+                expected_version.as_deref().unwrap_or_default(),
+                false,
+                &method,
+            )
+            .await
+        }
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/snapshots/", "rollback") {
+        if let Err(error) = consume_admin_json_body(request.into_body()).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            activate_admin_candidate(
+                digest,
+                &control,
+                &context,
+                expected_version.as_deref().unwrap_or_default(),
+                true,
+                &method,
+            )
+            .await
+        }
+    } else if path == "/api/v1/drain" {
+        if let Err(error) = consume_admin_json_body(request.into_body()).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            match tokio::time::timeout(ADMIN_MUTATION_TIMEOUT, control.reload.drain_data_plane())
+                .await
+            {
+                Ok(Ok(())) => admin_json_value_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "schema_version": "oxidase.admin/v1",
+                        "draining": true
+                    }),
+                    &method,
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "admin drain failed");
+                    admin_code_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "admin.drain_failed",
+                        &method,
+                    )
+                }
+                Err(_) => admin_code_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "admin.mutation_timeout",
+                    &method,
+                ),
+            }
+        }
+    } else if path == "/api/v1/reload-source" {
+        if let Err(error) = consume_admin_json_body(request.into_body()).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            let source = control.reload.current_snapshot().summary().source.clone();
+            match tokio::time::timeout(
+                ADMIN_MUTATION_TIMEOUT,
+                control.reload.reload_path(PathBuf::from(source)),
+            )
+            .await
+            {
+                Ok(Ok(report)) => admin_json_value_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "schema_version": "oxidase.admin/v1",
+                        "version": report.current_version,
+                        "previous_version": report.previous_version
+                    }),
+                    &method,
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "admin source reload failed");
+                    admin_code_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "admin.reload_source_failed",
+                        &method,
+                    )
+                }
+                Err(_) => admin_code_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "admin.mutation_timeout",
+                    &method,
+                ),
+            }
+        }
+    } else {
+        admin_code_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "admin.bundle_activation_unavailable",
+            &method,
+        )
+    };
+    drop(permit);
+    response
+}
+
+fn admin_action_digest(
+    path: &str,
+    prefix: &str,
+    action: &str,
+) -> Option<oxidase_bundle::BundleDigest> {
+    let rest = path.strip_prefix(prefix)?;
+    let (digest, actual_action) = rest.split_once('/')?;
+    if actual_action != action {
+        return None;
+    }
+    serde_json::from_value(serde_json::Value::String(digest.to_owned())).ok()
+}
+
+async fn consume_admin_json_body(mut body: Incoming) -> Result<(), AdminUploadError> {
+    const MAX_JSON_BODY_BYTES: u64 = 64 * 1024;
+    let mut received = 0_u64;
+    let mut bytes = Vec::new();
+    let receive = async {
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| AdminUploadError {
+                status: StatusCode::BAD_REQUEST,
+                code: "admin.request_body",
+            })?;
+            if let Some(data) = frame.data_ref() {
+                received = received
+                    .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+                    .ok_or(AdminUploadError {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        code: "admin.payload_too_large",
+                    })?;
+                if received > MAX_JSON_BODY_BYTES {
+                    return Err(AdminUploadError {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        code: "admin.payload_too_large",
+                    });
+                }
+                bytes.extend_from_slice(data);
+            } else if frame.trailers_ref().is_some() {
+                return Err(AdminUploadError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "admin.request_trailers",
+                });
+            }
+        }
+        Ok::<(), AdminUploadError>(())
+    };
+    tokio::time::timeout(ADMIN_MUTATION_TIMEOUT, receive)
+        .await
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "admin.request_timeout",
+        })??;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.invalid_json",
+        })?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        Ok(())
+    } else {
+        Err(AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.unexpected_body",
+        })
+    }
+}
+
+async fn validate_admin_candidate(
+    digest: oxidase_bundle::BundleDigest,
+    control: &AdminControlPlane,
+    context: &oxidase_runtime::CandidateOperationContext,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let bundle_path = control.candidates.candidate_path(digest);
+    let deployment_root = control.deployment_root.clone();
+    let previous = control.reload.current_snapshot();
+    let outcome = control
+        .candidates
+        .validate_candidate(digest, context, move |archive| async move {
+            tokio::task::spawn_blocking(move || {
+                oxidase_runtime::prepare_bundle_archive(
+                    &archive,
+                    &bundle_path,
+                    &deployment_root,
+                    Some(&previous),
+                )
+            })
+            .await
+            .map_err(|error| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.validation_worker",
+                    format!("candidate validation worker failed: {error}"),
+                )
+            })?
+            .map(|_| ())
+            .map_err(|error| {
+                oxidase_runtime::CandidateStoreError::new(error.code(), error.message())
+            })
+        })
+        .await;
+    match outcome {
+        Ok(outcome) => admin_json_value_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "schema_version": "oxidase.admin/v1",
+                "digest": outcome.candidate.digest,
+                "status": outcome.candidate.status,
+                "idempotent_replay": outcome.idempotent_replay
+            }),
+            method,
+        ),
+        Err(error) => admin_candidate_error_response(&error, method),
+    }
+}
+
+async fn activate_admin_candidate(
+    digest: oxidase_bundle::BundleDigest,
+    control: &AdminControlPlane,
+    context: &oxidase_runtime::CandidateOperationContext,
+    expected_version: &str,
+    rollback: bool,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let bundle_path = control.candidates.candidate_path(digest);
+    let deployment_root = control.deployment_root.clone();
+    let reload = control.reload.clone();
+    let expected_version = expected_version.to_owned();
+    let activate = move |archive: Arc<oxidase_bundle::BundleArchive>| async move {
+        let previous = reload.current_snapshot();
+        if previous.config_version.as_str() != expected_version {
+            return Err(oxidase_runtime::CandidateStoreError::new(
+                "candidate.precondition",
+                "current snapshot changed before candidate preparation",
+            ));
+        }
+        let prepared = tokio::task::spawn_blocking(move || {
+            oxidase_runtime::prepare_bundle_archive(
+                &archive,
+                &bundle_path,
+                &deployment_root,
+                Some(&previous),
+            )
+        })
+        .await
+        .map_err(|error| {
+            oxidase_runtime::CandidateStoreError::new(
+                "candidate.activation_worker",
+                format!("candidate activation worker failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            oxidase_runtime::CandidateStoreError::new(error.code(), error.message())
+        })?;
+        let report = reload
+            .activate_prepared(prepared.snapshot, prepared.reuse, expected_version)
+            .await
+            .map_err(|error| {
+                oxidase_runtime::CandidateStoreError::new(
+                    if matches!(error, ServerError::PreconditionFailed) {
+                        "candidate.precondition"
+                    } else {
+                        "candidate.activation"
+                    },
+                    error.to_string(),
+                )
+            })?;
+        Ok(report.current_version)
+    };
+    let outcome = if rollback {
+        control.candidates.rollback(digest, context, activate).await
+    } else {
+        control
+            .candidates
+            .activate_candidate(digest, context, activate)
+            .await
+    };
+    match outcome {
+        Ok(outcome) => admin_json_value_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "schema_version": "oxidase.admin/v1",
+                "digest": outcome.digest,
+                "version": outcome.current_version,
+                "previous_version": outcome.previous_version,
+                "idempotent_replay": outcome.idempotent_replay,
+                "already_current": outcome.already_current
+            }),
+            method,
+        ),
+        Err(error) => admin_candidate_error_response(&error, method),
+    }
+}
+
+async fn stage_admin_candidate(
+    body: Incoming,
+    control: &AdminControlPlane,
+    context: oxidase_runtime::CandidateOperationContext,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let spool = match tokio::time::timeout(
+        ADMIN_MUTATION_TIMEOUT,
+        spool_admin_upload(
+            body,
+            control.upload_directory.clone(),
+            control.max_candidate_bytes,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(spool)) => spool,
+        Ok(Err(error)) => return admin_code_response(error.status, error.code, method),
+        Err(_) => {
+            return admin_code_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "admin.request_timeout",
+                method,
+            );
+        }
+    };
+    let outcome = control
+        .candidates
+        .stage_file(spool.to_path_buf(), context)
+        .await;
+    drop(spool);
+    match outcome {
+        Ok(outcome) => admin_json_value_response(
+            if outcome.already_present {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            &serde_json::json!({
+                "schema_version": "oxidase.admin/v1",
+                "digest": outcome.candidate.digest,
+                "status": outcome.candidate.status,
+                "already_present": outcome.already_present
+            }),
+            method,
+        ),
+        Err(error) => admin_candidate_error_response(&error, method),
+    }
+}
+
+struct AdminUploadError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+async fn spool_admin_upload(
+    mut body: Incoming,
+    directory: PathBuf,
+    max_bytes: u64,
+) -> Result<tempfile::TempPath, AdminUploadError> {
+    let temporary = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(directory))
+        .await
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "admin.upload_worker",
+        })?
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "admin.upload_io",
+        })?;
+    let (file, path) = temporary.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut received = 0_u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.request_body",
+        })?;
+        if let Some(data) = frame.data_ref() {
+            received = received
+                .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+                .ok_or(AdminUploadError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "admin.payload_too_large",
+                })?;
+            if received > max_bytes {
+                return Err(AdminUploadError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "admin.payload_too_large",
+                });
+            }
+            file.write_all(data).await.map_err(|_| AdminUploadError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "admin.upload_io",
+            })?;
+        } else if frame.trailers_ref().is_some() {
+            return Err(AdminUploadError {
+                status: StatusCode::BAD_REQUEST,
+                code: "admin.request_trailers",
+            });
+        }
+    }
+    file.flush().await.map_err(|_| AdminUploadError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "admin.upload_io",
+    })?;
+    file.sync_all().await.map_err(|_| AdminUploadError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "admin.upload_io",
+    })?;
+    drop(file);
+    Ok(path)
+}
+
+fn admin_candidate_error_response(
+    error: &oxidase_runtime::CandidateStoreError,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let status = match error.code() {
+        "candidate.not_found" => StatusCode::NOT_FOUND,
+        "candidate.precondition" => StatusCode::PRECONDITION_FAILED,
+        "candidate.capacity" => StatusCode::SERVICE_UNAVAILABLE,
+        "candidate.limit" => StatusCode::PAYLOAD_TOO_LARGE,
+        "candidate.idempotency_conflict" => StatusCode::CONFLICT,
+        code if code.starts_with("bundle.") => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    tracing::warn!(code = error.code(), error = %error, "admin candidate operation failed");
+    admin_code_response(status, error.code(), method)
+}
+
+fn admin_code_response(
+    status: StatusCode,
+    code: &'static str,
+    method: &Method,
+) -> Response<GatewayBody> {
+    admin_json_value_response(
+        status,
+        &serde_json::json!({
+            "schema_version": "oxidase.admin/v1",
+            "code": code
+        }),
+        method,
+    )
+}
+
+fn admin_json_value_response(
+    status: StatusCode,
+    value: &serde_json::Value,
+    method: &Method,
+) -> Response<GatewayBody> {
+    match serde_json::to_vec(value) {
+        Ok(body) => admin_response(
+            status,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"code\":\"admin.serialization_failed\"}\n"),
+            method,
+        ),
+    }
+}
+
+fn admin_security_response(
+    error: crate::admin::AdminSecurityError,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let body = serde_json::json!({
+        "schema_version": "oxidase.admin/v1",
+        "code": error.code()
+    });
+    let bytes = serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::from_static(b"{\"code\":\"admin.internal\"}\n"));
+    let mut response = admin_response(
+        error.status(),
+        "application/json; charset=utf-8",
+        bytes,
+        method,
+    );
+    if error.status() == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"oxidase-admin\""),
+        );
+    }
+    response
+}
+
+#[derive(Serialize)]
+struct RuntimeAdminResponse<'a> {
+    schema_version: &'static str,
+    config_version: &'a str,
+    listener_count: usize,
+    cluster_count: usize,
+    site_count: usize,
+}
+
+fn current_runtime_admin_response(
+    snapshot: &RuntimeSnapshot,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let response = RuntimeAdminResponse {
+        schema_version: "oxidase.admin/v1",
+        config_version: snapshot.config_version.as_str(),
+        listener_count: snapshot.listeners.len(),
+        cluster_count: snapshot.resources.clusters.len(),
+        site_count: snapshot.resources.sites.len(),
+    };
+    json_admin_response(&response, method)
+}
+
+#[derive(Serialize)]
+struct SnapshotListAdminResponse<'a> {
+    schema_version: &'static str,
+    current: &'a str,
+    snapshots: [&'a str; 1],
+}
+
+fn snapshot_list_admin_response(
+    snapshot: &RuntimeSnapshot,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let version = snapshot.config_version.as_str();
+    json_admin_response(
+        &SnapshotListAdminResponse {
+            schema_version: "oxidase.admin/v1",
+            current: version,
+            snapshots: [version],
+        },
+        method,
+    )
+}
+
+fn json_admin_response(value: &impl Serialize, method: &Method) -> Response<GatewayBody> {
+    match serde_json::to_vec(value) {
+        Ok(body) => admin_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":{\"code\":\"admin.serialization_failed\"}}\n"),
+            method,
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -2110,6 +3238,20 @@ impl std::error::Error for ReloadError {}
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("invalid administration listener configuration: {0}")]
+    AdminConfiguration(String),
+    #[error("cannot prepare administration transport: {0}")]
+    AdminPreparation(Box<Diagnostic>),
+    #[error("snapshot activation precondition failed")]
+    PreconditionFailed,
+    #[cfg(unix)]
+    #[error("cannot bind administration Unix socket `{path}`: {source}")]
+    AdminUnixBind {
+        path: PathBuf,
+        source_span: Box<SourceSpan>,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot bind listener `{listener}` to {address}: {source}")]
     Bind {
         listener: String,
@@ -2148,6 +3290,30 @@ impl ServerError {
     #[must_use]
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         match self {
+            Self::AdminConfiguration(message) => vec![Diagnostic::new(
+                "admin.listener_configuration",
+                message.clone(),
+                SourceSpan::synthetic("admin.listen"),
+            )],
+            Self::AdminPreparation(diagnostic) => vec![diagnostic.as_ref().clone()],
+            Self::PreconditionFailed => vec![Diagnostic::new(
+                "admin.precondition_failed",
+                "snapshot activation precondition failed",
+                SourceSpan::synthetic("admin.if_match"),
+            )],
+            #[cfg(unix)]
+            Self::AdminUnixBind {
+                path,
+                source_span,
+                source,
+            } => vec![Diagnostic::new(
+                "admin.unix_bind",
+                format!(
+                    "cannot bind administration Unix socket `{}`: {source}",
+                    path.display()
+                ),
+                source_span.as_ref().clone(),
+            )],
             Self::Bind {
                 listener,
                 address,
