@@ -230,11 +230,23 @@ impl ConnectionRequestBudget {
     }
 
     pub(crate) fn try_begin(&self) -> RequestAdmission {
-        let result = self
-            .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                (used < self.max).then_some(used + 1)
-            });
+        // compare_exchange preserves Rust 1.88 support without relying on the
+        // atomic update helper renamed by newer stable toolchains.
+        let mut previous = self.used.load(Ordering::Relaxed);
+        let result = loop {
+            if previous >= self.max {
+                break Err(previous);
+            }
+            match self.used.compare_exchange_weak(
+                previous,
+                previous + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(previous) => break Ok(previous),
+                Err(actual) => previous = actual,
+            }
+        };
         match result {
             Ok(previous) if previous + 1 == self.max => RequestAdmission::LastAllowed,
             Ok(_) => RequestAdmission::Allowed,

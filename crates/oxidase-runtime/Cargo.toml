@@ -31,7 +31,7 @@ zeroize.workspace = true
 rcgen.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true
