@@ -12,6 +12,7 @@ pub(crate) struct GatewaySource {
     #[serde(default)]
     pub imports: Vec<PathBuf>,
     pub bundle: Option<BundleSource>,
+    pub admin: Option<AdminSource>,
     #[serde(default)]
     pub resources: ResourcesSource,
     #[serde(default)]
@@ -20,6 +21,176 @@ pub(crate) struct GatewaySource {
     pub listeners: Vec<ListenerSource>,
     #[serde(default)]
     pub tests: Vec<ConfigTestSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminSource {
+    pub listen: AdminListenSource,
+    pub auth: AdminAuthSource,
+    pub storage: AdminStorageSource,
+    #[serde(default)]
+    pub bundle_trust: AdminBundleTrustSource,
+    #[serde(default)]
+    pub permissions: AdminPermissionsSource,
+    #[serde(default)]
+    pub candidates: AdminCandidateLimitsSource,
+    #[serde(default)]
+    pub history: AdminHistoryLimitsSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminStorageSource {
+    pub directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminBundleTrustSource {
+    pub deployment_root: Option<PathBuf>,
+    #[serde(default)]
+    pub verification_keys: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AdminListenSource {
+    Unix(AdminUnixListenVariantSource),
+    Https(AdminHttpsListenVariantSource),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminUnixListenVariantSource {
+    pub unix: AdminUnixListenSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminHttpsListenVariantSource {
+    pub https: AdminHttpsListenSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminUnixListenSource {
+    pub path: PathBuf,
+    #[serde(default = "default_admin_unix_mode")]
+    pub mode: String,
+}
+
+fn default_admin_unix_mode() -> String {
+    "0660".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminHttpsListenSource {
+    pub bind: String,
+    pub certificate: String,
+    #[serde(default)]
+    pub client_auth: ClientAuthSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminAuthSource {
+    pub mode: String,
+    pub token_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminPermissionsSource {
+    #[serde(default = "default_true")]
+    pub read: bool,
+    #[serde(default)]
+    pub stage: bool,
+    #[serde(default)]
+    pub activate: bool,
+    #[serde(default)]
+    pub rollback: bool,
+    #[serde(default)]
+    pub drain: bool,
+    #[serde(default)]
+    pub reload_source: bool,
+}
+
+impl Default for AdminPermissionsSource {
+    fn default() -> Self {
+        Self {
+            read: true,
+            stage: false,
+            activate: false,
+            rollback: false,
+            drain: false,
+            reload_source: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminCandidateLimitsSource {
+    #[serde(default = "default_admin_candidate_count")]
+    pub max_count: u32,
+    #[serde(default = "default_admin_candidate_total_bytes")]
+    pub max_bytes: String,
+    #[serde(default = "default_admin_candidate_bytes")]
+    pub max_candidate_bytes: String,
+}
+
+impl Default for AdminCandidateLimitsSource {
+    fn default() -> Self {
+        Self {
+            max_count: default_admin_candidate_count(),
+            max_bytes: default_admin_candidate_total_bytes(),
+            max_candidate_bytes: default_admin_candidate_bytes(),
+        }
+    }
+}
+
+fn default_admin_candidate_count() -> u32 {
+    8
+}
+
+fn default_admin_candidate_total_bytes() -> String {
+    "512MiB".to_owned()
+}
+
+fn default_admin_candidate_bytes() -> String {
+    "256MiB".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminHistoryLimitsSource {
+    #[serde(default = "default_admin_history_count")]
+    pub max_snapshots: u32,
+    #[serde(default = "default_admin_history_bytes")]
+    pub max_bytes: String,
+}
+
+impl Default for AdminHistoryLimitsSource {
+    fn default() -> Self {
+        Self {
+            max_snapshots: default_admin_history_count(),
+            max_bytes: default_admin_history_bytes(),
+        }
+    }
+}
+
+fn default_admin_history_count() -> u32 {
+    5
+}
+
+fn default_admin_history_bytes() -> String {
+    "1GiB".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
