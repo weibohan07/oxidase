@@ -1,11 +1,11 @@
 # Implementation status
 
-Last updated: 2026-08-30
+Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-portable-bundles`
-- public starting point: v0.4 trust/mTLS merge `8f45b04`
+- active milestone branch: `feat/v0.4-secure-control-plane`
+- public starting point: v0.4 portable-Bundle merge `e018b2e`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -224,8 +224,8 @@ Last updated: 2026-08-30
   and a full non-evictable key map fail closed with 429.
 - Peer and rate-key expiry use ordered bounded indexes rather than scanning the full
   configured capacity for each rotating rejected identity. Completed data-plane and
-  admin connection tasks are reaped between accepts; the current admin listener has
-  a fixed 256-live-connection safety cap pending its source-level control plane.
+  admin connection tasks are reaped between accepts; the admin listener has a fixed
+  256-live-connection safety cap.
 - Concurrency queues are bounded to `max_in_flight`; `queue_timeout: 0ms` is
   fail-fast. Concurrency state reuses the compiler-owned Service identity across
   compatible reloads so old active work remains counted while a new limit governs
@@ -407,6 +407,23 @@ Last updated: 2026-08-30
   signature policy, capability, sensitive reference, or portable section prevents
   publication rather than partially replacing the current snapshot.
 
+## PR5 work in progress
+
+- The optional top-level `admin` block compiles to portable Admin policy for Unix
+  sockets or HTTPS, bearer/mTLS authentication, independent permissions, local
+  storage limits, and trusted Ed25519 Bundle verification keys. The server has
+  read routes and signed candidate stage/validate/activate/rollback handlers; the
+  CLI has explicit `ctl --unix` and `ctl --https` clients. These changes remain
+  unfinished and are not classified as a completed milestone.
+- Candidate storage is content-addressed and bounded, with retained activation
+  descriptors and a process-local audit ring. Shared Bundle activation preparation
+  is consumed by the CLI and server. The limitations below qualify these paths;
+  see `docs/admin-api.md` and ADR 0012 for the current API and design boundary.
+- No Hosted validation is established for the current PR5 changes. Local checks
+  and Hosted qualification are separate evidence; the existing milestone evidence
+  above does not qualify this implementation. The release version remains
+  `0.3.0-alpha.1`.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
@@ -415,9 +432,12 @@ Last updated: 2026-08-30
   HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
 - Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
-- Authenticated/staged Admin activation and rollback, DNS/SRV discovery, standard
-  access-log/OpenTelemetry export, and deployment/release packaging remain future
-  v0.4 PRs.
+- Complete Admin audit delivery, Admin policy/transport reload reconciliation,
+  retained-history read responses, and independent drain/source-reload-only
+  operation are not implemented. PR5's partial authenticated/staged activation
+  implementation is described above.
+- DNS/SRV discovery, standard access-log/OpenTelemetry export, and deployment/release
+  packaging remain future v0.4 PRs.
 
 ## Known limitations
 
@@ -489,8 +509,27 @@ Last updated: 2026-08-30
   and ordinary add/remove/address transitions are supported.
 - Redirects currently allow only local absolute paths. Intentional cross-origin
   redirects require a future explicit allow policy.
-- The admin listener is CLI-configured rather than part of the gateway source and is
-  not dynamically rebound during config reload.
+- Admin can be configured in Gateway source. The legacy CLI-configured read-only
+  listener is restricted to loopback. The bound Admin transport, authentication
+  mode and Secret identity, permissions, TLS configuration, Bundle verification
+  keys, and candidate-store settings remain fixed at startup; changing these
+  settings requires a restart. Source reload and Bundle activation do not reconcile
+  the bound Admin listener or revoke its previous permission policy.
+- A configuration granting only Admin `drain` and/or `reload_source` compiles but
+  its mutations return `503 admin.control_unavailable`: current mutation handling
+  is constructed only with stage/activate/rollback candidate storage enabled.
+- Admin `/api/v1/snapshots` exposes only the current config version as a one-entry
+  list, not retained activation history. `/api/v1/runtime` reports the current
+  version and counts, not the full runtime capabilities. API JSON errors currently
+  use `oxidase.admin/v1` plus `code`, separately from CLI diagnostic envelopes.
+- Admin auditing covers only some CandidateStore paths in a bounded process-local
+  memory ring. Early failures, idempotent paths, drain, and source reload are not
+  comprehensively audited; there is no configured output sink, durable delivery,
+  or drop counter. Candidate validation, staging work after upload, and activation
+  also lack a total execution deadline.
+- Signed Admin Bundles can retain explicit absolute runtime references as well as
+  deployment-relative references. `admin.bundle_trust.deployment_root` is an
+  explicit resolution base, not a general filesystem sandbox.
 - Ingress governance is local to one Oxidase process. There is no trusted-proxy
   client-identity policy, distributed rate-limit store, cross-process connection
   budget, or arbitrary Header-derived limiter key. The actual kernel peer address is
@@ -503,6 +542,9 @@ Last updated: 2026-08-30
 
 ## Validation boundary
 
+- PR5 remains work in progress with no established Hosted validation for the
+  current changes. Passing local checks does not establish Hosted or deployment
+  qualification.
 - Every milestone PR is required to pass the locked Rust 1.88 check/test, stable
   fmt/Clippy/test/doc/release-build, cargo-deny, and fuzz compile jobs before normal
   protected-main merge. Evidence is commit-specific; a green older workflow is not
@@ -525,8 +567,9 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Build the authenticated Admin API with bounded candidate storage, signature-
-   required stage/validate/activate, rollback history, RBAC, and audit redaction.
+1. Complete PR5 Admin behavior: restart/reload policy boundaries, independent
+   drain/source-reload permissions, history read responses, bounded execution,
+   comprehensive audit delivery, and commit-specific Hosted qualification.
 2. Add commit-activated DNS/SRV discovery, deterministic endpoint reconciliation,
    address policy, stale-if-error, and separate upstream phase timeouts.
 3. Add bounded access logs and optional OpenTelemetry, deployment packaging, release
