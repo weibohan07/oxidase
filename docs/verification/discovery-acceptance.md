@@ -69,6 +69,27 @@ build errors while collaborators were editing unfrozen APIs were not acceptance
 runs; only the subsequent frozen-source receipts qualify those changes. SRV and
 the 6D fuzz/Linux campaign remain NOT RUN, not implied by these local results.
 
+### Frozen implementation local gates and actual Hosted failure
+
+Frozen implementation `250b285044a9d1c969d8eaad5d98f14dfa60afe0` passed all nine
+local gates listed below, including both entire workspace test runs. Raw output:
+`artifacts/discovery-6b-250b285-local-gates.log.gz`. This is macOS evidence, not
+the subsequent Hosted outcome.
+
+That exact head ran [PR run `37136494778`](https://github.com/weibohan07/oxidase/actions/runs/37136494778).
+MSRV 1.88, Dependency policy and Fuzz harness compile smoke PASS. Stable workspace
+FAIL at Clippy; its tests/release/docs were skipped. GitHub used Rust 1.99, which
+deprecates `AtomicU64::fetch_update`; local stable was 1.97.1. Raw failing job:
+`artifacts/discovery-6b-pr17-37136494778-stable-failure.log.gz`.
+
+The repair uses a checked compare-exchange loop supported by Rust 1.88 and newer
+stable, without a warning suppression or MSRV increase. Regression
+`endpoint_incarnation_cas_is_unique_under_race_and_fails_closed_at_exhaustion`
+proves 2,048 concurrent unique claims and no rollover after `u64::MAX`. Stable
+and Rust 1.88 discovery tests pass 18/18 after the repair. The repaired final head
+requires its own four checks and an independent merged-main run; neither the
+old macOS PASS nor the receipt-only Draft run qualifies it.
+
 ## 6A historical gates and Hosted-failure investigation
 
 ### Actual PR 16 Hosted failure
@@ -176,8 +197,8 @@ is committed as `44489c5` (`feat(proxy): enforce transport identity and absolute
 upstream deadlines`). All nine gates below PASS; full output is retained in
 `artifacts/discovery-6a-local-gates.log.gz`. The following `b105021` documentation
 head failed Hosted run `37129738230`; the later `f023764` repair has its own fresh
-nine-gate PASS receipt above. Repaired final PR-head and merged-main Hosted
-receipts are pending.
+nine-gate PASS receipt above. The final 6A PR-head and independent merged-main
+receipts are recorded in the protected delivery section at the top of this file.
 
 | Actual command | Local result |
 | --- | --- |

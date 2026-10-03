@@ -1708,11 +1708,7 @@ impl PreparedCluster {
                 endpoints.push(endpoint);
                 continue;
             }
-            let Ok(previous_incarnation) = self.runtime.endpoint_incarnations.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |incarnation| incarnation.checked_add(1),
-            ) else {
+            let Some(incarnation) = self.runtime.claim_endpoint_incarnation() else {
                 desired.clear();
                 endpoints.clear();
                 membership.families = [
@@ -1758,7 +1754,7 @@ impl PreparedCluster {
                 state,
                 dynamic: Some(DynamicEndpointIdentity {
                     target: *target,
-                    incarnation: previous_incarnation + 1,
+                    incarnation,
                     logical_target: plan.name.clone(),
                     owner: Arc::clone(&membership.owner),
                 }),
@@ -2257,6 +2253,28 @@ struct ClusterRuntimeState {
     retry_exhausted: AtomicU64,
     overload_rejections: AtomicU64,
     unavailable_rejections: AtomicU64,
+}
+
+impl ClusterRuntimeState {
+    /// Checked CAS is supported by Rust 1.88 as well as current stable. The
+    /// newer `try_update` spelling is unavailable on our MSRV, while its older
+    /// `fetch_update` spelling is now deprecated on Hosted stable. Never wrap
+    /// this serial: old pool/callback incarnations must remain distinguishable.
+    fn claim_endpoint_incarnation(&self) -> Option<u64> {
+        let mut previous = self.endpoint_incarnations.load(Ordering::Acquire);
+        loop {
+            let next = previous.checked_add(1)?;
+            match self.endpoint_incarnations.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(next),
+                Err(actual) => previous = actual,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3415,6 +3433,48 @@ mod discovery_membership_tests {
         DnsResolverSource, DnsResolverSpec,
     };
     use oxidase_core::SourceSpan;
+
+    #[test]
+    fn endpoint_incarnation_cas_is_unique_under_race_and_fails_closed_at_exhaustion() {
+        let runtime = Arc::new(ClusterRuntimeState::default());
+        let started = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let started = Arc::clone(&started);
+                std::thread::spawn(move || {
+                    started.wait();
+                    (0..256)
+                        .map(|_| {
+                            runtime
+                                .claim_endpoint_incarnation()
+                                .expect("bounded serial")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let all = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("worker succeeds"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            all,
+            (1..=2048).collect(),
+            "no incarnation can be reused across concurrent owners"
+        );
+        runtime
+            .endpoint_incarnations
+            .store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(runtime.claim_endpoint_incarnation(), Some(u64::MAX));
+        assert_eq!(runtime.claim_endpoint_incarnation(), None);
+        assert_eq!(runtime.claim_endpoint_incarnation(), None);
+        assert_eq!(
+            runtime.endpoint_incarnations.load(Ordering::Acquire),
+            u64::MAX,
+            "overflow cannot resurrect old pool identities"
+        );
+    }
 
     fn dynamic_spec() -> ClusterSpec {
         let mut spec = super::tests::cluster(LoadBalancePolicy::RoundRobin, Vec::new());
