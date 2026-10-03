@@ -103,6 +103,10 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
         true
     );
     assert_eq!(
+        summary["retained_stream_proof"]["successful_new_b_streams"],
+        8
+    );
+    assert_eq!(
         summary["retained_stream_proof"]["gateway_cancelled_termination_delta"],
         1
     );

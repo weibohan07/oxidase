@@ -912,6 +912,23 @@ struct RetainedProofPlan<'a> {
     payload_size: usize,
 }
 
+fn validate_completed_new_b_stream(
+    response: (u16, u64, bool),
+    payload_size: usize,
+) -> Result<(), SoakError> {
+    let (status, bytes, was_cancelled) = response;
+    let expected_bytes = u64::try_from(payload_size)
+        .ok()
+        .and_then(|size| size.checked_add(5))
+        .ok_or_else(|| fail("new B stream proof payload size overflow"))?;
+    if status != 200 || was_cancelled || bytes != expected_bytes {
+        return Err(fail(format!(
+            "new B stream proof requires a complete validated 200 response: status={status}, bytes={bytes}, cancelled={was_cancelled}"
+        )));
+    }
+    Ok(())
+}
+
 async fn retained_stream_proof(
     plan: RetainedProofPlan<'_>,
     dns: &mut FixtureProcess,
@@ -973,8 +990,14 @@ async fn retained_stream_proof(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let mut successful_new_b_streams = 0;
     for _ in 0..8 {
-        client.request(true, false, Some("b")).await?;
+        // request() has already checked the actual B socket, fixed SNI,
+        // authority, path, every opaque gRPC byte and the final trailers. A
+        // non-200 response skips those checks, so it cannot count as proof.
+        let response = client.request(true, false, Some("b")).await?;
+        validate_completed_new_b_stream(response, payload_size)?;
+        successful_new_b_streams += 1;
     }
     let normal_drops = upstream.command(FixtureCommand::Status).await?["body_drops"]
         .as_u64()
@@ -1085,7 +1108,7 @@ async fn retained_stream_proof(
     })
     .await?;
     Ok(
-        json!({"held_h2_grpc_completed":true,"grpc_status_trailer":true,"opaque_grpc_bytes_verified":true,"gateway_cancelled_termination_delta":cancelled_delta,"fixture_unreleased_body_drop_delta":1,"upgrade_across_withdrawal_and_publication":true,"withdrawn_endpoint_new_streams":0,"unchanged_dns_runtime":before,"after_dns":after_dns,"after_activate":after_activate}),
+        json!({"held_h2_grpc_completed":true,"grpc_status_trailer":true,"opaque_grpc_bytes_verified":true,"gateway_cancelled_termination_delta":cancelled_delta,"fixture_unreleased_body_drop_delta":1,"upgrade_across_withdrawal_and_publication":true,"successful_new_b_streams":successful_new_b_streams,"withdrawn_endpoint_new_streams":0,"unchanged_dns_runtime":before,"after_dns":after_dns,"after_activate":after_activate}),
     )
 }
 
@@ -1757,6 +1780,25 @@ mod tests {
                 .push(&Bytes::from_static(&[0, 0, 0, 0, 2, b'x', b'y']))
                 .is_err()
         );
+    }
+    #[test]
+    fn new_b_stream_proof_requires_complete_validated_200_without_cancellation() {
+        validate_completed_new_b_stream((200, 32773, false), 32768)
+            .expect("complete five-byte gRPC header and validated payload");
+        for response in [
+            (503, 0, false),
+            (503, 32773, false),
+            (206, 32773, false),
+            (200, 0, false),
+            (200, 32772, false),
+            (200, 32774, false),
+            (200, 32773, true),
+        ] {
+            assert!(
+                validate_completed_new_b_stream(response, 32768).is_err(),
+                "invalid response cannot contribute to the eight-stream proof: {response:?}"
+            );
+        }
     }
     #[test]
     fn campaign_argument_limits_bound_memory_and_control_artifacts() {
