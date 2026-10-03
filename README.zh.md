@@ -42,8 +42,10 @@ workspace 仍为 `0.3.0-alpha.1`。第六阶段 6A 分离 HTTP/TLS 逻辑身份�
 pre-response 期限。旧计时模式保留并给出迁移 warning，新 Bundle 语义须声明 capability。
 详见[上游超时](docs/configuration/upstream-timeouts.md)。6B 增加有界 A/AAAA 动态发现：
 尊重各记录 TTL，仅对指定暂时错误使用有限 stale 宽限，直拨已批准地址。
-DNS 更新不发布配置、不改变 Admin ETag，也不能恢复 drain 后的流量；SRV 仍由下一子阶段
-单独开放。详见[动态发现](docs/configuration/discovery.md)和
+DNS 更新不发布配置、不改变 Admin ETag，也不能恢复 drain 后的流量。6C 增加 SRV 两层
+选择：先选健康可用的最低 priority，再按完整 16 位权重选择 target，最后选择其地址。
+SRV 不改变 HTTP authority 或 TLS 验证/SNI 身份；移除成员后不再发新 lease，已开始的流可完成。
+详见[动态发现](docs/configuration/discovery.md)和
 [实际验收记录](docs/verification/discovery-acceptance.md)。OpenTelemetry 与打包不在本任务
 范围内，也不代表 production-ready。
 

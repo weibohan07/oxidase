@@ -8,6 +8,7 @@ use oxidase_core::SourceSpan;
 use url::Url;
 
 pub const DNS_ADDRESS_DISCOVERY_FEATURE: &str = "dns-address-discovery";
+pub const DNS_SRV_DISCOVERY_FEATURE: &str = "dns-srv-discovery";
 pub const MAX_DNS_DISCOVERY_CLUSTERS: usize = 128;
 pub const MAX_DNS_NAMESERVERS: usize = 4;
 pub const MAX_DNS_ENDPOINTS: u16 = 256;
@@ -19,6 +20,7 @@ pub const MAX_DNS_RESPONSE_BYTES: usize = 65_535;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsRecordType {
     AAndAaaa,
+    Srv,
 }
 
 impl DnsRecordType {
@@ -26,6 +28,7 @@ impl DnsRecordType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AAndAaaa => "a_aaaa",
+            Self::Srv => "srv",
         }
     }
 }
@@ -113,8 +116,8 @@ pub struct DnsDiscoverySpec {
     /// Canonical lower-case absolute DNS name, including its final dot.
     pub name: String,
     pub record: DnsRecordType,
-    /// Physical dial port; the fixed logical origin may use a different port.
-    pub port: u16,
+    /// A/AAAA physical dial port. SRV uses each target RR port and has no override.
+    pub port: Option<u16>,
     pub origin: Url,
     pub resolver: DnsResolverSpec,
     pub refresh: DnsRefreshSpec,
@@ -132,14 +135,31 @@ impl DnsDiscoverySpec {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DnsPolicyError> {
-        if normalize_dns_name(&self.name)? != self.name {
+        let name = match self.record {
+            DnsRecordType::AAndAaaa => normalize_dns_name(&self.name)?,
+            DnsRecordType::Srv => normalize_srv_name(&self.name)?,
+        };
+        if name != self.name {
             return Err(policy_error(
                 "name",
                 "DNS name must be canonical lower-case FQDN",
             ));
         }
-        if self.port == 0 {
-            return Err(policy_error("port", "DNS dial port must be in 1..=65535"));
+        match (self.record, self.port) {
+            (DnsRecordType::AAndAaaa, Some(port)) if port != 0 => {}
+            (DnsRecordType::Srv, None) => {}
+            (DnsRecordType::AAndAaaa, _) => {
+                return Err(policy_error(
+                    "port",
+                    "A/AAAA DNS dial port must be in 1..=65535",
+                ));
+            }
+            (DnsRecordType::Srv, Some(_)) => {
+                return Err(policy_error(
+                    "port",
+                    "SRV dial ports come from the records; no fixed port may be configured",
+                ));
+            }
         }
         validate_dns_origin(&self.origin)?;
         validate_dns_duration("resolver.query_timeout", self.resolver.query_timeout, false)?;
@@ -229,6 +249,35 @@ pub(crate) fn normalize_dns_name(source: &str) -> Result<String, DnsPolicyError>
         ));
     }
     Ok(format!("{}.", name.to_ascii_lowercase()))
+}
+
+/// SRV query grammar is deliberately separate from HTTP/TLS hostname grammar.
+pub(crate) fn normalize_srv_name(source: &str) -> Result<String, DnsPolicyError> {
+    let name = source.strip_suffix('.').unwrap_or(source);
+    let mut parts = name.splitn(3, '.');
+    let service = parts.next().unwrap_or_default();
+    let transport = parts.next().unwrap_or_default();
+    let host = parts.next().unwrap_or_default();
+    let label = service.strip_prefix('_').unwrap_or_default();
+    if name.len() > 253
+        || !name.is_ascii()
+        || host.ends_with('.')
+        || label.is_empty()
+        || service.len() > 63
+        || label.starts_with('-')
+        || label.ends_with('-')
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !transport.eq_ignore_ascii_case("_tcp")
+    {
+        return Err(policy_error(
+            "name",
+            "use the ASCII SRV question `_service._tcp.hostname`; UDP, wildcards and empty service labels are unsupported",
+        ));
+    }
+    let host = normalize_dns_name(host).map_err(|_| policy_error("name", "SRV question must end in a plain ASCII DNS hostname, not an IP, service label or zone identifier"))?;
+    Ok(format!("{}._tcp.{host}", service.to_ascii_lowercase()))
 }
 
 pub(crate) fn validate_dns_origin(origin: &Url) -> Result<(), DnsPolicyError> {

@@ -1794,7 +1794,12 @@ impl PortableClusterV1 {
 pub struct PortableDnsDiscoveryV1 {
     pub name: String,
     pub record: String,
-    pub port: u16,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_dns_port"
+    )]
+    pub port: Option<u16>,
     pub origin: String,
     pub resolver: PortableDnsResolverV1,
     pub refresh: PortableDnsRefreshV1,
@@ -1876,12 +1881,16 @@ impl PortableDnsDiscoveryV1 {
     }
 
     fn compile(&self) -> Result<DnsDiscoverySpec, PortableConfigError> {
-        if self.record != "a_aaaa" {
-            return Err(invalid(
-                "clusters.discovery.dns.record",
-                "only a_aaaa is supported; SRV is not implemented in phase 6B",
-            ));
-        }
+        let record = match self.record.as_str() {
+            "a_aaaa" => DnsRecordType::AAndAaaa,
+            "srv" => DnsRecordType::Srv,
+            _ => {
+                return Err(invalid(
+                    "clusters.discovery.dns.record",
+                    "expected a_aaaa or srv",
+                ));
+            }
+        };
         let source = match self.resolver.mode.as_str() {
             "system" if self.resolver.nameservers.is_empty() => DnsResolverSource::System,
             "nameservers" => DnsResolverSource::NameServers(
@@ -1908,7 +1917,7 @@ impl PortableDnsDiscoveryV1 {
         };
         let policy = DnsDiscoverySpec {
             name: self.name.clone(),
-            record: DnsRecordType::AAndAaaa,
+            record,
             port: self.port,
             origin: parse_dns_origin(&self.origin).map_err(|error| {
                 invalid(
@@ -1958,6 +1967,14 @@ impl PortableDnsDiscoveryV1 {
         })?;
         Ok(policy)
     }
+}
+
+fn deserialize_present_dns_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Missing is supplied by serde(default); a present null is never omission.
+    u16::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

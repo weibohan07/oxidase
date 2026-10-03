@@ -1,10 +1,13 @@
-# DNS address discovery (phase 6B)
+# DNS address and SRV discovery (phases 6B–6C)
 
-Phase 6B adds A/AAAA address discovery to the existing Cluster/Proxy data plane.
+Phase 6B adds A/AAAA address discovery; phase 6C adds SRV target groups to the
+same existing Cluster/Proxy data plane.
 This is alpha policy, not a DNS resolver product or a stable configuration API.
 The implementation and its final Hosted/qualification evidence are tracked
 separately in [the acceptance ledger](../verification/discovery-acceptance.md).
-SRV is explicitly rejected in this stage; it is a separate phase 6C delivery.
+The selection contract is also recorded in
+[ADR 0015](../adr/0015-srv-target-selection.md). Code and local tests are not a
+substitute for the separate final-head Hosted checks or phase-6D campaigns.
 
 ## Configuration
 
@@ -51,16 +54,34 @@ resources:
         pre_response_total: 60s
 ```
 
-`name` is an ASCII hostname, canonicalized to lower case with a final DNS dot.
-An optional input trailing dot is accepted; IP literals, wildcards, underscores,
-empty labels and IPv6 zone identifiers are not accepted. `record` defaults to
-`a_aaaa`; `srv` produces a precise unsupported-phase diagnostic rather than an
-inert plan. `port` is required and is `1..=65535`.
+For `record: a_aaaa` (the default), `name` is an ASCII hostname, canonicalized to
+lower case with a final DNS dot. An optional single input trailing dot is accepted;
+IP literals, wildcards, underscores, empty labels and IPv6 zone identifiers are
+not accepted. `port` is required and is `1..=65535`.
+
+For `record: srv`, use the separate `_service._tcp.hostname` query grammar and
+omit `port` entirely, including null. The port comes from each SRV record:
+
+```yaml
+discovery:
+  dns:
+    name: _https._tcp.api.internal.example
+    record: srv
+    origin: https://api.internal.example/base/
+    resolver:
+      nameservers: [10.0.0.53:53]
+```
+
+The SRV service/transport labels do not become TLS names. The service label is
+nonempty ASCII letters/digits/hyphens with a leading underscore; `_tcp` is the
+only accepted transport because the data plane dials TCP. `_udp`, wildcard/IP
+suffixes, empty labels and multiple final dots fail at the name's source span.
+Input case normalizes to a lower-case FQDN. Unknown record types are rejected.
 
 `origin` is a fixed HTTP(S) logical authority and optional base path, without
 credentials, query, fragment or control characters. Its authority port and the
-physical DNS dial `port` may differ deliberately. DNS answers do not choose the
-scheme, HTTP Host/H2 authority, base path, SNI/verification name, Trust Store or
+physical A/AAAA dial `port` or SRV record port may differ deliberately. DNS answers
+do not choose the scheme, HTTP Host/H2 authority, base path, SNI/verification name, Trust Store or
 client certificate. Existing [upstream TLS/mTLS policy](mtls.md) applies to
 HTTPS discovery origins even before any addresses are resolved.
 
@@ -81,7 +102,8 @@ validation, DoH, DoT, mDNS or a service registry.
 Per candidate, at most 128 discovery Clusters are accepted. Each policy permits
 `max_endpoints` in `1..=256` (default 256), a cap on physical members across both
 families, and `max_targets` in `1..=32` (default 32), a cap on distinct logical
-query/CNAME names including the initial name—not IP address count. Resolver
+query/CNAME names including the initial service name and distinct SRV targets—not
+IP address count. Resolver
 responses additionally have fixed limits: 512 aggregate records, 65,535 encoded
 bytes and CNAME depth 8. Parallel work, query coalescing and retained state are
 bounded by the owned runtime; application requests do not start ad-hoc lookups.
@@ -118,6 +140,12 @@ lifetime bounds where applicable. Failure backoff and response-order changes do
 not renew positive or stale deadlines. A query is coalesced per committed owner,
 not multiplied by concurrent business requests.
 
+For SRV target families, a bounded owner-local negative/failure memo avoids
+repeating target questions on every short-lived SRV refresh. Negative suppression
+is capped by `max_interval`, preserving the original SOA/CNAME expiry separately;
+memo reads cannot slide the retry deadline. Only a newly received answer can
+replace that observation. Positive address bytes are not stored in this memo.
+
 REFUSED is treated as temporary refusal by the configured resolver, not as
 authoritative name withdrawal. This project allowlist only retains previously
 approved addresses under the unchanged address/identity policy and original
@@ -126,6 +154,53 @@ the grace on repeated refusal. NXDOMAIN/NODATA remain explicit withdrawal.
 Production refresh jitter mixes OS-seeded randomness with the static Cluster
 identity; deterministic schedule tests inject a seed. Jitter changes scheduling,
 never record freshness or the stale deadline.
+
+## SRV target selection and address expansion
+
+An SRV record keeps its canonical target, port, priority, full `0..=65535` weight
+and original expiry. Target selection first uses the lowest numeric priority
+that has a health-eligible target, then applies RFC-2782-style weighting
+at that priority. Zero weights participate in the inclusive zero draw with
+randomized ordering; an all-zero priority selects uniformly. Tests inject seeds;
+production does not allocate an array proportional to the weight sum.
+
+Configured `round_robin`, `weighted_round_robin` or `least_requests` applies only
+to physical addresses within the selected target. Those address weights are one:
+three A/AAAA addresses do not triple that SRV target's weight. Admission
+saturation may try another eligible target at the same priority; it is not a
+health failure and cannot silently send traffic to a backup priority. A fully
+saturated eligible priority returns `UpstreamOverloaded`/503.
+
+Identical target/port/priority/weight records deduplicate using the smallest
+expiry. Different weights for the same target/port/priority are an invalid
+answer, independent of response order. The same target at different ports or
+priorities retains the distinct record policies. Weight/priority-only changes
+do not change physical health/pool identity; remove/re-add does create a fresh
+incarnation. The logical target is resolved once per A/AAAA family, not once per
+port or priority. The original target remains identity through a bounded CNAME
+lookup. Accepting a target alias is explicit Oxidase interoperability policy;
+operators should publish non-alias targets, and this is not a claim of strict
+RFC-2782 non-alias conformance.
+
+A sole logical SRV record with target `.` withdraws the service immediately and
+sends no target address queries. Identical dot/port/priority/weight tuples
+deduplicate even if their TTLs differ; distinct all-dot tuples or a response
+mixing `.` and ordinary targets are invalid. Missing,
+withdrawn, malformed or policy-rejected targets cannot be stale-resurrected.
+Successful SRV resolution preserves each target family's structured result:
+one slow target does not discard another target's already received addresses.
+Pending work at the one whole-round query deadline becomes a bounded timeout.
+The attempt expiry is the minimum of the SRV record, final address and every
+CNAME edge's original absolute expiry—not the time all children finish.
+
+The same closed transient-error allowlist may retain previously approved
+membership only until its original expiry plus finite grace. A failed whole
+service lookup and a failed individual target are distinct observations; neither
+renews TTL, stale lifetime or a business request's pre-response deadline.
+DNS wire record counts and encoded retained-result size are bounded across the
+round. Hickory enforces the physical 65,535-byte packet bound; raw negative/error
+EDNS bytes that the resolver discards are not falsely counted as observable
+aggregate result bytes. There is no second DNS parser to intercept those packets.
 
 ## Address policy and actual dialing
 
@@ -182,10 +257,14 @@ Offline Explain describes the policy, not an invented current address.
 Portable plans serialize only fixed discovery/resolver/origin/address/timeout
 policy and source provenance, never current answers, health, pools, generation or
 expiration timestamps. Discovery requires both `dns-address-discovery` and
-`upstream-deadlines` manifest capabilities. Missing declarations and unsupported
-features are rejected; old static Bundles remain compatible.
+`upstream-deadlines` manifest capabilities. SRV additionally requires
+`dns-srv-discovery`; an address-only runtime rejects that required feature before
+preparation. Stripping the declaration while keeping an SRV plan also fails
+before activation. Missing declarations and unsupported features are rejected;
+old static and A/AAAA Bundles remain compatible, including their numeric `port`
+encoding. SRV plans omit the port; explicit null is never equivalent to absence.
 
-SRV priority/weights, active Linux qualification and phase-six fuzz campaigns are
-not implied by this document. Their implementation/actual execution belongs to
-the separately gated stages recorded in the acceptance ledger. There is no new
+Active Linux qualification and phase-six fuzz campaigns are not implied by this
+document. Their actual execution belongs to the separately gated phase-6D stage
+recorded in the acceptance ledger. There is no new
 DNS-cache mutation API, DNSSEC claim or change to fifth-stage Admin authority.

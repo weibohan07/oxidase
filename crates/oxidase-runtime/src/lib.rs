@@ -64,6 +64,7 @@ pub use cluster::{
 };
 pub use discovery::{
     DiscoveryAddressError, DiscoveryErrorCode, DiscoveryReconcileOutcome, DiscoveryResolutionState,
-    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation,
+    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation, SrvObservation, SrvRecord,
+    SrvSelectionRng, SrvTargetAddressObservation, SrvTargetRuntimeStatus,
     normalize_discovery_address, validate_discovery_address,
 };

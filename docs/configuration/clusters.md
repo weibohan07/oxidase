@@ -57,11 +57,13 @@ resources:
 Every accepted field above has runtime meaning. Unknown fields and unsupported
 values fail compilation with a source diagnostic.
 
-For phase 6B, a Cluster can instead select A/AAAA address discovery with a fixed
-logical `origin`, explicit dial port and bounded resolver/address policy. Choose
+For phases 6B–6C, a Cluster can instead select A/AAAA or SRV discovery with a fixed
+logical `origin` and bounded resolver/address policy. A/AAAA declares a dial port;
+SRV omits it and uses each record's port. Choose
 exactly one source: `endpoints` or `discovery`, never both (even an empty endpoint
 list). See [DNS address discovery](discovery.md) for its full contract and
-separate acceptance evidence. SRV is rejected until its own phase 6C delivery.
+separate acceptance evidence. SRV priority/weight selects a logical target first;
+the configured Cluster policy selects among that target's weight-one addresses.
 
 ## Endpoints and protocol
 
@@ -192,8 +194,9 @@ discovery status is a bounded operational view, not a new publication authority.
 
 ## Current limits
 
-Phase 6B adds A/AAAA discovery under the bounded policy described above; SRV is
-explicitly not accepted yet. Cross-process health consensus, hedging, arbitrary retry scripting and
+Phases 6B–6C add bounded A/AAAA and SRV discovery. SRV's full zero-inclusive
+16-bit record weight is not the static endpoint `1..=1000` weight field.
+Cross-process health consensus, hedging, arbitrary retry scripting and
 a general circuit-breaker policy beyond bounded admission/passive ejection are
 not implemented here. New phased timeouts have independent observable boundaries
 and one logical pre-head budget; legacy `connect_timeout`/`response_timeout` remain

@@ -924,8 +924,13 @@ fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
         hash.field_bytes("discovery_contract", b"dns-address/v1")
             .field_bytes("dns_name", dns.name.as_bytes())
             .field_bytes("dns_record", dns.record.as_str().as_bytes())
-            .field_u64("dns_port", u64::from(dns.port))
             .field_bytes("dns_origin", dns.origin.as_str().as_bytes());
+        if let Some(port) = dns.port {
+            hash.field_bytes("dns_port_mode", b"fixed")
+                .field_u64("dns_port", u64::from(port));
+        } else {
+            hash.field_bytes("dns_port_mode", b"srv-record");
+        }
         match &dns.resolver.source {
             oxidase_config::DnsResolverSource::System => {
                 hash.field_bytes("dns_resolver_mode", b"system");
@@ -1230,7 +1235,9 @@ mod tests {
         let baseline = cluster_fingerprint(original);
         let mutations: &[fn(&mut oxidase_config::DnsDiscoverySpec)] = &[
             |dns| dns.name = "other.example.test.".to_owned(),
-            |dns| dns.port += 1,
+            |dns| dns.port = dns.port.map(|port| port + 1),
+            |dns| dns.port = None,
+            |dns| dns.record = oxidase_config::DnsRecordType::Srv,
             |dns| dns.origin = Url::parse("https://logical.example.test/base/").expect("origin"),
             |dns| {
                 dns.resolver.source = oxidase_config::DnsResolverSource::NameServers(vec![

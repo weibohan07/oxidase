@@ -22,10 +22,10 @@ pub use compiler::{
 };
 pub use diagnostic::{CompileError, Diagnostic};
 pub use discovery::{
-    DNS_ADDRESS_DISCOVERY_FEATURE, DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec,
-    DnsRecordType, DnsRefreshSpec, DnsResolverSource, DnsResolverSpec, MAX_DNS_CNAME_DEPTH,
-    MAX_DNS_DISCOVERY_CLUSTERS, MAX_DNS_ENDPOINTS, MAX_DNS_NAMESERVERS, MAX_DNS_RECORDS,
-    MAX_DNS_RESPONSE_BYTES, MAX_DNS_TARGETS, normalize_dns_ip,
+    DNS_ADDRESS_DISCOVERY_FEATURE, DNS_SRV_DISCOVERY_FEATURE, DnsAddressPolicy, DnsDiscoveryLimits,
+    DnsDiscoverySpec, DnsRecordType, DnsRefreshSpec, DnsResolverSource, DnsResolverSpec,
+    MAX_DNS_CNAME_DEPTH, MAX_DNS_DISCOVERY_CLUSTERS, MAX_DNS_ENDPOINTS, MAX_DNS_NAMESERVERS,
+    MAX_DNS_RECORDS, MAX_DNS_RESPONSE_BYTES, MAX_DNS_TARGETS, normalize_dns_ip,
 };
 pub use portable::{
     PORTABLE_GATEWAY_CONFIG_SCHEMA_V1, PortableAdminAuditV1, PortableAdminAuthV1,

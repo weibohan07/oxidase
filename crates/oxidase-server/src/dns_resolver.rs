@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
@@ -19,7 +20,10 @@ use oxidase_config::{
     DnsAddressPolicy, DnsDiscoverySpec, DnsResolverSource, DnsResolverSpec, MAX_DNS_CNAME_DEPTH,
     MAX_DNS_NAMESERVERS, MAX_DNS_RECORDS, MAX_DNS_RESPONSE_BYTES, normalize_dns_ip,
 };
-use oxidase_runtime::{DiscoveryErrorCode, DnsAddressRecord, DnsFamily, DnsObservation};
+use oxidase_runtime::{
+    DiscoveryErrorCode, DnsAddressRecord, DnsFamily, DnsObservation, SrvObservation, SrvRecord,
+    SrvTargetAddressObservation,
+};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -29,6 +33,7 @@ pub(crate) struct DnsResolver {
     pool: NameServerPool<TokioRuntimeProvider>,
     query_timeout: Duration,
     admission: Arc<Semaphore>,
+    target_failures: Mutex<BTreeMap<(String, bool), TargetFailureMemo>>,
 }
 
 pub(crate) struct ResolvedFamily {
@@ -36,6 +41,100 @@ pub(crate) struct ResolvedFamily {
     /// SOA-derived negative expiry only. The supervisor separately caps its
     /// next query by max_interval and applies a non-busy-loop scheduling floor.
     pub(crate) retry_after: Option<Instant>,
+}
+
+pub(crate) struct ResolvedSrv {
+    pub(crate) observation: SrvObservation,
+    /// Whole-RRset negative expiry, or the earliest target-family memo expiry
+    /// after a positive RRset. This schedules queries, never extends membership.
+    pub(crate) retry_after: Option<Instant>,
+}
+
+struct TargetFailureMemo {
+    observation: DnsObservation,
+    /// Operational query suppression, capped by the resource refresh policy.
+    not_before: Instant,
+    /// Original SOA/CNAME negative expiration; never rebased by a cache read.
+    retry_after: Option<Instant>,
+    failures: u8,
+}
+
+struct TargetResolution {
+    target: String,
+    family: DnsFamily,
+    result: ResolvedFamily,
+    cached: bool,
+}
+
+/// Counts observable results, not opaque EDNS/error bytes discarded by Hickory.
+/// Individual wire packets remain bounded by Hickory at 65,535 bytes.
+#[derive(Default)]
+struct SrvRoundBudget {
+    totals: Mutex<AnswerBudget>,
+    exhausted: AtomicBool,
+}
+
+impl SrvRoundBudget {
+    fn reserve_name(&self, name: &Name, limit: usize) -> Result<(), DnsObservation> {
+        let mut budget = self
+            .totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget.names.insert(name.clone());
+        if budget.names.len() > limit {
+            self.exhausted.store(true, Ordering::Relaxed);
+            return Err(DnsObservation::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn charge(&self, response: &DnsResponse) -> Result<(), DnsObservation> {
+        let result = self
+            .totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .charge(response);
+        if result.is_err() {
+            self.exhausted.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn charge_error(&self, error: &NetError) -> Result<(), DnsObservation> {
+        let NetError::Dns(DnsError::NoRecordsFound(records)) = error else {
+            return Ok(());
+        };
+        let mut message = hickory_resolver::proto::op::Message::error_msg(
+            0,
+            hickory_resolver::proto::op::OpCode::Query,
+            records.response_code,
+        );
+        message.queries.push((*records.query).clone());
+        if let Some(authorities) = &records.authorities {
+            message.authorities = authorities.to_vec();
+        }
+        if let Some(servers) = &records.ns {
+            for server in servers.iter() {
+                message.additionals.extend(server.glue.iter().cloned());
+            }
+        }
+        let response = DnsResponse::from_message(message).map_err(|_| {
+            self.exhausted.store(true, Ordering::Relaxed);
+            DnsObservation::LimitExceeded
+        })?;
+        self.charge(&response)
+    }
+
+    fn exhausted(&self, limit: usize) -> bool {
+        let budget = self
+            .totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.exhausted.load(Ordering::Relaxed)
+            || budget.names.len() > limit
+            || budget.records > MAX_DNS_RECORDS
+            || budget.bytes > MAX_DNS_RESPONSE_BYTES
+    }
 }
 
 /// Bootstrap errors carry fixed diagnostic codes, never resolver file content.
@@ -139,6 +238,7 @@ impl DnsResolver {
             ),
             query_timeout: spec.query_timeout,
             admission,
+            target_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -194,7 +294,19 @@ impl DnsResolver {
         family: DnsFamily,
         retry_after: &mut Option<Instant>,
     ) -> DnsObservation {
-        let Ok(mut name) = canonical_name(&spec.name) else {
+        self.resolve_address_chain(spec, &spec.name, family, retry_after, None)
+            .await
+    }
+
+    async fn resolve_address_chain(
+        &self,
+        spec: &DnsDiscoverySpec,
+        target: &str,
+        family: DnsFamily,
+        retry_after: &mut Option<Instant>,
+        round: Option<&SrvRoundBudget>,
+    ) -> DnsObservation {
+        let Ok(mut name) = canonical_name(target) else {
             return DnsObservation::InvalidAnswer;
         };
         let kind = match family {
@@ -206,6 +318,11 @@ impl DnsResolver {
         if let Err(answer) = budget.visit(&name, spec.limits.max_targets as usize) {
             return answer;
         }
+        if let Some(round) = round
+            && let Err(answer) = round.reserve_name(&name, spec.limits.max_targets as usize)
+        {
+            return answer;
+        }
         loop {
             let mut stream = self.pool.lookup(
                 Query::query(name.clone(), kind),
@@ -214,6 +331,11 @@ impl DnsResolver {
             let response = match stream.next().await {
                 Some(Ok(response)) => response,
                 Some(Err(error)) => {
+                    if let Some(round) = round
+                        && let Err(answer) = round.charge_error(&error)
+                    {
+                        return answer;
+                    }
                     *retry_after = negative_error_expiry(&error, Instant::now()).map(|expiry| {
                         chain_until.map_or(expiry, |chain: Instant| chain.min(expiry))
                     });
@@ -226,6 +348,11 @@ impl DnsResolver {
                 }
             };
             let observed = Instant::now();
+            if let Some(round) = round
+                && let Err(answer) = round.charge(&response)
+            {
+                return answer;
+            }
             if let Err(answer) = budget.charge(&response) {
                 return answer;
             }
@@ -329,6 +456,12 @@ impl DnsResolver {
                 if let Err(answer) = budget.visit(&alias, spec.limits.max_targets as usize) {
                     return answer;
                 }
+                if let Some(round) = round
+                    && let Err(answer) =
+                        round.reserve_name(&alias, spec.limits.max_targets as usize)
+                {
+                    return answer;
+                }
                 budget.cname_depth += 1;
                 if budget.cname_depth > MAX_DNS_CNAME_DEPTH {
                     return DnsObservation::LimitExceeded;
@@ -343,6 +476,461 @@ impl DnsResolver {
             }
         }
     }
+}
+
+impl DnsResolver {
+    fn cached_target_failure(&self, target: &str, family: DnsFamily) -> Option<ResolvedFamily> {
+        self.target_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(target.to_owned(), family == DnsFamily::Aaaa))
+            .filter(|memo| Instant::now() < memo.not_before)
+            .map(|memo| ResolvedFamily {
+                observation: memo.observation.clone(),
+                retry_after: memo.retry_after,
+            })
+    }
+
+    fn memo_target_result(
+        &self,
+        target: &str,
+        family: DnsFamily,
+        result: &ResolvedFamily,
+        spec: &DnsDiscoverySpec,
+    ) {
+        let key = (target.to_owned(), family == DnsFamily::Aaaa);
+        let mut memo = self
+            .target_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(result.observation, DnsObservation::Positive { .. }) {
+            memo.remove(&key);
+            return;
+        }
+        let now = Instant::now();
+        let negative = matches!(
+            result.observation,
+            DnsObservation::NameNotFound | DnsObservation::NoData
+        );
+        let failures = if negative {
+            0
+        } else {
+            memo.get(&key)
+                .map_or(0, |memo| memo.failures)
+                .saturating_add(1)
+                .min(16)
+        };
+        let delay = if negative {
+            spec.refresh.min_interval
+        } else {
+            spec.refresh
+                .min_interval
+                .saturating_mul(1u32 << (failures - 1))
+                .min(spec.refresh.max_interval)
+        };
+        let not_before = if negative {
+            result
+                .retry_after
+                .filter(|expiry| *expiry > now)
+                .unwrap_or(now + delay)
+                .min(now + spec.refresh.max_interval)
+        } else {
+            now + delay
+        };
+        memo.insert(
+            key,
+            TargetFailureMemo {
+                observation: result.observation.clone(),
+                not_before,
+                retry_after: result.retry_after,
+                failures,
+            },
+        );
+        debug_assert!(memo.len() <= usize::from(spec.limits.max_targets) * 2);
+    }
+
+    /// One deadline spans the service RRset and every target/family lookup.
+    /// A successful RRset plus completed target results survives other targets'
+    /// deadline expiry; pending target families receive explicit timeout results.
+    pub(crate) async fn resolve_srv_with_schedule(&self, spec: &DnsDiscoverySpec) -> ResolvedSrv {
+        let Some(deadline) = Instant::now().checked_add(self.query_timeout) else {
+            return srv_failure(DnsObservation::InvalidAnswer, None);
+        };
+        let round = SrvRoundBudget::default();
+        let records =
+            match tokio::time::timeout_at(deadline, self.resolve_srv_records(spec, &round)).await {
+                Ok(Ok(records)) => records,
+                Ok(Err(answer)) => {
+                    if !matches!(answer.observation, SrvObservation::TransientFailure { .. }) {
+                        self.target_failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
+                    }
+                    return answer;
+                }
+                Err(_) => {
+                    return srv_failure(
+                        DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::Timeout,
+                        },
+                        None,
+                    );
+                }
+            };
+        let present = records
+            .iter()
+            .map(|record| record.target.clone())
+            .collect::<BTreeSet<_>>();
+        self.target_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(target, _), _| present.contains(target));
+        let targets = records
+            .iter()
+            .filter(|record| record.fresh_until > Instant::now())
+            .map(|record| record.target.clone())
+            .collect::<BTreeSet<_>>();
+        let mut pending = targets
+            .iter()
+            .flat_map(|target| [(target.clone(), false), (target.clone(), true)])
+            .collect::<BTreeSet<_>>();
+        // Four family futures imply at most four active target jobs. Unlike a
+        // join per target, this releases a fast A result even if its AAAA stalls.
+        let mut work = futures_util::stream::iter(pending.iter().cloned().collect::<Vec<_>>())
+            .map(|(target, aaaa)| {
+                let round = &round;
+                async move {
+                    let family = if aaaa { DnsFamily::Aaaa } else { DnsFamily::A };
+                    if let Some(result) = self.cached_target_failure(&target, family) {
+                        return TargetResolution {
+                            target,
+                            family,
+                            result,
+                            cached: true,
+                        };
+                    }
+                    let mut retry_after = None;
+                    let observation = match self.admission.acquire().await {
+                        Ok(_permit) => {
+                            self.resolve_address_chain(
+                                spec,
+                                &target,
+                                family,
+                                &mut retry_after,
+                                Some(round),
+                            )
+                            .await
+                        }
+                        Err(_) => DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::Network,
+                        },
+                    };
+                    TargetResolution {
+                        target,
+                        family,
+                        result: ResolvedFamily {
+                            observation,
+                            retry_after,
+                        },
+                        cached: false,
+                    }
+                }
+            })
+            .buffer_unordered(4);
+        let mut addresses = Vec::new();
+        let mut revoked = BTreeSet::new();
+        loop {
+            let completed = tokio::select! {
+                biased;
+                ()=tokio::time::sleep_until(deadline)=>None,
+                answer=work.next()=>answer,
+            };
+            let Some(answer) = completed else {
+                break;
+            };
+            pending.remove(&(answer.target.clone(), answer.family == DnsFamily::Aaaa));
+            if round.exhausted(spec.limits.max_targets as usize)
+                || matches!(answer.result.observation, DnsObservation::LimitExceeded)
+            {
+                return srv_failure(DnsObservation::LimitExceeded, None);
+            }
+            if revoked.contains(&answer.target) {
+                continue;
+            }
+            if matches!(answer.result.observation, DnsObservation::NameNotFound) {
+                revoked.insert(answer.target.clone());
+                addresses.retain(|previous: &SrvTargetAddressObservation| {
+                    previous.target != answer.target
+                });
+                for family in [DnsFamily::A, DnsFamily::Aaaa] {
+                    pending.remove(&(answer.target.clone(), family == DnsFamily::Aaaa));
+                    if !answer.cached {
+                        self.memo_target_result(&answer.target, family, &answer.result, spec);
+                    }
+                    addresses.push(SrvTargetAddressObservation {
+                        target: answer.target.clone(),
+                        family,
+                        observation: DnsObservation::NameNotFound,
+                    });
+                }
+            } else {
+                if !answer.cached {
+                    self.memo_target_result(&answer.target, answer.family, &answer.result, spec);
+                }
+                addresses.push(SrvTargetAddressObservation {
+                    target: answer.target,
+                    family: answer.family,
+                    observation: answer.result.observation,
+                });
+            }
+        }
+        drop(work);
+        for (target, aaaa) in pending {
+            let family = if aaaa { DnsFamily::Aaaa } else { DnsFamily::A };
+            let result = ResolvedFamily {
+                observation: DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout,
+                },
+                retry_after: None,
+            };
+            self.memo_target_result(&target, family, &result, spec);
+            addresses.push(SrvTargetAddressObservation {
+                target,
+                family,
+                observation: result.observation,
+            });
+        }
+        addresses.sort_by(|left, right| {
+            (&left.target, left.family == DnsFamily::Aaaa)
+                .cmp(&(&right.target, right.family == DnsFamily::Aaaa))
+        });
+        let retry_after = self
+            .target_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|memo| memo.not_before)
+            .min();
+        ResolvedSrv {
+            observation: SrvObservation::Positive { records, addresses },
+            retry_after,
+        }
+    }
+
+    async fn resolve_srv_records(
+        &self,
+        spec: &DnsDiscoverySpec,
+        round: &SrvRoundBudget,
+    ) -> Result<Vec<SrvRecord>, ResolvedSrv> {
+        let Ok(_permit) = self.admission.acquire().await else {
+            return Err(srv_failure(
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Network,
+                },
+                None,
+            ));
+        };
+        let mut name = canonical_service_name(&spec.name)
+            .map_err(|_| srv_failure(DnsObservation::InvalidAnswer, None))?;
+        let mut local = AnswerBudget::default();
+        local
+            .visit(&name, spec.limits.max_targets as usize)
+            .map_err(|error| srv_failure(error, None))?;
+        round
+            .reserve_name(&name, spec.limits.max_targets as usize)
+            .map_err(|error| srv_failure(error, None))?;
+        let mut chain_until = None;
+        loop {
+            let mut query = self.pool.lookup(
+                Query::query(name.clone(), RecordType::SRV),
+                DnsRequestOptions::default(),
+            );
+            let response = match query.next().await {
+                Some(Ok(response)) => response,
+                Some(Err(error)) => {
+                    round
+                        .charge_error(&error)
+                        .map_err(|error| srv_failure(error, None))?;
+                    let retry_after = negative_error_expiry(&error, Instant::now())
+                        .map(|until| chain_until.map_or(until, |chain: Instant| chain.min(until)));
+                    return Err(srv_failure(classify_error(error), retry_after));
+                }
+                None => {
+                    return Err(srv_failure(
+                        DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::Network,
+                        },
+                        None,
+                    ));
+                }
+            };
+            let observed = Instant::now();
+            round
+                .charge(&response)
+                .map_err(|error| srv_failure(error, None))?;
+            if response.queries.len() != 1
+                || response.queries[0].name() != &name
+                || response.queries[0].query_type() != RecordType::SRV
+                || response.queries[0].query_class() != DNSClass::IN
+            {
+                return Err(srv_failure(DnsObservation::InvalidAnswer, None));
+            }
+            if response.response_code != ResponseCode::NoError {
+                let retry_after = negative_response_expiry(&response, &name, observed)
+                    .map(|until| chain_until.map_or(until, |chain| chain.min(until)));
+                return Err(srv_failure(
+                    match response.response_code {
+                        ResponseCode::NXDomain => DnsObservation::NameNotFound,
+                        ResponseCode::ServFail => DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::ServerFailure,
+                        },
+                        ResponseCode::Refused => DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::Refused,
+                        },
+                        _ => DnsObservation::InvalidAnswer,
+                    },
+                    retry_after,
+                ));
+            }
+            let mut followed = false;
+            loop {
+                let mut aliases = BTreeMap::<Name, u32>::new();
+                let mut records = BTreeMap::<(String, u16, u16), SrvRecord>::new();
+                let mut dots = BTreeSet::new();
+                for record in response.answers.iter().filter(|record| record.name == name) {
+                    if record.dns_class != DNSClass::IN {
+                        return Err(srv_failure(DnsObservation::InvalidAnswer, None));
+                    }
+                    match &record.data {
+                        RData::CNAME(alias) => {
+                            let alias = canonical_service_name(&alias.0.to_ascii())
+                                .map_err(|_| srv_failure(DnsObservation::InvalidAnswer, None))?;
+                            aliases
+                                .entry(alias)
+                                .and_modify(|ttl| *ttl = (*ttl).min(record.ttl))
+                                .or_insert(record.ttl);
+                        }
+                        RData::SRV(srv) => {
+                            if srv.target.is_root() {
+                                dots.insert((srv.port, srv.priority, srv.weight));
+                                continue;
+                            }
+                            if srv.port == 0 {
+                                return Err(srv_failure(DnsObservation::InvalidAnswer, None));
+                            }
+                            let target = canonical_name(&srv.target.to_ascii())
+                                .map_err(|_| srv_failure(DnsObservation::InvalidAnswer, None))?;
+                            round
+                                .reserve_name(&target, spec.limits.max_targets as usize)
+                                .map_err(|error| srv_failure(error, None))?;
+                            let fresh = observed
+                                .checked_add(Duration::from_secs(u64::from(record.ttl)))
+                                .ok_or_else(|| srv_failure(DnsObservation::InvalidAnswer, None))?;
+                            let fresh_until = chain_until.map_or(fresh, |chain| chain.min(fresh));
+                            let target = target.to_ascii();
+                            let key = (target.clone(), srv.port, srv.priority);
+                            if let Some(previous) = records.get_mut(&key) {
+                                if previous.weight != srv.weight {
+                                    return Err(srv_failure(DnsObservation::InvalidAnswer, None));
+                                }
+                                previous.fresh_until = previous.fresh_until.min(fresh_until);
+                            } else {
+                                records.insert(
+                                    key,
+                                    SrvRecord {
+                                        target,
+                                        port: srv.port,
+                                        priority: srv.priority,
+                                        weight: srv.weight,
+                                        fresh_until,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if aliases.len() > 1
+                    || (!aliases.is_empty() && (!records.is_empty() || !dots.is_empty()))
+                    || (!dots.is_empty() && !records.is_empty())
+                    || dots.len() > 1
+                {
+                    return Err(srv_failure(DnsObservation::InvalidAnswer, None));
+                }
+                if !dots.is_empty() {
+                    return Err(ResolvedSrv {
+                        observation: SrvObservation::ServiceUnavailable,
+                        retry_after: None,
+                    });
+                }
+                if !records.is_empty() {
+                    return Ok(records.into_values().collect());
+                }
+                let Some((alias, ttl)) = aliases.into_iter().next() else {
+                    if followed {
+                        break;
+                    }
+                    let retry_after = negative_response_expiry(&response, &name, observed)
+                        .map(|until| chain_until.map_or(until, |chain| chain.min(until)));
+                    return Err(srv_failure(DnsObservation::NoData, retry_after));
+                };
+                local
+                    .visit(&alias, spec.limits.max_targets as usize)
+                    .map_err(|error| srv_failure(error, None))?;
+                round
+                    .reserve_name(&alias, spec.limits.max_targets as usize)
+                    .map_err(|error| srv_failure(error, None))?;
+                local.cname_depth += 1;
+                if local.cname_depth > MAX_DNS_CNAME_DEPTH {
+                    return Err(srv_failure(DnsObservation::LimitExceeded, None));
+                }
+                let fresh = observed
+                    .checked_add(Duration::from_secs(u64::from(ttl)))
+                    .ok_or_else(|| srv_failure(DnsObservation::InvalidAnswer, None))?;
+                chain_until = Some(chain_until.map_or(fresh, |chain| chain.min(fresh)));
+                name = alias;
+                followed = true;
+            }
+        }
+    }
+}
+
+fn srv_failure(observation: DnsObservation, retry_after: Option<Instant>) -> ResolvedSrv {
+    let observation = match observation {
+        DnsObservation::NameNotFound => SrvObservation::NameNotFound,
+        DnsObservation::NoData => SrvObservation::NoData,
+        DnsObservation::TransientFailure { code } => SrvObservation::TransientFailure { code },
+        DnsObservation::PolicyRejected => SrvObservation::PolicyRejected,
+        DnsObservation::InvalidAnswer | DnsObservation::Positive { .. } => {
+            SrvObservation::InvalidAnswer
+        }
+        DnsObservation::LimitExceeded => SrvObservation::LimitExceeded,
+    };
+    ResolvedSrv {
+        observation,
+        retry_after,
+    }
+}
+
+fn canonical_service_name(text: &str) -> Result<Name, ()> {
+    let text = text.strip_suffix('.').unwrap_or(text);
+    if text.is_empty()
+        || text.len() > 253
+        || !text.is_ascii()
+        || text.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(());
+    }
+    Name::from_ascii(format!("{}.", text.to_ascii_lowercase())).map_err(|_| ())
 }
 
 fn server(address: SocketAddr) -> Result<NameServerConfig, DnsResolverBootstrapError> {
@@ -533,7 +1121,7 @@ mod tests {
     use super::*;
     use hickory_resolver::proto::op::{Message, OpCode};
     use hickory_resolver::proto::rr::Record;
-    use hickory_resolver::proto::rr::rdata::{A, AAAA, CNAME, SOA, TXT};
+    use hickory_resolver::proto::rr::rdata::{A, AAAA, CNAME, SOA, SRV, TXT};
     use oxidase_config::{DnsDiscoveryLimits, DnsRecordType, DnsRefreshSpec};
     use oxidase_core::SourceSpan;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -542,7 +1130,7 @@ mod tests {
         DnsDiscoverySpec {
             name: "fixture.oxidase.invalid.".to_owned(),
             record: DnsRecordType::AAndAaaa,
-            port: 8443,
+            port: Some(8443),
             origin: "http://fixture.oxidase.invalid/base"
                 .parse()
                 .expect("logical origin"),
@@ -1107,5 +1695,715 @@ mod tests {
             .expect("SOA schedule constrained by alias");
         assert!(expiry >= before + Duration::from_secs(1));
         assert!(expiry < Instant::now() + Duration::from_secs(1));
+    }
+
+    fn srv_spec(address: SocketAddr) -> DnsDiscoverySpec {
+        let mut spec = spec(address);
+        spec.record = DnsRecordType::Srv;
+        spec.port = None;
+        spec.name = "_http._tcp.fixture.oxidase.invalid.".to_owned();
+        spec
+    }
+
+    fn srv_record(
+        name: &Name,
+        target: &str,
+        port: u16,
+        priority: u16,
+        weight: u16,
+        ttl: u32,
+    ) -> Record {
+        let target = if target == "." {
+            Name::root()
+        } else {
+            canonical_name(target).expect("target hostname")
+        };
+        Record::from_rdata(
+            name.clone(),
+            ttl,
+            RData::SRV(SRV::new(priority, weight, port, target)),
+        )
+    }
+
+    fn srv_positive(answer: ResolvedSrv) -> (Vec<SrvRecord>, Vec<SrvTargetAddressObservation>) {
+        let SrvObservation::Positive { records, addresses } = answer.observation else {
+            panic!("expected positive SRV, got {:?}", answer.observation);
+        };
+        (records, addresses)
+    }
+
+    #[tokio::test]
+    async fn srv_preserves_zero_max_weights_ports_priorities_and_coalesces_target_families() {
+        let fixture = DnsFixture::start(|question, _| {
+            if question.query_type() == RecordType::SRV {
+                FixtureReply::answers(vec![
+                    srv_record(question.name(), "node.oxidase.invalid", 8001, 10, 0, 60),
+                    srv_record(question.name(), "NODE.oxidase.invalid.", 8001, 10, 0, 1),
+                    srv_record(
+                        question.name(),
+                        "node.oxidase.invalid",
+                        8002,
+                        10,
+                        u16::MAX,
+                        30,
+                    ),
+                    srv_record(question.name(), "node.oxidase.invalid", 8001, 20, 7, 20),
+                ])
+            } else {
+                FixtureReply::answers(vec![address_record(
+                    question.name(),
+                    if question.query_type() == RecordType::A {
+                        "192.0.2.1"
+                    } else {
+                        "2001:db8::1"
+                    },
+                    60,
+                )])
+            }
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let before = Instant::now();
+        let (records, addresses) =
+            srv_positive(resolver(&policy).resolve_srv_with_schedule(&policy).await);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            (records[0].port, records[0].priority, records[0].weight),
+            (8001, 10, 0)
+        );
+        assert!(
+            records[0].fresh_until >= before + Duration::from_secs(1)
+                && records[0].fresh_until <= Instant::now() + Duration::from_secs(1)
+        );
+        assert!(records.iter().any(|record| record.weight == u16::MAX));
+        assert_eq!(
+            addresses.len(),
+            2,
+            "same target with several ports/priorities is looked up once per family"
+        );
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn srv_dot_withdrawal_skips_addresses_and_mixed_dot_or_conflicting_weights_are_invalid() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let handler_mode = Arc::clone(&mode);
+        let fixture = DnsFixture::start(move |question, _| {
+            assert_eq!(
+                question.query_type(),
+                RecordType::SRV,
+                "withdrawal must never perform target lookup"
+            );
+            FixtureReply::answers(match handler_mode.load(Ordering::Relaxed) {
+                0 => vec![srv_record(question.name(), ".", 0, 0, 0, 30)],
+                1 => vec![
+                    srv_record(question.name(), ".", 0, 0, 0, 30),
+                    srv_record(question.name(), "node.oxidase.invalid", 8000, 0, 1, 30),
+                ],
+                2 => vec![
+                    srv_record(question.name(), "node.oxidase.invalid", 8000, 0, 1, 30),
+                    srv_record(question.name(), "node.oxidase.invalid", 8000, 0, 2, 30),
+                ],
+                3 => vec![
+                    srv_record(question.name(), ".", 0, 0, 0, 30),
+                    srv_record(question.name(), ".", 0, 0, 0, 10),
+                ],
+                _ => vec![
+                    srv_record(question.name(), ".", 0, 0, 0, 30),
+                    srv_record(question.name(), ".", 0, 1, 0, 30),
+                ],
+            })
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let client = resolver(&policy);
+        for (value, expected) in [
+            (0, SrvObservation::ServiceUnavailable),
+            (1, SrvObservation::InvalidAnswer),
+            (2, SrvObservation::InvalidAnswer),
+            (3, SrvObservation::ServiceUnavailable),
+            (4, SrvObservation::InvalidAnswer),
+        ] {
+            mode.store(value, Ordering::Relaxed);
+            assert_eq!(
+                client.resolve_srv_with_schedule(&policy).await.observation,
+                expected
+            );
+        }
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn srv_service_and_target_cname_expirations_are_independent_and_keep_target_identity() {
+        let fixture = DnsFixture::start(|question, _| {
+            let name = question.name().to_ascii();
+            if name == "_http._tcp.fixture.oxidase.invalid." {
+                FixtureReply::answers(vec![Record::from_rdata(
+                    question.name().clone(),
+                    1,
+                    RData::CNAME(CNAME(
+                        canonical_service_name("_http._tcp.alias.oxidase.invalid")
+                            .expect("service alias"),
+                    )),
+                )])
+            } else if question.query_type() == RecordType::SRV {
+                FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "original.oxidase.invalid",
+                    8443,
+                    10,
+                    1,
+                    60,
+                )])
+            } else if name == "original.oxidase.invalid." {
+                FixtureReply::answers(vec![Record::from_rdata(
+                    question.name().clone(),
+                    2,
+                    RData::CNAME(CNAME(
+                        canonical_name("backing.oxidase.invalid").expect("alias"),
+                    )),
+                )])
+            } else {
+                FixtureReply::answers(vec![address_record(
+                    question.name(),
+                    if question.query_type() == RecordType::A {
+                        "192.0.2.2"
+                    } else {
+                        "2001:db8::2"
+                    },
+                    60,
+                )])
+            }
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let before = Instant::now();
+        let (records, addresses) =
+            srv_positive(resolver(&policy).resolve_srv_with_schedule(&policy).await);
+        assert_eq!(records[0].target, "original.oxidase.invalid.");
+        assert!(
+            records[0].fresh_until >= before + Duration::from_secs(1)
+                && records[0].fresh_until <= Instant::now() + Duration::from_secs(1)
+        );
+        for address in addresses {
+            assert_eq!(address.target, "original.oxidase.invalid.");
+            for address in positive(address.observation) {
+                assert!(
+                    address.fresh_until >= before + Duration::from_secs(2)
+                        && address.fresh_until <= Instant::now() + Duration::from_secs(2)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn srv_whole_round_timeout_preserves_fast_target_and_releases_single_global_slot() {
+        let fixture = DnsFixture::start(|question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![
+                    srv_record(question.name(), "fast.oxidase.invalid", 8000, 0, 1, 1),
+                    srv_record(question.name(), "slow.oxidase.invalid", 8000, 1, 1, 1),
+                ]);
+            }
+            let mut reply = FixtureReply::answers(vec![address_record(
+                question.name(),
+                if question.query_type() == RecordType::A {
+                    "192.0.2.3"
+                } else {
+                    "2001:db8::3"
+                },
+                1,
+            )]);
+            if question.name().to_ascii() == "slow.oxidase.invalid."
+                || question.query_type() == RecordType::AAAA
+            {
+                reply.delay = Duration::from_millis(250);
+            }
+            reply
+        })
+        .await;
+        let mut policy = srv_spec(fixture.address);
+        policy.resolver.query_timeout = Duration::from_millis(100);
+        let quota = Arc::new(Semaphore::new(1));
+        let client = DnsResolver::new(&policy.resolver, Arc::clone(&quota))
+            .expect("one shared actual query slot");
+        let started = Instant::now();
+        let (_, addresses) = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "targets cannot obtain fresh round deadlines"
+        );
+        assert_eq!(
+            quota.available_permits(),
+            1,
+            "SRV parent cannot hold query quota while waiting for targets"
+        );
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.target == "fast.oxidase.invalid."
+                    && address.family == DnsFamily::A
+                    && matches!(address.observation, DnsObservation::Positive { .. }))
+        );
+        assert!(
+            addresses.iter().any(|address| {
+                address.target == "fast.oxidase.invalid."
+                    && address.family == DnsFamily::Aaaa
+                    && matches!(
+                        address.observation,
+                        DnsObservation::TransientFailure {
+                            code: DiscoveryErrorCode::Timeout
+                        }
+                    )
+            }),
+            "a stalled sibling family cannot erase the completed A observation"
+        );
+        for address in addresses
+            .iter()
+            .filter(|address| address.target == "slow.oxidase.invalid.")
+        {
+            assert!(matches!(
+                address.observation,
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout
+                }
+            ));
+        }
+        for address in addresses
+            .iter()
+            .filter(|address| address.target == "fast.oxidase.invalid.")
+        {
+            if let DnsObservation::Positive { addresses } = &address.observation {
+                assert!(
+                    addresses[0].fresh_until < Instant::now() + Duration::from_secs(1),
+                    "partial completion retains its original expiry"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn srv_negative_target_memo_respects_soa_across_short_and_zero_rrset_refreshes() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let handler_mode = Arc::clone(&mode);
+        let fixture = DnsFixture::start(move |question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "missing.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    if handler_mode.load(Ordering::Relaxed) == 1 {
+                        0
+                    } else {
+                        1
+                    },
+                )]);
+            }
+            let mut reply = FixtureReply::code(ResponseCode::NoError);
+            reply.authorities.push(soa("oxidase.invalid", 30, 5));
+            reply
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let client = resolver(&policy);
+        let _ = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        let before = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.not_before))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 3);
+        let _ = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(
+            fixture.counts.udp.load(Ordering::Relaxed),
+            4,
+            "only SRV RRset, not either negative family, is queried before SOA expiry"
+        );
+        mode.store(1, Ordering::Relaxed);
+        let _ = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 5);
+        mode.store(0, Ordering::Relaxed);
+        let _ = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 6);
+        let after = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.not_before))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(before, after, "cache hits never restart negative TTL");
+        let scheduled = client.resolve_srv_with_schedule(&policy).await;
+        assert_eq!(scheduled.retry_after, before.values().copied().min());
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn srv_negative_target_refresh_ceiling_recovers_before_long_soa_expiry_without_sliding() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let handler_mode = Arc::clone(&mode);
+        let fixture = DnsFixture::start(move |question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "recovering.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    60,
+                )]);
+            }
+            if handler_mode.load(Ordering::Relaxed) == 0 {
+                let mut reply = FixtureReply::code(ResponseCode::NoError);
+                reply.authorities.push(soa("oxidase.invalid", 60, 60));
+                return reply;
+            }
+            FixtureReply::answers(vec![address_record(
+                question.name(),
+                if question.query_type() == RecordType::A {
+                    "192.0.2.40"
+                } else {
+                    "2001:db8::40"
+                },
+                60,
+            )])
+        })
+        .await;
+        let mut policy = srv_spec(fixture.address);
+        // Test-adjusted monotonic bounds avoid a multi-second sleep; the
+        // compiler's production refresh constraints are tested separately.
+        policy.refresh.min_interval = Duration::from_millis(5);
+        policy.refresh.max_interval = Duration::from_millis(50);
+        let client = resolver(&policy);
+        let before = Instant::now();
+        let initial = client.resolve_srv_with_schedule(&policy).await;
+        let first = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), (value.not_before, value.retry_after)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 3);
+        assert_eq!(first.len(), 2);
+        for (not_before, received_expiry) in first.values() {
+            assert!(*not_before <= Instant::now() + Duration::from_millis(50));
+            assert!(
+                received_expiry.is_some_and(|expiry| expiry >= before + Duration::from_secs(60)),
+                "the raw negative TTL remains distinct from the operational ceiling"
+            );
+        }
+        assert_eq!(
+            initial.retry_after,
+            first.values().map(|value| value.0).min()
+        );
+        let cached = client.resolve_srv_with_schedule(&policy).await;
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 4);
+        let unchanged = client
+            .target_failures
+            .lock()
+            .expect("memo")
+            .iter()
+            .map(|(key, value)| (key.clone(), (value.not_before, value.retry_after)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(first, unchanged, "neither deadline slides on a cache hit");
+        assert_eq!(cached.retry_after, initial.retry_after);
+        mode.store(1, Ordering::Relaxed);
+        let ceiling = first.values().map(|value| value.0).max().expect("ceiling");
+        tokio::time::sleep_until(ceiling + Duration::from_millis(5)).await;
+        let (_, recovered) = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 7);
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .iter()
+                .all(|family| matches!(family.observation, DnsObservation::Positive { .. })),
+            "both address families can recover before the original60s SOA expiry"
+        );
+        assert!(client.target_failures.lock().expect("memo").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_failure_memo_has_bounded_non_sliding_backoff_and_positive_recovery() {
+        let mut policy = srv_spec("127.0.0.1:5300".parse().expect("numeric resolver"));
+        policy.refresh.max_interval = Duration::from_secs(4);
+        let client = resolver(&policy);
+        let target = "failed.oxidase.invalid.";
+        let failed = ResolvedFamily {
+            observation: DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::ServerFailure,
+            },
+            retry_after: None,
+        };
+        for seconds in [1, 2, 4, 4] {
+            let before = Instant::now();
+            client.memo_target_result(target, DnsFamily::A, &failed, &policy);
+            let first = client
+                .cached_target_failure(target, DnsFamily::A)
+                .expect("memo");
+            let suppressed_until = client.target_failures.lock().expect("memo")
+                [&(target.to_owned(), false)]
+                .not_before;
+            assert_eq!(suppressed_until, before + Duration::from_secs(seconds));
+            assert!(
+                first.retry_after.is_none(),
+                "transient errors have no SOA expiry"
+            );
+            tokio::time::advance(Duration::from_millis(100)).await;
+            let repeated = client
+                .cached_target_failure(target, DnsFamily::A)
+                .expect("memo");
+            assert_eq!(first.retry_after, repeated.retry_after);
+            assert_eq!(
+                client.target_failures.lock().expect("memo")[&(target.to_owned(), false)]
+                    .not_before,
+                suppressed_until
+            );
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+            assert!(client.cached_target_failure(target, DnsFamily::A).is_none());
+        }
+        client.memo_target_result(
+            target,
+            DnsFamily::A,
+            &ResolvedFamily {
+                observation: DnsObservation::Positive { addresses: vec![] },
+                retry_after: None,
+            },
+            &policy,
+        );
+        assert!(client.target_failures.lock().expect("memo").is_empty());
+    }
+
+    #[tokio::test]
+    async fn srv_failure_memo_prunes_removed_targets_instead_of_growing_with_churn() {
+        let target = Arc::new(AtomicU8::new(0));
+        let handler_target = Arc::clone(&target);
+        let fixture = DnsFixture::start(move |question, _| {
+            if question.query_type() == RecordType::SRV {
+                let target = format!(
+                    "node-{}.oxidase.invalid",
+                    handler_target.load(Ordering::Relaxed)
+                );
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    &target,
+                    8000,
+                    0,
+                    1,
+                    60,
+                )]);
+            }
+            let mut reply = FixtureReply::code(ResponseCode::NoError);
+            reply.authorities.push(soa("oxidase.invalid", 30, 5));
+            reply
+        })
+        .await;
+        let mut policy = srv_spec(fixture.address);
+        policy.limits.max_targets = 2;
+        let client = resolver(&policy);
+        for value in 0..10 {
+            target.store(value, Ordering::Relaxed);
+            let _ = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+            let memo = client.target_failures.lock().expect("memo");
+            assert_eq!(memo.len(), 2);
+            assert!(
+                memo.keys()
+                    .all(|(name, _)| { name == &format!("node-{value}.oxidase.invalid.") }),
+                "a removed target cannot retain an operational negative/failure entry"
+            );
+        }
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 30);
+    }
+
+    #[tokio::test]
+    async fn srv_tcp_fallback_and_address_policy_use_the_same_bounded_raw_pool() {
+        let fixture = DnsFixture::start(|question, _| {
+            let mut reply = match question.query_type() {
+                RecordType::SRV => FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "node.oxidase.invalid",
+                    65535,
+                    0,
+                    1,
+                    60,
+                )]),
+                RecordType::A => FixtureReply::answers(vec![
+                    address_record(question.name(), "192.0.2.10", 60),
+                    address_record(question.name(), "127.0.0.1", 60),
+                ]),
+                RecordType::AAAA => FixtureReply::answers(vec![
+                    address_record(question.name(), "::ffff:192.0.2.10", 60),
+                    address_record(question.name(), "::1", 60),
+                ]),
+                _ => unreachable!("SRV and its address families only"),
+            };
+            reply.truncate_udp = true;
+            reply
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let (records, addresses) =
+            srv_positive(resolver(&policy).resolve_srv_with_schedule(&policy).await);
+        assert_eq!(records[0].port, u16::MAX);
+        for family in addresses {
+            let normalized = positive(family.observation);
+            assert_eq!(normalized.len(), 1);
+            assert_eq!(
+                normalized[0].address,
+                "192.0.2.10".parse::<IpAddr>().expect("documentation IP")
+            );
+        }
+        assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 3);
+        assert_eq!(fixture.counts.tcp.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn srv_target_nxdomain_fences_late_positive_and_negative_memo_is_target_wide() {
+        let fixture = DnsFixture::start(|question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "missing.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    30,
+                )]);
+            }
+            if question.query_type() == RecordType::A {
+                let mut reply = FixtureReply::code(ResponseCode::NXDomain);
+                reply.authorities.push(soa("oxidase.invalid", 30, 5));
+                reply
+            } else {
+                let mut reply =
+                    FixtureReply::answers(vec![address_record(question.name(), "2001:db8::4", 30)]);
+                reply.delay = Duration::from_millis(20);
+                reply
+            }
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        let client = resolver(&policy);
+        let (_, addresses) = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert_eq!(addresses.len(), 2);
+        assert!(
+            addresses
+                .iter()
+                .all(|address| address.observation == DnsObservation::NameNotFound)
+        );
+        let calls = fixture.counts.udp.load(Ordering::Relaxed);
+        let (_, addresses) = srv_positive(client.resolve_srv_with_schedule(&policy).await);
+        assert!(
+            addresses
+                .iter()
+                .all(|address| address.observation == DnsObservation::NameNotFound)
+        );
+        assert_eq!(
+            fixture.counts.udp.load(Ordering::Relaxed),
+            calls + 1,
+            "target NXDOMAIN suppresses both address families"
+        );
+    }
+
+    #[tokio::test]
+    async fn srv_aggregate_limits_include_negative_authorities_and_unique_query_names() {
+        let fixture = DnsFixture::start(|question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "negative.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    30,
+                )]);
+            }
+            let mut reply = FixtureReply::code(ResponseCode::NoError);
+            reply.authorities = vec![soa("oxidase.invalid", 30, 5); MAX_DNS_RECORDS];
+            reply.truncate_udp = true;
+            reply
+        })
+        .await;
+        let policy = srv_spec(fixture.address);
+        assert_eq!(
+            resolver(&policy)
+                .resolve_srv_with_schedule(&policy)
+                .await
+                .observation,
+            SrvObservation::LimitExceeded,
+            "initial SRV RR plus retained negative authority RR must share512 budget"
+        );
+        let fixture = DnsFixture::start(|question, _| {
+            if question.query_type() == RecordType::SRV {
+                return FixtureReply::answers(vec![srv_record(
+                    question.name(),
+                    "node.oxidase.invalid",
+                    8000,
+                    0,
+                    1,
+                    30,
+                )]);
+            }
+            FixtureReply::answers(vec![Record::from_rdata(
+                question.name().clone(),
+                30,
+                RData::CNAME(CNAME(
+                    canonical_name("alias.oxidase.invalid").expect("alias"),
+                )),
+            )])
+        })
+        .await;
+        let mut policy = srv_spec(fixture.address);
+        policy.limits.max_targets = 2;
+        assert_eq!(
+            resolver(&policy)
+                .resolve_srv_with_schedule(&policy)
+                .await
+                .observation,
+            SrvObservation::LimitExceeded,
+            "service + SRV target + CNAME count distinct names across all queries"
+        );
+    }
+
+    #[test]
+    fn srv_observable_byte_budget_exhaustion_is_latched_even_for_retained_error_payload() {
+        let name = canonical_name("negative.oxidase.invalid").expect("name");
+        let mut message = Message::response(1, OpCode::Query);
+        message.answers = (0..150)
+            .map(|_| {
+                Record::from_rdata(name.clone(), 1, RData::TXT(TXT::new(vec!["x".repeat(240)])))
+            })
+            .collect();
+        let response = DnsResponse::from_message(message).expect("bounded packet");
+        let round = SrvRoundBudget::default();
+        assert!(round.charge(&response).is_ok());
+        assert_eq!(round.charge(&response), Err(DnsObservation::LimitExceeded));
+        assert!(round.exhausted(32));
+        let exact = SrvRoundBudget::default();
+        exact.totals.lock().expect("budget").bytes =
+            MAX_DNS_RESPONSE_BYTES - response.as_buffer().len();
+        assert!(
+            exact.charge(&response).is_ok(),
+            "the exact bound is allowed"
+        );
+        assert!(!exact.exhausted(32));
+        let mut negative = hickory_resolver::net::NoRecords::new(
+            Query::query(name, RecordType::A),
+            ResponseCode::NXDomain,
+        );
+        negative.authorities = Some(Arc::from(response.answers.clone()));
+        let error = NetError::Dns(DnsError::NoRecordsFound(negative));
+        let negative_round = SrvRoundBudget::default();
+        assert!(negative_round.charge_error(&error).is_ok());
+        assert_eq!(
+            negative_round.charge_error(&error),
+            Err(DnsObservation::LimitExceeded),
+            "retained negative authority payload participates in the round budget"
+        );
+        assert!(negative_round.exhausted(32));
     }
 }

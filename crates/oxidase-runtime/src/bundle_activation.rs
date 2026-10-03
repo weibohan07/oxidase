@@ -106,6 +106,7 @@ pub fn bundle_runtime_capabilities() -> BundleCapabilities {
             "portable-runtime".to_owned(),
             oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
             oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned(),
+            oxidase_config::DNS_SRV_DISCOVERY_FEATURE.to_owned(),
         ]),
         supported_sections: BTreeMap::from([(
             RUNTIME_SECTION.to_owned(),
@@ -774,6 +775,7 @@ mod tests {
                 "portable-runtime".to_owned(),
                 oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
                 oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned(),
+                oxidase_config::DNS_SRV_DISCOVERY_FEATURE.to_owned(),
             ])
         );
         assert_eq!(
@@ -806,6 +808,73 @@ mod tests {
         let error = prepare_bundle_archive(&archive, &bundle, directory.path(), None)
             .expect_err("missing runtime section is rejected");
         assert_eq!(error.code(), "bundle.runtime_section_missing");
+    }
+
+    #[test]
+    fn srv_bundle_cannot_omit_feature_or_cross_an_address_only_runtime() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("oxidase.yaml");
+        std::fs::write(&source, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: _https._tcp.api.example.test\n          record: srv\n          origin: http://logical.example.test/base/\nservices:\n  root:\n    type: respond\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      ref: root\n").expect("source");
+        let gateway = oxidase_config::Compiler::compile_path(source).expect("offline source");
+        let snapshot = crate::RuntimeSnapshot::prepare(gateway.clone()).expect("offline prepare");
+        let plan = snapshot.export_portable(&gateway).expect("export").plan;
+        for omit_srv in [false, true] {
+            let bundle = directory.path().join(format!("candidate-{omit_srv}.oxb"));
+            let mut manifest = BundleManifest::new(
+                BuildMetadata {
+                    tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    source_commit: None,
+                    gateway_api: oxidase_config::API_VERSION.to_owned(),
+                    oxista_api: oxidase_site::SITE_API_VERSION.to_owned(),
+                },
+                env!("CARGO_PKG_VERSION"),
+            );
+            manifest.required_features = plan.required_features();
+            if omit_srv {
+                manifest
+                    .required_features
+                    .remove(oxidase_config::DNS_SRV_DISCOVERY_FEATURE);
+            }
+            manifest.sections.insert(
+                super::RUNTIME_SECTION.to_owned(),
+                oxidase_bundle::StableSection::from_serde(
+                    super::PORTABLE_RUNTIME_PLAN_SCHEMA_V1,
+                    true,
+                    &plan,
+                )
+                .expect("runtime section"),
+            );
+            BundleBuilder::new(manifest)
+                .write_atomic(&bundle)
+                .expect("Bundle");
+            let archive = oxidase_bundle::BundleArchive::read_path(
+                &bundle,
+                &oxidase_bundle::BundleLimits::default(),
+            )
+            .expect("archive");
+            archive
+                .verify_capabilities(&bundle_runtime_capabilities())
+                .expect("current capability declarations");
+            if omit_srv {
+                let error = prepare_bundle_archive(&archive, &bundle, directory.path(), None)
+                    .expect_err("stripped capability is rejected before preparation");
+                assert_eq!(error.code(), "bundle.required_feature_missing");
+            } else {
+                let mut old_capabilities = bundle_runtime_capabilities();
+                old_capabilities
+                    .supported_features
+                    .remove(oxidase_config::DNS_SRV_DISCOVERY_FEATURE);
+                let error = archive
+                    .verify_capabilities(&old_capabilities)
+                    .expect_err("6B address-only runtime cannot execute SRV");
+                assert_eq!(
+                    error.kind(),
+                    oxidase_bundle::BundleErrorKind::UnsupportedRequiredFeature
+                );
+                prepare_bundle_archive(&archive, &bundle, directory.path(), None)
+                    .expect("current runtime accepts the fully declared offline SRV plan");
+            }
+        }
     }
 
     #[test]

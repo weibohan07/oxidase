@@ -50,7 +50,7 @@ pub struct Metrics {
     transport_overflow: Arc<TransportSeries>,
     governance: RwLock<GovernanceSeriesMap>,
     upstream_timeouts: [AtomicU64; 7],
-    discovery: Mutex<BTreeMap<String, [u64; 16]>>,
+    discovery: Mutex<BTreeMap<String, [u64; 24]>>,
     discovery_tasks: AtomicU64,
 }
 
@@ -76,7 +76,34 @@ impl Metrics {
             DnsObservation::InvalidAnswer => 5,
             DnsObservation::LimitExceeded => 6,
         };
-        let index = result + usize::from(family == oxidase_runtime::DnsFamily::Aaaa) * 8;
+        self.record_discovery_result(
+            cluster,
+            usize::from(family == oxidase_runtime::DnsFamily::Aaaa),
+            result,
+        );
+    }
+
+    pub(crate) fn record_srv_discovery(
+        &self,
+        cluster: &str,
+        observation: &oxidase_runtime::SrvObservation,
+    ) {
+        use oxidase_runtime::SrvObservation;
+        let result = match observation {
+            SrvObservation::Positive { .. } => 0,
+            SrvObservation::NameNotFound => 1,
+            SrvObservation::NoData => 2,
+            SrvObservation::TransientFailure { .. } => 3,
+            SrvObservation::PolicyRejected => 4,
+            SrvObservation::InvalidAnswer => 5,
+            SrvObservation::LimitExceeded => 6,
+            SrvObservation::ServiceUnavailable => 7,
+        };
+        self.record_discovery_result(cluster, 2, result);
+    }
+
+    fn record_discovery_result(&self, cluster: &str, family: usize, result: usize) {
+        let index = result + family * 8;
         let mut series = self
             .discovery
             .lock()
@@ -479,7 +506,7 @@ impl Metrics {
             .iter()
         {
             let cluster = escape_label(cluster);
-            for (family_index, family) in ["a", "aaaa"].into_iter().enumerate() {
+            for (family_index, family) in ["a", "aaaa", "srv"].into_iter().enumerate() {
                 for (index, result) in [
                     "positive",
                     "name_not_found",
@@ -488,6 +515,7 @@ impl Metrics {
                     "policy_rejected",
                     "invalid_answer",
                     "limit_exceeded",
+                    "service_unavailable",
                 ]
                 .into_iter()
                 .enumerate()
@@ -531,6 +559,14 @@ impl Metrics {
 
             if let Some(discovery) = status.discovery {
                 output.push_str(&format!("oxidase_discovery_endpoints{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_eligible_endpoints{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_generation{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_retired_admission_counters{{cluster=\"{cluster_name}\"}} {}\n", discovery.endpoint_count, discovery.eligible_endpoints, discovery.generation, discovery.retired_admission_counters));
+                if cluster
+                    .spec()
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|plan| plan.record == oxidase_config::DnsRecordType::Srv)
+                {
+                    output.push_str(&format!("oxidase_discovery_srv_groups{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_eligible_priority{{cluster=\"{cluster_name}\"}} {}\n", discovery.srv_targets.len(), discovery.eligible_priority.map_or(-1, i32::from)));
+                }
                 for health in CLUSTER_HEALTH_STATES {
                     let count = status
                         .endpoints
