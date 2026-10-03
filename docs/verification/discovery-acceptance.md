@@ -59,6 +59,20 @@ cancellation. Ordinary smoke, fuzz campaigns, Linux curves and final Hosted
 receipts are reported separately below when executed; a workflow definition does
 not qualify them.
 
+### First frozen 6D head: actual gate finding
+
+Head `220bb7384cd528a07995a6805c1b02dd66623f70` passed the final local
+35-second process smokes and one additional ASan property run, but **failed**
+the complete workspace Clippy gate. Its actual [PR run `37148237544`](https://github.com/weibohan07/oxidase/actions/runs/37148237544)
+also failed Stable workspace at `clippy::duplicate_mod`; stable test/release/doc
+steps were skipped. The new recovery regression and resolver unit tests loaded
+the same DNS fixture twice in one library test crate. This is repaired by one
+shared `cfg(test)` module, not a lint allowance or a production-state change.
+All-target/all-feature workspace Clippy and the resolver 26/26 plus recovery-fault
+test pass after the repair. The repaired head still needs fresh complete gates,
+its own Hosted checks and actual Linux qualification. Raw local/Hosted failures
+are retained as `artifacts/discovery-6d-220bb73-*-failure.log.gz`.
+
 ## Protected 6A delivery receipt
 
 PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without

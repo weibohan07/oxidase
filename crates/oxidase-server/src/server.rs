@@ -4910,10 +4910,6 @@ impl ServerError {
 }
 
 #[cfg(test)]
-#[path = "../tests/support/dns_fixture.rs"]
-mod control_plane_dns_fixture;
-
-#[cfg(test)]
 mod tests {
     use std::convert::Infallible;
     use std::fs;
@@ -8044,18 +8040,18 @@ listeners:
         write_respond_gateway(&config, "published", None);
         let dns_mode = Arc::new(AtomicUsize::new(0));
         let fixture_mode = Arc::clone(&dns_mode);
-        let dns = super::control_plane_dns_fixture::DnsFixture::start(move |question, _| {
+        let dns = crate::dns_test_fixture::DnsFixture::start(move |question, _| {
             use hickory_resolver::proto::op::ResponseCode;
             use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata::A};
             if question.query_type() != RecordType::A {
-                return super::control_plane_dns_fixture::FixtureReply::code(ResponseCode::NoError);
+                return crate::dns_test_fixture::FixtureReply::code(ResponseCode::NoError);
             }
             let last = if fixture_mode.load(Ordering::Acquire) == 0 {
                 1
             } else {
                 2
             };
-            super::control_plane_dns_fixture::FixtureReply::answers(vec![Record::from_rdata(
+            crate::dns_test_fixture::FixtureReply::answers(vec![Record::from_rdata(
                 question.name().clone(),
                 2,
                 RData::A(A(std::net::Ipv4Addr::new(127, 0, 0, last))),

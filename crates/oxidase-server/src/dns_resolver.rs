@@ -1112,13 +1112,9 @@ fn negative_error_expiry(error: &NetError, observed: Instant) -> Option<Instant>
 }
 
 #[cfg(test)]
-#[path = "../tests/support/dns_fixture.rs"]
-mod fixture;
-
-#[cfg(test)]
 mod tests {
-    use super::fixture::{DnsFixture, FixtureReply};
     use super::*;
+    use crate::dns_test_fixture::{DnsFixture, FixtureReply};
     use hickory_resolver::proto::op::{Message, OpCode};
     use hickory_resolver::proto::rr::Record;
     use hickory_resolver::proto::rr::rdata::{A, AAAA, CNAME, SOA, SRV, TXT};

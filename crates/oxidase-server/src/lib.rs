@@ -7,6 +7,9 @@ mod cluster_health;
 mod connection;
 mod discovery_manager;
 mod dns_resolver;
+#[cfg(test)]
+#[path = "../tests/support/dns_fixture.rs"]
+mod dns_test_fixture;
 mod ingress;
 mod leaves;
 mod metrics;
