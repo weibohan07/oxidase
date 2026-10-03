@@ -7,9 +7,39 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use std::{io::Write, path::Path};
 
 use serde_json::Value;
 use tokio::process::Command;
+
+struct CampaignEvidence(Option<tempfile::TempDir>);
+
+impl CampaignEvidence {
+    fn path(&self) -> &Path {
+        self.0.as_ref().expect("active evidence directory").path()
+    }
+
+    fn keep(&mut self) -> PathBuf {
+        self.0.take().expect("active evidence directory").keep()
+    }
+}
+
+impl Drop for CampaignEvidence {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(directory) = self.0.take()
+        {
+            let retained = directory.keep();
+            // Reporting evidence must not introduce a second panic during
+            // timeout/spawn/parse/assertion unwinding.
+            let _ = writeln!(
+                std::io::stderr(),
+                "retained failed campaign evidence at {}",
+                retained.display()
+            );
+        }
+    }
+}
 
 fn gateway() -> PathBuf {
     let path = std::env::var_os("OXIDASE_DISCOVERY_TEST_GATEWAY").map_or_else(
@@ -33,7 +63,9 @@ fn gateway() -> PathBuf {
 }
 
 async fn real_process_campaign(campaign: &str, seed: &str) {
-    let output = tempfile::tempdir().expect("isolated evidence directory");
+    let mut output = CampaignEvidence(Some(
+        tempfile::tempdir().expect("isolated evidence directory"),
+    ));
     let command = Command::new(env!("CARGO_BIN_EXE_oxidase-discovery-soak"))
         .arg("run")
         .arg("--gateway")
@@ -100,6 +132,10 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
             > 0
     );
     assert_eq!(summary["unexpected_errors"], 0);
+    assert_eq!(
+        summary["started_operations"], summary["requests"],
+        "every admitted worker operation must have a collected result"
+    );
     let accounted = [
         "success",
         "cancelled_responses",
@@ -159,6 +195,42 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
     }
     assert_eq!(summary["gateway_exited"], true);
     assert_eq!(summary["post_exit_rss"], Value::Null);
+}
+
+#[tokio::test]
+async fn timeout_and_post_success_assertion_preserve_the_original_evidence() {
+    let parent = tempfile::tempdir().expect("isolated retention regression");
+    for timeout in [true, false] {
+        let directory = tempfile::tempdir_in(parent.path()).expect("child evidence directory");
+        let path = directory.path().to_owned();
+        std::fs::write(path.join("receipt.json"), br#"{"result":"contradictory"}"#)
+            .expect("original fixture evidence");
+        let failed = tokio::spawn(async move {
+            let evidence = CampaignEvidence(Some(directory));
+            if timeout {
+                tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+                    .await
+                    .expect("bounded campaign timed out before an output existed");
+            } else {
+                let receipt: Value = serde_json::from_slice(
+                    &std::fs::read(evidence.path().join("receipt.json")).expect("receipt"),
+                )
+                .expect("original JSON");
+                assert_eq!(receipt["result"], "pass", "post-success receipt assertion");
+            }
+        })
+        .await
+        .expect_err("the boundary must actually panic");
+        assert!(failed.is_panic());
+        assert_eq!(
+            std::fs::read(path.join("receipt.json")).expect("panic retained original bytes"),
+            br#"{"result":"contradictory"}"#
+        );
+    }
+    let directory = tempfile::tempdir_in(parent.path()).expect("successful evidence directory");
+    let path = directory.path().to_owned();
+    drop(CampaignEvidence(Some(directory)));
+    assert!(!path.exists(), "successful tests retain no temporary state");
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ use super::{
 use crate::common::{XorShift64, client_config, identity, write_identity};
 
 const TOKEN: &str = "test-only-qualification-bearer-token";
+type WorkerEvent = (bool, bool, Result<(u16, u64, bool), String>);
 
 struct FixtureModePlan {
     name: &'static str,
@@ -889,15 +890,37 @@ async fn websocket(
     Ok(true)
 }
 
-async fn join_workers(workers: &mut tokio::task::JoinSet<()>) -> Result<(), SoakError> {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while let Some(result) = workers.join_next().await {
-            result.map_err(|error| fail(format!("load worker failed: {error}")))?;
+async fn send_completed_worker_event(
+    events: &tokio::sync::mpsc::Sender<WorkerEvent>,
+    event: WorkerEvent,
+) -> Result<(), SoakError> {
+    tokio::time::timeout(Duration::from_secs(30), events.send(event))
+        .await
+        .map_err(|_| fail("completed worker result delivery timed out"))?
+        .map_err(|_| fail("completed worker result receiver closed"))
+}
+
+async fn collect_finished_workers(
+    workers: &mut tokio::task::JoinSet<Result<(), SoakError>>,
+    events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>,
+    mut record: impl FnMut(WorkerEvent),
+) -> Result<(), SoakError> {
+    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(deadline);
+    let mut events_closed = false;
+    while !workers.is_empty() || !events_closed {
+        tokio::select! {
+            _ = &mut deadline => return Err(fail("load workers/result collector required forced termination")),
+            event = events.recv(), if !events_closed => match event {
+                Some(event) => record(event),
+                None => events_closed = true,
+            },
+            joined = workers.join_next(), if !workers.is_empty() => {
+                joined.expect("nonempty worker set").map_err(|error|fail(format!("load worker failed: {error}")))??;
+            }
         }
-        Ok::<(), SoakError>(())
-    })
-    .await
-    .map_err(|_| fail("load workers required forced termination"))?
+    }
+    Ok(())
 }
 
 /// Planned campaign stop closes admission between operations. It does not
@@ -1339,8 +1362,8 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
     let mut rollbacks = 1u64;
     let expected_unavailable = Arc::new(AtomicBool::new(true));
     let control_epoch = Arc::new(AtomicU64::new(0));
-    let (events, mut received) =
-        tokio::sync::mpsc::channel::<(bool, bool, Result<(u16, u64, bool), String>)>(256);
+    let (events, mut received) = tokio::sync::mpsc::channel::<WorkerEvent>(256);
+    let started_operations = Arc::new(AtomicU64::new(0));
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut workers = tokio::task::JoinSet::new();
     let targets = [
@@ -1361,6 +1384,7 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
         let expected = Arc::clone(&expected_unavailable);
         let epoch = Arc::clone(&control_epoch);
         let payload_size = args.payload_size;
+        let started = Arc::clone(&started_operations);
         workers.spawn(async move {
             let mut random=XorShift64::new(seed);let mut client=None;let mut operations=0u64;
             // Keep one negotiated protocol per worker. Switching on every
@@ -1370,19 +1394,19 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
                 if *stop.borrow(){break;}
                 let cancel=random.next().is_multiple_of(17);let is_grpc=matches!(campaign,Campaign::Protocol);
                 if client.is_none()||operations.is_multiple_of(128){client=tokio::select!{_=stop.changed()=>break,connection=tokio::time::timeout(Duration::from_secs(5),DataClient::connect(address,if use_h2{Arc::clone(&h2)}else{Arc::clone(&h1)},use_h2,targets,payload_size))=>connection.ok().and_then(Result::ok)};}
+                // Connection preparation is not an admitted HTTP operation.
+                // Once admitted, stop cannot discard either its work or result.
+                if *stop.borrow(){break;}
+                started.fetch_add(1,Ordering::Release);
                 let expected_now=expected.load(Ordering::Acquire);
                 let started_epoch = epoch.load(Ordering::Acquire);
                 let result=if let Some(client)=&mut client{complete_bounded_request(client.request(is_grpc,cancel,None)).await}else{Err("client connection failure".into())};
                 if result.is_err()||(!use_h2&&cancel){client=None;}
                 let expected_now = expected_now || expected.load(Ordering::Acquire) || epoch.load(Ordering::Acquire) != started_epoch;
-                tokio::select! {
-                    _ = stop.changed() => break,
-                    sent = events.send((is_grpc,expected_now,result)) => {
-                        if sent.is_err() { break; }
-                    }
-                }
+                send_completed_worker_event(&events,(is_grpc,expected_now,result)).await?;
                 operations+=1;tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            Ok::<(),SoakError>(())
         });
     }
     drop(events);
@@ -1549,9 +1573,8 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
         tokio::select! {Some((is_grpc,expected_now,result))=received.recv()=>{requests+=1;if is_grpc{grpc+=1;}match result{Ok((200,n,was_cancelled))=>{if was_cancelled{cancelled+=1;if is_grpc{grpc_cancelled+=1;}}else{success+=1;if is_grpc{grpc_completed+=1;}}bytes+=n;},Ok((503,_,_)) if expected_now=>expected+=1,other=>{failures+=1;if unexpected_samples.len()<32{unexpected_samples.push(json!({"result":format!("{other:?}"),"expected_unavailable":expected_now,"grpc":is_grpc,"at_ms":crate::millis(start.elapsed())}));}}}},_=tokio::time::sleep(Duration::from_millis(10))=>{}}
     }
     let _ = stop.send(true);
-    join_workers(&mut workers).await?;
     drop(probe);
-    while let Ok((is_grpc, expected_now, result)) = received.try_recv() {
+    collect_finished_workers(&mut workers,&mut received,|(is_grpc,expected_now,result)| {
         requests += 1;
         if is_grpc {
             grpc += 1;
@@ -1572,9 +1595,9 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
                 bytes += n;
             }
             Ok((503, _, _)) if expected_now => expected += 1,
-            _ => failures += 1,
+            other => { failures += 1; if unexpected_samples.len()<32 { unexpected_samples.push(json!({"result":format!("{other:?}"),"expected_unavailable":expected_now,"grpc":is_grpc,"at_ms":crate::millis(start.elapsed()),"phase":"worker_shutdown"})); } },
         }
-    }
+    }).await?;
     upstream.command(FixtureCommand::Release).await?;
     command_json(
         &args.gateway,
@@ -1630,10 +1653,16 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
             "worker accounting mismatch: requests={requests}, classified={accounted_workers}"
         )));
     }
+    let started_operations = started_operations.load(Ordering::Acquire);
+    if started_operations != requests {
+        return Err(fail(format!(
+            "worker operation receipts missing: started={started_operations}, recorded={requests}"
+        )));
+    }
     std::fs::write(
         args.output.join("final-evidence.json"),
         serde_json::to_vec_pretty(&json!({
-            "requests":requests,"success":success,"cancelled_responses":cancelled,
+            "requests":requests,"started_operations":started_operations,"success":success,"cancelled_responses":cancelled,
             "unexpected_errors":unexpected_errors,"worker_errors":failures,"upgrade_unavailable":upgrade_unavailable,"upgrade_errors":upgrade_errors,"dns":dns_stats,"upstream":upstream_stats,
             "last_sample":samples.last(),"gateway_pid":gateway.pid,
         }))
@@ -1741,7 +1770,7 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
         "schema_version":"oxidase.discovery-soak/v1", "result":if unexpected_errors==0{"pass"}else{"fail"},
         "parameters":{"campaign":args.campaign,"duration_ms":crate::millis(args.duration),"warmup_ms":crate::millis(args.warm_up),"cooldown_ms":crate::millis(args.cooldown),"concurrency":args.concurrency,"seed":args.seed,"sample_interval_ms":crate::millis(args.sample_interval),"reload_interval_ms":crate::millis(args.reload_interval),"payload_size":args.payload_size},
         "elapsed_ms":crate::millis(start.elapsed()),"pids":pids,"initial_runtime":initial,"drained_runtime":drained,
-        "requests":requests,"success":success,"cancelled_responses":cancelled,"expected_unavailable":expected,
+        "requests":requests,"started_operations":started_operations,"success":success,"cancelled_responses":cancelled,"expected_unavailable":expected,
         "unexpected_errors":unexpected_errors,"worker_errors":failures,"unexpected_samples":unexpected_samples,"bytes":bytes,
         "grpc_attempted":grpc,"grpc_completed":grpc_completed,"grpc_cancelled":grpc_cancelled,
         "upgrade_tunnels":tunnels,"upgrade_unavailable":upgrade_unavailable,"upgrade_errors":upgrade_errors,"retained_stream_proof":retained,"final_sample":final_sample,
@@ -1915,15 +1944,83 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_load_worker_cannot_be_counted_as_campaign_success() {
         let mut workers = tokio::task::JoinSet::new();
+        let (events, mut received) = tokio::sync::mpsc::channel::<WorkerEvent>(1);
+        drop(events);
         workers.spawn(async {
             panic!("injected qualification worker panic");
         });
         assert!(
-            join_workers(&mut workers)
+            collect_finished_workers(&mut workers, &mut received, |_| {})
                 .await
                 .expect_err("worker panic must fail")
                 .to_string()
                 .contains("load worker failed")
+        );
+    }
+    #[tokio::test]
+    async fn full_result_channel_and_stop_cannot_hide_completed_validator_error() {
+        let (events, mut received) = tokio::sync::mpsc::channel::<WorkerEvent>(1);
+        events
+            .try_send((false, false, Ok((200, 1, false))))
+            .expect("first recorded operation fills channel");
+        let started = Arc::new(AtomicU64::new(1));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let (attempt, attempted) = tokio::sync::oneshot::channel();
+        let mut workers = tokio::task::JoinSet::new();
+        let started_worker = Arc::clone(&started);
+        let worker = workers.spawn(async move {
+            started_worker.fetch_add(1, Ordering::Release);
+            let mut validator = PayloadValidator::new(true, 2, b'a');
+            let error = validator
+                .push(&Bytes::from_static(&[0, 0, 0, 0, 2, b'x', b'y']))
+                .expect_err("real opaque DATA validation error")
+                .to_string();
+            attempt
+                .send(())
+                .expect("completed outcome exists before stop");
+            send_completed_worker_event(&events, (true, false, Err(error))).await
+        });
+        attempted.await.expect("bounded source acknowledgment");
+        stop.send(true)
+            .expect("planned stop while result channel is full");
+        tokio::task::yield_now().await;
+        assert!(*stopped.borrow());
+        assert!(
+            !worker.is_finished(),
+            "result must wait for capacity, not discard on stop"
+        );
+        let mut recorded = 0u64;
+        let mut errors = 0u64;
+        collect_finished_workers(&mut workers, &mut received, |(_, _, result)| {
+            recorded += 1;
+            if let Err(error) = result {
+                assert!(error.contains("opaque response DATA"));
+                errors += 1;
+            }
+        })
+        .await
+        .expect("concurrent join/drain cannot deadlock");
+        assert_eq!(recorded, started.load(Ordering::Acquire));
+        assert_eq!(recorded, 2);
+        assert_eq!(
+            errors, 1,
+            "completed error must make final campaign result FAIL"
+        );
+    }
+    #[tokio::test]
+    async fn closed_result_receiver_makes_worker_join_fail_instead_of_silent_stop() {
+        let (events, mut received) = tokio::sync::mpsc::channel::<WorkerEvent>(1);
+        received.close();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async move {
+            send_completed_worker_event(&events, (false, false, Ok((200, 1, false)))).await
+        });
+        assert!(
+            collect_finished_workers(&mut workers, &mut received, |_| {})
+                .await
+                .expect_err("closed receiver cannot yield PASS")
+                .to_string()
+                .contains("result receiver closed")
         );
     }
 }
