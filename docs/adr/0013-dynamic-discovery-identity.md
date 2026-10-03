@@ -86,6 +86,37 @@ The exact resolver release, limits and executable acceptance evidence are record
 when their stages are implemented. DNS wire parsing is delegated to a maintained
 library, not a parallel protocol stack.
 
+### Implemented 6B decision
+
+Hickory resolver is pinned to `0.26.3` with only Tokio and system-config features.
+The actual minimal workspace graph passed Rust 1.88 checks and the unchanged
+cargo-deny policy; optional encrypted-DNS features are not enabled. Raw
+`NameServerPool` delegates UDP/TCP parsing and truncation fallback without a second
+completed-answer cache. Global admission is 64; at most 128 committed supervisors,
+4 numeric nameservers, 512 aggregate records and 65,535 encoded bytes per family
+resolution, 8 CNAME edges, 32 logical names and 256 merged physical members.
+
+Local resolver construction is prepared off async workers and frozen before the
+final publication condition. Only commit activates queries. Same resource reuse
+retains its owner/input/session; replacement or explicit resume creates a fresh
+fenced session. Removal aborts and joins old discovery tasks independently of a
+pinned old stream. Drain stops them; only an existing explicit publication control
+operation can resume traffic. Recovery-required LKG, if still Running, may keep
+its already-authorized operational refresh without regaining write authority.
+
+Positive TTL, CNAME TTL and validated SOA negative expiry use absolute monotonic
+timestamps. Query floors/backoff/jitter never renew membership. NXDOMAIN clears
+both families and cancels the concurrent sibling lookup; NODATA only clears its
+family. Timeout/network/SERVFAIL/REFUSED alone allow finite stale use, anchored
+at original expiry. Policy/malformed/limit rejection cannot use stale. Expired
+bookkeeping does not occupy the eligible endpoint quota. Reconciliation rejection
+uses failure backoff rather than the rejected raw positive TTL.
+
+Production early-only jitter mixes OS-seeded process-local randomness and the
+configured Resource ID; tests inject a seed. Neither seed nor a DNS value is a
+correctness identity or metric label. Dynamic metrics are aggregate fixed-enum
+series, and authenticated Cluster status is observation only.
+
 References: [locked Hyper connector boundary](https://docs.rs/hyper-util/0.1.20/hyper_util/client/legacy/connect/index.html),
 [RFC 2782](https://www.rfc-editor.org/rfc/rfc2782.html),
 [RFC 2308](https://www.rfc-editor.org/rfc/rfc2308.html),

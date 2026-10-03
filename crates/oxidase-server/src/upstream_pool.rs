@@ -99,9 +99,13 @@ where
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry
-            .entries
-            .retain(|_, entry| entry.owner.strong_count() > 0);
+        registry.entries.retain(|_, entry| {
+            entry.owner.upgrade().is_some_and(|owner| {
+                entry
+                    .connector
+                    .compatible_with_cluster(&owner, &entry.endpoint)
+            })
+        });
         registry.clock = registry.clock.saturating_add(1);
         let now = registry.clock;
         if let Some(entry) = registry.entries.get_mut(&key) {
@@ -115,7 +119,11 @@ where
                 .get(cluster.id())
                 .and_then(Weak::upgrade)
                 .is_some_and(|owner| Arc::ptr_eq(&owner, cluster));
-        if !current_owner {
+        let endpoints = cluster.endpoints();
+        let endpoint = endpoints
+            .iter()
+            .find(|endpoint| connector.pool_identity(cluster.id(), endpoint.name()) == key);
+        if !current_owner || endpoint.is_none() {
             // A request pinned before publication can reach Proxy afterwards.
             // Its private Arc dies with that attempt instead of retaining the
             // retired resource in a global strong or weak-key map.
@@ -133,11 +141,10 @@ where
         }
         // Recover the static endpoint name from its domain-separated key;
         // names are configuration-bounded and never derived from request data.
-        let endpoint = cluster
-            .endpoints()
-            .iter()
-            .find(|endpoint| connector.pool_identity(cluster.id(), endpoint.name()) == key)
-            .map_or_else(String::new, |endpoint| endpoint.name().to_owned());
+        let endpoint = endpoint
+            .expect("membership checked above")
+            .name()
+            .to_owned();
         registry.entries.insert(
             key,
             PoolEntry {
@@ -160,9 +167,13 @@ where
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry
-            .entries
-            .retain(|_, entry| entry.owner.strong_count() > 0);
+        registry.entries.retain(|_, entry| {
+            entry.owner.upgrade().is_some_and(|owner| {
+                entry
+                    .connector
+                    .compatible_with_cluster(&owner, &entry.endpoint)
+            })
+        });
         registry.clock = registry.clock.saturating_add(1);
         let now = registry.clock;
         let entry = registry.entries.get_mut(&key)?;
@@ -175,9 +186,13 @@ where
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry
-            .entries
-            .retain(|_, entry| entry.owner.strong_count() > 0);
+        registry.entries.retain(|_, entry| {
+            entry.owner.upgrade().is_some_and(|owner| {
+                entry
+                    .connector
+                    .compatible_with_cluster(&owner, &entry.endpoint)
+            })
+        });
         registry.entries.len()
     }
 
@@ -434,5 +449,90 @@ mod tests {
             1,
             "issued failed Client remains independently owned"
         );
+    }
+
+    #[tokio::test]
+    async fn dns_withdrawal_reclaims_idle_pool_and_readd_cannot_reuse_old_incarnation() {
+        use oxidase_runtime::{DnsAddressRecord, DnsFamily, DnsObservation};
+        let directory = TempDir::new().expect("source fixture");
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: pool.oxidase.invalid\n          port: 8001\n          origin: http://logical.oxidase.invalid/base\n          resolver:\n            nameservers: [127.0.0.1:59999]\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: proxy\n      cluster: api\n").expect("source");
+        let snapshot = RuntimeSnapshot::prepare(Compiler::compile_path(path).expect("compile"))
+            .expect("prepare");
+        let cluster = Arc::clone(
+            snapshot
+                .resources
+                .clusters
+                .values()
+                .next()
+                .expect("cluster"),
+        );
+        assert!(cluster.activate_discovery_policy());
+        let observation = || DnsObservation::Positive {
+            addresses: vec![DnsAddressRecord {
+                address: "192.0.2.1".parse().expect("approved IP"),
+                fresh_until: tokio::time::Instant::now() + Duration::from_secs(60),
+            }],
+        };
+        let query = cluster.begin_discovery_query().expect("query lease");
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::A,
+            observation(),
+            tokio::time::Instant::now(),
+        );
+        drop(query);
+        let old_endpoint = Arc::clone(&cluster.endpoints()[0]);
+        let registry = BoundedPoolRegistry::<Empty<Bytes>>::new(2);
+        registry.reconcile_snapshot(&snapshot);
+        let make_connector = |endpoint: &oxidase_runtime::PreparedEndpoint| {
+            DirectConnector::new(
+                LogicalOrigin::from_url(endpoint.url()).expect("origin"),
+                DialTarget::new(endpoint.dial_target().expect("actual approved socket"))
+                    .expect("target"),
+                cluster.protocol(),
+                None,
+                TransportTimeouts::for_cluster(&cluster),
+            )
+            .expect("connector")
+            .with_endpoint_incarnation(endpoint.incarnation())
+        };
+        let old_connector = make_connector(&old_endpoint);
+        let old_key = old_connector.pool_identity(cluster.id(), old_endpoint.name());
+        let issued = registry.get_or_build(old_key, &cluster, old_connector, cluster.protocol(), 2);
+        let old_pool = Arc::downgrade(&issued);
+        assert_eq!(registry.pools_count(), 1);
+        let query = cluster.begin_discovery_query().expect("withdrawal");
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::A,
+            DnsObservation::NoData,
+            tokio::time::Instant::now(),
+        );
+        drop(query);
+        assert_eq!(registry.pools_count(), 0);
+        assert!(registry.get_existing(old_key).is_none());
+        assert!(
+            old_pool.upgrade().is_some(),
+            "already issued Client remains independent of idle registry ownership"
+        );
+        let query = cluster.begin_discovery_query().expect("readd");
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::A,
+            observation(),
+            tokio::time::Instant::now(),
+        );
+        drop(query);
+        let new_endpoint = Arc::clone(&cluster.endpoints()[0]);
+        assert_ne!(old_endpoint.incarnation(), new_endpoint.incarnation());
+        let connector = make_connector(&new_endpoint);
+        let new_key = connector.pool_identity(cluster.id(), new_endpoint.name());
+        assert_ne!(old_key, new_key);
+        let new_pool = registry.get_or_build(new_key, &cluster, connector, cluster.protocol(), 2);
+        assert!(!Arc::ptr_eq(&issued, &new_pool));
+        assert_eq!(registry.pools_count(), 1);
+        drop(issued);
+        assert!(old_pool.upgrade().is_none());
     }
 }

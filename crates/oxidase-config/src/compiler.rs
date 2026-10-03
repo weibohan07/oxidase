@@ -26,6 +26,11 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
+use crate::discovery::{
+    DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec, DnsRecordType, DnsRefreshSpec,
+    DnsResolverSource, DnsResolverSpec, normalize_dns_ip, normalize_dns_name, parse_dns_origin,
+    validate_dns_nameserver,
+};
 use crate::source::{
     ActiveHealthSource, AdminAuthSource, AdminListenSource, AdminSource, BodySource, BundleSource,
     CertificateSource, ClientAuthSource, ClusterEndpointSource, ClusterSource, ClusterTlsSource,
@@ -235,6 +240,14 @@ impl CompiledGateway {
                     protocol: cluster.protocol,
                     load_balance: cluster.load_balance,
                     endpoint_count: cluster.endpoints.len(),
+                    discovery: cluster.discovery.as_ref().map(|dns| DnsDiscoverySummary {
+                        name: dns.name.clone(),
+                        record: dns.record.as_str().to_owned(),
+                        origin: dns.origin.as_str().to_owned(),
+                        port: dns.port,
+                        max_endpoints: dns.limits.max_endpoints,
+                        endpoint_selection: "runtime state dependent".to_owned(),
+                    }),
                     active_health: cluster.health.active.is_some(),
                     passive_health: cluster.health.passive.is_some(),
                     retry_max_attempts: cluster.retry.max_attempts,
@@ -356,6 +369,8 @@ pub struct ClusterSpec {
     pub id: ResourceId,
     pub protocol: ClusterProtocol,
     pub endpoints: Vec<ClusterEndpointSpec>,
+    /// Static policy only; live DNS answers never enter immutable configuration.
+    pub discovery: Option<DnsDiscoverySpec>,
     pub load_balance: LoadBalancePolicy,
     pub health: ClusterHealthSpec,
     pub retry: RetrySpec,
@@ -750,9 +765,21 @@ pub struct ClusterSummary {
     pub protocol: ClusterProtocol,
     pub load_balance: LoadBalancePolicy,
     pub endpoint_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DnsDiscoverySummary>,
     pub active_health: bool,
     pub passive_health: bool,
     pub retry_max_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsDiscoverySummary {
+    pub name: String,
+    pub record: String,
+    pub origin: String,
+    pub port: u16,
+    pub max_endpoints: u16,
+    pub endpoint_selection: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2220,11 +2247,23 @@ fn compile_resources(
             },
         );
     }
+    let mut discovery_clusters = 0;
     for (name, located) in &merged.clusters {
         let protocol_path = format!("{}.protocol", located.field_path);
         let protocol_source = located.span_at(&protocol_path);
         let protocol = parse_cluster_protocol(&located.value.protocol, &protocol_source)?;
-        if located.value.endpoints.is_empty() {
+        let discovery = compile_cluster_discovery(located)?;
+        if discovery.is_some() {
+            discovery_clusters += 1;
+            if discovery_clusters > crate::MAX_DNS_DISCOVERY_CLUSTERS {
+                return Err(semantic_error_at(
+                    "resource.discovery_cluster_limit",
+                    "at most 128 DNS discovery Clusters may be configured",
+                    located.span_at(&format!("{}.discovery", located.field_path)),
+                ));
+            }
+        }
+        if located.value.endpoints.is_empty() && discovery.is_none() {
             return Err(semantic_error_at(
                 "resource.cluster_empty",
                 "cluster must contain at least one endpoint",
@@ -2261,7 +2300,19 @@ fn compile_resources(
             .value
             .tls
             .as_ref()
-            .map(|source| compile_cluster_tls(source, located, &resources, &endpoints))
+            .map(|source| {
+                compile_cluster_tls(
+                    source,
+                    located,
+                    &resources,
+                    endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.url.scheme() == "https")
+                        || discovery
+                            .as_ref()
+                            .is_some_and(|dns| dns.origin.scheme() == "https"),
+                )
+            })
             .transpose()?;
         let id = ResourceId::new(format!("cluster:{name}"));
         resources.clusters.insert(
@@ -2270,6 +2321,7 @@ fn compile_resources(
                 id,
                 protocol,
                 endpoints,
+                discovery,
                 load_balance,
                 health,
                 retry,
@@ -3750,7 +3802,23 @@ fn compile_cluster_timeouts(
             located.span_at(&format!("{}.timeouts", located.field_path)),
         ));
     }
-    if let Some(timeouts) = &source.timeouts {
+    if source.discovery.is_some() {
+        for name in ["connect_timeout", "response_timeout"] {
+            if declared(name) {
+                return Err(CompileError::one(Diagnostic::new(
+                    "resource.discovery_legacy_timeout",
+                    "DNS discovery requires the phased timeout contract; legacy fields cannot be used",
+                    located.span_at(&format!("{}.{}", located.field_path, name)),
+                ).with_label("DNS discovery policy", located.span_at(&format!("{}.discovery", located.field_path)))
+                 .with_help("remove legacy timeout fields; discovery defaults to phased timing, or configure `timeouts` explicitly")));
+            }
+        }
+    }
+    let discovery_defaults = source
+        .discovery
+        .as_ref()
+        .map(|_| crate::source::UpstreamTimeoutSource::default());
+    if let Some(timeouts) = source.timeouts.as_ref().or(discovery_defaults.as_ref()) {
         for (name, legacy) in [
             ("connect_timeout", &source.connect_timeout),
             ("response_timeout", &source.response_timeout),
@@ -3915,20 +3983,17 @@ fn compile_cluster_tls(
     source: &ClusterTlsSource,
     located: &Located<ClusterSource>,
     resources: &CompiledResources,
-    endpoints: &[ClusterEndpointSpec],
+    has_https_origin: bool,
 ) -> Result<ClusterTlsSpec, CompileError> {
     let field_path = format!("{}.tls", located.field_path);
-    if !endpoints
-        .iter()
-        .any(|endpoint| endpoint.url.scheme() == "https")
-    {
+    if !has_https_origin {
         return Err(CompileError::one(
             Diagnostic::new(
                 "resource.cluster_tls_inert",
-                "cluster TLS policy has no effect because every endpoint uses `http`",
+                "cluster TLS policy has no effect because every static or discovery origin uses `http`",
                 located.span_at(&field_path),
             )
-            .with_help("remove `tls`, or configure at least one `https` endpoint"),
+            .with_help("remove `tls`, or configure an `https` static/discovery origin"),
         ));
     }
 
@@ -4065,6 +4130,193 @@ fn normalize_upstream_server_name(source: &str) -> Result<String, String> {
         ));
     }
     Ok(normalized)
+}
+
+fn compile_cluster_discovery(
+    located: &Located<ClusterSource>,
+) -> Result<Option<DnsDiscoverySpec>, CompileError> {
+    let base = format!("{}.discovery.dns", located.field_path);
+    let span = |field: &str| located.span_at(&format!("{base}.{field}"));
+    let fail = |field: &str, message: &str| {
+        semantic_error_at("resource.discovery_policy", message, span(field))
+    };
+    let declared = |field: &str| located.spans.get(&format!("{base}.{field}")).is_some();
+    let Some(discovery) = &located.value.discovery else {
+        if located
+            .spans
+            .get(&format!("{}.discovery", located.field_path))
+            .is_some()
+        {
+            return Err(semantic_error_at(
+                "resource.discovery_policy",
+                "discovery must be a non-null `dns` policy mapping",
+                located.span_at(&format!("{}.discovery", located.field_path)),
+            ));
+        }
+        return Ok(None);
+    };
+    if located
+        .spans
+        .get(&format!("{}.endpoints", located.field_path))
+        .is_some()
+    {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "resource.cluster_endpoint_source_conflict",
+                "configure exactly one of `endpoints` and `discovery`",
+                located.span_at(&format!("{}.endpoints", located.field_path)),
+            )
+            .with_label("discovery source", located.span_at(&base))
+            .with_help("remove `endpoints` entirely when using DNS discovery"),
+        ));
+    }
+    let dns = &discovery.dns;
+    if dns.record != "a_aaaa" {
+        return Err(CompileError::one(Diagnostic::new(
+            "resource.discovery_record_unsupported", "this stage supports only DNS `a_aaaa`; SRV is not implemented yet", span("record"),
+        ).with_help("use `record: a_aaaa` with an explicit dial port, or static endpoints; SRV is delivered separately in phase 6C")));
+    }
+    let name = normalize_dns_name(&dns.name).map_err(|error| fail(&error.field, error.message))?;
+    let port = dns
+        .port
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| fail("port", "a_aaaa discovery requires a dial port in 1..=65535"))?;
+    let origin =
+        parse_dns_origin(&dns.origin).map_err(|error| fail(&error.field, error.message))?;
+    if dns.resolver.nameservers.is_some()
+        && (dns.resolver.system.is_some() || declared("resolver.system"))
+    {
+        return Err(CompileError::one(Diagnostic::new(
+            "resource.discovery_resolver_conflict", "system resolver and explicit nameservers are mutually exclusive", span("resolver.nameservers"),
+        ).with_label("system resolver declaration", span("resolver.system"))
+         .with_help("omit `system` for explicit IP:port nameservers; otherwise use `system: true` without `nameservers`")));
+    }
+    if dns.resolver.system == Some(false)
+        || (dns.resolver.system.is_none() && declared("resolver.system"))
+    {
+        return Err(fail(
+            "resolver.system",
+            "system must be true; omit it when configuring explicit nameservers",
+        ));
+    }
+    let resolver_source = match &dns.resolver.nameservers {
+        Some(servers) => {
+            if servers.is_empty() || servers.len() > crate::MAX_DNS_NAMESERVERS {
+                return Err(fail(
+                    "resolver.nameservers",
+                    "configure 1 through 4 explicit IP:port nameservers",
+                ));
+            }
+            let mut addresses = servers
+                .iter()
+                .enumerate()
+                .map(|(index, server)| {
+                    let field = format!("resolver.nameservers[{index}]");
+                    let address: SocketAddr = server.parse().map_err(|_| {
+                        fail(
+                            &field,
+                            "nameserver must be an explicit IP:port, not a hostname",
+                        )
+                    })?;
+                    validate_dns_nameserver(address)
+                        .map_err(|error| fail(&field, error.message))?;
+                    Ok(SocketAddr::new(
+                        normalize_dns_ip(address.ip()),
+                        address.port(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, CompileError>>()?;
+            addresses.sort_unstable();
+            addresses.dedup();
+            DnsResolverSource::NameServers(addresses)
+        }
+        None if declared("resolver.nameservers") => {
+            return Err(fail(
+                "resolver.nameservers",
+                "nameservers must be a non-null sequence of explicit IP:port addresses",
+            ));
+        }
+        None => DnsResolverSource::System,
+    };
+    let duration = |field: &str, value: &str, allow_zero: bool| {
+        if allow_zero {
+            parse_nonnegative_duration(value, &span(field))
+        } else {
+            parse_upstream_phase_duration(value, &span(field))
+        }
+    };
+    let bounded = |field: &str, value: u32| {
+        u16::try_from(value)
+            .map_err(|_| fail(field, "value exceeds the DNS discovery resource bound"))
+    };
+    let mut spans = BTreeMap::new();
+    for field in [
+        "name",
+        "record",
+        "port",
+        "origin",
+        "resolver",
+        "resolver.system",
+        "resolver.nameservers",
+        "resolver.query_timeout",
+        "refresh",
+        "refresh.min_interval",
+        "refresh.max_interval",
+        "refresh.jitter_percent",
+        "refresh.stale_if_error",
+        "limits",
+        "limits.max_endpoints",
+        "limits.max_targets",
+        "address_policy",
+        "address_policy.allow_private",
+        "address_policy.allow_loopback",
+        "address_policy.allow_link_local",
+    ] {
+        spans.insert(field.to_owned(), span(field));
+    }
+    if let Some(servers) = &dns.resolver.nameservers {
+        for index in 0..servers.len() {
+            let field = format!("resolver.nameservers[{index}]");
+            spans.insert(field.clone(), span(&field));
+        }
+    }
+    let policy = DnsDiscoverySpec {
+        name,
+        record: DnsRecordType::AAndAaaa,
+        port,
+        origin,
+        resolver: DnsResolverSpec {
+            source: resolver_source,
+            query_timeout: duration("resolver.query_timeout", &dns.resolver.query_timeout, false)?,
+        },
+        refresh: DnsRefreshSpec {
+            min_interval: duration("refresh.min_interval", &dns.refresh.min_interval, false)?,
+            max_interval: duration("refresh.max_interval", &dns.refresh.max_interval, false)?,
+            jitter_percent: u8::try_from(dns.refresh.jitter_percent).map_err(|_| {
+                fail(
+                    "refresh.jitter_percent",
+                    "jitter_percent must be in 0..=100",
+                )
+            })?,
+            stale_if_error: duration("refresh.stale_if_error", &dns.refresh.stale_if_error, true)?,
+        },
+        limits: DnsDiscoveryLimits {
+            max_endpoints: bounded("limits.max_endpoints", dns.limits.max_endpoints)?,
+            max_targets: bounded("limits.max_targets", dns.limits.max_targets)?,
+        },
+        address_policy: DnsAddressPolicy {
+            allow_private: dns.address_policy.allow_private,
+            allow_loopback: dns.address_policy.allow_loopback,
+            allow_link_local: dns.address_policy.allow_link_local,
+        },
+        source: located.span_at(&base),
+        spans,
+    };
+    policy
+        .validate()
+        .map_err(|error| fail(&error.field, error.message))?;
+    Ok(Some(policy))
 }
 
 fn compile_cluster_endpoints(
@@ -5460,7 +5712,7 @@ listeners:
     }
 
     #[test]
-    fn phased_upstream_defaults_and_exact_spans_do_not_expose_discovery() {
+    fn phased_upstream_defaults_and_exact_spans_reject_ambiguous_discovery() {
         let source = timeout_gateway_source("      timeouts:\n        connect: 15ms\n")
             .replace('\n', "\r\n");
         let (_directory, path) = write_config(&source);
@@ -5488,10 +5740,14 @@ listeners:
         assert!(gateway.warnings.is_empty());
 
         let (_directory, path) = write_config(&timeout_gateway_source(
-            "      discovery:\n        dns:\n          name: unimplemented.test\n",
+            "      discovery:\n        dns:\n          name: unimplemented.test\n          port: 8080\n          origin: http://logical.test\n",
         ));
-        let error = Compiler::compile_path(path).expect_err("6A must not expose inert discovery");
-        assert_eq!(error.diagnostics[0].code, "source.parse");
+        let error =
+            Compiler::compile_path(path).expect_err("static and discovery sources cannot mix");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "resource.cluster_endpoint_source_conflict"
+        );
         assert!(error.to_string().contains("discovery"));
     }
 

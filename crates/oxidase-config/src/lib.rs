@@ -2,6 +2,7 @@
 
 mod compiler;
 mod diagnostic;
+mod discovery;
 pub mod portable;
 mod source;
 
@@ -13,12 +14,19 @@ pub use compiler::{
     CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec, ClusterHealthSpec,
     ClusterLimits, ClusterProtocol, ClusterSpec, ClusterSummary, ClusterTlsSpec,
     ClusterTlsTrustSpec, CompiledGateway, CompiledListener, CompiledResources, Compiler,
-    GatewaySummary, Http1Settings, Http2Settings, HttpListenerSpec, HttpVersion, ListenerLimits,
-    ListenerProtocol, LoadBalancePolicy, PassiveHealthSpec, RetryBodyMode, RetryCause,
-    RetryRequestBodySpec, RetrySpec, SecretSpec, SiteSpec, SniCertificateSpec, SniPattern,
-    StatusRange, TlsListenerSpec, TrustStoreSpec, UpstreamTimeoutSpec,
+    DnsDiscoverySummary, GatewaySummary, Http1Settings, Http2Settings, HttpListenerSpec,
+    HttpVersion, ListenerLimits, ListenerProtocol, LoadBalancePolicy, PassiveHealthSpec,
+    RetryBodyMode, RetryCause, RetryRequestBodySpec, RetrySpec, SecretSpec, SiteSpec,
+    SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec, TrustStoreSpec,
+    UpstreamTimeoutSpec,
 };
 pub use diagnostic::{CompileError, Diagnostic};
+pub use discovery::{
+    DNS_ADDRESS_DISCOVERY_FEATURE, DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec,
+    DnsRecordType, DnsRefreshSpec, DnsResolverSource, DnsResolverSpec, MAX_DNS_CNAME_DEPTH,
+    MAX_DNS_DISCOVERY_CLUSTERS, MAX_DNS_ENDPOINTS, MAX_DNS_NAMESERVERS, MAX_DNS_RECORDS,
+    MAX_DNS_RESPONSE_BYTES, MAX_DNS_TARGETS, normalize_dns_ip,
+};
 pub use portable::{
     PORTABLE_GATEWAY_CONFIG_SCHEMA_V1, PortableAdminAuditV1, PortableAdminAuthV1,
     PortableAdminBundleTrustV1, PortableAdminCandidateLimitsV1, PortableAdminHistoryLimitsV1,

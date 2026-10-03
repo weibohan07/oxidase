@@ -34,6 +34,10 @@ impl PreparedUpstreamTls {
             .endpoints
             .iter()
             .any(|endpoint| endpoint.url.scheme() == "https")
+            && !cluster
+                .discovery
+                .as_ref()
+                .is_some_and(|dns| dns.origin.scheme() == "https")
         {
             return Ok(None);
         }

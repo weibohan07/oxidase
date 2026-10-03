@@ -50,9 +50,44 @@ pub struct Metrics {
     transport_overflow: Arc<TransportSeries>,
     governance: RwLock<GovernanceSeriesMap>,
     upstream_timeouts: [AtomicU64; 7],
+    discovery: Mutex<BTreeMap<String, [u64; 16]>>,
+    discovery_tasks: AtomicU64,
 }
 
 impl Metrics {
+    pub(crate) fn discovery_task_started(self: &Arc<Self>) -> DiscoveryTaskGuard {
+        self.discovery_tasks.fetch_add(1, Ordering::Relaxed);
+        DiscoveryTaskGuard(Arc::clone(self))
+    }
+
+    pub(crate) fn record_discovery(
+        &self,
+        cluster: &str,
+        family: oxidase_runtime::DnsFamily,
+        observation: &oxidase_runtime::DnsObservation,
+    ) {
+        use oxidase_runtime::DnsObservation;
+        let result = match observation {
+            DnsObservation::Positive { .. } => 0,
+            DnsObservation::NameNotFound => 1,
+            DnsObservation::NoData => 2,
+            DnsObservation::TransientFailure { .. } => 3,
+            DnsObservation::PolicyRejected => 4,
+            DnsObservation::InvalidAnswer => 5,
+            DnsObservation::LimitExceeded => 6,
+        };
+        let index = result + usize::from(family == oxidase_runtime::DnsFamily::Aaaa) * 8;
+        let mut series = self
+            .discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !series.contains_key(cluster) && series.len() >= MAX_OBSERVE_SERIES {
+            return;
+        }
+        let counters = series.entry(cluster.to_owned()).or_default();
+        counters[index] = counters[index].saturating_add(1);
+    }
+
     pub(crate) fn record_upstream_timeout(&self, phase: TimeoutPhase) {
         let index = match phase {
             TimeoutPhase::Queue => 0,
@@ -433,6 +468,34 @@ impl Metrics {
     #[must_use]
     pub fn render_prometheus_for(&self, snapshot: &RuntimeSnapshot) -> String {
         let mut output = self.render_prometheus();
+        output.push_str(&format!(
+            "oxidase_discovery_active_supervisors {}\n",
+            self.discovery_tasks.load(Ordering::Relaxed)
+        ));
+        for (cluster, counters) in self
+            .discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            let cluster = escape_label(cluster);
+            for (family_index, family) in ["a", "aaaa"].into_iter().enumerate() {
+                for (index, result) in [
+                    "positive",
+                    "name_not_found",
+                    "no_data",
+                    "transient_failure",
+                    "policy_rejected",
+                    "invalid_answer",
+                    "limit_exceeded",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    output.push_str(&format!("oxidase_discovery_queries_total{{cluster=\"{cluster}\",family=\"{family}\",result=\"{result}\"}} {}\n", counters[family_index * 8 + index]));
+                }
+            }
+        }
         let now = Instant::now();
         for cluster in snapshot.resources.clusters.values() {
             let status = cluster.status(now);
@@ -466,6 +529,20 @@ impl Metrics {
                 ));
             }
 
+            if let Some(discovery) = status.discovery {
+                output.push_str(&format!("oxidase_discovery_endpoints{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_eligible_endpoints{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_generation{{cluster=\"{cluster_name}\"}} {}\noxidase_discovery_retired_admission_counters{{cluster=\"{cluster_name}\"}} {}\n", discovery.endpoint_count, discovery.eligible_endpoints, discovery.generation, discovery.retired_admission_counters));
+                for health in CLUSTER_HEALTH_STATES {
+                    let count = status
+                        .endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.runtime.health == health)
+                        .count();
+                    output.push_str(&format!("oxidase_discovery_health_endpoints{{cluster=\"{cluster_name}\",state=\"{}\"}} {count}\n", cluster_health_name(health)));
+                }
+                // Dynamic IP/target/incarnation identifiers must never create
+                // endpoint metric label cardinality across DNS churn.
+                continue;
+            }
             let mut endpoints = status.endpoints;
             endpoints.sort_by(|left, right| left.name.cmp(&right.name));
             for endpoint in endpoints {
@@ -513,6 +590,14 @@ impl Metrics {
             }
         }
         output
+    }
+}
+
+pub(crate) struct DiscoveryTaskGuard(Arc<Metrics>);
+
+impl Drop for DiscoveryTaskGuard {
+    fn drop(&mut self) {
+        self.0.discovery_tasks.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

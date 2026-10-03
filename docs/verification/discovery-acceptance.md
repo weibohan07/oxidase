@@ -18,17 +18,79 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 
 | Stage | Implementation | Local / Hosted / campaign evidence |
 | --- | --- | --- |
-| 6A transport identity/deadlines | cancellation fixture repaired and locally verified; not merged | post-fix nine gates PASS; old PR run `37129738230` FAIL; repaired-head and merged-main Hosted acceptance pending |
-| 6B A/AAAA discovery | not implemented by this branch | NOT RUN |
+| 6A transport identity/deadlines | normally merged through protected PR #16 | final head `39caf68` PR run `37131533884` PASS; merged main `aaece2a` push run `37131852985` PASS |
+| 6B A/AAAA discovery | in progress from protected main `aaece2a` | no final-head implementation/Hosted acceptance yet |
 | 6C SRV discovery | not implemented by this branch | NOT RUN |
 | 6D integration/qualification | not implemented by this branch | NOT RUN |
 
-## 6A executable contract
+## Protected 6A delivery receipt
+
+PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without
+an administrator override. Base: `ebfb7549bf9c1ddd91384cf85cff4098982b8acf`;
+final head: `39caf6874be5acef42ec442f44fcc46974ec0d97`;
+merge: `aaece2a0c263ce58e3ba7d398a33c11892186316`.
+The exact final-head [PR run](https://github.com/weibohan07/oxidase/actions/runs/37131533884)
+and independent merged-main [push run](https://github.com/weibohan07/oxidase/actions/runs/37131852985)
+both completed successfully with all four required jobs: MSRV 1.88, Stable
+workspace, Dependency policy and Fuzz harness compile smoke. Main remained strict,
+with force pushes/deletion disabled. Earlier failed/local-only receipts below
+remain history, not the final acceptance record.
+
+## 6A executable contract and intermediate evidence
 
 These local results describe the tested implementation, not final-head Hosted
 acceptance. The Draft's design-only head `53a1b14` passed PR run `37122950253`;
 that run must not be used to qualify the later implementation. The later
 implementation head `b105021` has an actual failed Hosted run, recorded below.
+
+## 6B executable contract (before final-head gates)
+
+Draft [PR #17](https://github.com/weibohan07/oxidase/pull/17) starts from protected
+main `aaece2a0c263ce58e3ba7d398a33c11892186316`. Its receipt-only head `e8a323d`
+passed run `37132909545`; that run does **not** qualify the A/AAAA implementation
+that followed. Final implementation-head and merged-main gates remain separate.
+
+| ID | Contract | Executable regression | Current local evidence |
+| --- | --- | --- | --- |
+| DS-10 | Strict source/portable contracts, precise spans, no DNS during validation | `oxidase-config/tests/dns_discovery.rs`; actual CLI `actual_check_bundle_build_and_verify_are_offline_and_do_not_query_dns` | focused source/portable/MSRV and real CLI PASS; frozen full gate pending |
+| DS-11 | Approved physical target is actual socket; fixed authority/base/raw query | `dns_rotation_moves_new_h2_stream_to_b_while_old_a_stream_finishes_with_trailers` | real TLS/H2 downstream and distinct H2 upstream peers PASS |
+| DS-12 | Independent family/CNAME expirations, TTL0 unavailable, no fresh lifetime refund | resolver `raw_queries_observe_independent_families_deduplicate_and_preserve_zero_ttl`; runtime discovery membership tests; wire `cold_failure_recovers_but_nxdomain_and_zero_ttl_revoke_real_pool_use` | focused resolver/runtime/wire PASS |
+| DS-13 | UDP/TCP fallback, canonical names, CNAME cycles/depth, packet/record/target quotas | `dns_resolver::tests` (14 real/pure fixture tests) | PASS 14/14; fixed limits and dependency graph/MSRV checked |
+| DS-14 | Negative/deletion distinct from transient; finite stale and bounded failure schedule | negative SOA/CNAME resolver tests; runtime stale-deadline tests; `family_negative_cache_backoff_and_name_revocation_are_bounded_and_independent` | targeted tests PASS; no completed-answer cache restarts TTL |
+| DS-15 | New H2 stream cannot use removed pool; existing A stream completes; fresh readd incarnation | real A→B wire test; `dns_withdrawal_reclaims_idle_pool_and_readd_cannot_reuse_old_incarnation`; runtime session/queued-lease tests | real wire and final server library gate PASS; latest runtime receipt recorded with full gate |
+| DS-16 | Expired bookkeeping is not eligible quota; rejected positive does not hide recovery under its raw TTL | paused runtime merge-quota test; `merged_quota_rejection_uses_failure_backoff_not_rejected_positive_ttl` | regression added and server scheduling PASS; frozen workspace gate pending |
+| DS-17 | Commit-only task activation, explicit owner retirement, resume-safe independent health tasks | health `removed_cluster_stops_supervisor_even_when_an_old_snapshot_is_pinned`; `replaced_health_policy_cancels_old_owner_and_same_arc_resume_restarts_once`; runtime query-session fencing tests | health PASS 11/11; no failed candidate long-lived task |
+| DS-18 | DNS does not publish configuration or create dynamic metric labels | both real DNS wire tests compare exact PublishedRuntime Arc/ETag/origin/version/readiness; metrics reject `endpoint="discovered-..."` | wire PASS; signed Admin competition and restart campaign belong to 6D |
+| DS-19 | Jitter desynchronizes instances and is deterministically testable without extending TTL | `early_jitter_has_deterministic_seed_and_does_not_refund_ttl` | injected-seed and early-bound regression PASS |
+
+The final focused server library run passed 207 tests; one existing ignored manual
+benchmark was **not run**. Focused Clippy denied warnings successfully. Intermediate
+build errors while collaborators were editing unfrozen APIs were not acceptance
+runs; only the subsequent frozen-source receipts qualify those changes. SRV and
+the 6D fuzz/Linux campaign remain NOT RUN, not implied by these local results.
+
+### Frozen implementation local gates and actual Hosted failure
+
+Frozen implementation `250b285044a9d1c969d8eaad5d98f14dfa60afe0` passed all nine
+local gates listed below, including both entire workspace test runs. Raw output:
+`artifacts/discovery-6b-250b285-local-gates.log.gz`. This is macOS evidence, not
+the subsequent Hosted outcome.
+
+That exact head ran [PR run `37136494778`](https://github.com/weibohan07/oxidase/actions/runs/37136494778).
+MSRV 1.88, Dependency policy and Fuzz harness compile smoke PASS. Stable workspace
+FAIL at Clippy; its tests/release/docs were skipped. GitHub used Rust 1.99, which
+deprecates `AtomicU64::fetch_update`; local stable was 1.97.1. Raw failing job:
+`artifacts/discovery-6b-pr17-37136494778-stable-failure.log.gz`.
+
+The repair uses a checked compare-exchange loop supported by Rust 1.88 and newer
+stable, without a warning suppression or MSRV increase. Regression
+`endpoint_incarnation_cas_is_unique_under_race_and_fails_closed_at_exhaustion`
+proves 2,048 concurrent unique claims and no rollover after `u64::MAX`. Stable
+and Rust 1.88 discovery tests pass 18/18 after the repair. The repaired final head
+requires its own four checks and an independent merged-main run; neither the
+old macOS PASS nor the receipt-only Draft run qualifies it.
+
+## 6A historical gates and Hosted-failure investigation
 
 ### Actual PR 16 Hosted failure
 
@@ -39,8 +101,8 @@ Both `MSRV 1.88` and `Stable workspace` FAIL at the existing `oxidase-soak`
 `crates/oxidase-soak/src/lib.rs:311`: `summary.body_cancellations > 0` was false.
 This is the only reported failing test in those two jobs; the new 6A CLI and wire
 regressions before it actually passed in both jobs. That run's overall gate is
-FAIL, not partially green acceptance. The PR has not been merged; the repaired
-final head needs its own Hosted run.
+FAIL, not partially green acceptance. At that point the PR had not been merged;
+the repaired final head subsequently passed its own run as recorded above.
 
 Raw failing job output is retained in
 `artifacts/discovery-6a-pr16-37129738230-failure.log.gz`. The local nine-gate PASS
@@ -135,8 +197,8 @@ is committed as `44489c5` (`feat(proxy): enforce transport identity and absolute
 upstream deadlines`). All nine gates below PASS; full output is retained in
 `artifacts/discovery-6a-local-gates.log.gz`. The following `b105021` documentation
 head failed Hosted run `37129738230`; the later `f023764` repair has its own fresh
-nine-gate PASS receipt above. Repaired final PR-head and merged-main Hosted
-receipts are pending.
+nine-gate PASS receipt above. The final 6A PR-head and independent merged-main
+receipts are recorded in the protected delivery section at the top of this file.
 
 | Actual command | Local result |
 | --- | --- |

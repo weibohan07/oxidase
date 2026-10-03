@@ -105,6 +105,7 @@ pub fn bundle_runtime_capabilities() -> BundleCapabilities {
         supported_features: BTreeSet::from([
             "portable-runtime".to_owned(),
             oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
+            oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned(),
         ]),
         supported_sections: BTreeMap::from([(
             RUNTIME_SECTION.to_owned(),
@@ -772,6 +773,7 @@ mod tests {
             BTreeSet::from([
                 "portable-runtime".to_owned(),
                 oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
+                oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned(),
             ])
         );
         assert_eq!(

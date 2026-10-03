@@ -40,8 +40,12 @@ bootstrap，修改时需重启。详见[管理 API](docs/admin-api.md)、
 workspace 仍为 `0.3.0-alpha.1`。第六阶段 6A 分离 HTTP/TLS 逻辑身份、实际拨号地址
 和连接池身份，增加六项分阶段上游 timeout；queue、上传与所有 retry 共用一个绝对
 pre-response 期限。旧计时模式保留并给出迁移 warning，新 Bundle 语义须声明 capability。
-详见[上游超时](docs/configuration/upstream-timeouts.md)。6A 尚未开放 DNS discovery；
-OpenTelemetry 与打包不在本任务范围内，也不代表 production-ready。
+详见[上游超时](docs/configuration/upstream-timeouts.md)。6B 增加有界 A/AAAA 动态发现：
+尊重各记录 TTL，仅对指定暂时错误使用有限 stale 宽限，直拨已批准地址。
+DNS 更新不发布配置、不改变 Admin ETag，也不能恢复 drain 后的流量；SRV 仍由下一子阶段
+单独开放。详见[动态发现](docs/configuration/discovery.md)和
+[实际验收记录](docs/verification/discovery-acceptance.md)。OpenTelemetry 与打包不在本任务
+范围内，也不代表 production-ready。
 
 当前入站数据面支持明文 HTTP/1.1，以及通过 TLS 1.2/1.3 和 ALPN 选择 HTTP/1.1
 或 HTTP/2 的 HTTPS；所有现有 Service 节点均可在选定协议上运行。Proxy 继续通过

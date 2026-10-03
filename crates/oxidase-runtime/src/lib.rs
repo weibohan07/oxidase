@@ -4,6 +4,7 @@ mod admin_token;
 mod bundle_activation;
 mod candidate;
 mod cluster;
+mod discovery;
 mod executor;
 mod governance;
 mod portable;
@@ -58,6 +59,11 @@ pub use candidate::{
 };
 pub use cluster::{
     ClusterAdmissionError, ClusterEndpointReservation, ClusterRequestPermit, ClusterRetryPermit,
-    ClusterRuntimeStatus, EndpointHealthState, EndpointRuntimeState, EndpointRuntimeStatus,
-    EndpointStatusSnapshot, PreparedCluster, PreparedEndpoint,
+    ClusterRuntimeStatus, DiscoveryQueryLease, EndpointHealthState, EndpointRuntimeState,
+    EndpointRuntimeStatus, EndpointStatusSnapshot, PreparedCluster, PreparedEndpoint,
+};
+pub use discovery::{
+    DiscoveryAddressError, DiscoveryErrorCode, DiscoveryReconcileOutcome, DiscoveryResolutionState,
+    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation,
+    normalize_discovery_address, validate_discovery_address,
 };

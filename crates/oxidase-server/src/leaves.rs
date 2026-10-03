@@ -208,6 +208,11 @@ impl ProxyClient {
         self.static_targets.reconcile_snapshot(snapshot);
     }
 
+    pub(crate) fn prune_pools(&self) {
+        // Registry pruning drops only idle ownership, never issued streams.
+        let _ = self.pool_registry.pools_count();
+    }
+
     async fn pool(
         &self,
         cluster: &Arc<PreparedCluster>,
@@ -607,8 +612,8 @@ impl ProxyClient {
                                     | AttemptFailure::Resolution
                                     | AttemptFailure::LocalOverload
                             ) {
-                                cluster.record_passive_failure(
-                                    endpoint.name(),
+                                cluster.record_passive_failure_for(
+                                    &endpoint,
                                     std::time::Instant::now(),
                                 );
                             }
@@ -630,7 +635,7 @@ impl ProxyClient {
                                         ));
                                     };
                                     drop(previous);
-                                    match cluster.acquire_excluding(&tried).await {
+                                    match cluster.acquire_excluding_for(&tried, &endpoint).await {
                                         Ok(next) => {
                                             permit = next;
                                             retry_permit = Some(storm_permit);
@@ -653,7 +658,7 @@ impl ProxyClient {
                             }
                             metrics.record_upstream_timeout(TimeoutPhase::ResponseHeader);
                             cluster
-                                .record_passive_failure(endpoint.name(), std::time::Instant::now());
+                                .record_passive_failure_for(&endpoint, std::time::Instant::now());
                             let header_bound = cluster
                                 .spec()
                                 .timeouts
@@ -677,7 +682,7 @@ impl ProxyClient {
                                         ));
                                     };
                                     drop(previous);
-                                    match cluster.acquire_excluding(&tried).await {
+                                    match cluster.acquire_excluding_for(&tried, &endpoint).await {
                                         Ok(next) => {
                                             permit = next;
                                             retry_permit = Some(storm_permit);
@@ -706,9 +711,8 @@ impl ProxyClient {
                             // already admitted. A replay upload can still be in Hyper
                             // after an early head; wait for its actual adapter to close
                             // before transferring the single Cluster admission slot.
-                            if let Some(reservation) = cluster
-                                .reserve_retry_endpoint(&tried, &previous_endpoint)
-                                .await
+                            if let Some(reservation) =
+                                cluster.reserve_retry_endpoint_for(&tried, &endpoint).await
                             {
                                 lease.cancel_upload();
                                 lease.wait_request_closed().await;
@@ -726,8 +730,8 @@ impl ProxyClient {
                                     ));
                                 }
                                 if response.status().is_server_error() {
-                                    cluster.record_passive_failure(
-                                        &previous_endpoint,
+                                    cluster.record_passive_failure_for(
+                                        &endpoint,
                                         std::time::Instant::now(),
                                     );
                                 }
@@ -750,8 +754,8 @@ impl ProxyClient {
                             {
                                 Ok(plan) => plan,
                                 Err(error) => {
-                                    cluster.record_passive_failure(
-                                        endpoint.name(),
+                                    cluster.record_passive_failure_for(
+                                        &endpoint,
                                         std::time::Instant::now(),
                                     );
                                     return ServiceOutcome::Failed(ServiceError::new(
@@ -764,8 +768,8 @@ impl ProxyClient {
                             if sanitize_runtime_headers(&mut parts.headers, WireProtocol::Http1)
                                 .is_err()
                             {
-                                cluster.record_passive_failure(
-                                    endpoint.name(),
+                                cluster.record_passive_failure_for(
+                                    &endpoint,
                                     std::time::Instant::now(),
                                 );
                                 return ServiceOutcome::Failed(ServiceError::new(
@@ -773,7 +777,7 @@ impl ProxyClient {
                                     "upstream Upgrade response has invalid connection metadata",
                                 ));
                             }
-                            cluster.record_passive_success(endpoint.name());
+                            cluster.record_passive_success_for(&endpoint);
                             let Some(permit) = lease.take_for_retry() else {
                                 return ServiceOutcome::Failed(ServiceError::new(
                                     ErrorClass::InvalidState,
@@ -788,7 +792,7 @@ impl ProxyClient {
                             });
                         }
                     } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-                        cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
+                        cluster.record_passive_failure_for(&endpoint, std::time::Instant::now());
                         return ServiceOutcome::Failed(ServiceError::new(
                             ErrorClass::UpstreamProtocol,
                             "upstream returned an unsolicited 101 response",
@@ -811,7 +815,7 @@ impl ProxyClient {
                     )
                     .is_err()
                     {
-                        cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
+                        cluster.record_passive_failure_for(&endpoint, std::time::Instant::now());
                         return ServiceOutcome::Failed(ServiceError::new(
                             ErrorClass::UpstreamProtocol,
                             "upstream response contains invalid connection-specific metadata",
@@ -820,11 +824,11 @@ impl ProxyClient {
                     parts.headers.remove(header::CONTENT_LENGTH);
                     let outcome_recorded = parts.status.is_server_error();
                     if outcome_recorded {
-                        cluster.record_passive_failure(endpoint.name(), std::time::Instant::now());
+                        cluster.record_passive_failure_for(&endpoint, std::time::Instant::now());
                     }
                     let body = if request.method() == Method::HEAD {
                         if !outcome_recorded {
-                            cluster.record_passive_success(endpoint.name());
+                            cluster.record_passive_success_for(&endpoint);
                         }
                         drop(lease);
                         GatewayBodyPlan::Head {

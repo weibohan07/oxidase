@@ -57,6 +57,12 @@ resources:
 Every accepted field above has runtime meaning. Unknown fields and unsupported
 values fail compilation with a source diagnostic.
 
+For phase 6B, a Cluster can instead select A/AAAA address discovery with a fixed
+logical `origin`, explicit dial port and bounded resolver/address policy. Choose
+exactly one source: `endpoints` or `discovery`, never both (even an empty endpoint
+list). See [DNS address discovery](discovery.md) for its full contract and
+separate acceptance evidence. SRV is rejected until its own phase 6C delivery.
+
 ## Endpoints and protocol
 
 Structured endpoint names are unique within a Cluster and contain 1–128 ASCII
@@ -158,8 +164,16 @@ assuming idempotency responsibility.
 Runtime state is reused only for the same Cluster Resource ID, endpoint name,
 canonical URL, and upstream protocol. Policy-only changes can retain health and
 counters; changing URL or protocol creates new endpoint state. Health supervisors
-start only after commit, stop after removal and release of old pinned snapshots,
-and use weak ownership to avoid task cycles.
+start only after commit, are explicitly retired after committed removal or policy
+replacement, and use weak ownership to avoid task cycles. An old pinned stream
+alone does not keep an obsolete health supervisor running.
+
+Discovery membership is separate from immutable configuration/publication. DNS
+updates do not change PublishedRuntime's ETag or origin; removal prevents new
+endpoint leases/pool checkout while already leased streams can finish. Identical
+membership with reordered records or refreshed TTLs keeps compatible identities;
+remove/re-add produces a fresh incarnation. A discovery-policy replacement
+retires its old query/health ownership even if an old stream still pins resources.
 
 On the configured authenticated Admin transport, `GET /api/v1/clusters` returns sorted Cluster and endpoint
 names, protocol/policy, health state, active counts, fixed counters, last transition,
@@ -172,12 +186,18 @@ endpoint names plus fixed protocol/policy/result/state enums. URLs, paths, queri
 client addresses, Header values, and error strings are never labels. Bind the admin
 listener only to a trusted network. Permissions and writable candidate/source/
 drain operations follow the existing [Admin contract](../admin-api.md).
+Dynamic discovery series aggregate by configured Cluster and closed result enums,
+not DNS address, generated member name, target or generation. Authenticated
+discovery status is a bounded operational view, not a new publication authority.
 
 ## Current limits
 
-Endpoints are static configuration at the 6A delivery boundary. Dynamic A/AAAA/SRV
-discovery, cross-process health consensus, hedging, arbitrary retry scripting and
+Phase 6B adds A/AAAA discovery under the bounded policy described above; SRV is
+explicitly not accepted yet. Cross-process health consensus, hedging, arbitrary retry scripting and
 a general circuit-breaker policy beyond bounded admission/passive ejection are
 not implemented here. New phased timeouts have independent observable boundaries
 and one logical pre-head budget; legacy `connect_timeout`/`response_timeout` remain
 explicit compatibility mode. Native static-name caching is not TTL-aware discovery.
+New discovery policies implicitly use the phased defaults if `timeouts` is
+omitted; explicit legacy timeout fields beside discovery are rejected rather
+than allowed to renew retries. Static source/Bundle compatibility stays unchanged.

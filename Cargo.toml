@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 futures-util = "0.3"
 h2 = "0.4"
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["tokio", "system-config"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

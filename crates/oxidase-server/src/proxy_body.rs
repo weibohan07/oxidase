@@ -381,7 +381,7 @@ fn classify_downstream_body_error(error: BoxError) -> BoxError {
 pub(crate) struct ClusterResponseBody<B> {
     inner: Pin<Box<B>>,
     cluster: Arc<PreparedCluster>,
-    endpoint: Box<str>,
+    endpoint: Arc<oxidase_runtime::PreparedEndpoint>,
     permit: Option<ClusterRequestPermit>,
     outcome_recorded: bool,
     request_progress: Option<RequestProgress>,
@@ -399,7 +399,7 @@ where
         permit: ClusterRequestPermit,
         outcome_recorded: bool,
     ) -> Self {
-        let endpoint = permit.endpoint().name().into();
+        let endpoint = Arc::clone(permit.endpoint());
         let mut body = Self {
             inner: Box::pin(inner),
             cluster,
@@ -435,7 +435,7 @@ where
         lease: AttemptLeaseGuard,
         outcome_recorded: bool,
     ) -> Self {
-        let endpoint = lease.endpoint().name().into();
+        let endpoint = Arc::clone(lease.endpoint());
         let progress = lease.progress();
         let mut body = Self {
             inner: Box::pin(inner),
@@ -464,10 +464,10 @@ impl<B> ClusterResponseBody<B> {
                 // A post-head reset can be caused by a failed downstream
                 // upload. It is not evidence that the endpoint is unhealthy.
             } else if succeeded {
-                self.cluster.record_passive_success(&self.endpoint);
+                self.cluster.record_passive_success_for(&self.endpoint);
             } else {
                 self.cluster
-                    .record_passive_failure(&self.endpoint, std::time::Instant::now());
+                    .record_passive_failure_for(&self.endpoint, std::time::Instant::now());
             }
             self.outcome_recorded = true;
         }

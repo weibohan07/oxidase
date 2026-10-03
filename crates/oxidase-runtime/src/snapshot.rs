@@ -912,13 +912,59 @@ fn dependency_path_forms(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 fn cluster_fingerprint(source: &ClusterSpec) -> ContentDigest {
-    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v3");
+    let mut hash = ContentDigestBuilder::new("oxidase/cluster/v4");
     hash.field_bytes("protocol", source.protocol.as_str().as_bytes());
     hash.field_u64("endpoint_count", source.endpoints.len() as u64);
     for endpoint in &source.endpoints {
         hash.field_bytes("endpoint_name", endpoint.name.as_bytes())
             .field_bytes("endpoint_url", endpoint.url.as_str().as_bytes())
             .field_u64("endpoint_weight", u64::from(endpoint.weight));
+    }
+    if let Some(dns) = &source.discovery {
+        hash.field_bytes("discovery_contract", b"dns-address/v1")
+            .field_bytes("dns_name", dns.name.as_bytes())
+            .field_bytes("dns_record", dns.record.as_str().as_bytes())
+            .field_u64("dns_port", u64::from(dns.port))
+            .field_bytes("dns_origin", dns.origin.as_str().as_bytes());
+        match &dns.resolver.source {
+            oxidase_config::DnsResolverSource::System => {
+                hash.field_bytes("dns_resolver_mode", b"system");
+            }
+            oxidase_config::DnsResolverSource::NameServers(servers) => {
+                hash.field_bytes("dns_resolver_mode", b"nameservers")
+                    .field_u64("dns_nameserver_count", servers.len() as u64);
+                for server in servers {
+                    hash.field_bytes("dns_nameserver", server.to_string().as_bytes());
+                }
+            }
+        }
+        hash.field_u128(
+            "dns_query_timeout_ns",
+            dns.resolver.query_timeout.as_nanos(),
+        )
+        .field_u128("dns_min_interval_ns", dns.refresh.min_interval.as_nanos())
+        .field_u128("dns_max_interval_ns", dns.refresh.max_interval.as_nanos())
+        .field_u64("dns_jitter_percent", u64::from(dns.refresh.jitter_percent))
+        .field_u128(
+            "dns_stale_if_error_ns",
+            dns.refresh.stale_if_error.as_nanos(),
+        )
+        .field_u64("dns_max_endpoints", u64::from(dns.limits.max_endpoints))
+        .field_u64("dns_max_targets", u64::from(dns.limits.max_targets))
+        .field_u64(
+            "dns_allow_private",
+            u64::from(dns.address_policy.allow_private),
+        )
+        .field_u64(
+            "dns_allow_loopback",
+            u64::from(dns.address_policy.allow_loopback),
+        )
+        .field_u64(
+            "dns_allow_link_local",
+            u64::from(dns.address_policy.allow_link_local),
+        );
+    } else {
+        hash.field_bytes("discovery_contract", b"static/v1");
     }
     hash.field_bytes("load_balance", source.load_balance.as_str().as_bytes());
     if let Some(active) = &source.health.active {
@@ -1173,6 +1219,54 @@ mod tests {
 
     use super::{PreparationErrorKind, RuntimeSnapshot, cluster_fingerprint};
     use crate::CandidateWorkControl;
+
+    #[test]
+    fn dns_fingerprint_covers_each_policy_boundary_but_not_diagnostic_origin() {
+        let directory = tempdir().expect("temporary source root");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(&config, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: api.example.test\n          port: 8443\n          origin: http://logical.example.test/base/\nservices:\n  root:\n    type: respond\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      ref: root\n").expect("offline policy source");
+        let gateway = Compiler::compile_path(config).expect("DNS-independent compile");
+        let original = &gateway.resources.clusters[&ResourceId::new("cluster:api")];
+        let baseline = cluster_fingerprint(original);
+        let mutations: &[fn(&mut oxidase_config::DnsDiscoverySpec)] = &[
+            |dns| dns.name = "other.example.test.".to_owned(),
+            |dns| dns.port += 1,
+            |dns| dns.origin = Url::parse("https://logical.example.test/base/").expect("origin"),
+            |dns| {
+                dns.resolver.source = oxidase_config::DnsResolverSource::NameServers(vec![
+                    "127.0.0.1:5300".parse().expect("socket"),
+                ])
+            },
+            |dns| dns.resolver.query_timeout += Duration::from_secs(1),
+            |dns| dns.refresh.min_interval += Duration::from_secs(1),
+            |dns| dns.refresh.max_interval += Duration::from_secs(1),
+            |dns| dns.refresh.jitter_percent += 1,
+            |dns| dns.refresh.stale_if_error += Duration::from_secs(1),
+            |dns| dns.limits.max_endpoints -= 1,
+            |dns| dns.limits.max_targets -= 1,
+            |dns| dns.address_policy.allow_private = false,
+            |dns| dns.address_policy.allow_loopback = true,
+            |dns| dns.address_policy.allow_link_local = true,
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut changed = original.clone();
+            mutate(changed.discovery.as_mut().expect("discovery policy"));
+            assert_ne!(
+                cluster_fingerprint(&changed),
+                baseline,
+                "policy boundary {index}"
+            );
+        }
+        let mut moved = original.clone();
+        let dns = moved.discovery.as_mut().expect("policy");
+        dns.source.line += 1;
+        dns.spans.get_mut("name").expect("name origin").line += 1;
+        assert_eq!(
+            cluster_fingerprint(&moved),
+            baseline,
+            "diagnostic coordinates cannot replace Resource policy identity"
+        );
+    }
 
     #[test]
     fn controlled_preparation_preserves_cancellation_and_deadline_codes() {
@@ -1490,6 +1584,7 @@ listeners:
         let cluster = |protocol, endpoints: &[&str]| ClusterSpec {
             id: ResourceId::new("cluster:api"),
             protocol,
+            discovery: None,
             endpoints: endpoints
                 .iter()
                 .enumerate()
