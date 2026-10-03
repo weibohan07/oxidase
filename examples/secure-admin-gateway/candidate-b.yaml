@@ -1,0 +1,13 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+services:
+  public:
+    type: respond
+    body:
+      text: B
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    protocol: http
+    service:
+      ref: public
