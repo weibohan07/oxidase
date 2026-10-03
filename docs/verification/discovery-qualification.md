@@ -15,6 +15,14 @@ addresses. No public DNS, fixed open port, OpenSSL, curl or Docker is required.
 All generated signing keys, TLS identities and bearer tokens are test-only.
 Private key/token bytes must not be copied to qualification artifacts.
 
+Planned stop closes new worker-operation admission, completes already-started
+requests within twelve seconds, and concurrently collects results and joins workers
+within fifteen seconds. Completed results never race against stop. Independent
+`started_operations`, recorded requests and classified worker outcomes must agree;
+Upgrade control probes have separate unavailable/error counters. A full/closed
+result channel or panicked worker cannot silently produce PASS. Ordinary smoke
+failures retain their original evidence even on timeout, parsing or assertion panic.
+
 On Linux, RSS and FD samples read `/proc/<gateway_pid>/status` and
 `/proc/<gateway_pid>/fd`, never `/proc/self` in the controller. Raw authenticated
 metrics, runtime and Cluster observations are retained with each sample. Missing

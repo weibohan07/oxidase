@@ -38,13 +38,13 @@ These tests execute each operation/policy-mutation branch and 32 fixed-seed mixe
 programs. They are not libFuzzer campaigns or network/concurrency qualification.
 
 Actual local ASan campaigns ran on clean implementation
-`9812a2db26d3f973e74cdae4c6eab7f13a9833b7`, using cargo-fuzz 0.13.2 and
+`2964d8df05cdaf4805c59dfecfc7823e11864f1a`, using cargo-fuzz 0.13.2 and
 Rust nightly 1.100.0 (2026-08-29), dev/debug assertions and offline Cargo:
 
 | Target | Seed | Actual fuzz seconds | Executions | Corpus files before/after | Peak fuzzer RSS MiB |
 | --- | --- | --- | --- | --- | --- |
-| discovery_runtime | 600401 | 61 | 1050 | 2 / 289 | 244 |
-| portable_discovery | 600402 | 61 | 238 | 2 / 59 | 445 |
+| discovery_runtime | 600401 | 61 | 3950 | 2 / 477 | 540 |
+| portable_discovery | 600402 | 61 | 269 | 2 / 67 | 443 |
 
 Both exited zero, with no crash, timeout, OOM or failure artifact. The head,
 source-set SHA-256 and both lockfiles were unchanged before/after each run. These
@@ -52,5 +52,6 @@ are bounded macOS aarch64 property campaigns, not Hosted campaigns, gateway RSS
 measurements or proof of absence of bugs. Exact commands, tool versions, source
 hashes, corpus statistics and raw logs are retained in
 [`docs/verification/artifacts`](../docs/verification/artifacts/)
-as `discovery-6d-asan-*-9812a2d.{json,log.gz}`; see the
+as `discovery-6d-asan-*-2964d8d.{json,log.gz}`. Earlier `9812a2d` campaigns remain
+retained as historical independent evidence; see the
 [acceptance ledger](../docs/verification/discovery-acceptance.md).

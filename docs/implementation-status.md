@@ -4,7 +4,8 @@ Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `hardening/v0.4-discovery-qualification` (phase 6D)
+- phase-six delivery: 6A–6D, protected PRs #16–#19; exact delivery receipts are
+  maintained in the discovery acceptance ledger and PR records
 - public starting point: completed secure-control-plane merge `ebfb754`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
@@ -546,9 +547,18 @@ Last updated: 2026-10-03
   PID, with separate warm-up/steady/cooldown phases and null for unavailable
   counters. It validates opaque gRPC DATA/trailers, cancellation acknowledgements,
   held Upgrade traffic and signed publication without changing the Admin model.
-- Exact test results, actual ASan/Linux campaigns and independent final-head/main
-  Hosted gates are maintained in `docs/verification/discovery-acceptance.md`.
-  Current in-progress campaign work is not a production-readiness claim.
+- Both fresh ASan property campaigns actually run for 61 seconds on frozen source
+  `2964d8d`. Linux run `37152433497` executes 600-second discovery and 120-second
+  protocol loads plus distinct warm-up/cooldown, with separate gateway/fixture/load
+  PIDs. Started/recorded/classified counts agree, strict eight-new-peer proofs pass,
+  and measured final active/permit/supervisor gauges are zero. Qualification-tool
+  cancellation/result accounting failures have concrete regressions and retained
+  history, not weakened assertions. Pool/health-task/old-snapshot measurements remain
+  unavailable; positive RSS drift does not establish convergence or leak freedom.
+- Exact results, original failures, actual ASan/Linux campaigns and independent
+  final-head/main Hosted receipts are maintained in
+  `docs/verification/discovery-acceptance.md` and the protected PR delivery records.
+  This bounded alpha qualification is not a production-readiness claim.
 
 ## Not implemented
 
@@ -562,9 +572,9 @@ Last updated: 2026-10-03
   platform, distributed control-plane transactions, and online ambiguous-journal
   reconciliation are not implemented. Bootstrap changes and uncertain-intent
   reconciliation use the documented explicit restart procedure.
-- Integration qualification remains the authorized phase 6D sub-stage.
-  Standard access-log/OpenTelemetry export and deployment/release
-  packaging are outside this task.
+- Standard access-log/OpenTelemetry export and deployment/release packaging remain
+  outside the completed phase-six scope; no phase-seven work or version bump is
+  included in this delivery.
 
 ## Known limitations
 

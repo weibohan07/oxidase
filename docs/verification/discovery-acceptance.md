@@ -3,7 +3,8 @@
 Scope: 6A–6D only. Actual starting protected main:
 `ebfb7549bf9c1ddd91384cf85cff4098982b8acf`.
 Gateway/Oxista/Bundle/Admin remain alpha and workspace stays `0.3.0-alpha.1`.
-This is an evidence ledger, not a claim that in-progress stages are implemented.
+This ledger distinguishes implementation tests, executed campaigns and protected
+delivery receipts. Final-head and merged-main CI are separate from source qualification.
 
 ## Baseline
 
@@ -21,7 +22,7 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 | 6A transport identity/deadlines | normally merged through protected PR #16 | final head `39caf68` PR run `37131533884` PASS; merged main `aaece2a` push run `37131852985` PASS |
 | 6B A/AAAA discovery | normally merged through protected PR #17 | final head `bd58363` PR run `37137424130` PASS; merged main `890a802` push run `37138029438` PASS |
 | 6C SRV discovery | normally merged through protected PR #18 | final head `b27974a` PR run `37143336854` PASS; merged main `a1a06b0` push run `37143737883` PASS |
-| 6D integration/qualification | in progress from protected main `a1a06b0` | final-head integration/Hosted/fuzz/Linux acceptance not yet recorded |
+| 6D integration/qualification | validated implementation; protected delivery tracked in [PR #19](https://github.com/weibohan07/oxidase/pull/19), based on `a1a06b0` | source `2964d8d`: all nine local gates, fresh ASan and Linux run `37152433497` PASS; final-head/main receipts are recorded separately in the PR delivery record |
 
 ## 6D integration contract
 
@@ -243,6 +244,109 @@ DATA validator error: the error must be delivered and cause FAIL, while closed
 receivers and panicked workers also fail. Raw evidence is retained under
 `artifacts/discovery-6d-result-delivery-*`; final complete gates and the fresh
 Linux campaign remain independent requirements.
+
+### Final implementation source: complete gates and fresh ASan campaigns
+
+Clean, frozen `2964d8df05cdaf4805c59dfecfc7823e11864f1a` passes all nine
+requested local locked commands, including stable/Rust 1.88 workspace tests,
+release, denied-warning Clippy/docs, unchanged cargo-deny policy and all fuzz-bin
+compilation. Fourteen actual CLI example operations also pass: basic
+check/test/explain, secure-resilient check, secure-admin check/test, A/AAAA and SRV
+check/test, offline SRV Explain and dynamic Bundle build/inspect/verify. The
+example unsigned verification is not an authenticated Admin-signature claim;
+actual signed activation and restart have their separate regressions.
+Raw receipts are `artifacts/discovery-6d-2964d8d-{final-gates,examples}*`.
+
+The exact source-head [PR run `37152408243`](https://github.com/weibohan07/oxidase/actions/runs/37152408243)
+completed with all four required jobs SUCCESS. A later documentation/artifact
+receipt commit must obtain its own final-head required checks; this source green
+cannot substitute for them or the independent merged-main push run.
+
+Both ASan property campaigns were rerun on this same clean source with identical
+before/after HEAD, source-set hash and lockfiles, offline Cargo, cargo-fuzz 0.13.2,
+nightly Rust 1.100.0 (2026-08-29) and the same bounded parameters described above.
+
+| Target | Seed | Actual fuzz seconds | Executions | Corpus files initial/final | New units added | Peak fuzzer RSS MiB | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| discovery_runtime | 600401 | 61 | 3950 | 2 / 477 | 505 | 540 | PASS |
+| portable_discovery | 600402 | 61 | 269 | 2 / 67 | 72 | 443 | PASS |
+
+Both exit zero with no crash, timeout, OOM or failure artifact. Source-set hash
+is `fbdd5df0e922e95eba44341aaf7ab9fa563133cbddad30cd94ed16551220f10f` over
+164 tracked source/manifest inputs. Raw records are
+`artifacts/discovery-6d-asan-{runtime,portable}-2964d8d.{json,log.gz}`.
+These are actual local bounded property campaigns, not Hosted fuzz or gateway
+RSS observations. The final same-source Linux dispatch is recorded separately.
+
+### Final executed Linux qualification and independent review
+
+[Run `37152433497`](https://github.com/weibohan07/oxidase/actions/runs/37152433497)
+completed SUCCESS on the same implementation `2964d8d`, Ubuntu x86_64, kernel
+6.17.0-1022-azure and Rust/Cargo 1.99.0. Artifact `11284797841`, 2,806,018 bytes,
+has service digest
+`sha256:779de292b3892f0bcdc7abc4c512c9125c5dcd52eba896a332fafeb384bd9156`.
+The raw archive and both summaries are retained under
+`artifacts/discovery-6d-linux-37152433497-*`. The recorded dirty state is only the
+generated `discovery-results/` directory. Subsequent receipt changes are
+documentation/artifacts only, not a silent change to the qualified implementation.
+
+Discovery ran 600 seconds steady, concurrency 8, seed 600601; protocol ran 120
+seconds steady, concurrency 6, seed 600602. Both used 30-second warm-up,
+120-second cooldown, 3-second control interval, nominal 1-second samples and
+32768-byte response payloads. Total observations were 750.459 / 270.365 seconds.
+Gateway PIDs 6317 / 7570 differ from all controller/DNS/upstream PIDs; all 650 / 251
+raw resource samples and metrics scrapes belong to those gateway processes.
+
+| Recorded worker outcomes | Discovery | Protocol |
+| --- | --- | --- |
+| Independently started = recorded = classified | 330818 | 36361 |
+| Complete / intentional cancellation / expected unavailable | 74394 / 4644 / 251780 | 7678 / 527 / 28156 |
+| Worker / Upgrade / total unexpected errors | 0 / 0 / 0 | 0 / 0 / 0 |
+| Separately counted unavailable Upgrade probes | 0 | 15 |
+| Actual gateway retries | 1478 | 0 (POST is not retried) |
+| Complete gRPC responses / Upgrade tunnels | 0 / 1 held proof | 7678 / 19 |
+
+Both independent retained-stream receipts verify eight full new-B 200 streams,
+zero new streams to the withdrawn peer, old held gRPC DATA/trailers and Upgrade
+bytes through publication, and real cancellation confirmed by both upstream Drop
+and gateway termination delta. All 165 / 33 complete before/after-DNS runtime
+objects match. Signed activation/rollback and terminal drain use the existing
+authenticated manager, not a fixture-side publisher. The zero-error and complete
+operation-accounting guards remain enforced rather than inferred from a partial sum.
+
+Independent recomputation of original gateway samples found:
+
+| Curve | Discovery | Protocol |
+| --- | --- | --- |
+| RSS post-warm / peak / final KiB | 24088 / 26148 / 25296 | 23192 / 24668 / 24532 |
+| Steady RSS slope KiB/s | +2.952819 | +8.974746 |
+| RSS medians in four equal steady-time quarters KiB | 24484 / 24860 / 25280 / 25856 | 23726 / 23968 / 24156 / 24540 |
+| Last steady-time quarter RSS slope KiB/s | +0.318109 | +20.994927 |
+| FD post-warm / peak / final | 26 / 30 / 17 | 24 / 27 / 14 |
+| Steady FD slope FD/s | +0.000024513 | -0.001320358 |
+
+Cooldown RSS falls 500 / 136 KiB but remains 1208 / 1340 KiB above post-warm
+baseline. Protocol's last quarter is still rising; neither overall RSS convergence
+nor long-term leak freedom is established. FD is bounded and falls back. Actual
+sample intervals vary (107–1859 / 251–1877 ms), so the recording is not exactly 1 Hz.
+Final measured active requests/connections/H2 streams/tunnels, discovery
+supervisors, cluster/retry permits and retired-admission counters are zero.
+Health-task, pool and old-snapshot counts stay null throughout; their reclamation
+is not measured by this process API. Short tunnels need not coincide with a
+sampling tick; their actual start/termination and held-flow checks are separate evidence.
+
+Actual DNS coverage includes TCP fallback 112 / 93, CNAME 240 / 32, TTL0 232 / 52,
+NXDOMAIN/NODATA/SERVFAIL and SRV queries/reversed answers/dot withdrawal 373 / 25 / 36.
+Healthy/unhealthy/passively-ejected states, bounded retries and TLS H1/H2 ALPN
+are observed. Logs contain only expected UpstreamUnavailable outcomes, no WARN,
+other error class or panic, and audit failed/dropped counts are zero. Positive AAAA,
+all seven timeout counters and body-error events remain zero in these campaigns:
+their correctness is established by separate ordinary wire tests, not this load run.
+
+Qualification guards PASS means this bounded campaign executed its assertions;
+it is not production readiness, a complete resource census or long-term stability.
+The final documentation head's four required jobs and independent merged-main
+push run must still be verified and recorded in [PR #19](https://github.com/weibohan07/oxidase/pull/19).
 
 ## Protected 6A delivery receipt
 

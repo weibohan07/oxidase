@@ -1,0 +1,81 @@
+{
+  "schema_version": "oxidase.fuzz-campaign/v1",
+  "environment": "local macOS aarch64; offline, no network fixture",
+  "target": "portable_discovery",
+  "expected_commit": "2964d8df05cdaf4805c59dfecfc7823e11864f1a",
+  "sanitizer": "address",
+  "profile": "dev with debug assertions and overflow checks",
+  "seed": 600402,
+  "requested_seconds": 60,
+  "timeout_seconds_per_input": 10,
+  "rss_limit_mib": 2048,
+  "max_len": 32768,
+  "command": [
+    "cargo",
+    "+nightly",
+    "fuzz",
+    "run",
+    "portable_discovery",
+    "--dev",
+    "--sanitizer",
+    "address",
+    "/private/tmp/oxidase-6d-asan-portable-2964d8d/corpus",
+    "--",
+    "-max_total_time=60",
+    "-seed=600402",
+    "-timeout=10",
+    "-rss_limit_mb=2048",
+    "-max_len=32768",
+    "-print_final_stats=1",
+    "-artifact_prefix=/private/tmp/oxidase-6d-asan-portable-2964d8d/artifacts/"
+  ],
+  "environment_variables": {
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "before": {
+    "commit": "2964d8df05cdaf4805c59dfecfc7823e11864f1a",
+    "dirty": [],
+    "source": {
+      "sha256": "fbdd5df0e922e95eba44341aaf7ab9fa563133cbddad30cd94ed16551220f10f",
+      "files": 164
+    },
+    "fuzz_lock_sha256": "edef369e965e9c9aa28f3d864ae31fd4b27a3220698a1f62ec1e4b49846cda28",
+    "root_lock_sha256": "d34a3181122dbb34e9aaf65c9b0fb3d0d671cd9f4067b8028d178bddf85f41ac"
+  },
+  "versions": {
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "nightly_cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)",
+    "nightly_rustc": "rustc 1.100.0-nightly (fd7ed57df 2026-08-29)",
+    "operating_system": "Darwin arm64"
+  },
+  "started_at": "2026-10-03T20:42:52.830Z",
+  "initial_corpus_files": 2,
+  "finished_at": "2026-10-03T20:43:56.464Z",
+  "process_wall_seconds": 63.631446458000006,
+  "actual_fuzz_seconds": 61,
+  "executions": 269,
+  "peak_rss_mib": 443,
+  "new_corpus_units_added": 72,
+  "final_corpus_files": 67,
+  "exit_code": 0,
+  "signal": null,
+  "crash": false,
+  "timeout": false,
+  "oom": false,
+  "artifacts": [],
+  "log_sha256": "fe9503c1545510757d4e45750659bdc1b766dbc6f2ea880367a7b639f90ecae8",
+  "after": {
+    "commit": "2964d8df05cdaf4805c59dfecfc7823e11864f1a",
+    "dirty": [],
+    "source": {
+      "sha256": "fbdd5df0e922e95eba44341aaf7ab9fa563133cbddad30cd94ed16551220f10f",
+      "files": 164
+    },
+    "fuzz_lock_sha256": "edef369e965e9c9aa28f3d864ae31fd4b27a3220698a1f62ec1e4b49846cda28",
+    "root_lock_sha256": "d34a3181122dbb34e9aaf65c9b0fb3d0d671cd9f4067b8028d178bddf85f41ac"
+  },
+  "source_unchanged": true,
+  "lockfiles_unchanged": true,
+  "exact_commit_unchanged": true,
+  "result": "PASS"
+}

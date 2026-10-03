@@ -61,6 +61,9 @@ source-free process restart and a validation-only separated-process campaign too
 See the [qualification procedure](docs/verification/discovery-qualification.md)
 for PID-attributed Linux measurements; local smoke, executed campaigns and final
 Hosted checks remain distinct evidence.
+Two 61-second ASan property campaigns and Linux 10-minute discovery / 2-minute
+protocol loads have actually executed; the ledger retains raw PID curves, positive
+RSS drift and unavailable counters rather than claiming leak-free convergence.
 OpenTelemetry and packaging remain outside this task. This is not a
 production-readiness claim.
 
