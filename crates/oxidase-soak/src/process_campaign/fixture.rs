@@ -436,6 +436,9 @@ struct UpstreamState {
     health_failure_replies: AtomicU64,
     requests: AtomicU64,
     request_faults: AtomicU64,
+    request_body_errors: AtomicU64,
+    request_content_faults: AtomicU64,
+    request_timeouts: AtomicU64,
     retries: AtomicU64,
     cancellations: AtomicU64,
     connections: AtomicU64,
@@ -443,6 +446,7 @@ struct UpstreamState {
     tunnels: Mutex<tokio::task::JoinSet<()>>,
     active_tunnels: Arc<AtomicU64>,
     payload_size: usize,
+    request_read_delay: Duration,
 }
 
 struct StreamBody {
@@ -547,6 +551,9 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
         .ok_or_else(|| fail("fixture payload bound"))?;
     let state = Arc::new(UpstreamState {
         payload_size,
+        request_read_delay: Duration::from_millis(
+            plan["request_read_delay_ms"].as_u64().unwrap_or(0).min(500),
+        ),
         ..UpstreamState::default()
     });
     state.healthy_a.store(true, Ordering::Relaxed);
@@ -555,10 +562,10 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
     for (listener, id) in [(first, "a"), (second, "b")] {
         let tls = Arc::new(tls.clone());
         let state = Arc::clone(&state);
-        tasks.spawn(async move{let gate=Arc::new(Semaphore::new(256));let mut conns=tokio::task::JoinSet::new();loop{tokio::select!{Some(_)=conns.join_next(),if !conns.is_empty()=>{},accepted=listener.accept()=>{let Ok((socket,_))=accepted else{break};let Ok(target)=socket.local_addr()else{continue};let Ok(permit)=Arc::clone(&gate).try_acquire_owned()else{continue};let tls=Arc::clone(&tls);let state=Arc::clone(&state);conns.spawn(async move{let _permit=permit;let Ok(socket)=TlsAcceptor::from(tls).accept(socket).await else{return};state.connections.fetch_add(1,Ordering::Relaxed);let sni=socket.get_ref().1.server_name().unwrap_or("").to_owned();let h2=socket.get_ref().1.alpn_protocol()==Some(b"h2");let service=service_fn(move|request|serve(request,id,target,sni.clone(),Arc::clone(&state)));if h2{let _=http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket),service).await;}else{let _=http1::Builder::new().serve_connection(TokioIo::new(socket),service).with_upgrades().await;}});}}}});
+        tasks.spawn(async move{let gate=Arc::new(Semaphore::new(256));let mut conns=tokio::task::JoinSet::new();loop{tokio::select!{Some(_)=conns.join_next(),if !conns.is_empty()=>{},accepted=listener.accept()=>{let Ok((socket,_))=accepted else{break};let Ok(target)=socket.local_addr()else{continue};let Ok(permit)=Arc::clone(&gate).try_acquire_owned()else{continue};let tls=Arc::clone(&tls);let state=Arc::clone(&state);conns.spawn(async move{let _permit=permit;let Ok(socket)=TlsAcceptor::from(tls).accept(socket).await else{return};state.connections.fetch_add(1,Ordering::Relaxed);let sni=socket.get_ref().1.server_name().unwrap_or("").to_owned();let h2=socket.get_ref().1.alpn_protocol()==Some(b"h2");let narrow_upload_window=!state.request_read_delay.is_zero();let service=service_fn(move|request|serve(request,id,target,sni.clone(),Arc::clone(&state)));if h2{let mut builder=http2::Builder::new(TokioExecutor::new());if narrow_upload_window{builder.initial_stream_window_size(1);}let _=builder.serve_connection(TokioIo::new(socket),service).await;}else{let _=http1::Builder::new().serve_connection(TokioIo::new(socket),service).with_upgrades().await;}});}}}});
     }
     control(Ready{role:"upstream".into(),pid:std::process::id(),address,alternate:Some(alternate)},|command|{match command{FixtureCommand::Health{healthy_a,healthy_b,retry_a}=>{state.healthy_a.store(healthy_a,Ordering::Relaxed);state.healthy_b.store(healthy_b,Ordering::Relaxed);state.retry_a.store(retry_a,Ordering::Relaxed);},FixtureCommand::Release=>{state.release_epoch.fetch_add(1,Ordering::Release);},_=>{}}
-        json!({"ok":true,"requests":state.requests.load(Ordering::Relaxed),"request_faults":state.request_faults.load(Ordering::Relaxed),"retries":state.retries.load(Ordering::Relaxed),"retryable_status_replies":state.retries.load(Ordering::Relaxed),"health_success_replies":state.health_success_replies.load(Ordering::Relaxed),"health_failure_replies":state.health_failure_replies.load(Ordering::Relaxed),"body_drops":state.cancellations.load(Ordering::Relaxed),"connections":state.connections.load(Ordering::Relaxed),"active_tunnels":state.active_tunnels.load(Ordering::Relaxed)})}).await?;
+        json!({"ok":true,"requests":state.requests.load(Ordering::Relaxed),"request_faults":state.request_faults.load(Ordering::Relaxed),"request_body_errors":state.request_body_errors.load(Ordering::Relaxed),"request_content_faults":state.request_content_faults.load(Ordering::Relaxed),"request_timeouts":state.request_timeouts.load(Ordering::Relaxed),"retries":state.retries.load(Ordering::Relaxed),"retryable_status_replies":state.retries.load(Ordering::Relaxed),"health_success_replies":state.health_success_replies.load(Ordering::Relaxed),"health_failure_replies":state.health_failure_replies.load(Ordering::Relaxed),"body_drops":state.cancellations.load(Ordering::Relaxed),"connections":state.connections.load(Ordering::Relaxed),"active_tunnels":state.active_tunnels.load(Ordering::Relaxed)})}).await?;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     let mut tunnels = std::mem::take(
@@ -652,12 +659,27 @@ async fn serve(
         .headers()
         .get(header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+    if !state.request_read_delay.is_zero() {
+        tokio::time::sleep(state.request_read_delay).await;
+    }
     let checked = tokio::time::timeout(
         Duration::from_secs(5),
         verify_request_body(request.body_mut(), grpc),
     )
     .await;
     if !matches!(checked, Ok(Ok(()))) {
+        match checked {
+            Ok(Err(RequestFault::Body)) => {
+                state.request_body_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(RequestFault::Content)) => {
+                state.request_content_faults.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                state.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Ok(())) => unreachable!("checked above"),
+        }
         state.request_faults.fetch_add(1, Ordering::Relaxed);
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -753,6 +775,7 @@ enum RequestFault {
 async fn verify_request_body<B>(body: &mut B, grpc: bool) -> Result<(), RequestFault>
 where
     B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Debug,
 {
     // This is an opaque fixture vector, not a protobuf or gRPC decoder. Only
     // seven bytes may be retained, regardless of DATA frame segmentation.
@@ -763,7 +786,10 @@ where
     };
     let mut offset = 0usize;
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| RequestFault::Body)?;
+        let frame = frame.map_err(|error| {
+            eprintln!("{}",json!({"event":"fixture_request_body_error","grpc":grpc,"received_bytes":offset,"error":format!("{error:?}")}));
+            RequestFault::Body
+        })?;
         if let Some(data) = frame.data_ref() {
             let end = offset
                 .checked_add(data.len())
@@ -788,6 +814,209 @@ mod tests {
     use hickory_resolver::proto::op::Query;
 
     use super::*;
+
+    #[tokio::test]
+    async fn forced_pre_head_drop_is_body_error_but_planned_stop_preserves_opaque_post() {
+        struct SegmentedPost {
+            first: Option<Bytes>,
+            tail: Option<Bytes>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        }
+        impl Body for SegmentedPost {
+            type Data = Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+                if let Some(first) = self.first.take() {
+                    return Poll::Ready(Some(Ok(Frame::data(first))));
+                }
+                if self.tail.is_none() {
+                    return Poll::Ready(None);
+                }
+                if Pin::new(&mut self.release).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                Poll::Ready(self.tail.take().map(|bytes| Ok(Frame::data(bytes))))
+            }
+            fn size_hint(&self) -> http_body::SizeHint {
+                http_body::SizeHint::with_exact(
+                    (self.first.as_ref().map_or(0, Bytes::len)
+                        + self.tail.as_ref().map_or(0, Bytes::len)) as u64,
+                )
+            }
+        }
+        struct ObservedIncoming {
+            body: Incoming,
+            bytes: Arc<AtomicU64>,
+        }
+        impl Body for ObservedIncoming {
+            type Data = Bytes;
+            type Error = hyper::Error;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+                let frame = Pin::new(&mut self.body).poll_frame(cx);
+                if let Poll::Ready(Some(Ok(frame))) = &frame
+                    && let Some(data) = frame.data_ref()
+                {
+                    self.bytes.fetch_add(data.len() as u64, Ordering::Release);
+                }
+                frame
+            }
+        }
+        async fn wait_for(counter: &AtomicU64, expected: u64) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while counter.load(Ordering::Acquire) < expected {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("bounded actual wire acknowledgment");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral fixture");
+        let address = listener.local_addr().expect("actual socket");
+        let bytes = Arc::new(AtomicU64::new(0));
+        let errors = Arc::new(AtomicU64::new(0));
+        let complete = Arc::new(AtomicU64::new(0));
+        let content_faults = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&bytes);
+        let observed_errors = Arc::clone(&errors);
+        let observed_complete = Arc::clone(&complete);
+        let observed_content_faults = Arc::clone(&content_faults);
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.expect("actual H2 client");
+                let bytes = Arc::clone(&observed);
+                let errors = Arc::clone(&observed_errors);
+                let complete = Arc::clone(&observed_complete);
+                let content_faults = Arc::clone(&observed_content_faults);
+                connections.spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let bytes = Arc::clone(&bytes);
+                        let errors = Arc::clone(&errors);
+                        let complete = Arc::clone(&complete);
+                        let content_faults = Arc::clone(&content_faults);
+                        async move {
+                            assert_eq!(request.method(), http::Method::POST);
+                            assert_eq!(request.headers()[header::CONTENT_TYPE], "application/grpc");
+                            let mut body = ObservedIncoming {
+                                body: request.into_body(),
+                                bytes,
+                            };
+                            let status = match verify_request_body(&mut body, true).await {
+                                Ok(()) => {
+                                    complete.fetch_add(1, Ordering::Release);
+                                    StatusCode::OK
+                                }
+                                Err(RequestFault::Body) => {
+                                    errors.fetch_add(1, Ordering::Release);
+                                    StatusCode::BAD_REQUEST
+                                }
+                                Err(RequestFault::Content) => {
+                                    content_faults.fetch_add(1, Ordering::Release);
+                                    StatusCode::BAD_REQUEST
+                                }
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::new()))
+                                    .expect("fixture response"),
+                            )
+                        }
+                    });
+                    let _ = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.expect("fixture task did not panic");
+            }
+        });
+        for planned_stop in [false, true] {
+            let socket = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("actual loopback");
+            let (mut sender, connection) = hyper::client::conn::http2::handshake::<
+                _,
+                _,
+                SegmentedPost,
+            >(TokioExecutor::new(), TokioIo::new(socket))
+            .await
+            .expect("actual H2 handshake");
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let (release, tail) = tokio::sync::oneshot::channel();
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let request = Request::builder()
+                .method(http::Method::POST)
+                .uri("http://opaque.fixture.test/Call")
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .body(SegmentedPost {
+                    first: Some(Bytes::from_static(&[0])),
+                    tail: Some(Bytes::from_static(&[0, 0, 0, 2, b'h', b'i'])),
+                    release: tail,
+                })
+                .expect("real seven-byte POST");
+            let task = tokio::spawn(async move {
+                if planned_stop {
+                    super::super::client::complete_bounded_request(sender.send_request(request))
+                        .await
+                        .map(|response| response.status())
+                } else {
+                    tokio::select! {_=stopped.changed()=>Err("forced pre-head drop".to_owned()),response=sender.send_request(request)=>response.map(|response|response.status()).map_err(|error|error.to_string())}
+                }
+            });
+            wait_for(&bytes, if planned_stop { 2 } else { 1 }).await;
+            stop.send(true).expect("planned stop notification");
+            if planned_stop {
+                assert!(
+                    !task.is_finished(),
+                    "planned stop must not drop pending upload"
+                );
+                release
+                    .send(())
+                    .expect("release remaining six opaque bytes");
+                assert_eq!(
+                    task.await
+                        .expect("bounded request worker")
+                        .expect("intact request"),
+                    StatusCode::OK
+                );
+                wait_for(&complete, 1).await;
+            } else {
+                assert!(task.await.expect("forced worker").is_err());
+                driver.abort();
+                wait_for(&errors, 1).await;
+                drop(release);
+            }
+            driver.abort();
+            let _ = driver.await;
+        }
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            8,
+            "one cancelled byte plus all seven planned bytes"
+        );
+        assert_eq!(
+            errors.load(Ordering::Acquire),
+            1,
+            "forced reset is not exact-content corruption"
+        );
+        assert_eq!(content_faults.load(Ordering::Acquire), 0);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("fixture joined")
+            .expect("fixture did not panic");
+    }
 
     fn upstream() -> Ready {
         Ready {

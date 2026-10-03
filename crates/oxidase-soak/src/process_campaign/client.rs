@@ -890,7 +890,7 @@ async fn websocket(
 }
 
 async fn join_workers(workers: &mut tokio::task::JoinSet<()>) -> Result<(), SoakError> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while let Some(result) = workers.join_next().await {
             result.map_err(|error| fail(format!("load worker failed: {error}")))?;
         }
@@ -898,6 +898,17 @@ async fn join_workers(workers: &mut tokio::task::JoinSet<()>) -> Result<(), Soak
     })
     .await
     .map_err(|_| fail("load workers required forced termination"))?
+}
+
+/// Planned campaign stop closes admission between operations. It does not
+/// manufacture an upload reset by dropping an already-started bounded request.
+pub(super) async fn complete_bounded_request<T, E: std::fmt::Display>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    tokio::time::timeout(Duration::from_secs(12), operation)
+        .await
+        .map_err(|_| "request timeout".to_owned())?
+        .map_err(|error| error.to_string())
 }
 
 struct RetainedProofPlan<'a> {
@@ -1168,6 +1179,19 @@ fn validate_arguments(args: &ProcessArguments) -> Result<(), SoakError> {
 }
 
 async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
+    // Qualification-only fault injection; absent in normal campaigns and never
+    // part of the Gateway DSL. Bound it below all configured phase deadlines.
+    let fixture_read_delay_ms = std::env::var("OXIDASE_SOAK_REQUEST_READ_DELAY_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|delay| *delay <= 500)
+                .ok_or_else(|| fail("fixture request read delay must be 0..=500 ms"))
+        })
+        .transpose()?
+        .unwrap_or(0);
     let directory = tempfile::tempdir().map_err(io_error)?;
     let root = directory.path().canonicalize().map_err(io_error)?;
     let identity = identity()?;
@@ -1175,7 +1199,7 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
     std::fs::write(root.join("admin.token"), format!("{TOKEN}\n")).map_err(io_error)?;
     std::fs::write(
         root.join("fixture-plan.json"),
-        serde_json::to_vec(&json!({"payload_size":args.payload_size})).map_err(json_error)?,
+        serde_json::to_vec(&json!({"payload_size":args.payload_size,"request_read_delay_ms":fixture_read_delay_ms})).map_err(json_error)?,
     )
     .map_err(io_error)?;
     std::fs::write(root.join("signing.key"), [31u8; 32]).map_err(io_error)?;
@@ -1309,6 +1333,8 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
     let mut grpc_completed = 0u64;
     let mut grpc_cancelled = 0u64;
     let mut tunnels = 1u64;
+    let mut upgrade_unavailable = 0u64;
+    let mut upgrade_errors = 0u64;
     let mut activations = 2u64;
     let mut rollbacks = 1u64;
     let expected_unavailable = Arc::new(AtomicBool::new(true));
@@ -1346,7 +1372,7 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
                 if client.is_none()||operations.is_multiple_of(128){client=tokio::select!{_=stop.changed()=>break,connection=tokio::time::timeout(Duration::from_secs(5),DataClient::connect(address,if use_h2{Arc::clone(&h2)}else{Arc::clone(&h1)},use_h2,targets,payload_size))=>connection.ok().and_then(Result::ok)};}
                 let expected_now=expected.load(Ordering::Acquire);
                 let started_epoch = epoch.load(Ordering::Acquire);
-                let result=if let Some(client)=&mut client{tokio::select!{_=stop.changed()=>break,result=tokio::time::timeout(Duration::from_secs(12),client.request(is_grpc,cancel,None))=>result.map_err(|_|"request timeout".into()).and_then(|r|r.map_err(|e|e.to_string()))}}else{Err("client connection failure".into())};
+                let result=if let Some(client)=&mut client{complete_bounded_request(client.request(is_grpc,cancel,None)).await}else{Err("client connection failure".into())};
                 if result.is_err()||(!use_h2&&cancel){client=None;}
                 let expected_now = expected_now || expected.load(Ordering::Acquire) || epoch.load(Ordering::Acquire) != started_epoch;
                 tokio::select! {
@@ -1505,9 +1531,11 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
                 .await
                 {
                     Ok(Ok(true)) => tunnels += 1,
-                    Ok(Ok(false)) if expected_unavailable.load(Ordering::Acquire) => expected += 1,
+                    Ok(Ok(false)) if expected_unavailable.load(Ordering::Acquire) => {
+                        upgrade_unavailable += 1
+                    }
                     other => {
-                        failures += 1;
+                        upgrade_errors += 1;
                         if unexpected_samples.len() < 32 {
                             unexpected_samples
                                 .push(json!({"upgrade":format!("{other:?}"), "mode":mode}));
@@ -1589,6 +1617,29 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
     .await?;
     let dns_stats = dns.command(FixtureCommand::Status).await?;
     let upstream_stats = upstream.command(FixtureCommand::Status).await?;
+    let unexpected_errors = failures
+        .checked_add(upgrade_errors)
+        .ok_or_else(|| fail("operation counter overflow"))?;
+    let accounted_workers = success
+        .checked_add(cancelled)
+        .and_then(|total| total.checked_add(expected))
+        .and_then(|total| total.checked_add(failures))
+        .ok_or_else(|| fail("worker counter overflow"))?;
+    if requests != accounted_workers {
+        return Err(fail(format!(
+            "worker accounting mismatch: requests={requests}, classified={accounted_workers}"
+        )));
+    }
+    std::fs::write(
+        args.output.join("final-evidence.json"),
+        serde_json::to_vec_pretty(&json!({
+            "requests":requests,"success":success,"cancelled_responses":cancelled,
+            "unexpected_errors":unexpected_errors,"worker_errors":failures,"upgrade_unavailable":upgrade_unavailable,"upgrade_errors":upgrade_errors,"dns":dns_stats,"upstream":upstream_stats,
+            "last_sample":samples.last(),"gateway_pid":gateway.pid,
+        }))
+        .map_err(json_error)?,
+    )
+    .map_err(io_error)?;
     let coverage = json!({
         "full_control_cycle": changes >= if matches!(args.campaign,Campaign::Protocol) {12} else {11},
         "active_health_successes_max_observed": samples.iter().filter_map(|sample|sample.active_health_successes).max(),
@@ -1674,24 +1725,30 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
         || upstream_stats["request_faults"] != 0
         || dns_stats["queries"].as_u64().is_none_or(|count| count == 0)
     {
-        return Err(fail(
-            "qualification did not prove live traffic, real cancellation, DNS queries and tunnel cleanup",
-        ));
+        return Err(fail(format!(
+            "qualification did not prove live traffic, real cancellation, DNS queries and tunnel cleanup: success={success}, body_drops={}, active_tunnels={}, request_faults={}, dns_queries={}",
+            upstream_stats["body_drops"],
+            upstream_stats["active_tunnels"],
+            upstream_stats["request_faults"],
+            dns_stats["queries"],
+        )));
     }
     let pids = json!({"gateway":gateway.pid,"generator":std::process::id(),"dns":dns.ready.pid,"upstream":upstream.ready.pid});
     gateway.stop().await?;
     dns.stop().await?;
     upstream.stop().await?;
     let summary = json!({
-        "schema_version":"oxidase.discovery-soak/v1", "result":if failures==0{"pass"}else{"fail"},
+        "schema_version":"oxidase.discovery-soak/v1", "result":if unexpected_errors==0{"pass"}else{"fail"},
         "parameters":{"campaign":args.campaign,"duration_ms":crate::millis(args.duration),"warmup_ms":crate::millis(args.warm_up),"cooldown_ms":crate::millis(args.cooldown),"concurrency":args.concurrency,"seed":args.seed,"sample_interval_ms":crate::millis(args.sample_interval),"reload_interval_ms":crate::millis(args.reload_interval),"payload_size":args.payload_size},
         "elapsed_ms":crate::millis(start.elapsed()),"pids":pids,"initial_runtime":initial,"drained_runtime":drained,
         "requests":requests,"success":success,"cancelled_responses":cancelled,"expected_unavailable":expected,
-        "unexpected_errors":failures,"unexpected_samples":unexpected_samples,"bytes":bytes,
+        "unexpected_errors":unexpected_errors,"worker_errors":failures,"unexpected_samples":unexpected_samples,"bytes":bytes,
         "grpc_attempted":grpc,"grpc_completed":grpc_completed,"grpc_cancelled":grpc_cancelled,
-        "upgrade_tunnels":tunnels,"retained_stream_proof":retained,"final_sample":final_sample,
+        "upgrade_tunnels":tunnels,"upgrade_unavailable":upgrade_unavailable,"upgrade_errors":upgrade_errors,"retained_stream_proof":retained,"final_sample":final_sample,
         "activations":activations,"rollbacks":rollbacks,"dns":dns_stats,"upstream":upstream_stats,
         "observed_coverage":coverage,
+        "fixture_request_read_delay_ms":fixture_read_delay_ms,
+        "fixture_request_stream_window":if fixture_read_delay_ms>0{Some(1)}else{None},
         "rss_kib":monitor::curve(&samples,|s|s.rss_kib),"open_fds":monitor::curve(&samples,|s|s.open_fds),
         "gateway_exited":true,"post_exit_rss":null,"post_exit_fds":null,
     });
@@ -1701,7 +1758,7 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
     )
     .map_err(io_error)?;
     println!("{summary}");
-    if failures > 0 {
+    if unexpected_errors > 0 {
         return Err(fail("qualification observed unexpected request failures"));
     }
     Ok(())

@@ -67,15 +67,22 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
         .await
         .expect("bounded campaign")
         .expect("real process spawn");
+    if !result.status.success() {
+        // Do not destroy the only concrete fault/cancellation evidence, or mask
+        // it behind a missing-success-summary error, when a campaign fails.
+        let evidence = std::fs::read(output.path().join("final-evidence.json"))
+            .unwrap_or_else(|error| format!("final evidence unavailable: {error}").into_bytes());
+        let retained = output.keep();
+        panic!(
+            "campaign {campaign} failed; retained evidence at {}:\n{}\n{}\n{}",
+            retained.display(),
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&evidence)
+        );
+    }
     let summary =
         std::fs::read(output.path().join("summary.json")).expect("actual campaign receipt");
-    assert!(
-        result.status.success(),
-        "campaign {campaign} failed:\n{}\n{}\n{}",
-        String::from_utf8_lossy(&result.stderr),
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&summary)
-    );
     let summary: Value = serde_json::from_slice(&summary).expect("valid JSON receipt");
     assert_eq!(summary["result"], "pass");
     let mut pids = ["gateway", "generator", "dns", "upstream"]
@@ -93,6 +100,22 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
             > 0
     );
     assert_eq!(summary["unexpected_errors"], 0);
+    let accounted = [
+        "success",
+        "cancelled_responses",
+        "expected_unavailable",
+        "worker_errors",
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, field| {
+        total.checked_add(summary[field].as_u64().expect("worker outcome count"))
+    })
+    .expect("bounded worker accounting");
+    assert_eq!(
+        summary["requests"].as_u64(),
+        Some(accounted),
+        "control-loop Upgrade probes must not enter worker request outcome counts"
+    );
     assert_eq!(summary["upstream"]["request_faults"], 0);
     assert_eq!(
         summary["retained_stream_proof"]["opaque_grpc_bytes_verified"],
