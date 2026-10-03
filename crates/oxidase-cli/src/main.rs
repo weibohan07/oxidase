@@ -18,6 +18,7 @@ use oxidase_runtime::{
 use oxidase_site::PreparedSiteBody;
 use serde::Serialize;
 
+mod admin_client;
 mod bundle_support;
 mod diagnostic_output;
 
@@ -61,6 +62,47 @@ enum Command {
     Bundle {
         #[command(subcommand)]
         command: BundleCommand,
+    },
+    /// Operate an authenticated Oxidase administration endpoint.
+    Ctl {
+        /// Connect through a Unix-domain administration socket.
+        #[arg(
+            long,
+            value_name = "SOCKET",
+            required_unless_present = "https",
+            conflicts_with = "https"
+        )]
+        unix: Option<PathBuf>,
+        /// Connect to an HTTPS administration origin.
+        #[arg(
+            long,
+            value_name = "URL",
+            required_unless_present = "unix",
+            conflicts_with = "unix"
+        )]
+        https: Option<String>,
+        /// Read the bearer credential from this file; its value is never logged.
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<PathBuf>,
+        /// Additional CA bundle trusted by the HTTPS control client.
+        #[arg(long, value_name = "PEM", requires = "https")]
+        ca_bundle: Option<PathBuf>,
+        /// Client certificate chain for administration mTLS.
+        #[arg(
+            long,
+            value_name = "PEM",
+            requires_all = ["https", "client_key"]
+        )]
+        client_certificate: Option<PathBuf>,
+        /// Client private key for administration mTLS.
+        #[arg(
+            long,
+            value_name = "PEM",
+            requires_all = ["https", "client_certificate"]
+        )]
+        client_key: Option<PathBuf>,
+        #[command(subcommand)]
+        command: CtlCommand,
     },
     /// Serve a compiled gateway (enabled by the data-plane phase).
     Serve {
@@ -134,6 +176,24 @@ enum BundleCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CtlCommand {
+    /// Show the current runtime and snapshot identity.
+    Status,
+    /// Show bounded Cluster and endpoint runtime state.
+    Clusters,
+    /// Upload and verify one signed Bundle candidate.
+    Stage { bundle: PathBuf },
+    /// Re-run preparation validation for a staged candidate.
+    Validate { digest: String },
+    /// Atomically activate a validated candidate.
+    Activate { digest: String },
+    /// Re-prepare and activate one retained successful snapshot.
+    Rollback { digest: String },
+    /// Stop accepting new data-plane work and gracefully drain.
+    Drain,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -173,6 +233,12 @@ impl Cli {
                 | BundleCommand::Sign { bundle, .. } => bundle,
                 BundleCommand::Diff { old, .. } => old,
             },
+            Command::Ctl {
+                unix, token_file, ..
+            } => unix
+                .as_deref()
+                .or(token_file.as_deref())
+                .unwrap_or_else(|| Path::new("oxidase-ctl")),
         }
     }
 }
@@ -269,6 +335,10 @@ fn bundle_failure(error: bundle_support::BundleCliError, source: &Path) -> CliFa
             field_path: "bundle".to_owned(),
         },
     ))
+}
+
+fn ctl_failure(error: admin_client::AdminClientError, source: &Path) -> CliFailure {
+    CliFailure::one(diagnostic_at(error.code(), error.message(), source, "ctl"))
 }
 
 async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
@@ -469,6 +539,103 @@ async fn run(cli: Cli, reporter: &Reporter) -> Result<RunSuccess, CliFailure> {
                 )
             }
         },
+        Command::Ctl {
+            unix,
+            https,
+            token_file,
+            ca_bundle,
+            client_certificate,
+            client_key,
+            command,
+        } => {
+            let source = unix
+                .clone()
+                .or_else(|| token_file.clone())
+                .unwrap_or_else(|| PathBuf::from("oxidase-ctl"));
+            let endpoint = match (unix, https) {
+                (Some(path), None) => admin_client::AdminEndpoint::Unix(path),
+                (None, Some(url)) => {
+                    let url = url::Url::parse(&url).map_err(|error| {
+                        CliFailure::one(diagnostic_at(
+                            "ctl.https_url",
+                            format!("invalid admin HTTPS URL: {error}"),
+                            &source,
+                            "ctl.https",
+                        ))
+                    })?;
+                    admin_client::AdminEndpoint::Https(admin_client::AdminHttpsEndpoint {
+                        url,
+                        ca_bundle,
+                        client_certificate,
+                        client_key,
+                    })
+                }
+                _ => unreachable!("clap requires exactly one control endpoint"),
+            };
+            let bearer_token = match token_file {
+                Some(path) => Some(
+                    admin_client::read_bearer_token(&path)
+                        .await
+                        .map_err(|error| ctl_failure(error, &path))?,
+                ),
+                None => None,
+            };
+            let credentials = admin_client::AdminCredentials { bearer_token };
+            let operation = match command {
+                CtlCommand::Status => admin_client::AdminOperation::Status,
+                CtlCommand::Clusters => admin_client::AdminOperation::Clusters,
+                CtlCommand::Stage { bundle } => admin_client::AdminOperation::Stage { bundle },
+                CtlCommand::Validate { digest } => {
+                    admin_client::AdminOperation::Validate { digest }
+                }
+                CtlCommand::Activate { digest } => {
+                    admin_client::AdminOperation::Activate { digest }
+                }
+                CtlCommand::Rollback { digest } => {
+                    admin_client::AdminOperation::Rollback { digest }
+                }
+                CtlCommand::Drain => admin_client::AdminOperation::Drain,
+            };
+            let response = admin_client::execute(&endpoint, &credentials, operation)
+                .await
+                .map_err(|error| ctl_failure(error, &source))?;
+            admin_client::ensure_success(&response).map_err(|error| ctl_failure(error, &source))?;
+            let payload =
+                serde_json::from_slice::<serde_json::Value>(&response.body).map_err(|error| {
+                    CliFailure::one(diagnostic_at(
+                        "ctl.response_json",
+                        format!("admin response is not valid JSON: {error}"),
+                        &source,
+                        "ctl.response",
+                    ))
+                })?;
+            if reporter.is_json() {
+                println!(
+                    "{}",
+                    serde_json::to_string(&payload).map_err(|error| {
+                        CliFailure::one(diagnostic_at(
+                            "ctl.output_encode",
+                            format!("cannot encode admin response: {error}"),
+                            &source,
+                            "ctl.output",
+                        ))
+                    })?
+                );
+            } else {
+                reporter.human_stdout(serde_json::to_string_pretty(&payload).map_err(|error| {
+                    CliFailure::one(diagnostic_at(
+                        "ctl.output_encode",
+                        format!("cannot encode admin response: {error}"),
+                        &source,
+                        "ctl.output",
+                    ))
+                })?);
+            }
+            Ok(RunSuccess {
+                stdout_payload: true,
+                diagnostics: Vec::new(),
+            })
+        }
         Command::Serve {
             config,
             bundle,
@@ -1374,10 +1541,54 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        BundleCommand, Cli, Command, CompilationManifest, compare_expectation, explain,
+        BundleCommand, Cli, Command, CompilationManifest, CtlCommand, compare_expectation, explain,
         listener_protocol_label, prepare_snapshot, snapshot_resource_count,
         watch_dependencies_with_timing,
     };
+
+    #[test]
+    fn ctl_requires_one_transport_and_complete_mtls_identity() {
+        let parsed = Cli::try_parse_from([
+            "oxidase",
+            "ctl",
+            "--unix",
+            "/run/oxidase/admin.sock",
+            "status",
+        ])
+        .expect("Unix ctl syntax parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Ctl {
+                command: CtlCommand::Status,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "oxidase",
+                "ctl",
+                "--unix",
+                "/run/oxidase/admin.sock",
+                "--https",
+                "https://admin.example/",
+                "status",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "oxidase",
+                "ctl",
+                "--https",
+                "https://admin.example/",
+                "--client-certificate",
+                "client.pem",
+                "status",
+            ])
+            .is_err(),
+            "an mTLS client certificate cannot be configured without its key"
+        );
+    }
 
     #[test]
     fn bundle_cli_inputs_are_explicit_and_source_watch_cannot_target_a_bundle() {

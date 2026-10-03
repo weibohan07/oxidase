@@ -1000,7 +1000,12 @@ version = "0.3.0-alpha.1"
 dependencies = [
  "bytes",
  "clap",
+ "futures-util",
  "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "oxidase-bundle",
  "oxidase-config",
  "oxidase-core",
@@ -1009,12 +1014,18 @@ dependencies = [
  "oxidase-site",
  "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
