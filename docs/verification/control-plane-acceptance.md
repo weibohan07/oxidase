@@ -3,10 +3,11 @@
 Scope: finish phase five only. Starting feature HEAD:
 `8694bde9dfce2356a55a2f13ca54c1adb107c39d`; starting main:
 `e018b2e24d87185e545cf1b0efb6200acff30f08`.
-Final control-plane library and fuzz-source commit:
-`7db5fe8e24222b7ac4bb94ab86893bd4ee875b9e`.
-Subsequent `2d37d9d` moves CLI-only TLS trust preparation off async workers and
-adds its cancellation/admission regression; it does not alter fuzzed code.
+Final production/fuzz code commit:
+`7568382dfe169c81b6695bdae4d555c16867201a`.
+`2d37d9d` moves CLI TLS trust preparation off async workers and adds its
+cancellation/admission regression. `7568382` disarms audit completion for a
+known rejected start, retaining cancellation only while acknowledgment is unknown.
 Documentation-only delivery revisions do not change the tested libraries or
 harnesses and are not new functional evidence.
 
@@ -80,6 +81,14 @@ test keeps a duplicate descriptor alive across owner drop, verifies a new owner
 can acquire the lock, and proves that new owner's exclusivity survives closing
 the inherited descriptor.
 
+Hosted MSRV run `37107990501` on `64f3928` also found a phantom audit completion:
+a rejected start's reserved guard emitted cancelled work, making the failure
+counter race between one and two. The fixed admission path disarms that guard
+after explicit rejection; caller cancellation while acknowledgment is unknown
+still emits its reserved completion. The regression preserves the single-start
+failure assertion and drains the worker with an explicit rejected flush, proving
+there is no extra cancellation event rather than merely relaxing the counter.
+
 ## Real crash/fault evidence
 
 The journal suite rendezvouses with and kills actual subprocesses in eight modes:
@@ -103,21 +112,27 @@ This is local fuzzing, not a Hosted campaign or proof of absence of bugs.
 
 | Target | Seed | libFuzzer / wall seconds | Executions | Active corpus | New units | Peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| admin_request, current seeds explicitly included | 424242 | 61 / 74.21 | 279539 | 1411 → 1523 | 1121 | 498 MB |
-| candidate_journal | 424243 | 61 / 70.63 | 238077 | 408 → 455 | 386 | 523 MB |
+| admin_request, current seeds explicitly included | 424242 | 61 / 68.38 | 280426 | 1508 → 1616 | 988 | 501 MB |
+| candidate_journal | 424243 | 61 / 63.66 | 226813 | 454 → 484 | 282 | 497 MB |
 
 ```sh
 CARGO_NET_OFFLINE=true cargo +nightly fuzz run admin_request fuzz/corpus/admin_request fuzz/seeds/admin_request --dev --sanitizer address -- -max_total_time=60 -seed=424242 -timeout=10 -rss_limit_mb=2048 -max_len=32768 -print_final_stats=1
 CARGO_NET_OFFLINE=true cargo +nightly fuzz run candidate_journal --dev --sanitizer address -- -max_total_time=60 -seed=424243 -timeout=10 -rss_limit_mb=2048 -max_len=65536 -print_final_stats=1
 ```
 
-Retained corpora were used (filesystem counts Admin 3687 → 4742 plus four current
-seed files, Candidate 985 → 1329). These runs are reproducible commands, not a claim
+Retained corpora were used (filesystem counts Admin 4742 → 5627 plus four current
+seed files, Candidate 1329 → 1601). These runs are reproducible commands, not a claim
 that a future changing corpus produces identical execution counts.
 Saved losslessly compressed final raw logs:
-[Admin](artifacts/control-plane-admin-7db5fe8-asan.log.gz),
-[Candidate journal](artifacts/control-plane-journal-7db5fe8-asan.log.gz). SHA-256 of the
+[Admin](artifacts/control-plane-admin-7568382-asan.log.gz),
+[Candidate journal](artifacts/control-plane-journal-7568382-asan.log.gz). SHA-256 of the
 decompressed original output respectively:
+`81eade1531c455fc0fae0a856e39c5828160a39452f30ef5122e21897ead9d43`,
+`a3e4d7861fd3633f850347d8c2e7a2f35c1884172ee8bd33cb03829bd6e4bf0c`.
+Earlier campaigns on `7db5fe8` remain historical evidence:
+[Admin](artifacts/control-plane-admin-7db5fe8-asan.log.gz),
+[Candidate journal](artifacts/control-plane-journal-7db5fe8-asan.log.gz), with
+original output SHA-256 values
 `cca58bc530a05b7c93989d112c9c1259f9bb4614c3acc51bb926286db0fa9737`,
 `b1d7e821e7cc721de11be9f6f26a3086d11d0001f6799d20454c550029133683`.
 Earlier campaigns on `a195838` remain as historical evidence only:
