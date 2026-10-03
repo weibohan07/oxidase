@@ -28,8 +28,8 @@ use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::discovery::{
     DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec, DnsRecordType, DnsRefreshSpec,
-    DnsResolverSource, DnsResolverSpec, normalize_dns_ip, normalize_dns_name, parse_dns_origin,
-    validate_dns_nameserver,
+    DnsResolverSource, DnsResolverSpec, normalize_dns_ip, normalize_dns_name, normalize_srv_name,
+    parse_dns_origin, validate_dns_nameserver,
 };
 use crate::source::{
     ActiveHealthSource, AdminAuthSource, AdminListenSource, AdminSource, BodySource, BundleSource,
@@ -777,7 +777,8 @@ pub struct DnsDiscoverySummary {
     pub name: String,
     pub record: String,
     pub origin: String,
-    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub max_endpoints: u16,
     pub endpoint_selection: String,
 }
@@ -4171,17 +4172,36 @@ fn compile_cluster_discovery(
         ));
     }
     let dns = &discovery.dns;
-    if dns.record != "a_aaaa" {
-        return Err(CompileError::one(Diagnostic::new(
-            "resource.discovery_record_unsupported", "this stage supports only DNS `a_aaaa`; SRV is not implemented yet", span("record"),
-        ).with_help("use `record: a_aaaa` with an explicit dial port, or static endpoints; SRV is delivered separately in phase 6C")));
+    let record = match dns.record.as_str() {
+        "a_aaaa" => DnsRecordType::AAndAaaa,
+        "srv" => DnsRecordType::Srv,
+        _ => return Err(CompileError::one(Diagnostic::new(
+            "resource.discovery_record_unsupported", "DNS record must be `a_aaaa` or `srv`", span("record"),
+        ).with_help("use `a_aaaa` with an explicit dial port, or `srv` with no fixed port and a `_service._tcp.hostname` question"))),
+    };
+    let name = match record {
+        DnsRecordType::AAndAaaa => normalize_dns_name(&dns.name),
+        DnsRecordType::Srv => normalize_srv_name(&dns.name),
     }
-    let name = normalize_dns_name(&dns.name).map_err(|error| fail(&error.field, error.message))?;
-    let port = dns
-        .port
-        .and_then(|port| u16::try_from(port).ok())
-        .filter(|port| *port != 0)
-        .ok_or_else(|| fail("port", "a_aaaa discovery requires a dial port in 1..=65535"))?;
+    .map_err(|error| fail(&error.field, error.message))?;
+    let port = match record {
+        DnsRecordType::AAndAaaa => Some(
+            dns.port
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(|| {
+                    fail("port", "a_aaaa discovery requires a dial port in 1..=65535")
+                })?,
+        ),
+        DnsRecordType::Srv => {
+            if declared("port") {
+                return Err(CompileError::one(Diagnostic::new(
+                    "resource.discovery_srv_port", "SRV dial ports come from DNS records; no fixed `port` field may be declared", span("port"),
+                ).with_help("remove `port` entirely, including null; keep the independent fixed HTTP/TLS `origin`")));
+            }
+            None
+        }
+    };
     let origin =
         parse_dns_origin(&dns.origin).map_err(|error| fail(&error.field, error.message))?;
     if dns.resolver.nameservers.is_some()
@@ -4283,7 +4303,7 @@ fn compile_cluster_discovery(
     }
     let policy = DnsDiscoverySpec {
         name,
-        record: DnsRecordType::AAndAaaa,
+        record,
         port,
         origin,
         resolver: DnsResolverSpec {

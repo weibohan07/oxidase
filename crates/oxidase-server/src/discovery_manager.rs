@@ -4,16 +4,21 @@
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
-use oxidase_config::{DnsDiscoverySpec, MAX_DNS_DISCOVERY_CLUSTERS};
+use oxidase_config::{DnsDiscoverySpec, DnsRecordType, MAX_DNS_DISCOVERY_CLUSTERS};
 use oxidase_core::{ContentDigestBuilder, Diagnostic, ResourceId};
-use oxidase_runtime::{DnsFamily, DnsObservation, PreparedCluster, RuntimeSnapshot};
+use oxidase_runtime::{
+    DnsFamily, DnsObservation, PreparedCluster, RuntimeSnapshot, SrvObservation,
+};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::dns_resolver::{DnsResolver, MAX_DNS_QUERIES, ResolvedFamily, validate_bootstrap};
+use crate::dns_resolver::{
+    DnsResolver, MAX_DNS_QUERIES, ResolvedFamily, ResolvedSrv, validate_bootstrap,
+};
 use crate::leaves::ProxyClient;
 use crate::metrics::Metrics;
 
@@ -250,6 +255,10 @@ async fn run_owner(
     seed: u64,
 ) {
     let _task = metrics.discovery_task_started();
+    if plan.record == DnsRecordType::Srv {
+        run_srv_owner(weak, plan, resolver, proxy, metrics, id, seed).await;
+        return;
+    }
     let Some(cluster) = weak.upgrade() else {
         return;
     };
@@ -330,6 +339,86 @@ async fn run_owner(
     }
 }
 
+async fn run_srv_owner(
+    weak: Weak<PreparedCluster>,
+    plan: DnsDiscoverySpec,
+    resolver: DnsResolver,
+    proxy: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
+    id: ResourceId,
+    seed: u64,
+) {
+    let Some(cluster) = weak.upgrade() else {
+        return;
+    };
+    let mut retired = cluster.discovery_retirement();
+    drop(cluster);
+    let mut schedule = RefreshSchedule::new(&id, seed);
+    loop {
+        if *retired.borrow() {
+            break;
+        }
+        let Some(cluster) = weak.upgrade() else {
+            break;
+        };
+        drop(cluster.endpoints());
+        proxy.prune_pools();
+        if schedule.next() > Instant::now() {
+            let wake = cluster
+                .next_discovery_expiry()
+                .map_or(schedule.next(), |expiry| expiry.min(schedule.next()));
+            drop(cluster);
+            tokio::select! {
+                biased;
+                _ = retired.changed() => break,
+                () = tokio::time::sleep_until(wake) => {},
+            }
+            continue;
+        }
+        let Some(query) = cluster.begin_discovery_query() else {
+            break;
+        };
+        let mut answer = tokio::select! {
+            biased;
+            _ = retired.changed() => break,
+            answer = resolver.resolve_srv_with_schedule(&plan) => answer,
+        };
+        let now = Instant::now();
+        let receipt = cluster.reconcile_srv(&query, answer.observation.clone(), now);
+        if !receipt.applied {
+            break;
+        }
+        normalize_reconciled_srv_answer(&mut answer, receipt);
+        schedule.complete_srv(&answer, &plan, now);
+        metrics.record_srv_discovery(cluster.name(), &answer.observation);
+        cluster.set_discovery_refresh(&query, schedule.next());
+        proxy.prune_pools();
+        drop(query);
+        drop(cluster);
+    }
+}
+
+fn normalize_reconciled_srv_answer(
+    answer: &mut ResolvedSrv,
+    receipt: oxidase_runtime::DiscoveryReconcileOutcome,
+) {
+    // A successful service RRset can retain a fast target/family while a sibling
+    // is unavailable. Only rejection of the entire positive input justifies
+    // discarding its original expiry schedule and using whole-service backoff.
+    if receipt.positive_rejected && matches!(answer.observation, SrvObservation::Positive { .. }) {
+        answer.observation = match receipt.observation_error_code {
+            Some(oxidase_runtime::DiscoveryErrorCode::PolicyRejected) => {
+                SrvObservation::PolicyRejected
+            }
+            Some(oxidase_runtime::DiscoveryErrorCode::LimitExceeded) => {
+                SrvObservation::LimitExceeded
+            }
+            _ => SrvObservation::InvalidAnswer,
+        };
+        answer.retry_after = None;
+    }
+}
+
 fn normalize_reconciled_answer(
     answer: &mut ResolvedFamily,
     error: Option<oxidase_runtime::DiscoveryErrorCode>,
@@ -353,6 +442,12 @@ struct RefreshSchedule {
     next: [Instant; 2],
     failures: [u8; 2],
     random: u64,
+}
+
+enum RefreshTiming {
+    Positive(Option<Instant>),
+    Negative(Option<Instant>),
+    Failure,
 }
 
 impl RefreshSchedule {
@@ -389,15 +484,65 @@ impl RefreshSchedule {
         now: Instant,
     ) {
         let index = usize::from(family == DnsFamily::Aaaa);
-        let refresh = &plan.refresh;
-        let delay = match &answer.observation {
+        let timing = match &answer.observation {
             DnsObservation::Positive { addresses } => {
-                self.failures[index] = 0;
-                let remaining = addresses
+                RefreshTiming::Positive(addresses.iter().map(|record| record.fresh_until).min())
+            }
+            DnsObservation::NameNotFound | DnsObservation::NoData => {
+                RefreshTiming::Negative(answer.retry_after)
+            }
+            _ => RefreshTiming::Failure,
+        };
+        let next = self.advance(index, timing, plan, now);
+        if matches!(answer.observation, DnsObservation::NameNotFound) {
+            self.next = [next; 2];
+            self.failures = [0; 2];
+        } else {
+            self.next[index] = next;
+        }
+    }
+
+    fn complete_srv(&mut self, answer: &ResolvedSrv, plan: &DnsDiscoverySpec, now: Instant) {
+        let timing = match &answer.observation {
+            SrvObservation::Positive { records, addresses } => {
+                let expiries = records
                     .iter()
-                    .map(|record| record.fresh_until.saturating_duration_since(now))
-                    .min()
-                    .unwrap_or_default();
+                    .map(|record| record.fresh_until)
+                    .chain(
+                        addresses
+                            .iter()
+                            .flat_map(|target| match &target.observation {
+                                DnsObservation::Positive { addresses } => addresses.as_slice(),
+                                _ => &[],
+                            })
+                            .map(|record| record.fresh_until),
+                    )
+                    .chain(answer.retry_after);
+                RefreshTiming::Positive(expiries.min())
+            }
+            SrvObservation::NameNotFound
+            | SrvObservation::NoData
+            | SrvObservation::ServiceUnavailable => RefreshTiming::Negative(answer.retry_after),
+            _ => RefreshTiming::Failure,
+        };
+        let next = self.advance(0, timing, plan, now);
+        self.next = [next; 2];
+    }
+
+    fn advance(
+        &mut self,
+        index: usize,
+        timing: RefreshTiming,
+        plan: &DnsDiscoverySpec,
+        now: Instant,
+    ) -> Instant {
+        let refresh = &plan.refresh;
+        let delay = match timing {
+            RefreshTiming::Positive(expiry) => {
+                self.failures[index] = 0;
+                let remaining = expiry.map_or(Duration::ZERO, |expiry| {
+                    expiry.saturating_duration_since(now)
+                });
                 // Early-only jitter never extends the actual TTL. The minimum
                 // interval throttles queries, not the membership's expiry.
                 let maximum = remaining.min(refresh.max_interval);
@@ -410,17 +555,16 @@ impl RefreshSchedule {
                 );
                 maximum.saturating_sub(reduction).max(refresh.min_interval)
             }
-            DnsObservation::NameNotFound | DnsObservation::NoData => {
+            RefreshTiming::Negative(expiry) => {
                 self.failures[index] = 0;
-                answer
-                    .retry_after
+                expiry
                     .map_or(refresh.min_interval, |expiry| {
                         expiry.saturating_duration_since(now)
                     })
                     .min(refresh.max_interval)
                     .max(refresh.min_interval)
             }
-            _ => {
+            RefreshTiming::Failure => {
                 self.failures[index] = self.failures[index].saturating_add(1).min(16);
                 refresh
                     .min_interval
@@ -428,13 +572,7 @@ impl RefreshSchedule {
                     .min(refresh.max_interval)
             }
         };
-        let next = now + delay;
-        if matches!(answer.observation, DnsObservation::NameNotFound) {
-            self.next = [next; 2];
-            self.failures = [0; 2];
-        } else {
-            self.next[index] = next;
-        }
+        now + delay
     }
 }
 
@@ -637,5 +775,146 @@ mod tests {
             1,
             "valid other family remains available"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_refresh_uses_original_component_expiry_and_target_negative_deadline() {
+        let (_dir, snapshot) = fixture();
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let plan = cluster.spec().discovery.as_ref().expect("policy");
+        let mut schedule = RefreshSchedule::new(cluster.id(), 42);
+        let now = Instant::now();
+        let mut answer = ResolvedSrv {
+            observation: SrvObservation::Positive {
+                records: vec![oxidase_runtime::SrvRecord {
+                    target: "target.example.test.".to_owned(),
+                    port: 8443,
+                    priority: 0,
+                    weight: 1,
+                    fresh_until: now + Duration::from_secs(60),
+                }],
+                addresses: vec![oxidase_runtime::SrvTargetAddressObservation {
+                    target: "target.example.test.".to_owned(),
+                    family: DnsFamily::A,
+                    observation: DnsObservation::Positive {
+                        addresses: vec![DnsAddressRecord {
+                            address: "192.0.2.1".parse().expect("IP"),
+                            fresh_until: now + Duration::from_secs(6),
+                        }],
+                    },
+                }],
+            },
+            retry_after: Some(now + Duration::from_secs(3)),
+        };
+        schedule.complete_srv(&answer, plan, now);
+        assert_eq!(schedule.next, [now + Duration::from_secs(3); 2]);
+        answer.retry_after = None;
+        schedule.complete_srv(&answer, plan, now + Duration::from_secs(5));
+        assert_eq!(
+            schedule.next,
+            [now + Duration::from_secs(6); 2],
+            "round completion cannot refund address TTL"
+        );
+        schedule.complete_srv(&answer, plan, now + Duration::from_secs(7));
+        assert_eq!(
+            schedule.next,
+            [now + Duration::from_secs(8); 2],
+            "expired answers only throttle queries, not leases"
+        );
+        answer.observation = SrvObservation::ServiceUnavailable;
+        answer.retry_after = Some(now + Duration::from_secs(12));
+        schedule.complete_srv(&answer, plan, now + Duration::from_secs(10));
+        assert_eq!(schedule.next, [now + Duration::from_secs(12); 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_srv_target_failure_keeps_positive_ttl_schedule_instead_of_service_backoff() {
+        let (_dir, snapshot) = fixture();
+        let mut spec = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster")
+            .spec()
+            .clone();
+        let plan = spec.discovery.as_mut().expect("plan");
+        plan.record = DnsRecordType::Srv;
+        plan.name = "_http._tcp.service.example.test.".to_owned();
+        plan.port = None;
+        plan.refresh.max_interval = Duration::from_secs(60);
+        plan.refresh.jitter_percent = 0;
+        let (cluster, _) = PreparedCluster::prepare(spec, None);
+        assert!(cluster.activate_discovery_policy());
+        let plan = cluster.spec().discovery.as_ref().expect("plan");
+        let mut schedule = RefreshSchedule::new(cluster.id(), 1);
+        let metrics = Metrics::default();
+        let now = Instant::now();
+        for step in 0..10 {
+            let now = now + Duration::from_secs(step);
+            let query = cluster.begin_discovery_query().expect("single round");
+            let mut answer = ResolvedSrv {
+                observation: SrvObservation::Positive {
+                    records: vec![oxidase_runtime::SrvRecord {
+                        target: "target.example.test.".to_owned(),
+                        port: 8443,
+                        priority: 0,
+                        weight: 1,
+                        fresh_until: now + Duration::from_secs(5),
+                    }],
+                    addresses: vec![
+                        oxidase_runtime::SrvTargetAddressObservation {
+                            target: "target.example.test.".to_owned(),
+                            family: DnsFamily::A,
+                            observation: DnsObservation::Positive {
+                                addresses: vec![DnsAddressRecord {
+                                    address: "192.0.2.1".parse().expect("IP"),
+                                    fresh_until: now + Duration::from_secs(5),
+                                }],
+                            },
+                        },
+                        oxidase_runtime::SrvTargetAddressObservation {
+                            target: "target.example.test.".to_owned(),
+                            family: DnsFamily::Aaaa,
+                            observation: DnsObservation::TransientFailure {
+                                code: DiscoveryErrorCode::ServerFailure,
+                            },
+                        },
+                    ],
+                },
+                retry_after: Some(now + Duration::from_secs(2)),
+            };
+            let receipt = cluster.reconcile_srv(&query, answer.observation.clone(), now);
+            assert!(receipt.applied);
+            assert_eq!(
+                receipt.observation_error_code,
+                Some(DiscoveryErrorCode::ServerFailure)
+            );
+            normalize_reconciled_srv_answer(&mut answer, receipt);
+            assert!(
+                matches!(answer.observation, SrvObservation::Positive { .. }),
+                "a failed sibling is not malformed service data"
+            );
+            schedule.complete_srv(&answer, plan, now);
+            metrics.record_srv_discovery(cluster.name(), &answer.observation);
+            assert_eq!(schedule.next, [now + Duration::from_secs(2); 2]);
+            assert_eq!(
+                schedule.failures[0], 0,
+                "whole-service exponential backoff cannot hide positive TTL"
+            );
+            assert_eq!(cluster.endpoints().len(), 1);
+        }
+        let rendered = metrics.render_prometheus_for(&snapshot);
+        assert!(rendered.contains(
+            "oxidase_discovery_queries_total{cluster=\"api\",family=\"srv\",result=\"positive\"} 10"
+        ));
+        assert!(rendered.contains(
+            "oxidase_discovery_queries_total{cluster=\"api\",family=\"srv\",result=\"invalid_answer\"} 0"
+        ));
     }
 }

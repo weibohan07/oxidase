@@ -36,7 +36,7 @@ fn discovery_is_offline_canonical_and_implicitly_uses_phased_timeouts() {
     let dns = cluster.discovery.as_ref().expect("static DNS policy");
     assert_eq!(dns.name, "api.example.test.");
     assert_eq!(dns.record.as_str(), "a_aaaa");
-    assert_eq!(dns.port, 8443);
+    assert_eq!(dns.port, Some(8443));
     assert_eq!(dns.origin.host_str(), Some("logical.example.test"));
     assert_eq!(dns.origin.path(), "/base/");
     assert_eq!(dns.resolver.source, DnsResolverSource::System);
@@ -99,10 +99,10 @@ fn discovery_rejects_static_even_empty_and_each_explicit_legacy_timer() {
 }
 
 #[test]
-fn discovery_rejects_srv_at_record_span_with_phase_specific_help() {
-    let text = gateway(&policy("")).replace("record: a_aaaa", "record: srv");
+fn discovery_rejects_unknown_record_at_record_span_with_supported_help() {
+    let text = gateway(&policy("")).replace("record: a_aaaa", "record: txt");
     let (_directory, file) = source(&text);
-    let error = Compiler::compile_path(file).expect_err("6B cannot accept inert SRV policy");
+    let error = Compiler::compile_path(file).expect_err("unknown records cannot be accepted");
     let diagnostic = &error.diagnostics[0];
     assert_eq!(diagnostic.code, "resource.discovery_record_unsupported");
     assert_eq!(
@@ -111,13 +111,13 @@ fn discovery_rejects_srv_at_record_span_with_phase_specific_help() {
     );
     assert_eq!(
         diagnostic.primary.start_byte,
-        text.find("record: srv").expect("record") + 8
+        text.find("record: txt").expect("record") + 8
     );
     assert!(
         diagnostic
             .help
             .as_ref()
-            .is_some_and(|help| help.contains("phase 6C"))
+            .is_some_and(|help| help.contains("a_aaaa") && help.contains("srv"))
     );
 }
 

@@ -9,15 +9,15 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use dns_fixture::{DnsFixture, FixtureReply};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::rdata::{A, AAAA};
-use hickory_resolver::proto::rr::{RData, Record, RecordType};
+use hickory_resolver::proto::rr::rdata::{A, AAAA, SRV};
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, Full, combinators::UnsyncBoxBody};
@@ -34,10 +34,10 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
-use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::crypto::ring::default_provider;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 type FixtureBody = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -53,20 +53,33 @@ struct Upstream {
     heads: Arc<AtomicU64>,
     connections: Arc<AtomicU64>,
     release: Arc<Semaphore>,
+    healthy: Arc<AtomicBool>,
+    sni: mpsc::Receiver<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Upstream {
     async fn start(address: SocketAddr, marker: &'static str) -> std::io::Result<Self> {
+        Self::start_transport(address, marker, None).await
+    }
+
+    async fn start_transport(
+        address: SocketAddr,
+        marker: &'static str,
+        tls: Option<Arc<ServerConfig>>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let (events, observed) = mpsc::channel(32);
         let heads = Arc::new(AtomicU64::new(0));
         let connections = Arc::new(AtomicU64::new(0));
         let release = Arc::new(Semaphore::new(0));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let (sni_events, sni) = mpsc::channel(32);
         let task_heads = Arc::clone(&heads);
         let task_connections = Arc::clone(&connections);
         let task_release = Arc::clone(&release);
+        let task_health = Arc::clone(&healthy);
         let task = tokio::spawn(async move {
             // Dropping this JoinSet aborts all accepted connection drivers.
             let mut tasks = tokio::task::JoinSet::new();
@@ -79,18 +92,27 @@ impl Upstream {
                         let events = events.clone();
                         let heads = Arc::clone(&task_heads);
                         let release = Arc::clone(&task_release);
+                        let healthy = Arc::clone(&task_health);
+                        let tls = tls.clone();
+                        let sni_events = sni_events.clone();
                         tasks.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let events = events.clone();
                                 let heads = Arc::clone(&heads);
                                 let release = Arc::clone(&release);
+                                let healthy = Arc::clone(&healthy);
                                 async move {
-                                    heads.fetch_add(1, Ordering::Relaxed);
                                     let authority = request.uri().authority().map_or_else(
                                         || request.headers().get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or("").to_owned(),
                                         |authority| authority.as_str().to_owned(),
                                     );
                                     let path = request.uri().path_and_query().expect("origin form").as_str().to_owned();
+                                    if path.ends_with("/health") {
+                                        return Ok::<_, Infallible>(Response::builder()
+                                            .status(if healthy.load(Ordering::Acquire) { 200 } else { 503 })
+                                            .body(Full::new(Bytes::new()).boxed_unsync()).expect("health response"));
+                                    }
+                                    heads.fetch_add(1, Ordering::Relaxed);
                                     let _ = events.try_send(Head { authority, path: path.clone() });
                                     let body: FixtureBody = if path.starts_with("/base/hold") {
                                         HeldBody::new(marker, release).boxed_unsync()
@@ -100,8 +122,17 @@ impl Upstream {
                                     Ok::<_, Infallible>(Response::new(body))
                                 }
                             });
-                            let _ = server_h2::Builder::new(TokioExecutor::new())
-                                .serve_connection(TokioIo::new(socket), service).await;
+                            if let Some(config) = tls {
+                                if let Ok(socket) = TlsAcceptor::from(config).accept(socket).await {
+                                    let name = socket.get_ref().1.server_name().unwrap_or("").to_owned();
+                                    let _ = sni_events.try_send(name);
+                                    let _ = server_h2::Builder::new(TokioExecutor::new())
+                                        .serve_connection(TokioIo::new(socket), service).await;
+                                }
+                            } else {
+                                let _ = server_h2::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(socket), service).await;
+                            }
                         });
                     }
                 }
@@ -113,6 +144,8 @@ impl Upstream {
             heads,
             connections,
             release,
+            healthy,
+            sni,
             task,
         })
     }
@@ -202,6 +235,40 @@ struct Gateway {
 
 impl Gateway {
     async fn start(dns: SocketAddr, port: u16) -> Self {
+        Self::start_policy(
+            dns,
+            &format!(
+                "name: endpoint.example.invalid\n          record: a_aaaa\n          port: {port}"
+            ),
+            "http",
+            "",
+            None,
+        )
+        .await
+    }
+
+    async fn start_srv(dns: SocketAddr, policy: &str, upstream_ca: Option<&str>) -> Self {
+        Self::start_policy(
+            dns,
+            "name: _http._tcp.service.example.invalid\n          record: srv",
+            if upstream_ca.is_some() {
+                "https"
+            } else {
+                "http"
+            },
+            policy,
+            upstream_ca,
+        )
+        .await
+    }
+
+    async fn start_policy(
+        dns: SocketAddr,
+        declaration: &str,
+        scheme: &str,
+        policy: &str,
+        upstream_ca: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("test-only source directory");
         let generated =
             rcgen::generate_simple_self_signed(vec!["discovery-gateway.example.test".to_owned()])
@@ -212,6 +279,15 @@ impl Gateway {
             generated.signing_key.serialize_pem(),
         )
         .expect("publicly-known test key only");
+        let (trust, tls) = if let Some(ca) = upstream_ca {
+            std::fs::write(directory.path().join("upstream-ca.pem"), ca).expect("test-only CA");
+            (
+                "  trust_stores:\n    upstream:\n      ca_bundle: upstream-ca.pem\n",
+                "      tls:\n        server_name: verified-upstream.example.test\n        trust:\n          system_roots: false\n          trust_store: upstream\n",
+            )
+        } else {
+            ("", "")
+        };
         let source = format!(
             r#"api_version: oxidase.dev/v1alpha1
 kind: gateway
@@ -220,15 +296,14 @@ resources:
     ingress:
       cert_chain: cert.pem
       private_key: key.pem
-  clusters:
+{trust}  clusters:
     api:
       protocol: h2
+{tls}{policy}
       discovery:
         dns:
-          name: endpoint.example.invalid
-          record: a_aaaa
-          port: {port}
-          origin: http://logical.example.invalid:8123/base
+          {declaration}
+          origin: {scheme}://logical.example.invalid:8123/base
           resolver:
             nameservers: ["{dns}"]
             query_timeout: 500ms
@@ -653,4 +728,438 @@ async fn cold_failure_recovers_but_nxdomain_and_zero_ttl_revoke_real_pool_use() 
     assert!(fixture.counts.udp.load(Ordering::Acquire) > 2);
     drop(client);
     gateway.running.shutdown().await.expect("gateway shutdown");
+}
+
+fn srv_record(
+    question: &hickory_resolver::proto::op::Query,
+    target: &str,
+    port: u16,
+    priority: u16,
+    weight: u16,
+) -> Record {
+    Record::from_rdata(
+        question.name().clone(),
+        2,
+        RData::SRV(SRV::new(
+            priority,
+            weight,
+            port,
+            Name::from_ascii(target).expect("target"),
+        )),
+    )
+}
+
+async fn wait_priority(gateway: &Gateway, priority: u16) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if gateway
+                .cluster
+                .discovery_status()
+                .expect("SRV status")
+                .eligible_priority
+                == Some(priority)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("priority transition");
+}
+
+#[tokio::test]
+async fn srv_health_priority_and_admission_cannot_send_saturated_primary_traffic_to_backup() {
+    let mut primary = Upstream::start("127.0.0.1:0".parse().expect("bind"), "primary")
+        .await
+        .expect("primary");
+    let mut backup = Upstream::start("127.0.0.1:0".parse().expect("bind"), "backup")
+        .await
+        .expect("backup");
+    let primary_port = primary.address.port();
+    let backup_port = backup.address.port();
+    let fixture = DnsFixture::start(move |question, _| {
+        if question.query_type() == RecordType::SRV {
+            FixtureReply::answers(vec![
+                srv_record(question, "primary.example.invalid.", primary_port, 0, 0),
+                srv_record(
+                    question,
+                    "backup.example.invalid.",
+                    backup_port,
+                    20,
+                    u16::MAX,
+                ),
+            ])
+        } else if question.query_type() == RecordType::A {
+            FixtureReply::answers(vec![dns_record(
+                question,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                2,
+            )])
+        } else {
+            FixtureReply::answers(Vec::new())
+        }
+    })
+    .await;
+    let gateway = Gateway::start_srv(fixture.address, "      health:\n        active:\n          path: /health\n          interval: 50ms\n          timeout: 500ms\n          healthy_threshold: 1\n          unhealthy_threshold: 1\n      limits:\n        max_in_flight: 4\n        max_in_flight_per_endpoint: 1\n        queue_timeout: 0ms\n", None).await;
+    wait_priority(&gateway, 0).await;
+    let published = gateway.running.reload_handle().published_runtime();
+    let mut client = gateway.client().await;
+    let held = client.request("/hold?raw=%2f&x=2&x=1").await;
+    assert_eq!(held.status(), StatusCode::OK);
+    let observed = primary.head().await;
+    assert_eq!(observed.authority, "logical.example.invalid:8123");
+    assert_eq!(observed.path, "/base/hold?raw=%2f&x=2&x=1");
+    let rejected = client.request("/saturated").await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    rejected.into_body().collect().await.expect("safe overload");
+    assert_eq!(
+        backup.heads.load(Ordering::Acquire),
+        0,
+        "capacity is not permission to cross SRV priority"
+    );
+    primary.release.add_permits(1);
+    held.into_body()
+        .collect()
+        .await
+        .expect("held body finishes");
+    primary.healthy.store(false, Ordering::Release);
+    wait_priority(&gateway, 20).await;
+    assert_eq!(
+        client
+            .request("/backup")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .expect("backup body")
+            .to_bytes(),
+        "backup"
+    );
+    let observed = backup.head().await;
+    assert_eq!(observed.authority, "logical.example.invalid:8123");
+    assert_eq!(observed.path, "/base/backup");
+    primary.healthy.store(true, Ordering::Release);
+    wait_priority(&gateway, 0).await;
+    assert_eq!(
+        client
+            .request("/recovered")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .expect("primary body")
+            .to_bytes(),
+        "primary"
+    );
+    assert!(Arc::ptr_eq(
+        &published,
+        &gateway.running.reload_handle().published_runtime()
+    ));
+    let metrics = gateway.metrics().await;
+    assert!(metrics.contains("family=\"srv\""));
+    assert!(!metrics.contains("target=\"primary.example"));
+    drop(client);
+    gateway.running.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn srv_weight_only_reuses_pool_but_withdrawal_and_new_target_do_not_reuse_it() {
+    let mut first = Upstream::start("127.0.0.1:0".parse().expect("bind"), "A")
+        .await
+        .expect("A");
+    let mut second = Upstream::start("127.0.0.1:0".parse().expect("bind"), "B")
+        .await
+        .expect("B");
+    let first_port = first.address.port();
+    let second_port = second.address.port();
+    let state = Arc::new(AtomicU8::new(0));
+    let service_queries = Arc::new(AtomicU64::new(0));
+    let address_queries = Arc::new(AtomicU64::new(0));
+    let mode = Arc::clone(&state);
+    let srv_count = Arc::clone(&service_queries);
+    let address_count = Arc::clone(&address_queries);
+    let fixture = DnsFixture::start(move |question, _| {
+        let mode = mode.load(Ordering::Acquire);
+        if question.query_type() == RecordType::SRV {
+            srv_count.fetch_add(1, Ordering::Release);
+            let (target, port) = match mode {
+                2 => (".", first_port),
+                3 => ("second.example.invalid.", second_port),
+                _ => ("first.example.invalid.", first_port),
+            };
+            FixtureReply::answers(vec![srv_record(
+                question,
+                target,
+                port,
+                0,
+                if mode == 1 { u16::MAX } else { 0 },
+            )])
+        } else {
+            address_count.fetch_add(1, Ordering::Release);
+            if question.query_type() == RecordType::A {
+                FixtureReply::answers(vec![dns_record(
+                    question,
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    2,
+                )])
+            } else {
+                FixtureReply::answers(Vec::new())
+            }
+        }
+    })
+    .await;
+    let gateway = Gateway::start_srv(fixture.address, "", None).await;
+    wait_priority(&gateway, 0).await;
+    let publication = gateway.running.reload_handle().published_runtime();
+    let endpoint = Arc::clone(&gateway.cluster.endpoints()[0]);
+    assert_eq!(
+        endpoint.dial_target().expect("numeric target").port(),
+        first_port
+    );
+    let mut client = gateway.client().await;
+    let mut held = client.request("/hold").await.into_body();
+    assert_eq!(
+        held.frame()
+            .await
+            .expect("DATA")
+            .expect("frame")
+            .into_data()
+            .expect("DATA"),
+        "A"
+    );
+    first.head().await;
+    let previous_queries = service_queries.load(Ordering::Acquire);
+    state.store(1, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = gateway.cluster.discovery_status().expect("SRV status");
+            if service_queries.load(Ordering::Acquire) > previous_queries
+                && status
+                    .srv_targets
+                    .iter()
+                    .any(|target| target.weight == u16::MAX)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("weight changes");
+    assert!(
+        Arc::ptr_eq(&endpoint, &gateway.cluster.endpoints()[0]),
+        "weight changes do not reset endpoint identity"
+    );
+    assert_eq!(
+        client
+            .request("/same-pool")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .expect("A body")
+            .to_bytes(),
+        "A"
+    );
+    first.head().await;
+    assert_eq!(
+        first.connections.load(Ordering::Acquire),
+        1,
+        "existing H2 client remains reusable for unchanged physical member"
+    );
+    state.store(2, Ordering::Release);
+    gateway.wait_members(None).await;
+    assert_eq!(
+        gateway
+            .cluster
+            .discovery_status()
+            .expect("status")
+            .resolution,
+        oxidase_runtime::DiscoveryResolutionState::ServiceUnavailable
+    );
+    let address_before = address_queries.load(Ordering::Acquire);
+    let service_before = service_queries.load(Ordering::Acquire);
+    assert_eq!(
+        client.request("/withdrawn").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while service_queries.load(Ordering::Acquire) <= service_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dot refresh");
+    assert_eq!(
+        address_queries.load(Ordering::Acquire),
+        address_before,
+        "dot never becomes an address lookup"
+    );
+    state.store(3, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if gateway.cluster.endpoints().first().is_some_and(|endpoint| {
+                endpoint.dial_target().expect("target").port() == second_port
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("new SRV target");
+    assert_eq!(
+        client
+            .request("/new?z=1&a=2")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .expect("B body")
+            .to_bytes(),
+        "B"
+    );
+    let observed = second.head().await;
+    assert_eq!(observed.authority, "logical.example.invalid:8123");
+    assert_eq!(observed.path, "/base/new?z=1&a=2");
+    assert_eq!(
+        first.heads.load(Ordering::Acquire),
+        2,
+        "removed H2 pool cannot receive new streams"
+    );
+    first.release.add_permits(1);
+    let remainder = held.collect().await.expect("retired A stream finishes");
+    assert_eq!(remainder.trailers().expect("trailers")["grpc-status"], "0");
+    assert_eq!(remainder.to_bytes(), "-finished");
+    assert!(Arc::ptr_eq(
+        &publication,
+        &gateway.running.reload_handle().published_runtime()
+    ));
+    drop(client);
+    gateway.running.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn srv_actual_socket_preserves_fixed_tls_name_and_rejects_an_untrusted_replacement() {
+    let trusted =
+        rcgen::generate_simple_self_signed(vec!["verified-upstream.example.test".to_owned()])
+            .expect("test cert");
+    let untrusted =
+        rcgen::generate_simple_self_signed(vec!["verified-upstream.example.test".to_owned()])
+            .expect("untrusted test cert");
+    let server_config = |identity: &rcgen::CertifiedKey<rcgen::KeyPair>| {
+        let key = tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+            identity.signing_key.serialize_der(),
+        )
+        .into();
+        let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.cert.der().clone()], key)
+            .expect("test key");
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Arc::new(config)
+    };
+    let mut first = Upstream::start_transport(
+        "127.0.0.1:0".parse().expect("bind"),
+        "trusted",
+        Some(server_config(&trusted)),
+    )
+    .await
+    .expect("trusted upstream");
+    let second = Upstream::start_transport(
+        "127.0.0.1:0".parse().expect("bind"),
+        "untrusted",
+        Some(server_config(&untrusted)),
+    )
+    .await
+    .expect("untrusted upstream");
+    let first_port = first.address.port();
+    let second_port = second.address.port();
+    let state = Arc::new(AtomicU8::new(0));
+    let mode = Arc::clone(&state);
+    let fixture = DnsFixture::start(move |question, _| {
+        if question.query_type() == RecordType::SRV {
+            FixtureReply::answers(vec![srv_record(
+                question,
+                "attacker-chosen-target.example.invalid.",
+                if mode.load(Ordering::Acquire) == 0 {
+                    first_port
+                } else {
+                    second_port
+                },
+                0,
+                1,
+            )])
+        } else if question.query_type() == RecordType::A {
+            FixtureReply::answers(vec![dns_record(
+                question,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                2,
+            )])
+        } else {
+            FixtureReply::answers(Vec::new())
+        }
+    })
+    .await;
+    let gateway = Gateway::start_srv(fixture.address, "", Some(&trusted.cert.pem())).await;
+    wait_priority(&gateway, 0).await;
+    let mut client = gateway.client().await;
+    assert_eq!(
+        client
+            .request("/secure?x=%2f")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .expect("trusted body")
+            .to_bytes(),
+        "trusted"
+    );
+    let observed = first.head().await;
+    assert_eq!(observed.authority, "logical.example.invalid:8123");
+    assert_eq!(observed.path, "/base/secure?x=%2f");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), first.sni.recv())
+            .await
+            .expect("SNI deadline")
+            .expect("SNI"),
+        "verified-upstream.example.test"
+    );
+    state.store(1, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !gateway
+            .cluster
+            .endpoints()
+            .first()
+            .is_some_and(|endpoint| endpoint.dial_target().expect("target").port() == second_port)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("untrusted target becomes current dial candidate");
+    let response = client.request("/untrusted").await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("safe failure")
+        .to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains("verified-upstream"));
+    assert_eq!(
+        second.heads.load(Ordering::Acquire),
+        0,
+        "TLS validation precedes HTTP dispatch at the actual new address"
+    );
+    assert_eq!(
+        first.heads.load(Ordering::Acquire),
+        1,
+        "old authenticated H2 pool cannot bypass new target"
+    );
+    drop(client);
+    gateway.running.shutdown().await.expect("shutdown");
 }

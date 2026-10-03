@@ -4,8 +4,10 @@
 //! tasks. Preparation is therefore side-effect free: the server may activate a
 //! health supervisor only after the containing snapshot has committed.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -13,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oxidase_config::{
     ActiveHealthSpec, ClusterEndpointSpec, ClusterHealthSpec, ClusterProtocol, ClusterSpec,
-    LoadBalancePolicy, PassiveHealthSpec,
+    DnsDiscoverySpec, DnsRecordType, LoadBalancePolicy, PassiveHealthSpec,
 };
 use oxidase_core::{ContentDigestBuilder, ResourceId};
 use serde::Serialize;
@@ -22,7 +24,8 @@ use tokio::sync::{Notify, watch};
 use crate::PreparedUpstreamTls;
 use crate::discovery::{
     DiscoveryErrorCode, DiscoveryReconcileOutcome, DiscoveryResolutionState,
-    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation,
+    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation, SrvObservation, SrvRecord,
+    SrvSelectionRng, SrvTargetAddressObservation, SrvTargetRuntimeStatus,
     normalize_discovery_address, validate_discovery_address,
 };
 
@@ -360,7 +363,43 @@ struct DynamicEndpointIdentity {
     owner: Arc<()>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DynamicEndpointKey {
+    logical_target: String,
+    target: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SrvGroupKey {
+    target: String,
+    port: u16,
+    priority: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SrvGroup {
+    key: SrvGroupKey,
+    weight: u16,
+    members: Vec<DynamicEndpointKey>,
+}
+
+type DesiredEndpoints = BTreeMap<DynamicEndpointKey, (tokio::time::Instant, bool)>;
+
+#[derive(Default)]
+struct SrvState {
+    records: Vec<SrvRecord>,
+    addresses: BTreeMap<String, [FamilyState; 2]>,
+    outcome: Option<DiscoveryResolutionState>,
+    transient: Option<DiscoveryErrorCode>,
+}
+
 impl PreparedEndpoint {
+    fn dynamic_key(&self) -> Option<DynamicEndpointKey> {
+        self.dynamic.as_ref().map(|identity| DynamicEndpointKey {
+            logical_target: identity.logical_target.clone(),
+            target: identity.target,
+        })
+    }
     #[must_use]
     pub fn name(&self) -> &str {
         &self.spec.name
@@ -444,11 +483,16 @@ struct EndpointMembership {
     query_sequence: u64,
     query: Option<QueryRound>,
     families: [FamilyState; 2],
-    valid_until: BTreeMap<SocketAddr, tokio::time::Instant>,
-    stale_targets: BTreeSet<SocketAddr>,
+    valid_until: BTreeMap<DynamicEndpointKey, tokio::time::Instant>,
+    stale_targets: BTreeSet<DynamicEndpointKey>,
     admission_counters: BTreeMap<SocketAddr, Weak<AdmissionCounter>>,
     last_success_unix_ms: Option<u64>,
     next_refresh: Option<tokio::time::Instant>,
+    srv: SrvState,
+    srv_groups: Vec<SrvGroup>,
+    srv_cursors: BTreeMap<SrvGroupKey, u64>,
+    srv_random: SrvSelectionRng,
+    inherited_counter_count: usize,
 }
 
 #[derive(Default)]
@@ -576,6 +620,34 @@ impl PreparedCluster {
                 })
             })
             .collect::<Vec<_>>();
+        let mut inherited = BTreeMap::new();
+        if let Some(previous) = same_cluster {
+            let previous = previous
+                .membership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inherited.extend(
+                previous
+                    .admission_counters
+                    .iter()
+                    .filter(|(_, counter)| {
+                        counter
+                            .upgrade()
+                            .is_some_and(|counter| counter.active() > 0)
+                    })
+                    .map(|(target, counter)| (*target, Weak::clone(counter))),
+            );
+            for endpoint in previous
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.state.admission.active() > 0)
+            {
+                if let Some(target) = endpoint.dial_target() {
+                    inherited.insert(target, Arc::downgrade(&endpoint.state.admission));
+                }
+            }
+        }
+        let inherited_counter_count = inherited.len();
         let (policy_retired, _) = watch::channel(false);
         let membership = Arc::new(Mutex::new(EndpointMembership {
             owner: Arc::new(()),
@@ -589,9 +661,15 @@ impl PreparedCluster {
             families: [FamilyState::default(), FamilyState::default()],
             valid_until: BTreeMap::new(),
             stale_targets: BTreeSet::new(),
-            admission_counters: BTreeMap::new(),
+            admission_counters: inherited,
             last_success_unix_ms: None,
             next_refresh: None,
+            srv: SrvState::default(),
+            srv_groups: Vec::new(),
+            srv_cursors: BTreeMap::new(),
+            // Operational entropy is not part of any correctness identity.
+            srv_random: SrvSelectionRng::new(RandomState::new().hash_one(spec.id.as_str())),
+            inherited_counter_count,
         }));
         (
             Self {
@@ -708,6 +786,9 @@ impl PreparedCluster {
         membership.stale_targets.clear();
         membership.last_success_unix_ms = None;
         membership.next_refresh = None;
+        membership.srv = SrvState::default();
+        membership.srv_groups.clear();
+        membership.srv_cursors.clear();
         if !membership.endpoints.is_empty() {
             membership.endpoints = Arc::from([]);
             membership.weighted_state.clear();
@@ -752,6 +833,9 @@ impl PreparedCluster {
             membership.families = [FamilyState::default(), FamilyState::default()];
             membership.valid_until.clear();
             membership.stale_targets.clear();
+            membership.srv = SrvState::default();
+            membership.srv_groups.clear();
+            membership.srv_cursors.clear();
             if !membership.endpoints.is_empty() {
                 membership.endpoints = Arc::from([]);
                 membership.weighted_state.clear();
@@ -842,6 +926,9 @@ impl PreparedCluster {
         let Some(plan) = &self.spec.discovery else {
             return Self::reconcile_receipt(&membership, false, false);
         };
+        if plan.record != DnsRecordType::AAndAaaa {
+            return Self::reconcile_receipt(&membership, false, false);
+        }
         let valid_query = membership.active
             && !membership.retired
             && Arc::ptr_eq(&membership.owner, &query.owner)
@@ -854,6 +941,7 @@ impl PreparedCluster {
         }
         let generation = membership.generation;
         let index = family_index(family);
+        let was_positive = matches!(&observation, DnsObservation::Positive { .. });
         match observation {
             DnsObservation::Positive { addresses } => {
                 if addresses.len() > 512 {
@@ -875,7 +963,7 @@ impl PreparedCluster {
                         }
                         if validate_discovery_address(
                             record.address,
-                            plan.port,
+                            plan.port.unwrap_or(0),
                             &plan.address_policy,
                         )
                         .is_err()
@@ -1004,9 +1092,337 @@ impl PreparedCluster {
         let mut receipt =
             Self::reconcile_receipt(&membership, true, generation != membership.generation);
         receipt.observation_error_code = membership.families[index].transient;
+        receipt.positive_rejected = was_positive && receipt.observation_error_code.is_some();
         drop(membership);
         self.runtime.endpoint_released.notify_waiters();
         receipt
+    }
+
+    /// Reconcile one complete, bounded SRV round under the same ownership and
+    /// lease-issuance gate as A/AAAA. Operational answers never publish config.
+    pub fn reconcile_srv(
+        &self,
+        query: &DiscoveryQueryLease,
+        observation: SrvObservation,
+        now: tokio::time::Instant,
+    ) -> DiscoveryReconcileOutcome {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(plan) = self
+            .spec
+            .discovery
+            .as_ref()
+            .filter(|plan| plan.record == DnsRecordType::Srv)
+        else {
+            return Self::reconcile_receipt(&membership, false, false);
+        };
+        let valid = membership.active
+            && !membership.retired
+            && Arc::ptr_eq(&membership.owner, &query.owner)
+            && membership
+                .query
+                .as_ref()
+                .is_some_and(|round| round.sequence == query.sequence && !round.name_revoked);
+        if !valid {
+            return Self::reconcile_receipt(&membership, false, false);
+        }
+        let generation = membership.generation;
+        let mut received_error = None;
+        let was_positive = matches!(&observation, SrvObservation::Positive { .. });
+        let mut positive_rejected = false;
+        match observation {
+            SrvObservation::Positive { records, addresses } => {
+                let result =
+                    Self::apply_srv_positive(&mut membership, plan, records, addresses, now);
+                if let Err(code) = result {
+                    membership.srv = SrvState::error(error_resolution(code), code);
+                    received_error = Some(code);
+                    positive_rejected = true;
+                } else {
+                    membership.last_success_unix_ms = Some(unix_time_millis());
+                    // The complete received round includes target-family
+                    // failures, not merely the successful SRV lookup itself.
+                    received_error = membership
+                        .srv
+                        .addresses
+                        .values()
+                        .flat_map(|families| families.iter())
+                        .find_map(|family| family.transient);
+                }
+            }
+            SrvObservation::NameNotFound | SrvObservation::ServiceUnavailable => {
+                let outcome = if matches!(observation, SrvObservation::ServiceUnavailable) {
+                    DiscoveryResolutionState::ServiceUnavailable
+                } else {
+                    DiscoveryResolutionState::NameNotFound
+                };
+                membership.srv = SrvState {
+                    outcome: Some(outcome),
+                    ..SrvState::default()
+                };
+                if let Some(round) = &mut membership.query {
+                    round.name_revoked = true;
+                }
+            }
+            SrvObservation::NoData => {
+                membership.srv = SrvState {
+                    outcome: Some(DiscoveryResolutionState::NoData),
+                    ..SrvState::default()
+                }
+            }
+            SrvObservation::TransientFailure { code } if code.allows_stale() => {
+                membership.srv.outcome = Some(DiscoveryResolutionState::TransientFailure);
+                membership.srv.transient = Some(code);
+                received_error = Some(code);
+            }
+            SrvObservation::TransientFailure { code } => {
+                membership.srv = SrvState::error(error_resolution(code), code);
+                received_error = Some(code);
+            }
+            SrvObservation::PolicyRejected => {
+                membership.srv = SrvState::error(
+                    DiscoveryResolutionState::PolicyRejected,
+                    DiscoveryErrorCode::PolicyRejected,
+                );
+                received_error = Some(DiscoveryErrorCode::PolicyRejected);
+            }
+            SrvObservation::InvalidAnswer => {
+                membership.srv = SrvState::error(
+                    DiscoveryResolutionState::InvalidAnswer,
+                    DiscoveryErrorCode::InvalidAnswer,
+                );
+                received_error = Some(DiscoveryErrorCode::InvalidAnswer);
+            }
+            SrvObservation::LimitExceeded => {
+                membership.srv = SrvState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                );
+                received_error = Some(DiscoveryErrorCode::LimitExceeded);
+            }
+        }
+        self.refresh_membership_locked(&mut membership, now);
+        if membership.srv.transient == Some(DiscoveryErrorCode::LimitExceeded) {
+            received_error = Some(DiscoveryErrorCode::LimitExceeded);
+            positive_rejected = was_positive;
+        }
+        let mut receipt =
+            Self::reconcile_receipt(&membership, true, generation != membership.generation);
+        receipt.observation_error_code = received_error;
+        receipt.positive_rejected = positive_rejected;
+        drop(membership);
+        self.runtime.endpoint_released.notify_waiters();
+        receipt
+    }
+
+    fn apply_srv_positive(
+        membership: &mut EndpointMembership,
+        plan: &DnsDiscoverySpec,
+        records: Vec<SrvRecord>,
+        addresses: Vec<SrvTargetAddressObservation>,
+        now: tokio::time::Instant,
+    ) -> Result<(), DiscoveryErrorCode> {
+        if records.len() > oxidase_config::MAX_DNS_RECORDS
+            || addresses.len() > usize::from(plan.limits.max_targets) * 2
+        {
+            return Err(DiscoveryErrorCode::LimitExceeded);
+        }
+        if records.iter().any(|record| record.target == ".") {
+            membership.srv = SrvState {
+                outcome: Some(DiscoveryResolutionState::ServiceUnavailable),
+                ..SrvState::default()
+            };
+            if let Some(round) = &mut membership.query {
+                round.name_revoked = true;
+            }
+            return Ok(());
+        }
+        let mut normalized = BTreeMap::<SrvGroupKey, SrvRecord>::new();
+        for mut record in records {
+            record.target =
+                canonical_srv_target(&record.target).ok_or(DiscoveryErrorCode::InvalidAnswer)?;
+            if record.port == 0 {
+                return Err(DiscoveryErrorCode::InvalidAnswer);
+            }
+            let key = SrvGroupKey {
+                target: record.target.clone(),
+                port: record.port,
+                priority: record.priority,
+            };
+            if let Some(previous) = normalized.get_mut(&key) {
+                if previous.weight != record.weight {
+                    return Err(DiscoveryErrorCode::InvalidAnswer);
+                }
+                previous.fresh_until = previous.fresh_until.min(record.fresh_until);
+            } else {
+                normalized.insert(key, record);
+            }
+        }
+        let targets = normalized
+            .keys()
+            .map(|key| key.target.clone())
+            .collect::<BTreeSet<_>>();
+        let mut bounded_names = targets.clone();
+        bounded_names.insert(plan.name.clone());
+        if bounded_names.len() > usize::from(plan.limits.max_targets) {
+            return Err(DiscoveryErrorCode::LimitExceeded);
+        }
+        let mut observations = BTreeMap::new();
+        let mut revoked = BTreeSet::new();
+        for mut observed in addresses {
+            observed.target =
+                canonical_srv_target(&observed.target).ok_or(DiscoveryErrorCode::InvalidAnswer)?;
+            if !targets.contains(&observed.target) {
+                return Err(DiscoveryErrorCode::InvalidAnswer);
+            }
+            if matches!(observed.observation, DnsObservation::NameNotFound) {
+                revoked.insert(observed.target.clone());
+            }
+            if observations
+                .insert(
+                    (observed.target, family_index(observed.family)),
+                    observed.observation,
+                )
+                .is_some()
+            {
+                return Err(DiscoveryErrorCode::InvalidAnswer);
+            }
+        }
+        membership
+            .srv
+            .addresses
+            .retain(|target, _| targets.contains(target));
+        for target in &targets {
+            let families = membership
+                .srv
+                .addresses
+                .entry(target.clone())
+                .or_insert_with(|| [FamilyState::default(), FamilyState::default()]);
+            if revoked.contains(target) {
+                *families = [
+                    FamilyState::empty(DiscoveryResolutionState::NameNotFound),
+                    FamilyState::empty(DiscoveryResolutionState::NameNotFound),
+                ];
+                continue;
+            }
+            for (index, family) in [DnsFamily::A, DnsFamily::Aaaa].into_iter().enumerate() {
+                if let Some(observation) = observations.remove(&(target.clone(), index)) {
+                    Self::apply_srv_family(&mut families[index], family, observation, plan, now)?;
+                }
+            }
+        }
+        let cached_records = membership
+            .srv
+            .addresses
+            .values()
+            .flat_map(|families| families.iter())
+            .map(|family| family.records.len())
+            .sum::<usize>();
+        if cached_records > oxidase_config::MAX_DNS_RECORDS {
+            return Err(DiscoveryErrorCode::LimitExceeded);
+        }
+        membership.srv.records = normalized
+            .into_values()
+            .filter(|record| record.fresh_until > now)
+            .collect();
+        membership.srv.outcome = Some(if membership.srv.records.is_empty() {
+            DiscoveryResolutionState::NoData
+        } else {
+            DiscoveryResolutionState::Fresh
+        });
+        membership.srv.transient = None;
+        Ok(())
+    }
+
+    fn apply_srv_family(
+        previous: &mut FamilyState,
+        family: DnsFamily,
+        observation: DnsObservation,
+        plan: &DnsDiscoverySpec,
+        now: tokio::time::Instant,
+    ) -> Result<(), DiscoveryErrorCode> {
+        match observation {
+            DnsObservation::Positive { addresses } => {
+                if addresses.len() > oxidase_config::MAX_DNS_RECORDS {
+                    return Err(DiscoveryErrorCode::LimitExceeded);
+                }
+                let mut records = BTreeMap::new();
+                let mut rejected = false;
+                for record in addresses {
+                    if family == DnsFamily::A && !record.address.is_ipv4() {
+                        return Err(DiscoveryErrorCode::InvalidAnswer);
+                    }
+                    if validate_discovery_address(record.address, 1, &plan.address_policy).is_err()
+                    {
+                        rejected = true;
+                        continue;
+                    }
+                    records
+                        .entry(normalize_discovery_address(record.address))
+                        .and_modify(|expiry: &mut tokio::time::Instant| {
+                            *expiry = (*expiry).min(record.fresh_until)
+                        })
+                        .or_insert(record.fresh_until);
+                }
+                let records = records
+                    .into_iter()
+                    .filter(|(_, expiry)| *expiry > now)
+                    .map(|(address, fresh_until)| DnsAddressRecord {
+                        address,
+                        fresh_until,
+                    })
+                    .collect::<Vec<_>>();
+                if records.len() > usize::from(plan.limits.max_endpoints) {
+                    return Err(DiscoveryErrorCode::LimitExceeded);
+                }
+                *previous = if records.is_empty() && rejected {
+                    FamilyState::error(
+                        DiscoveryResolutionState::PolicyRejected,
+                        DiscoveryErrorCode::PolicyRejected,
+                    )
+                } else {
+                    FamilyState {
+                        records,
+                        outcome: Some(DiscoveryResolutionState::Fresh),
+                        transient: None,
+                    }
+                };
+            }
+            DnsObservation::TransientFailure { code } if code.allows_stale() => {
+                previous.outcome = Some(DiscoveryResolutionState::TransientFailure);
+                previous.transient = Some(code);
+            }
+            DnsObservation::TransientFailure { code } => {
+                *previous = FamilyState::error(error_resolution(code), code)
+            }
+            DnsObservation::NameNotFound => {
+                *previous = FamilyState::empty(DiscoveryResolutionState::NameNotFound)
+            }
+            DnsObservation::NoData => {
+                *previous = FamilyState::empty(DiscoveryResolutionState::NoData)
+            }
+            DnsObservation::PolicyRejected => {
+                *previous = FamilyState::error(
+                    DiscoveryResolutionState::PolicyRejected,
+                    DiscoveryErrorCode::PolicyRejected,
+                )
+            }
+            DnsObservation::InvalidAnswer => {
+                *previous = FamilyState::error(
+                    DiscoveryResolutionState::InvalidAnswer,
+                    DiscoveryErrorCode::InvalidAnswer,
+                )
+            }
+            DnsObservation::LimitExceeded => {
+                *previous = FamilyState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                )
+            }
+        }
+        Ok(())
     }
 
     /// Checks exact current membership for health and idle-pool ownership. An
@@ -1107,6 +1523,14 @@ impl PreparedCluster {
         self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
         if self.spec.discovery.is_some() && (!membership.active || membership.retired) {
             return None;
+        }
+        if self
+            .spec
+            .discovery
+            .as_ref()
+            .is_some_and(|plan| plan.record == DnsRecordType::Srv)
+        {
+            return self.select_srv_endpoint(&mut membership, now, excluded);
         }
         let eligible = membership
             .endpoints
@@ -1543,7 +1967,7 @@ impl PreparedCluster {
         let plan = self.spec.discovery.as_ref()?;
         Some(DiscoveryRuntimeStatus {
             name: plan.name.clone(),
-            resolution: membership.resolution(),
+            resolution: membership.resolution(plan.record == DnsRecordType::Srv),
             generation: membership.generation,
             endpoint_count: membership.endpoints.len(),
             eligible_endpoints: membership
@@ -1563,8 +1987,34 @@ impl PreparedCluster {
             retired_admission_counters: membership
                 .admission_counters
                 .iter()
-                .filter(|(target, _)| !membership.valid_until.contains_key(target))
+                .filter(|(target, _)| {
+                    !membership
+                        .valid_until
+                        .keys()
+                        .any(|member| &member.target == *target)
+                })
                 .count(),
+            eligible_priority: Self::srv_eligible_priority(membership, Instant::now()),
+            srv_targets: membership
+                .srv_groups
+                .iter()
+                .map(|group| {
+                    let indices = Self::srv_group_indices(
+                        membership,
+                        group,
+                        Instant::now(),
+                        &BTreeSet::new(),
+                    );
+                    SrvTargetRuntimeStatus {
+                        target: group.key.target.clone(),
+                        port: group.key.port,
+                        priority: group.key.priority,
+                        weight: group.weight,
+                        addresses: group.members.len(),
+                        eligible_addresses: indices.len(),
+                    }
+                })
+                .collect(),
         })
     }
 
@@ -1591,6 +2041,7 @@ impl PreparedCluster {
             next_expiry: membership.valid_until.values().copied().min(),
             error_code: membership.error_code(),
             observation_error_code: None,
+            positive_rejected: false,
         }
     }
 
@@ -1612,53 +2063,64 @@ impl PreparedCluster {
         if !membership.active || membership.retired {
             return;
         }
-        let mut desired = BTreeMap::<SocketAddr, (tokio::time::Instant, bool)>::new();
-        for family in &mut membership.families {
-            family.records.retain(|record| {
-                record
-                    .fresh_until
-                    .checked_add(plan.refresh.stale_if_error)
-                    .is_some_and(|expiry| now < expiry)
-                    || now < record.fresh_until
-            });
-            for record in &family.records {
-                let (expiry, stale) = if now < record.fresh_until {
-                    (record.fresh_until, false)
-                } else if family
-                    .transient
-                    .is_some_and(DiscoveryErrorCode::allows_stale)
-                {
-                    let Some(expiry) = record.fresh_until.checked_add(plan.refresh.stale_if_error)
-                    else {
+        let (mut desired, mut groups) = if plan.record == DnsRecordType::Srv {
+            Self::srv_desired(membership, plan, now)
+        } else {
+            let mut desired = BTreeMap::<DynamicEndpointKey, (tokio::time::Instant, bool)>::new();
+            for family in &mut membership.families {
+                family.records.retain(|record| {
+                    record
+                        .fresh_until
+                        .checked_add(plan.refresh.stale_if_error)
+                        .is_some_and(|expiry| now < expiry)
+                        || now < record.fresh_until
+                });
+                for record in &family.records {
+                    let (expiry, stale) = if now < record.fresh_until {
+                        (record.fresh_until, false)
+                    } else if family
+                        .transient
+                        .is_some_and(DiscoveryErrorCode::allows_stale)
+                    {
+                        let Some(expiry) =
+                            record.fresh_until.checked_add(plan.refresh.stale_if_error)
+                        else {
+                            continue;
+                        };
+                        if now >= expiry {
+                            continue;
+                        }
+                        (expiry, true)
+                    } else {
                         continue;
                     };
-                    if now >= expiry {
+                    let Ok(target) = validate_discovery_address(
+                        record.address,
+                        plan.port.unwrap_or(0),
+                        &plan.address_policy,
+                    ) else {
                         continue;
-                    }
-                    (expiry, true)
-                } else {
-                    continue;
-                };
-                let Ok(target) =
-                    validate_discovery_address(record.address, plan.port, &plan.address_policy)
-                else {
-                    continue;
-                };
-                desired
-                    .entry(target)
-                    .and_modify(|current| {
-                        current.0 = current.0.max(expiry);
-                        current.1 &= stale;
-                    })
-                    .or_insert((expiry, stale));
+                    };
+                    desired
+                        .entry(DynamicEndpointKey {
+                            logical_target: plan.name.clone(),
+                            target,
+                        })
+                        .and_modify(|current| {
+                            current.0 = current.0.max(expiry);
+                            current.1 &= stale;
+                        })
+                        .or_insert((expiry, stale));
+                }
             }
-        }
+            (desired, Vec::new())
+        };
         let mut previous = membership
             .endpoints
             .iter()
             .filter_map(|endpoint| {
                 endpoint
-                    .dial_target()
+                    .dynamic_key()
                     .map(|target| (target, Arc::clone(endpoint)))
             })
             .collect::<BTreeMap<_, _>>();
@@ -1666,21 +2128,26 @@ impl PreparedCluster {
             if endpoint.state.admission.active() > 0 {
                 membership
                     .admission_counters
-                    .insert(*target, Arc::downgrade(&endpoint.state.admission));
+                    .insert(target.target, Arc::downgrade(&endpoint.state.admission));
             }
         }
         let cap = usize::from(plan.limits.max_endpoints).saturating_add(
             usize::try_from(self.runtime.admission.active())
                 .unwrap_or(usize::MAX)
-                .max(self.spec.limits.max_in_flight as usize),
+                .max(self.spec.limits.max_in_flight as usize)
+                .max(membership.inherited_counter_count),
         );
         let new_counters = desired
             .keys()
             .filter(|target| {
-                !membership.admission_counters.contains_key(target)
-                    && !previous.contains_key(target)
+                !membership.admission_counters.contains_key(&target.target)
+                    && !previous
+                        .keys()
+                        .any(|previous| previous.target == target.target)
             })
-            .count();
+            .map(|key| key.target)
+            .collect::<BTreeSet<_>>()
+            .len();
         if desired.len() > usize::from(plan.limits.max_endpoints)
             || membership
                 .admission_counters
@@ -1689,6 +2156,7 @@ impl PreparedCluster {
                 > cap
         {
             desired.clear();
+            groups.clear();
             membership.families = [
                 FamilyState::error(
                     DiscoveryResolutionState::LimitExceeded,
@@ -1699,6 +2167,12 @@ impl PreparedCluster {
                     DiscoveryErrorCode::LimitExceeded,
                 ),
             ];
+            if plan.record == DnsRecordType::Srv {
+                membership.srv = SrvState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                );
+            }
         }
         let changed = desired.len() != previous.len()
             || desired.keys().any(|target| !previous.contains_key(target));
@@ -1711,6 +2185,7 @@ impl PreparedCluster {
             let Some(incarnation) = self.runtime.claim_endpoint_incarnation() else {
                 desired.clear();
                 endpoints.clear();
+                groups.clear();
                 membership.families = [
                     FamilyState::error(
                         DiscoveryResolutionState::LimitExceeded,
@@ -1721,13 +2196,28 @@ impl PreparedCluster {
                         DiscoveryErrorCode::LimitExceeded,
                     ),
                 ];
+                if plan.record == DnsRecordType::Srv {
+                    membership.srv = SrvState::error(
+                        DiscoveryResolutionState::LimitExceeded,
+                        DiscoveryErrorCode::LimitExceeded,
+                    );
+                }
                 break;
             };
             let admission = membership
                 .admission_counters
-                .get(target)
+                .get(&target.target)
                 .and_then(Weak::upgrade)
+                .or_else(|| {
+                    previous
+                        .values()
+                        .find(|endpoint| endpoint.dial_target() == Some(target.target))
+                        .map(|endpoint| Arc::clone(&endpoint.state.admission))
+                })
                 .unwrap_or_else(|| Arc::new(AdmissionCounter::default()));
+            membership
+                .admission_counters
+                .insert(target.target, Arc::downgrade(&admission));
             let state = Arc::new(EndpointRuntimeState::new_at_with_admission(
                 Instant::now(),
                 admission,
@@ -1735,8 +2225,8 @@ impl PreparedCluster {
             let mut identity = ContentDigestBuilder::new("oxidase/discovery-endpoint/v1");
             identity
                 .field_bytes("cluster", self.spec.id.as_str())
-                .field_bytes("target", &plan.name)
-                .field_bytes("address", target.to_string());
+                .field_bytes("target", &target.logical_target)
+                .field_bytes("address", target.target.to_string());
             endpoints.push(Arc::new(PreparedEndpoint {
                 spec: ClusterEndpointSpec {
                     name: format!("discovered-{}", identity.finish().to_hex()),
@@ -1753,26 +2243,275 @@ impl PreparedCluster {
                 },
                 state,
                 dynamic: Some(DynamicEndpointIdentity {
-                    target: *target,
+                    target: target.target,
                     incarnation,
-                    logical_target: plan.name.clone(),
+                    logical_target: target.logical_target.clone(),
                     owner: Arc::clone(&membership.owner),
                 }),
             }));
         }
+        let group_changed = groups != membership.srv_groups;
         if changed || endpoints.len() != membership.endpoints.len() {
             membership.endpoints = endpoints.into();
             membership.weighted_state = vec![0; membership.endpoints.len()];
+        }
+        if changed || group_changed {
             membership.generation = membership.generation.saturating_add(1);
         }
+        membership.srv_groups = groups;
+        membership.srv_cursors.retain(|group, _| {
+            membership
+                .srv_groups
+                .iter()
+                .any(|current| &current.key == group)
+        });
         membership.valid_until = desired
             .iter()
-            .map(|(target, (expiry, _))| (*target, *expiry))
+            .map(|(target, (expiry, _))| (target.clone(), *expiry))
             .collect();
         membership.stale_targets = desired
             .iter()
-            .filter_map(|(target, (_, stale))| stale.then_some(*target))
+            .filter_map(|(target, (_, stale))| stale.then_some(target.clone()))
             .collect();
+    }
+
+    fn srv_desired(
+        membership: &mut EndpointMembership,
+        plan: &DnsDiscoverySpec,
+        now: tokio::time::Instant,
+    ) -> (DesiredEndpoints, Vec<SrvGroup>) {
+        let grace = plan.refresh.stale_if_error;
+        membership.srv.records.retain(|record| {
+            now < record.fresh_until
+                || record
+                    .fresh_until
+                    .checked_add(grace)
+                    .is_some_and(|expiry| now < expiry)
+        });
+        let targets = membership
+            .srv
+            .records
+            .iter()
+            .map(|record| record.target.clone())
+            .collect::<BTreeSet<_>>();
+        membership
+            .srv
+            .addresses
+            .retain(|target, _| targets.contains(target));
+        for families in membership.srv.addresses.values_mut() {
+            for family in families {
+                family.records.retain(|record| {
+                    now < record.fresh_until
+                        || record
+                            .fresh_until
+                            .checked_add(grace)
+                            .is_some_and(|expiry| now < expiry)
+                });
+            }
+        }
+        let mut desired = DesiredEndpoints::new();
+        let mut groups = Vec::new();
+        for record in &membership.srv.records {
+            let mut group = SrvGroup {
+                key: SrvGroupKey {
+                    target: record.target.clone(),
+                    port: record.port,
+                    priority: record.priority,
+                },
+                weight: record.weight,
+                members: Vec::new(),
+            };
+            if let Some(families) = membership.srv.addresses.get(&record.target) {
+                for family in families {
+                    for address in &family.records {
+                        // Original component deadlines are intersected, never
+                        // restarted by a failed SRV/address/CNAME refresh.
+                        let component_expiry =
+                            |fresh_until: tokio::time::Instant,
+                             transient: Option<DiscoveryErrorCode>| {
+                                if now < fresh_until {
+                                    Some(fresh_until)
+                                } else if transient.is_some_and(DiscoveryErrorCode::allows_stale) {
+                                    fresh_until
+                                        .checked_add(grace)
+                                        .filter(|expiry| now < *expiry)
+                                } else {
+                                    None
+                                }
+                            };
+                        // An address failure cannot authorize stale SRV data,
+                        // nor can an SRV failure authorize stale address data.
+                        let Some(srv_expiry) =
+                            component_expiry(record.fresh_until, membership.srv.transient)
+                        else {
+                            continue;
+                        };
+                        let Some(address_expiry) =
+                            component_expiry(address.fresh_until, family.transient)
+                        else {
+                            continue;
+                        };
+                        let expiry = srv_expiry.min(address_expiry);
+                        let stale = now >= record.fresh_until.min(address.fresh_until);
+                        let Ok(target) = validate_discovery_address(
+                            address.address,
+                            record.port,
+                            &plan.address_policy,
+                        ) else {
+                            continue;
+                        };
+                        let key = DynamicEndpointKey {
+                            logical_target: record.target.clone(),
+                            target,
+                        };
+                        desired
+                            .entry(key.clone())
+                            .and_modify(|current| {
+                                current.0 = current.0.max(expiry);
+                                current.1 &= stale;
+                            })
+                            .or_insert((expiry, stale));
+                        group.members.push(key);
+                    }
+                }
+            }
+            group.members.sort();
+            group.members.dedup();
+            if !group.members.is_empty() || now < record.fresh_until {
+                groups.push(group);
+            }
+        }
+        (desired, groups)
+    }
+
+    fn srv_group_indices(
+        membership: &EndpointMembership,
+        group: &SrvGroup,
+        now: Instant,
+        excluded: &BTreeSet<String>,
+    ) -> Vec<usize> {
+        membership
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| {
+                endpoint.state.is_eligible(now)
+                    && !excluded.contains(endpoint.name())
+                    && endpoint
+                        .dynamic_key()
+                        .is_some_and(|key| group.members.binary_search(&key).is_ok())
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn srv_eligible_priority(membership: &EndpointMembership, now: Instant) -> Option<u16> {
+        membership
+            .srv_groups
+            .iter()
+            .filter(|group| {
+                !Self::srv_group_indices(membership, group, now, &BTreeSet::new()).is_empty()
+            })
+            .map(|group| group.key.priority)
+            .min()
+    }
+
+    fn srv_candidates(
+        membership: &EndpointMembership,
+        now: Instant,
+        excluded: &BTreeSet<String>,
+    ) -> Vec<usize> {
+        // Exclusions and ordinary saturation do not reclassify healthy primary
+        // targets as unhealthy, so neither can silently bypass priority.
+        let Some(priority) = Self::srv_eligible_priority(membership, now) else {
+            return Vec::new();
+        };
+        membership
+            .srv_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.key.priority == priority
+                    && !Self::srv_group_indices(membership, group, now, excluded).is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn srv_address_order(
+        &self,
+        membership: &mut EndpointMembership,
+        group: usize,
+        mut eligible: Vec<usize>,
+    ) -> Vec<usize> {
+        match self.spec.load_balance {
+            LoadBalancePolicy::RoundRobin | LoadBalancePolicy::WeightedRoundRobin => {
+                // DNS addresses have equal weight 1. Keep an independent
+                // equal-weight RR cursor per logical target, not per IP count.
+                let cursor = membership
+                    .srv_cursors
+                    .entry(membership.srv_groups[group].key.clone())
+                    .or_default();
+                let start = (*cursor as usize) % eligible.len();
+                *cursor = cursor.wrapping_add(1);
+                eligible.rotate_left(start);
+            }
+            LoadBalancePolicy::LeastRequests => eligible.sort_by(|left, right| {
+                membership.endpoints[*left]
+                    .active_requests()
+                    .cmp(&membership.endpoints[*right].active_requests())
+                    .then_with(|| left.cmp(right))
+            }),
+        }
+        eligible
+    }
+
+    fn select_srv_endpoint(
+        &self,
+        membership: &mut EndpointMembership,
+        now: Instant,
+        excluded: &BTreeSet<String>,
+    ) -> Option<Arc<PreparedEndpoint>> {
+        let candidates = Self::srv_candidates(membership, now, excluded);
+        let weights = candidates
+            .iter()
+            .map(|index| membership.srv_groups[*index].weight)
+            .collect::<Vec<_>>();
+        let selected = candidates[membership.srv_random.weighted_index(&weights)?];
+        let addresses =
+            Self::srv_group_indices(membership, &membership.srv_groups[selected], now, excluded);
+        let addresses = self.srv_address_order(membership, selected, addresses);
+        Some(Arc::clone(&membership.endpoints[addresses[0]]))
+    }
+
+    fn try_acquire_srv(
+        &self,
+        membership: &mut EndpointMembership,
+        now: Instant,
+        excluded: &BTreeSet<String>,
+    ) -> EndpointAcquire {
+        let mut candidates = Self::srv_candidates(membership, now, excluded);
+        if candidates.is_empty() {
+            return EndpointAcquire::Unavailable;
+        }
+        while !candidates.is_empty() {
+            let weights = candidates
+                .iter()
+                .map(|index| membership.srv_groups[*index].weight)
+                .collect::<Vec<_>>();
+            let Some(chosen) = membership.srv_random.weighted_index(&weights) else {
+                return EndpointAcquire::Unavailable;
+            };
+            let group = candidates.remove(chosen);
+            let addresses =
+                Self::srv_group_indices(membership, &membership.srv_groups[group], now, excluded);
+            for index in self.srv_address_order(membership, group, addresses) {
+                if let Some(permit) = self.try_endpoint_permit(membership, index) {
+                    return Self::acquired_endpoint(membership, index, permit);
+                }
+            }
+        }
+        EndpointAcquire::Saturated
     }
 
     fn select_weighted(membership: &mut EndpointMembership, eligible: &[usize]) -> usize {
@@ -1837,6 +2576,14 @@ impl PreparedCluster {
                 || owner.is_none_or(|owner| !Arc::ptr_eq(owner, &membership.owner)))
         {
             return EndpointAcquire::Unavailable;
+        }
+        if self
+            .spec
+            .discovery
+            .as_ref()
+            .is_some_and(|plan| plan.record == DnsRecordType::Srv)
+        {
+            return self.try_acquire_srv(&mut membership, now, excluded);
         }
         let eligible = Self::eligible_indices(&membership, excluded, now);
         if eligible.is_empty() {
@@ -2017,6 +2764,33 @@ const fn family_index(family: DnsFamily) -> usize {
     }
 }
 
+fn canonical_srv_target(source: &str) -> Option<String> {
+    let name = source.strip_suffix('.').unwrap_or(source);
+    if name.is_empty()
+        || name.len() > 253
+        || !name.is_ascii()
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
+        return None;
+    }
+    Some(format!("{}.", name.to_ascii_lowercase()))
+}
+
+const fn error_resolution(code: DiscoveryErrorCode) -> DiscoveryResolutionState {
+    match code {
+        DiscoveryErrorCode::PolicyRejected => DiscoveryResolutionState::PolicyRejected,
+        DiscoveryErrorCode::InvalidAnswer => DiscoveryResolutionState::InvalidAnswer,
+        DiscoveryErrorCode::LimitExceeded => DiscoveryResolutionState::LimitExceeded,
+        _ => DiscoveryResolutionState::TransientFailure,
+    }
+}
+
 fn same_admission_owner(left: Option<&Arc<()>>, right: Option<&Arc<()>>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -2042,18 +2816,59 @@ impl FamilyState {
     }
 }
 
+impl SrvState {
+    fn error(outcome: DiscoveryResolutionState, code: DiscoveryErrorCode) -> Self {
+        Self {
+            outcome: Some(outcome),
+            transient: Some(code),
+            ..Self::default()
+        }
+    }
+}
+
 impl EndpointMembership {
     fn error_code(&self) -> Option<DiscoveryErrorCode> {
-        self.families.iter().find_map(|family| family.transient)
+        self.srv
+            .transient
+            .or_else(|| {
+                self.srv
+                    .addresses
+                    .values()
+                    .flat_map(|families| families.iter())
+                    .find_map(|family| family.transient)
+            })
+            .or_else(|| self.families.iter().find_map(|family| family.transient))
     }
 
-    fn resolution(&self) -> DiscoveryResolutionState {
+    fn resolution(&self, srv: bool) -> DiscoveryResolutionState {
         if self.retired {
             return DiscoveryResolutionState::Retired;
         }
         if !self.endpoints.is_empty() {
             if !self.stale_targets.is_empty() {
                 return DiscoveryResolutionState::Stale;
+            }
+            if srv {
+                return if self.srv.outcome == Some(DiscoveryResolutionState::Fresh)
+                    && self
+                        .srv
+                        .addresses
+                        .values()
+                        .flat_map(|families| families.iter())
+                        .all(|family| {
+                            matches!(
+                                family.outcome,
+                                Some(
+                                    DiscoveryResolutionState::Fresh
+                                        | DiscoveryResolutionState::NoData
+                                )
+                            )
+                        })
+                {
+                    DiscoveryResolutionState::Fresh
+                } else {
+                    DiscoveryResolutionState::Partial
+                };
             }
             return if self
                 .families
@@ -2064,6 +2879,16 @@ impl EndpointMembership {
             } else {
                 DiscoveryResolutionState::Partial
             };
+        }
+        if srv {
+            if let Some(outcome) = self.srv.outcome {
+                return if outcome == DiscoveryResolutionState::Fresh {
+                    DiscoveryResolutionState::Expired
+                } else {
+                    outcome
+                };
+            }
+            return DiscoveryResolutionState::Unresolved;
         }
         for state in [
             DiscoveryResolutionState::NameNotFound,
@@ -3481,7 +4306,7 @@ mod discovery_membership_tests {
         spec.discovery = Some(DnsDiscoverySpec {
             name: "service.example.test.".to_owned(),
             record: DnsRecordType::AAndAaaa,
-            port: 8080,
+            port: Some(8080),
             origin: "http://service.example.test/base"
                 .parse()
                 .expect("logical origin"),
@@ -3532,6 +4357,997 @@ mod discovery_membership_tests {
     ) -> DiscoveryReconcileOutcome {
         let query = cluster.begin_discovery_query().expect("single query slot");
         cluster.reconcile_dns(&query, family, observation, tokio::time::Instant::now())
+    }
+
+    fn srv_spec(policy: LoadBalancePolicy) -> ClusterSpec {
+        let mut spec = dynamic_spec();
+        spec.load_balance = policy;
+        let plan = spec.discovery.as_mut().expect("dynamic plan");
+        plan.name = "_http._tcp.service.example.test.".to_owned();
+        plan.record = DnsRecordType::Srv;
+        plan.port = None;
+        spec.health
+            .active
+            .as_mut()
+            .expect("health")
+            .healthy_threshold = 1;
+        spec.health
+            .active
+            .as_mut()
+            .expect("health")
+            .unhealthy_threshold = 1;
+        spec
+    }
+
+    fn srv(policy: LoadBalancePolicy) -> PreparedCluster {
+        let cluster = PreparedCluster::prepare(srv_spec(policy), None).0;
+        assert!(cluster.activate_discovery_policy());
+        cluster.membership.lock().expect("fixture lock").srv_random = SrvSelectionRng::new(5);
+        cluster
+    }
+
+    fn srv_record(target: &str, port: u16, priority: u16, weight: u16, ttl: u64) -> SrvRecord {
+        SrvRecord {
+            target: target.to_owned(),
+            port,
+            priority,
+            weight,
+            fresh_until: tokio::time::Instant::now() + Duration::from_secs(ttl),
+        }
+    }
+
+    fn srv_addresses(
+        target: &str,
+        family: DnsFamily,
+        addresses: &[&str],
+        ttl: u64,
+    ) -> SrvTargetAddressObservation {
+        SrvTargetAddressObservation {
+            target: target.to_owned(),
+            family,
+            observation: positive(addresses, Duration::from_secs(ttl)),
+        }
+    }
+
+    fn srv_failure(
+        target: &str,
+        family: DnsFamily,
+        observation: DnsObservation,
+    ) -> SrvTargetAddressObservation {
+        SrvTargetAddressObservation {
+            target: target.to_owned(),
+            family,
+            observation,
+        }
+    }
+
+    fn observe_srv(
+        cluster: &PreparedCluster,
+        observation: SrvObservation,
+    ) -> DiscoveryReconcileOutcome {
+        let query = cluster.begin_discovery_query().expect("single query slot");
+        cluster.reconcile_srv(&query, observation, tokio::time::Instant::now())
+    }
+
+    fn srv_positive(
+        cluster: &PreparedCluster,
+        records: Vec<SrvRecord>,
+        addresses: Vec<SrvTargetAddressObservation>,
+    ) -> DiscoveryReconcileOutcome {
+        observe_srv(cluster, SrvObservation::Positive { records, addresses })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_weight_is_per_logical_target_not_amplified_by_address_count() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("one.test.", 8080, 0, 1, 60),
+                srv_record("three.test.", 8080, 0, 1, 60),
+            ],
+            vec![
+                srv_addresses("one.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses(
+                    "three.test.",
+                    DnsFamily::A,
+                    &["198.51.100.2", "198.51.100.3", "198.51.100.4"],
+                    60,
+                ),
+            ],
+        );
+        let mut one = 0;
+        let mut three = 0;
+        let mut physical = BTreeSet::new();
+        for _ in 0..4096 {
+            let lease = cluster.acquire().await.expect("healthy group");
+            match lease.endpoint().logical_target() {
+                Some("one.test.") => one += 1,
+                Some("three.test.") => three += 1,
+                target => panic!("unexpected logical target {target:?}"),
+            }
+            physical.insert(lease.dial_target().expect("fixed address"));
+            assert_eq!(
+                lease.endpoint().url().as_str(),
+                "http://service.example.test/base"
+            );
+        }
+        assert!(
+            one > 1500 && three > 1500,
+            "three IPs do not triple target weight: {one}/{three}"
+        );
+        assert_eq!(
+            physical.len(),
+            4,
+            "address RR reaches every physical address"
+        );
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_lowest_healthy_priority_is_not_bypassed_by_saturation_or_retry_exclusion() {
+        let mut spec = srv_spec(LoadBalancePolicy::LeastRequests);
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("primary.test.", 8080, 10, 1, 60),
+                srv_record("backup.test.", 8080, 20, 65535, 60),
+            ],
+            vec![
+                srv_addresses("primary.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("backup.test.", DnsFamily::A, &["198.51.100.2"], 60),
+            ],
+        );
+        let held = cluster.acquire().await.expect("primary");
+        let primary = Arc::clone(held.endpoint());
+        assert_eq!(primary.logical_target(), Some("primary.test."));
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        let tried = BTreeSet::from([primary.name().to_owned()]);
+        assert!(
+            cluster
+                .reserve_retry_endpoint_for(&tried, &primary)
+                .await
+                .is_none()
+        );
+        assert!(
+            cluster
+                .select_endpoint_excluding(Instant::now(), &tried)
+                .is_none()
+        );
+        cluster.record_active_health_for(&primary, false, Instant::now());
+        assert_eq!(
+            cluster
+                .acquire()
+                .await
+                .expect("unhealthy primary allows backup")
+                .endpoint()
+                .logical_target(),
+            Some("backup.test.")
+        );
+        cluster.record_active_health_for(&primary, true, Instant::now());
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("status")
+                .eligible_priority,
+            Some(10)
+        );
+        assert!(
+            matches!(
+                cluster.acquire().await,
+                Err(ClusterAdmissionError::Overloaded)
+            ),
+            "recovered but held primary still cannot bypass quota"
+        );
+        drop(held);
+        assert_eq!(
+            cluster
+                .acquire()
+                .await
+                .expect("recovered primary")
+                .endpoint()
+                .logical_target(),
+            Some("primary.test.")
+        );
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_equal_priority_can_use_another_unsaturated_target_but_never_backup() {
+        let mut spec = srv_spec(LoadBalancePolicy::RoundRobin);
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 0, 60),
+                srv_record("b.test.", 8080, 0, 0, 60),
+                srv_record("backup.test.", 8080, 1, 65535, 60),
+            ],
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("b.test.", DnsFamily::A, &["198.51.100.2"], 60),
+                srv_addresses("backup.test.", DnsFamily::A, &["198.51.100.3"], 60),
+            ],
+        );
+        let first = cluster.acquire().await.expect("first equal priority");
+        let second = cluster
+            .acquire()
+            .await
+            .expect("other equal priority target");
+        assert_ne!(
+            first.endpoint().logical_target(),
+            second.endpoint().logical_target()
+        );
+        assert_ne!(first.endpoint().logical_target(), Some("backup.test."));
+        assert_ne!(second.endpoint().logical_target(), Some("backup.test."));
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        drop((first, second));
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_address_lb_is_applied_only_inside_selected_target() {
+        for policy in [
+            LoadBalancePolicy::RoundRobin,
+            LoadBalancePolicy::WeightedRoundRobin,
+            LoadBalancePolicy::LeastRequests,
+        ] {
+            let cluster = srv(policy);
+            srv_positive(
+                &cluster,
+                vec![srv_record("same.test.", 8080, 0, 65535, 60)],
+                vec![srv_addresses(
+                    "same.test.",
+                    DnsFamily::A,
+                    &["198.51.100.3", "198.51.100.1", "198.51.100.2"],
+                    60,
+                )],
+            );
+            let first = cluster.acquire().await.expect("first IP");
+            let second = cluster.acquire().await.expect("second IP");
+            let third = cluster.acquire().await.expect("third IP");
+            assert_eq!(
+                BTreeSet::from([
+                    first.dial_target(),
+                    second.dial_target(),
+                    third.dial_target()
+                ])
+                .len(),
+                3,
+                "per-target policy {policy:?}"
+            );
+            drop((first, second, third));
+            assert_eq!(cluster.active_requests(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_rr_reordering_and_ttl_reuse_incarnations_but_policy_updates_change_selection() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        let addresses = || {
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("b.test.", DnsFamily::A, &["198.51.100.2"], 60),
+            ]
+        };
+        let initial = srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 20),
+                srv_record("b.test.", 8080, 0, 2, 20),
+            ],
+            addresses(),
+        );
+        let first = cluster.endpoints();
+        let a = Arc::clone(&first[0]);
+        cluster.record_passive_failure_for(&a, Instant::now());
+        let reordered = srv_positive(
+            &cluster,
+            vec![
+                srv_record("b.test.", 8080, 0, 2, 60),
+                srv_record("A.TEST", 8080, 0, 1, 60),
+            ],
+            addresses(),
+        );
+        assert_eq!(initial.generation, reordered.generation);
+        assert!(
+            first
+                .iter()
+                .zip(cluster.endpoints().iter())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+        let updated = srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 10, 65535, 60),
+                srv_record("b.test.", 8080, 20, 0, 60),
+            ],
+            addresses(),
+        );
+        assert!(updated.generation > reordered.generation);
+        assert!(
+            first
+                .iter()
+                .zip(cluster.endpoints().iter())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+        assert_eq!(a.incarnation(), cluster.endpoints()[0].incarnation());
+        assert_eq!(a.runtime_state().failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("status")
+                .eligible_priority,
+            Some(10)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_same_target_multiple_priorities_share_one_physical_state() {
+        let mut spec = srv_spec(LoadBalancePolicy::RoundRobin);
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("a.test.", 8080, 10, 2, 60),
+            ],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        assert_eq!(cluster.endpoints().len(), 1);
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("groups")
+                .srv_targets
+                .len(),
+            2
+        );
+        let held = cluster.acquire().await.expect("one endpoint");
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        drop(held);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_target_and_port_are_identity_but_same_physical_aliases_share_admission() {
+        let mut spec = srv_spec(LoadBalancePolicy::RoundRobin);
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("alias.test.", 8080, 0, 1, 60),
+            ],
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("alias.test.", DnsFamily::A, &["198.51.100.1"], 60),
+            ],
+        );
+        let old = cluster.endpoints();
+        assert_eq!(old.len(), 2);
+        assert_ne!(old[0].incarnation(), old[1].incarnation());
+        let held = cluster.acquire().await.expect("shared socket admission");
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 9090, 0, 1, 60)],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        let new = cluster
+            .acquire()
+            .await
+            .expect("new physical port independent");
+        assert_eq!(new.dial_target().expect("new dial").port(), 9090);
+        assert!(
+            old.iter()
+                .all(|old| old.incarnation() != new.endpoint().incarnation())
+        );
+        assert_eq!(
+            new.endpoint().url(),
+            held.endpoint().url(),
+            "logical origin is not SRV port"
+        );
+        drop((held, new));
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_target_nxdomain_revokes_both_families_order_independently_and_not_other_targets() {
+        for reversed in [false, true] {
+            let cluster = srv(LoadBalancePolicy::RoundRobin);
+            let records = || {
+                vec![
+                    srv_record("a.test.", 8080, 0, 1, 60),
+                    srv_record("b.test.", 8080, 0, 1, 60),
+                ]
+            };
+            srv_positive(
+                &cluster,
+                records(),
+                vec![
+                    srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                    srv_addresses("a.test.", DnsFamily::Aaaa, &["2001:db8::1"], 60),
+                    srv_addresses("b.test.", DnsFamily::A, &["198.51.100.2"], 60),
+                ],
+            );
+            let mut observations = vec![
+                srv_failure("a.test.", DnsFamily::A, DnsObservation::NameNotFound),
+                srv_addresses("a.test.", DnsFamily::Aaaa, &["2001:db8::2"], 60),
+            ];
+            if reversed {
+                observations.reverse();
+            }
+            srv_positive(&cluster, records(), observations);
+            assert_eq!(cluster.endpoints().len(), 1);
+            assert_eq!(
+                cluster
+                    .acquire()
+                    .await
+                    .expect("other target retained")
+                    .endpoint()
+                    .logical_target(),
+                Some("b.test.")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_family_nodata_does_not_erase_sibling_and_duplicate_observations_fail_closed() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        let records = || vec![srv_record("a.test.", 8080, 0, 1, 60)];
+        srv_positive(
+            &cluster,
+            records(),
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("a.test.", DnsFamily::Aaaa, &["2001:db8::1"], 60),
+            ],
+        );
+        srv_positive(
+            &cluster,
+            records(),
+            vec![srv_failure("a.test.", DnsFamily::A, DnsObservation::NoData)],
+        );
+        assert_eq!(cluster.endpoints().len(), 1);
+        assert!(
+            cluster
+                .acquire()
+                .await
+                .expect("AAAA stays")
+                .dial_target()
+                .expect("IP")
+                .is_ipv6()
+        );
+        let receipt = srv_positive(
+            &cluster,
+            records(),
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.2"], 60),
+            ],
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::InvalidAnswer)
+        );
+        assert!(cluster.endpoints().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_dot_and_service_nxdomain_fence_same_round_and_never_resurrect_stale() {
+        for withdrawal in [
+            SrvObservation::ServiceUnavailable,
+            SrvObservation::NameNotFound,
+            SrvObservation::Positive {
+                records: vec![srv_record(".", 8080, 0, 0, 60)],
+                addresses: Vec::new(),
+            },
+        ] {
+            let cluster = srv(LoadBalancePolicy::RoundRobin);
+            srv_positive(
+                &cluster,
+                vec![srv_record("a.test.", 8080, 0, 1, 60)],
+                vec![srv_addresses(
+                    "a.test.",
+                    DnsFamily::A,
+                    &["198.51.100.1"],
+                    60,
+                )],
+            );
+            let held = cluster.acquire().await.expect("old stream");
+            let query = cluster.begin_discovery_query().expect("refresh");
+            assert!(
+                cluster
+                    .reconcile_srv(&query, withdrawal, tokio::time::Instant::now())
+                    .applied
+            );
+            assert!(
+                !cluster
+                    .reconcile_srv(
+                        &query,
+                        SrvObservation::Positive {
+                            records: vec![srv_record("a.test.", 8080, 0, 1, 60)],
+                            addresses: vec![srv_addresses(
+                                "a.test.",
+                                DnsFamily::A,
+                                &["198.51.100.1"],
+                                60
+                            )]
+                        },
+                        tokio::time::Instant::now()
+                    )
+                    .applied
+            );
+            drop(query);
+            observe_srv(
+                &cluster,
+                SrvObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout,
+                },
+            );
+            assert!(matches!(
+                cluster.acquire().await,
+                Err(ClusterAdmissionError::Unavailable)
+            ));
+            assert_eq!(
+                held.dial_target(),
+                Some("198.51.100.1:8080".parse().expect("held target"))
+            );
+            drop(held);
+            assert_eq!(cluster.active_requests(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_duplicate_rr_uses_shortest_ttl_and_conflicting_weight_is_rejected() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        let receipt = srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("A.TEST", 8080, 0, 1, 1),
+            ],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        assert_eq!(receipt.endpoint_count, 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        let receipt = srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("a.test.", 8080, 0, 2, 60),
+            ],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::InvalidAnswer)
+        );
+        assert!(cluster.endpoints().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_and_address_expiry_each_require_their_own_stale_authority() {
+        // An SRV-only failure cannot extend an expired address, and a target
+        // failure cannot extend a successfully observed but now expired SRV RR.
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 1)],
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        observe_srv(
+            &cluster,
+            SrvObservation::TransientFailure {
+                code: DiscoveryErrorCode::Refused,
+            },
+        );
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 1)],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 1)],
+            vec![srv_failure(
+                "a.test.",
+                DnsFamily::A,
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout,
+                },
+            )],
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_stale_is_bounded_by_each_original_component_deadline_not_latest_failure() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 5)],
+            vec![srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 2)],
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // A successful SRV refresh cannot extend the original failed address.
+        let receipt = srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_failure(
+                "a.test.",
+                DnsFamily::A,
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Refused,
+                },
+            )],
+        );
+        assert!(
+            !receipt.positive_rejected,
+            "a failed target family does not invalidate successful service records"
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::Refused)
+        );
+        assert!(cluster.acquire().await.is_ok());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_failure(
+                "a.test.",
+                DnsFamily::A,
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout,
+                },
+            )],
+        );
+        assert!(cluster.acquire().await.is_ok());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                cluster.acquire().await,
+                Err(ClusterAdmissionError::Unavailable)
+            ),
+            "original address 2s + 10s grace has expired"
+        );
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_zero_ttl_and_duplicate_zero_ttl_never_seed_stale() {
+        let cluster = srv(LoadBalancePolicy::RoundRobin);
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 1)],
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("a.test.", 8080, 0, 1, 0),
+            ],
+            vec![srv_failure(
+                "a.test.",
+                DnsFamily::A,
+                DnsObservation::TransientFailure {
+                    code: DiscoveryErrorCode::Timeout,
+                },
+            )],
+        );
+        observe_srv(
+            &cluster,
+            SrvObservation::TransientFailure {
+                code: DiscoveryErrorCode::Timeout,
+            },
+        );
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert!(cluster.endpoints().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_policy_replacement_retains_only_held_physical_admission_not_old_health() {
+        let mut initial = dynamic_spec();
+        initial.limits.max_in_flight_per_endpoint = 1;
+        let old = PreparedCluster::prepare(initial.clone(), None).0;
+        assert!(old.activate_discovery_policy());
+        observe(
+            &old,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        let held = old.acquire().await.expect("old permit");
+        let old_endpoint = Arc::clone(held.endpoint());
+        old.record_passive_failure_for(&old_endpoint, Instant::now());
+        let mut changed = initial;
+        changed.discovery.as_mut().expect("plan").origin =
+            "http://changed.test/base".parse().expect("origin");
+        changed
+            .discovery
+            .as_mut()
+            .expect("plan")
+            .refresh
+            .min_interval = Duration::from_secs(2);
+        let new = PreparedCluster::prepare(changed.clone(), Some(&old)).0;
+        assert!(new.activate_discovery_policy());
+        observe(
+            &new,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        let new_endpoint = Arc::clone(&new.endpoints()[0]);
+        assert!(!Arc::ptr_eq(&old_endpoint, &new_endpoint));
+        assert_ne!(old_endpoint.incarnation(), new_endpoint.incarnation());
+        assert_eq!(
+            new_endpoint
+                .runtime_state()
+                .failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(new_endpoint.url().host_str(), Some("changed.test"));
+        assert!(matches!(
+            new.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        changed.discovery.as_mut().expect("plan").port = Some(9090);
+        let other_port = PreparedCluster::prepare(changed, Some(&new)).0;
+        assert!(other_port.activate_discovery_policy());
+        observe(
+            &other_port,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        assert_eq!(
+            other_port
+                .acquire()
+                .await
+                .expect("different physical port")
+                .dial_target()
+                .expect("dial")
+                .port(),
+            9090
+        );
+        drop(held);
+        assert!(new.acquire().await.is_ok());
+        assert_eq!(new.active_requests(), 0);
+        assert_eq!(old_endpoint.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_quota_rejections_return_received_round_codes_and_cannot_use_old_membership() {
+        let mut spec = srv_spec(LoadBalancePolicy::RoundRobin);
+        spec.discovery.as_mut().expect("plan").limits.max_endpoints = 1;
+        spec.discovery.as_mut().expect("plan").limits.max_targets = 2;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        let receipt = srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        assert_eq!(receipt.endpoint_count, 1);
+        let held = cluster.acquire().await.expect("existing request");
+        let receipt = srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![
+                srv_addresses("a.test.", DnsFamily::A, &["198.51.100.1"], 60),
+                srv_addresses("a.test.", DnsFamily::Aaaa, &["2001:db8::1"], 60),
+            ],
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::LimitExceeded)
+        );
+        assert!(
+            receipt.positive_rejected,
+            "the merged membership exceeded the complete round quota"
+        );
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert_eq!(
+            held.dial_target(),
+            Some("198.51.100.1:8080".parse().expect("held address"))
+        );
+        let receipt = srv_positive(
+            &cluster,
+            vec![
+                srv_record("a.test.", 8080, 0, 1, 60),
+                srv_record("b.test.", 8080, 0, 1, 60),
+            ],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::LimitExceeded),
+            "service name plus distinct target names are bounded"
+        );
+        let receipt = srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60); 513],
+            Vec::new(),
+        );
+        assert_eq!(
+            receipt.observation_error_code,
+            Some(DiscoveryErrorCode::LimitExceeded)
+        );
+        drop(held);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn srv_removed_target_readdition_has_fresh_health_and_pool_identity_not_fresh_quota() {
+        let mut spec = srv_spec(LoadBalancePolicy::RoundRobin);
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        let records = || vec![srv_record("a.test.", 8080, 0, 1, 60)];
+        let addresses = || {
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )]
+        };
+        srv_positive(&cluster, records(), addresses());
+        let held = cluster.acquire().await.expect("long request");
+        let old = Arc::clone(held.endpoint());
+        let generation = held.generation();
+        observe_srv(&cluster, SrvObservation::NoData);
+        assert!(cluster.endpoints().is_empty());
+        srv_positive(&cluster, records(), addresses());
+        let new = Arc::clone(&cluster.endpoints()[0]);
+        assert_ne!(new.incarnation(), old.incarnation());
+        assert!(cluster.discovery_status().expect("status").generation > generation);
+        cluster.record_active_health_for(&old, false, Instant::now());
+        cluster.record_passive_failure_for(&old, Instant::now());
+        assert_eq!(new.runtime_state().failures.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            new.runtime_state().health_state(Instant::now()),
+            EndpointHealthState::UnknownEligible
+        );
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        assert!(!cluster.contains_endpoint(&old));
+        drop(held);
+        assert!(cluster.acquire().await.is_ok());
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn srv_concurrent_retirement_linearizes_new_leases_without_revoking_old_permits() {
+        let cluster = Arc::new(srv(LoadBalancePolicy::LeastRequests));
+        srv_positive(
+            &cluster,
+            vec![srv_record("a.test.", 8080, 0, 1, 60)],
+            vec![srv_addresses(
+                "a.test.",
+                DnsFamily::A,
+                &["198.51.100.1"],
+                60,
+            )],
+        );
+        let old = cluster.acquire().await.expect("existing stream");
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers = (0..8)
+            .map(|_| {
+                let cluster = Arc::clone(&cluster);
+                let start = Arc::clone(&start);
+                let revoked = Arc::clone(&revoked);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..128 {
+                        let was_revoked = revoked.load(Ordering::Acquire);
+                        let result = cluster.try_acquire_endpoint(&BTreeSet::new(), Instant::now());
+                        if was_revoked {
+                            assert!(matches!(result, EndpointAcquire::Unavailable));
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        cluster.retire_discovery_policy();
+        revoked.store(true, Ordering::Release);
+        for worker in workers {
+            worker.join().expect("lease worker");
+        }
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert_eq!(
+            cluster.active_requests(),
+            1,
+            "old stream permit remains valid"
+        );
+        drop(old);
+        assert_eq!(cluster.active_requests(), 0);
     }
 
     #[tokio::test]

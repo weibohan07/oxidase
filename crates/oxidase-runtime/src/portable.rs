@@ -216,6 +216,14 @@ impl PortableRuntimePlanV1 {
             required.insert(oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned());
             required.insert(oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned());
         }
+        if self.gateway.clusters.values().any(|cluster| {
+            cluster
+                .discovery
+                .as_ref()
+                .is_some_and(|dns| dns.record == "srv")
+        }) {
+            required.insert(oxidase_config::DNS_SRV_DISCOVERY_FEATURE.to_owned());
+        }
         required
     }
 
@@ -592,6 +600,43 @@ listeners:
     service:
       ref: root
 "#;
+
+    #[test]
+    fn srv_runtime_plan_requires_base_dns_deadlines_and_its_own_capability() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("oxidase.yaml");
+        let text = GATEWAY.replace("services:\n", "resources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: _https._tcp.api.example.test\n          record: srv\n          origin: http://logical.example.test/base/\nservices:\n");
+        fs::write(&source, text).expect("offline SRV source");
+        let gateway = Compiler::compile_path(source).expect("SRV source compiles offline");
+        let snapshot = RuntimeSnapshot::prepare(gateway.clone()).expect("offline preparation");
+        let plan = snapshot.export_portable(&gateway).expect("export").plan;
+        assert_eq!(
+            plan.required_features(),
+            BTreeSet::from([
+                "portable-runtime".to_owned(),
+                oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned(),
+                oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned(),
+                oxidase_config::DNS_SRV_DISCOVERY_FEATURE.to_owned(),
+            ])
+        );
+        let (restored, _) = plan
+            .prepare_with_assets(
+                ContentDigest::of_bytes(b"srv-offline-contract"),
+                directory.path(),
+                Vec::new(),
+                |_, _, _| unreachable!("no Assets"),
+                None,
+            )
+            .expect("source-free SRV policy reconstructs without querying DNS");
+        let dns = restored.resources.clusters[&ResourceId::new("cluster:api")]
+            .spec()
+            .discovery
+            .as_ref()
+            .expect("SRV");
+        assert_eq!(dns.record, oxidase_config::DnsRecordType::Srv);
+        assert_eq!(dns.port, None);
+        assert_eq!(dns.origin.as_str(), "http://logical.example.test/base/");
+    }
 
     #[test]
     fn source_free_runtime_plan_round_trips_deterministically() {
