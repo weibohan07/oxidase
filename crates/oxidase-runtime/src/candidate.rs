@@ -293,6 +293,17 @@ pub struct CandidateStore {
     fault: Mutex<Option<FaultPoint>>,
 }
 
+impl Drop for CandidateStore {
+    fn drop(&mut self) {
+        // flock ownership follows the open file description, so an inherited
+        // descriptor can outlive this owner even with CLOEXEC. No worker can
+        // still use Self once the final Arc drops; release ownership explicitly
+        // rather than waiting for every fork/dup descriptor to close.
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self._process_lock, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistentState {

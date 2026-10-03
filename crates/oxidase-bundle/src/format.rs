@@ -527,8 +527,6 @@ fn read_file_streaming(
     mut checkpoint: impl FnMut() -> Result<(), BundleError>,
 ) -> Result<BundleArchive, BundleError> {
     checkpoint()?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| BundleError::io(error, "seek opened bundle"))?;
     let metadata = file
         .metadata()
         .map_err(|error| BundleError::io(error, "stat opened bundle"))?;
@@ -538,6 +536,10 @@ fn read_file_streaming(
             "bundle path is not a regular file",
         ));
     }
+    // Reject a FIFO/device before attempting an unsupported seek. Safe path
+    // and opened-FD entrypoints must use the same InvalidModel classification.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| BundleError::io(error, "seek opened bundle"))?;
     let encoded_size = metadata.len();
     check_limit("bundle bytes", encoded_size, limits.max_bundle_bytes, 0)?;
     if encoded_size < HEADER_LEN as u64 {
@@ -2796,14 +2798,18 @@ mod tests {
         assert_eq!(read_pinned(&new, new_digest), b"new-inode-content");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn path_reader_rejects_fifo_without_blocking() {
-        use rustix::fs::{CWD, Mode, mkfifoat};
-
         let directory = tempfile::tempdir().expect("temporary directory");
         let fifo = directory.path().join("candidate.oxb");
-        mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).expect("test FIFO is created");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("POSIX test FIFO fixture")
+                .success()
+        );
         let error = BundleArchive::read_path(&fifo, &BundleLimits::default())
             .expect_err("a Bundle must be a regular file");
         assert_eq!(error.kind(), BundleErrorKind::InvalidModel);

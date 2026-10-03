@@ -4,6 +4,51 @@ use oxidase_bundle::{BuildMetadata, BundleBuilder, BundleManifest, CanonicalValu
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[test]
+fn dropping_the_last_store_owner_releases_inherited_lock_descriptors() {
+    let directory = temp();
+    let path = root(&directory);
+    let candidate_store = store(&path, CandidateStoreLimits::default());
+    let inherited = candidate_store
+        ._process_lock
+        .try_clone()
+        .expect("duplicate models inherited descriptor");
+    assert!(
+        CandidateStore::open(
+            &path,
+            CandidateStoreLimits::default(),
+            CandidateSignaturePolicy::allow_unsigned_for_development(),
+            BundleCapabilities::default()
+        )
+        .is_err()
+    );
+    drop(candidate_store);
+    let replacement = store(&path, CandidateStoreLimits::default());
+    assert!(
+        rustix::fs::flock(
+            &inherited,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err(),
+        "new owner remains exclusive while old descriptor still exists"
+    );
+    drop(inherited);
+    assert!(
+        CandidateStore::open(
+            &path,
+            CandidateStoreLimits::default(),
+            CandidateSignaturePolicy::allow_unsigned_for_development(),
+            BundleCapabilities::default()
+        )
+        .is_err(),
+        "closing old descriptor cannot release the replacement owner"
+    );
+    replacement
+        .ensure_mutations_allowed()
+        .expect("new owner usable");
+}
+
 #[test]
 fn structured_failure_diagnostics_survive_clone_but_do_not_enter_receipts() {
     let diagnostic = oxidase_core::Diagnostic::new(
