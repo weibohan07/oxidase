@@ -191,3 +191,8 @@ restricted mutations without read permission. Otherwise ctl first reads the ETag
 it never refreshes a `412` and blindly retries. Connect/TLS and total deadlines,
 bounded regular-file/response reads, and HTTP driver cancellation apply on every
 exit path.
+System trust-store enumeration and bounded CA/client-identity parsing run in a
+single admitted blocking worker before TCP connection. The total timeout covers
+waiting and preparation; the connection timeout covers TCP and TLS afterwards.
+Cancellation cannot release that worker's admission until the actual OS work
+returns, even though a native trust-store call itself cannot be forcibly stopped.

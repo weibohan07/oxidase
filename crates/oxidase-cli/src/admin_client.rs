@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -36,6 +36,8 @@ const MAX_CA_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIENT_CERTIFICATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIENT_KEY_BYTES: usize = 1024 * 1024;
 const MAX_STAGED_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+static TLS_PREPARATION_ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type RequestBody = BoxBody<Bytes, BoxError>;
@@ -584,6 +586,10 @@ async fn send_https(
     let port = endpoint.url.port_or_known_default().ok_or_else(|| {
         AdminClientError::new("ctl.https_url", "admin HTTPS endpoint has no port")
     })?;
+    // Trust-store enumeration and identity parsing belong to preparation, not
+    // the async connection driver. The enclosing operation deadline covers both
+    // preparation admission and execution; no socket is opened before it ends.
+    let config = build_tls_config(endpoint).await?;
     let connect_deadline = deadline.min(Instant::now() + options.connect_timeout);
     let stream = tokio::time::timeout_at(
         connect_deadline,
@@ -602,7 +608,6 @@ async fn send_https(
             format!("cannot connect to admin HTTPS endpoint: {error}"),
         )
     })?;
-    let config = build_tls_config(endpoint).await?;
     let tls = tokio::time::timeout_at(
         connect_deadline,
         TlsConnector::from(config).connect(server_name, stream),
@@ -623,11 +628,41 @@ async fn send_https(
 async fn build_tls_config(
     endpoint: &AdminHttpsEndpoint,
 ) -> Result<Arc<ClientConfig>, AdminClientError> {
+    let endpoint = endpoint.clone();
+    run_tls_preparation(Arc::clone(&TLS_PREPARATION_ADMISSION), move || {
+        build_tls_config_blocking(&endpoint)
+    })
+    .await
+}
+
+async fn run_tls_preparation<T: Send + 'static>(
+    admission: Arc<tokio::sync::Semaphore>,
+    prepare: impl FnOnce() -> Result<T, AdminClientError> + Send + 'static,
+) -> Result<T, AdminClientError> {
+    let permit = admission.acquire_owned().await.map_err(|_| {
+        AdminClientError::new(
+            "ctl.tls_config",
+            "Admin TLS preparation admission is closed",
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        // Dropping the caller cannot release admission for a still-running OS
+        // trust-store read. Only this worker's actual completion releases it.
+        let _permit = permit;
+        prepare()
+    })
+    .await
+    .map_err(|_| AdminClientError::new("ctl.tls_config", "Admin TLS preparation did not finish"))?
+}
+
+fn build_tls_config_blocking(
+    endpoint: &AdminHttpsEndpoint,
+) -> Result<Arc<ClientConfig>, AdminClientError> {
     let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     roots.add_parsable_certificates(native.certs);
     if let Some(path) = &endpoint.ca_bundle {
-        let bytes = bounded_read(path, MAX_CA_BUNDLE_BYTES, "ctl.ca_bundle").await?;
+        let bytes = bounded_read_blocking(path, MAX_CA_BUNDLE_BYTES, "ctl.ca_bundle")?;
         let certificates = CertificateDer::pem_slice_iter(&bytes)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
@@ -670,12 +705,11 @@ async fn build_tls_config(
     let mut config = match (&endpoint.client_certificate, &endpoint.client_key) {
         (None, None) => builder.with_no_client_auth(),
         (Some(certificate), Some(key)) => {
-            let certificate = bounded_read(
+            let certificate = bounded_read_blocking(
                 certificate,
                 MAX_CLIENT_CERTIFICATE_BYTES,
                 "ctl.client_certificate",
-            )
-            .await?;
+            )?;
             let certificates = CertificateDer::pem_slice_iter(&certificate)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
@@ -690,7 +724,7 @@ async fn build_tls_config(
                     "admin client certificate chain is empty",
                 ));
             }
-            let mut key_bytes = bounded_read(key, MAX_CLIENT_KEY_BYTES, "ctl.client_key").await?;
+            let mut key_bytes = bounded_read_blocking(key, MAX_CLIENT_KEY_BYTES, "ctl.client_key")?;
             let mut keys = PrivateKeyDer::pem_slice_iter(&key_bytes)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
@@ -726,6 +760,15 @@ async fn build_tls_config(
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+fn bounded_read_blocking(
+    path: &Path,
+    limit: usize,
+    code: &'static str,
+) -> Result<Zeroizing<Vec<u8>>, AdminClientError> {
+    let (file, _) = open_regular_file_checked(path, limit as u64, code)?;
+    read_opened_file(file, limit, code)
 }
 
 async fn bounded_read(
@@ -989,8 +1032,42 @@ mod tests {
     use super::{
         AdminClientOptions, AdminCredentials, AdminEndpoint, AdminHttpsEndpoint, AdminOperation,
         MAX_ADMIN_RESPONSE_BYTES, endpoint_authority, execute, open_bounded_regular_file,
-        open_with_inspected_metadata, read_bearer_token, read_opened_file,
+        open_with_inspected_metadata, read_bearer_token, read_opened_file, run_tls_preparation,
     };
+
+    #[tokio::test]
+    async fn tls_preparation_does_not_block_runtime_or_release_admission_on_cancellation() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(run_tls_preparation(Arc::clone(&admission), move || {
+            started_tx
+                .send(())
+                .expect("worker announces its blocking boundary");
+            release_rx.blocking_recv().expect("worker released by test");
+            Ok(())
+        }));
+        tokio::select! {
+            result = &mut first => panic!("blocked preparation finished early: {result:?}"),
+            started = started_rx => started.expect("worker started"),
+        }
+        // This is a current-thread runtime. Its timer can only expire while the
+        // synchronous preparation runs elsewhere, without blocking its executor.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), first)
+                .await
+                .is_err()
+        );
+        assert_eq!(admission.available_permits(), 0);
+        let mut second = Box::pin(run_tls_preparation(Arc::clone(&admission), || Ok(())));
+        assert!(futures_util::poll!(&mut second).is_pending());
+        release_tx.send(()).expect("blocked worker is still alive");
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("waiting preparation proceeds only after the worker ends")
+            .expect("second preparation succeeds");
+        assert_eq!(admission.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn token_reader_trims_one_line_without_exposing_it_in_debug() {

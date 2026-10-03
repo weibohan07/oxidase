@@ -431,6 +431,9 @@ Last updated: 2026-10-03
 - Admin bootstrap keeps transport/TLS/Trust/token/permissions/keys/limits coherent
   and independent from data-plane snapshots. Server/ctl share bounded LF/CRLF bearer
   parsing. JSONL audit has bounded reserved mutation completion and noise drop counts.
+- `ctl` builds TLS trust/identity in a single admitted blocking worker before
+  opening TCP. Total deadlines cover its wait and preparation; cancellation retains
+  admission until actual worker completion instead of blocking the async executor.
 - Store fault-injection tests and actual killed-subprocess recovery were executed;
   the exact matrix, broader wire/race tests, local gates, fuzz campaigns, final-head
   required checks, and post-merge main CI are tracked in
