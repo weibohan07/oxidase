@@ -43,6 +43,34 @@ acceptance. The Draft's design-only head `53a1b14` passed PR run `37122950253`;
 that run must not be used to qualify the later implementation. The later
 implementation head `b105021` has an actual failed Hosted run, recorded below.
 
+## 6B executable contract (before final-head gates)
+
+Draft [PR #17](https://github.com/weibohan07/oxidase/pull/17) starts from protected
+main `aaece2a0c263ce58e3ba7d398a33c11892186316`. Its receipt-only head `e8a323d`
+passed run `37132909545`; that run does **not** qualify the A/AAAA implementation
+that followed. Final implementation-head and merged-main gates remain separate.
+
+| ID | Contract | Executable regression | Current local evidence |
+| --- | --- | --- | --- |
+| DS-10 | Strict source/portable contracts, precise spans, no DNS during validation | `oxidase-config/tests/dns_discovery.rs`; actual CLI `actual_check_bundle_build_and_verify_are_offline_and_do_not_query_dns` | focused source/portable/MSRV and real CLI PASS; frozen full gate pending |
+| DS-11 | Approved physical target is actual socket; fixed authority/base/raw query | `dns_rotation_moves_new_h2_stream_to_b_while_old_a_stream_finishes_with_trailers` | real TLS/H2 downstream and distinct H2 upstream peers PASS |
+| DS-12 | Independent family/CNAME expirations, TTL0 unavailable, no fresh lifetime refund | resolver `raw_queries_observe_independent_families_deduplicate_and_preserve_zero_ttl`; runtime discovery membership tests; wire `cold_failure_recovers_but_nxdomain_and_zero_ttl_revoke_real_pool_use` | focused resolver/runtime/wire PASS |
+| DS-13 | UDP/TCP fallback, canonical names, CNAME cycles/depth, packet/record/target quotas | `dns_resolver::tests` (14 real/pure fixture tests) | PASS 14/14; fixed limits and dependency graph/MSRV checked |
+| DS-14 | Negative/deletion distinct from transient; finite stale and bounded failure schedule | negative SOA/CNAME resolver tests; runtime stale-deadline tests; `family_negative_cache_backoff_and_name_revocation_are_bounded_and_independent` | targeted tests PASS; no completed-answer cache restarts TTL |
+| DS-15 | New H2 stream cannot use removed pool; existing A stream completes; fresh readd incarnation | real A→B wire test; `dns_withdrawal_reclaims_idle_pool_and_readd_cannot_reuse_old_incarnation`; runtime session/queued-lease tests | real wire and final server library gate PASS; latest runtime receipt recorded with full gate |
+| DS-16 | Expired bookkeeping is not eligible quota; rejected positive does not hide recovery under its raw TTL | paused runtime merge-quota test; `merged_quota_rejection_uses_failure_backoff_not_rejected_positive_ttl` | regression added and server scheduling PASS; frozen workspace gate pending |
+| DS-17 | Commit-only task activation, explicit owner retirement, resume-safe independent health tasks | health `removed_cluster_stops_supervisor_even_when_an_old_snapshot_is_pinned`; `replaced_health_policy_cancels_old_owner_and_same_arc_resume_restarts_once`; runtime query-session fencing tests | health PASS 11/11; no failed candidate long-lived task |
+| DS-18 | DNS does not publish configuration or create dynamic metric labels | both real DNS wire tests compare exact PublishedRuntime Arc/ETag/origin/version/readiness; metrics reject `endpoint="discovered-..."` | wire PASS; signed Admin competition and restart campaign belong to 6D |
+| DS-19 | Jitter desynchronizes instances and is deterministically testable without extending TTL | `early_jitter_has_deterministic_seed_and_does_not_refund_ttl` | injected-seed and early-bound regression PASS |
+
+The final focused server library run passed 207 tests; one existing ignored manual
+benchmark was **not run**. Focused Clippy denied warnings successfully. Intermediate
+build errors while collaborators were editing unfrozen APIs were not acceptance
+runs; only the subsequent frozen-source receipts qualify those changes. SRV and
+the 6D fuzz/Linux campaign remain NOT RUN, not implied by these local results.
+
+## 6A historical gates and Hosted-failure investigation
+
 ### Actual PR 16 Hosted failure
 
 Implementation/documentation head `b105021` ran

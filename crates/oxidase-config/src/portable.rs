@@ -5,6 +5,7 @@
 //! compiler-owned configuration types and reparses every textual protocol value.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr as _;
 use std::time::Duration;
@@ -27,6 +28,10 @@ use crate::compiler::{
     PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec, RetrySpec, SecretSpec,
     SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec, TrustStoreSpec,
     UpstreamTimeoutSpec,
+};
+use crate::discovery::{
+    DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec, DnsRecordType, DnsRefreshSpec,
+    DnsResolverSource, DnsResolverSpec, parse_dns_origin,
 };
 
 pub const PORTABLE_GATEWAY_CONFIG_SCHEMA_V1: &str = "oxidase.gateway-config/v1";
@@ -151,6 +156,12 @@ impl PortableGatewayConfigV1 {
         for cluster in self.clusters.values_mut() {
             normalize_span(&mut cluster.protocol_source, source_root)?;
             normalize_span(&mut cluster.source, source_root)?;
+            if let Some(discovery) = &mut cluster.discovery {
+                normalize_span(&mut discovery.source, source_root)?;
+                for span in discovery.spans.values_mut() {
+                    normalize_span(span, source_root)?;
+                }
+            }
             if let Some(timeouts) = &mut cluster.timeouts {
                 for span in timeouts.source_spans_mut() {
                     normalize_span(span, source_root)?;
@@ -240,6 +251,18 @@ impl PortableGatewayConfigV1 {
             resources
                 .trust_stores
                 .insert(id.clone(), source.compile(id));
+        }
+        if self
+            .clusters
+            .values()
+            .filter(|cluster| cluster.discovery.is_some())
+            .count()
+            > crate::MAX_DNS_DISCOVERY_CLUSTERS
+        {
+            return Err(invalid(
+                "clusters.discovery",
+                "at most 128 DNS discovery Clusters may be configured",
+            ));
         }
         for (id, source) in &self.clusters {
             let id = resource_id(id, "cluster", "clusters")?;
@@ -351,6 +374,21 @@ impl PortableGatewayConfigV1 {
                 &format!("clusters.{id}.protocol_source"),
             )?;
             check(&cluster.source, &format!("clusters.{id}.source"))?;
+            if let Some(discovery) = &cluster.discovery {
+                check(
+                    &discovery.source,
+                    &format!("clusters.{id}.discovery.source"),
+                )?;
+                if discovery.spans.len() > 64 {
+                    return Err(invalid(
+                        format!("clusters.{id}.discovery.spans"),
+                        "at most 64 DNS policy spans are permitted",
+                    ));
+                }
+                for (name, span) in &discovery.spans {
+                    check(span, &format!("clusters.{id}.discovery.{name}"))?;
+                }
+            }
             if let Some(timeouts) = &cluster.timeouts {
                 for (name, span) in timeouts.source_spans() {
                     check(span, &format!("clusters.{id}.timeouts.{name}"))?;
@@ -1571,6 +1609,8 @@ impl PortableTrustStoreV1 {
 pub struct PortableClusterV1 {
     pub protocol: String,
     pub endpoints: Vec<PortableClusterEndpointV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<PortableDnsDiscoveryV1>,
     pub load_balance: String,
     pub health: PortableClusterHealthV1,
     pub retry: PortableRetryV1,
@@ -1593,6 +1633,10 @@ impl PortableClusterV1 {
                 .iter()
                 .map(PortableClusterEndpointV1::from_compiled)
                 .collect(),
+            discovery: source
+                .discovery
+                .as_ref()
+                .map(PortableDnsDiscoveryV1::from_compiled),
             load_balance: source.load_balance.as_str().to_owned(),
             health: PortableClusterHealthV1::from_compiled(&source.health),
             retry: PortableRetryV1::from_compiled(&source.retry),
@@ -1625,7 +1669,18 @@ impl PortableClusterV1 {
                 ));
             }
         };
-        if self.endpoints.is_empty() {
+        let discovery = self
+            .discovery
+            .as_ref()
+            .map(PortableDnsDiscoveryV1::compile)
+            .transpose()?;
+        if discovery.is_some() && !self.endpoints.is_empty() {
+            return Err(invalid(
+                "clusters.discovery",
+                "static endpoints and DNS discovery are mutually exclusive",
+            ));
+        }
+        if self.endpoints.is_empty() && discovery.is_none() {
             return Err(invalid(
                 "clusters.endpoints",
                 "at least one endpoint is required",
@@ -1669,7 +1724,17 @@ impl PortableClusterV1 {
         let tls = self
             .tls
             .as_ref()
-            .map(|tls| tls.compile(resources, &endpoints))
+            .map(|tls| {
+                tls.compile(
+                    resources,
+                    endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.url.scheme() == "https")
+                        || discovery
+                            .as_ref()
+                            .is_some_and(|dns| dns.origin.scheme() == "https"),
+                )
+            })
             .transpose()?;
         let connect_timeout = self
             .connect_timeout
@@ -1682,6 +1747,12 @@ impl PortableClusterV1 {
             .as_ref()
             .map(PortableUpstreamTimeoutV1::compile)
             .transpose()?;
+        if discovery.is_some() && timeouts.is_none() {
+            return Err(invalid(
+                "clusters.timeouts",
+                "DNS discovery requires explicit portable phased timing",
+            ));
+        }
         // These v1 compatibility fields remain in the transport shape, but
         // cannot carry a conflicting inert value beside the explicit contract.
         if let Some(policy) = &timeouts {
@@ -1702,6 +1773,7 @@ impl PortableClusterV1 {
             id,
             protocol,
             endpoints,
+            discovery,
             load_balance,
             health: self.health.compile()?,
             retry: self.retry.compile()?,
@@ -1713,6 +1785,178 @@ impl PortableClusterV1 {
             protocol_source: self.protocol_source.clone(),
             source: self.source.clone(),
         })
+    }
+}
+
+/// Portable static discovery policy; deliberately no live address or health data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDnsDiscoveryV1 {
+    pub name: String,
+    pub record: String,
+    pub port: u16,
+    pub origin: String,
+    pub resolver: PortableDnsResolverV1,
+    pub refresh: PortableDnsRefreshV1,
+    pub limits: PortableDnsLimitsV1,
+    pub address_policy: PortableDnsAddressPolicyV1,
+    pub source: SourceSpan,
+    pub spans: BTreeMap<String, SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDnsResolverV1 {
+    pub mode: String,
+    pub nameservers: Vec<String>,
+    pub query_timeout: PortableDurationV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDnsRefreshV1 {
+    pub min_interval: PortableDurationV1,
+    pub max_interval: PortableDurationV1,
+    pub jitter_percent: u8,
+    pub stale_if_error: PortableDurationV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDnsLimitsV1 {
+    pub max_endpoints: u16,
+    pub max_targets: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDnsAddressPolicyV1 {
+    pub allow_private: bool,
+    pub allow_loopback: bool,
+    pub allow_link_local: bool,
+}
+
+impl PortableDnsDiscoveryV1 {
+    fn from_compiled(source: &DnsDiscoverySpec) -> Self {
+        let (mode, nameservers) = match &source.resolver.source {
+            DnsResolverSource::System => ("system".to_owned(), Vec::new()),
+            DnsResolverSource::NameServers(servers) => (
+                "nameservers".to_owned(),
+                servers.iter().map(ToString::to_string).collect(),
+            ),
+        };
+        Self {
+            name: source.name.clone(),
+            record: source.record.as_str().to_owned(),
+            port: source.port,
+            origin: source.origin.as_str().to_owned(),
+            resolver: PortableDnsResolverV1 {
+                mode,
+                nameservers,
+                query_timeout: PortableDurationV1::from_duration(source.resolver.query_timeout),
+            },
+            refresh: PortableDnsRefreshV1 {
+                min_interval: PortableDurationV1::from_duration(source.refresh.min_interval),
+                max_interval: PortableDurationV1::from_duration(source.refresh.max_interval),
+                jitter_percent: source.refresh.jitter_percent,
+                stale_if_error: PortableDurationV1::from_duration(source.refresh.stale_if_error),
+            },
+            limits: PortableDnsLimitsV1 {
+                max_endpoints: source.limits.max_endpoints,
+                max_targets: source.limits.max_targets,
+            },
+            address_policy: PortableDnsAddressPolicyV1 {
+                allow_private: source.address_policy.allow_private,
+                allow_loopback: source.address_policy.allow_loopback,
+                allow_link_local: source.address_policy.allow_link_local,
+            },
+            source: source.source.clone(),
+            spans: source.spans.clone(),
+        }
+    }
+
+    fn compile(&self) -> Result<DnsDiscoverySpec, PortableConfigError> {
+        if self.record != "a_aaaa" {
+            return Err(invalid(
+                "clusters.discovery.dns.record",
+                "only a_aaaa is supported; SRV is not implemented in phase 6B",
+            ));
+        }
+        let source = match self.resolver.mode.as_str() {
+            "system" if self.resolver.nameservers.is_empty() => DnsResolverSource::System,
+            "nameservers" => DnsResolverSource::NameServers(
+                self.resolver
+                    .nameservers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, address)| {
+                        address.parse::<SocketAddr>().map_err(|_| {
+                            invalid(
+                                format!("clusters.discovery.dns.resolver.nameservers[{index}]"),
+                                "nameserver must be an explicit IP:port",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            _ => {
+                return Err(invalid(
+                    "clusters.discovery.dns.resolver.mode",
+                    "use system without nameservers or explicit nameservers mode",
+                ));
+            }
+        };
+        let policy = DnsDiscoverySpec {
+            name: self.name.clone(),
+            record: DnsRecordType::AAndAaaa,
+            port: self.port,
+            origin: parse_dns_origin(&self.origin).map_err(|error| {
+                invalid(
+                    format!("clusters.discovery.dns.{}", error.field),
+                    error.message,
+                )
+            })?,
+            resolver: DnsResolverSpec {
+                source,
+                query_timeout: self
+                    .resolver
+                    .query_timeout
+                    .compile_upstream_phase("clusters.discovery.dns.resolver.query_timeout")?,
+            },
+            refresh: DnsRefreshSpec {
+                min_interval: self
+                    .refresh
+                    .min_interval
+                    .compile_upstream_phase("clusters.discovery.dns.refresh.min_interval")?,
+                max_interval: self
+                    .refresh
+                    .max_interval
+                    .compile_upstream_phase("clusters.discovery.dns.refresh.max_interval")?,
+                jitter_percent: self.refresh.jitter_percent,
+                stale_if_error: self
+                    .refresh
+                    .stale_if_error
+                    .compile("clusters.discovery.dns.refresh.stale_if_error", true)?,
+            },
+            limits: DnsDiscoveryLimits {
+                max_endpoints: self.limits.max_endpoints,
+                max_targets: self.limits.max_targets,
+            },
+            address_policy: DnsAddressPolicy {
+                allow_private: self.address_policy.allow_private,
+                allow_loopback: self.address_policy.allow_loopback,
+                allow_link_local: self.address_policy.allow_link_local,
+            },
+            source: self.source.clone(),
+            spans: self.spans.clone(),
+        };
+        policy.validate().map_err(|error| {
+            invalid(
+                format!("clusters.discovery.dns.{}", error.field),
+                error.message,
+            )
+        })?;
+        Ok(policy)
     }
 }
 
@@ -1905,12 +2149,9 @@ impl PortableClusterTlsV1 {
     fn compile(
         &self,
         resources: &CompiledResources,
-        endpoints: &[ClusterEndpointSpec],
+        has_https_origin: bool,
     ) -> Result<ClusterTlsSpec, PortableConfigError> {
-        if !endpoints
-            .iter()
-            .any(|endpoint| endpoint.url.scheme() == "https")
-        {
+        if !has_https_origin {
             return Err(invalid(
                 "clusters.tls",
                 "TLS policy is inert when every endpoint uses http",

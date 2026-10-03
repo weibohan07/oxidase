@@ -47,8 +47,14 @@ from the physical dial and pool identity, and adds six phased upstream timeouts
 with one absolute pre-response budget across queue, upload and retries. Legacy
 timing is retained with migration warnings; new Bundle semantics require an
 explicit capability. See [upstream timeouts](docs/configuration/upstream-timeouts.md).
-DNS discovery is not yet exposed by 6A; OpenTelemetry and packaging remain outside
-this task. This is not a production-readiness claim.
+Phase 6B adds bounded operational A/AAAA discovery with record-specific TTLs,
+finite stale-on-transient-error reuse and direct dialing of approved addresses.
+DNS changes do not publish configuration, alter Admin ETags or restore drained
+traffic. SRV remains rejected until its separate stage. See
+[discovery](docs/configuration/discovery.md) and the
+[actual acceptance ledger](docs/verification/discovery-acceptance.md).
+OpenTelemetry and packaging remain outside this task. This is not a
+production-readiness claim.
 
 The runnable inbound data plane supports cleartext HTTP/1.1 plus HTTPS over TLS
 1.2/1.3 with ALPN-selected HTTP/1.1 or HTTP/2. Every current Service node runs on

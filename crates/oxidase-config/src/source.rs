@@ -294,7 +294,9 @@ pub(crate) struct TrustStoreSource {
 pub(crate) struct ClusterSource {
     #[serde(default = "default_cluster_protocol")]
     pub protocol: String,
+    #[serde(default)]
     pub endpoints: Vec<ClusterEndpointSource>,
+    pub discovery: Option<DiscoverySource>,
     #[serde(default)]
     pub load_balance: LoadBalanceSource,
     #[serde(default)]
@@ -307,6 +309,106 @@ pub(crate) struct ClusterSource {
     pub connect_timeout: Option<String>,
     pub response_timeout: Option<String>,
     pub timeouts: Option<UpstreamTimeoutSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiscoverySource {
+    pub dns: DnsDiscoverySource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DnsDiscoverySource {
+    pub name: String,
+    #[serde(default = "default_dns_record")]
+    pub record: String,
+    pub port: Option<u32>,
+    pub origin: String,
+    #[serde(default)]
+    pub resolver: DnsResolverSource,
+    #[serde(default)]
+    pub refresh: DnsRefreshSource,
+    #[serde(default)]
+    pub limits: DnsLimitsSource,
+    #[serde(default)]
+    pub address_policy: DnsAddressPolicySource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DnsResolverSource {
+    pub system: Option<bool>,
+    pub nameservers: Option<Vec<String>>,
+    pub query_timeout: String,
+}
+
+impl Default for DnsResolverSource {
+    fn default() -> Self {
+        Self {
+            system: None,
+            nameservers: None,
+            query_timeout: "2s".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DnsRefreshSource {
+    pub min_interval: String,
+    pub max_interval: String,
+    pub jitter_percent: u32,
+    pub stale_if_error: String,
+}
+
+impl Default for DnsRefreshSource {
+    fn default() -> Self {
+        Self {
+            min_interval: "1s".to_owned(),
+            max_interval: "1m".to_owned(),
+            jitter_percent: 10,
+            stale_if_error: "30s".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DnsLimitsSource {
+    pub max_endpoints: u32,
+    pub max_targets: u32,
+}
+
+impl Default for DnsLimitsSource {
+    fn default() -> Self {
+        Self {
+            max_endpoints: 256,
+            max_targets: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DnsAddressPolicySource {
+    pub allow_private: bool,
+    pub allow_loopback: bool,
+    pub allow_link_local: bool,
+}
+
+impl Default for DnsAddressPolicySource {
+    fn default() -> Self {
+        Self {
+            allow_private: true,
+            allow_loopback: false,
+            allow_link_local: false,
+        }
+    }
+}
+
+fn default_dns_record() -> String {
+    "a_aaaa".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,6 +426,19 @@ pub(crate) struct UpstreamTimeoutSource {
     pub response_body_idle: String,
     #[serde(default = "default_pre_response_total_timeout")]
     pub pre_response_total: String,
+}
+
+impl Default for UpstreamTimeoutSource {
+    fn default() -> Self {
+        Self {
+            connect: default_connect_timeout(),
+            tls_handshake: default_connect_timeout(),
+            request_body_idle: default_response_timeout(),
+            response_header: default_response_header_timeout(),
+            response_body_idle: default_response_timeout(),
+            pre_response_total: default_pre_response_total_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

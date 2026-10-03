@@ -875,6 +875,8 @@ fn prepare_snapshot(config: &Path) -> Result<PreparedSnapshot, CliFailure> {
         .with_prior(&warnings)
     })?;
     warnings.extend(snapshot.preparation_warnings().iter().cloned());
+    oxidase_server::validate_discovery_bootstrap(&snapshot)
+        .map_err(|diagnostics| CliFailure { diagnostics }.with_prior(&warnings))?;
     Ok(PreparedSnapshot { snapshot, warnings })
 }
 
@@ -888,6 +890,8 @@ fn prepare_bundle_source(config: &Path) -> Result<PreparedBundleSource, CliFailu
         .with_prior(&warnings)
     })?;
     warnings.extend(snapshot.preparation_warnings().iter().cloned());
+    oxidase_server::validate_discovery_bootstrap(&snapshot)
+        .map_err(|diagnostics| CliFailure { diagnostics }.with_prior(&warnings))?;
     Ok(PreparedBundleSource {
         gateway,
         snapshot,

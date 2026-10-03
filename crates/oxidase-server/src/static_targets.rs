@@ -148,8 +148,8 @@ impl StaticTargetCache {
             let Some(owner) = snapshot.resources.clusters.get(&entry.cluster) else {
                 return false;
             };
-            let Some(endpoint) = owner
-                .endpoints()
+            let endpoints = owner.endpoints();
+            let Some(endpoint) = endpoints
                 .iter()
                 .find(|endpoint| endpoint.name() == entry.endpoint)
             else {
@@ -442,7 +442,32 @@ where
     B::Error: Into<BoxError>,
 {
     let origin = LogicalOrigin::from_url(endpoint.url())?;
-    let targets = targets_cache.resolve(cluster, endpoint).await?;
+    // Dynamic membership already approved a concrete physical address. Never
+    // hand its logical origin back to libc or a default Hyper connector.
+    let targets = if let Some(target) = endpoint.dial_target() {
+        let plan = cluster.spec().discovery.as_ref().ok_or_else(|| {
+            TransportError::new(
+                TransportPhase::Resolve,
+                TransportErrorKind::AddressRejected,
+                None,
+            )
+        })?;
+        let approved = oxidase_runtime::validate_discovery_address(
+            target.ip(),
+            target.port(),
+            &plan.address_policy,
+        )
+        .map_err(|_| {
+            TransportError::new(
+                TransportPhase::Resolve,
+                TransportErrorKind::AddressRejected,
+                None,
+            )
+        })?;
+        vec![DialTarget::new(approved)?]
+    } else {
+        targets_cache.resolve(cluster, endpoint).await?
+    };
     physical_ready.store(true, Ordering::Release);
     let connectors = targets
         .into_iter()
@@ -454,7 +479,8 @@ where
                 cluster.upstream_tls().map(Arc::as_ref),
                 TransportTimeouts::for_cluster(cluster),
             )?
-            .with_connection_admission(Arc::clone(&targets_cache.connect_admission));
+            .with_connection_admission(Arc::clone(&targets_cache.connect_admission))
+            .with_endpoint_incarnation(endpoint.incarnation());
             Ok(
                 if protocol == ClusterProtocol::Http1
                     && cluster.protocol() != ClusterProtocol::Http1

@@ -4,7 +4,7 @@ Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-upstream-transport-deadlines` (phase 6A)
+- active milestone branch: `feat/v0.4-dns-address-discovery` (phase 6B)
 - public starting point: completed secure-control-plane merge `ebfb754`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
@@ -473,20 +473,51 @@ Last updated: 2026-10-03
   `docs/verification/discovery-acceptance.md`. A/AAAA, SRV and Linux discovery
   qualification are not marked complete by this 6A implementation.
 
+## Phase 6B A/AAAA operational discovery
+
+- Strict Cluster source selects exactly static endpoints or DNS discovery. The
+  dynamic policy fixes logical origin and TLS authentication independently of
+  physical addresses, supplies bounded resolver/refresh/address rules, and uses
+  phased upstream deadlines. Source and portable Bundle validation preserve
+  precise spans and require `dns-address-discovery` plus `upstream-deadlines`.
+- Pinned Hickory `0.26.3` is a UDP/TCP stub, not a second data plane or recursive
+  resolver. Local resolver inputs are frozen before publication without queries
+  or supervisor activation. Actual DNS failure makes only the Cluster unavailable
+  (safe 503), without changing the fifth-stage readiness/publication contract.
+- One committed task per resource, at most 128 discovery resources and 64 admitted
+  family queries. A/AAAA and CNAME expiries are monotonic and independent; validated
+  SOA negative scheduling and bounded failure backoff do not restart answer TTLs.
+  NXDOMAIN revokes both families and fences concurrent late positives. Only fixed
+  transient classes may use a finite stale window from original expiry.
+- Membership withdrawal and lease issuance share one lock boundary. Idle ownership
+  of removed pools is pruned; issued H1/H2 streams retain their original Client.
+  Same membership/TTL refresh preserves state; remove/readd gives a fresh health
+  and pool incarnation while retaining nonzero physical admission safely.
+- Dynamic paths never use the native static-name cache: the approved SocketAddr
+  is rechecked under the same policy and passed directly to TCP. Health uses the
+  same transport identity under its independent timeout/admission. Old supervisors
+  are cancelled explicitly, even if a streaming request still pins an old snapshot.
+- DNS runtime status is authenticated through the existing Cluster read endpoint;
+  metrics aggregate dynamic members and never label IP, DNS target, generation or
+  incarnation. DNS tasks have no SnapshotStore or publication capability.
+- SRV and the 6D Linux/fuzz integration campaign are not qualified by this stage.
+  Local and Hosted evidence remains separate in the phase-six acceptance ledger.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
   state.
 - Cleartext h2c, ACME, OCSP stapling, user-configurable TLS cipher suites, HTTP/3,
   HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
-- Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
+- SRV Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
 - Online Admin transport/credential/permission reconfiguration, a multi-user role
   platform, distributed control-plane transactions, and online ambiguous-journal
   reconciliation are not implemented. Bootstrap changes and uncertain-intent
   reconciliation use the documented explicit restart procedure.
-- DNS/SRV discovery, standard access-log/OpenTelemetry export, and deployment/release
-  packaging remain future v0.4 PRs.
+- SRV discovery and integration qualification remain authorized later phase-six
+  sub-stages. Standard access-log/OpenTelemetry export and deployment/release
+  packaging are outside this task.
 
 ## Known limitations
 
@@ -538,9 +569,9 @@ Last updated: 2026-10-03
   policy, or automatic certificate issuance. SNI wildcards match exactly one
   left-most DNS label and must appear literally in the selected leaf certificate
   subjectAltName.
-- Cluster endpoints are static configuration: dynamic DNS/service discovery,
-  cross-process health consensus, hedging, and arbitrary retry scripting are not
-  implemented. Retry never occurs after a downstream response head and request-body
+- Cluster endpoints may be static or bounded A/AAAA discovery; SRV, DNSSEC,
+  DoH/DoT, service registries, cross-process health consensus, hedging, and arbitrary
+  retry scripting are not implemented. Retry never occurs after a downstream response head and request-body
   replay exists only through explicit bounded buffering. Configurable Forwarded
   trust policy is not implemented; the current secure default always replaces
   incoming forwarding metadata.

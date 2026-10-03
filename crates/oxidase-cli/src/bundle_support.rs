@@ -28,6 +28,7 @@ pub(crate) enum BundleCliError {
     Archive(BundleError),
     Activation(BundleActivationError),
     Runtime(PortableRuntimeError),
+    Discovery(Vec<oxidase_core::Diagnostic>),
     Io { code: &'static str, message: String },
     Invalid { code: &'static str, message: String },
 }
@@ -35,6 +36,7 @@ pub(crate) enum BundleCliError {
 impl BundleCliError {
     pub(crate) fn structured_diagnostics(&self) -> Option<Vec<oxidase_core::Diagnostic>> {
         match self {
+            Self::Discovery(diagnostics) => Some(diagnostics.clone()),
             Self::Runtime(PortableRuntimeError::Preparation(error)) => {
                 Some(error.diagnostics().to_vec())
             }
@@ -45,6 +47,7 @@ impl BundleCliError {
 
     pub(crate) const fn code(&self) -> &'static str {
         match self {
+            Self::Discovery(_) => "discovery.resolver_prepare",
             Self::Archive(error) => error.code(),
             Self::Activation(error) => error.code(),
             Self::Runtime(error) => error.code(),
@@ -54,6 +57,7 @@ impl BundleCliError {
 
     pub(crate) fn message(&self) -> String {
         match self {
+            Self::Discovery(_) => "cannot prepare the local DNS resolver inputs".to_owned(),
             Self::Archive(error) => error.to_string(),
             Self::Activation(error) => error.message(),
             Self::Runtime(error) => error.to_string(),
@@ -65,7 +69,7 @@ impl BundleCliError {
         match self {
             Self::Archive(error) => error.offset(),
             Self::Activation(error) => error.offset(),
-            Self::Runtime(_) | Self::Io { .. } | Self::Invalid { .. } => None,
+            Self::Runtime(_) | Self::Discovery(_) | Self::Io { .. } | Self::Invalid { .. } => None,
         }
     }
 }
@@ -414,6 +418,12 @@ pub(crate) fn verify_bundle(
     plan.validate_with_assets(content_digest, &deployment_root, |key, digest, length| {
         resolver.resolve(key, digest, length)
     })?;
+    let compiled = plan
+        .gateway
+        .compile_at(&deployment_root)
+        .map_err(PortableRuntimeError::Config)?;
+    oxidase_server::validate_discovery_policy_bootstrap(compiled.resources.clusters.values())
+        .map_err(BundleCliError::Discovery)?;
     Ok(BundleVerifyOutput {
         structural,
         verified_key_ids: signature.verified_key_ids,
@@ -473,6 +483,8 @@ pub(crate) fn load_bundle_snapshot(
     }
     let verification = archive.verify_ed25519(&trusted, requirement)?;
     let prepared = prepare_bundle_archive(&archive, path, &deployment_root, None)?;
+    oxidase_server::validate_discovery_bootstrap(&prepared.snapshot)
+        .map_err(BundleCliError::Discovery)?;
     let inspection = archive.inspect(InspectionVerbosity::Safe);
     Ok(LoadedBundle {
         snapshot: prepared.snapshot,

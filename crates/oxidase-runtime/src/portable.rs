@@ -207,6 +207,15 @@ impl PortableRuntimePlanV1 {
         {
             required.insert(oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned());
         }
+        if self
+            .gateway
+            .clusters
+            .values()
+            .any(|cluster| cluster.discovery.is_some())
+        {
+            required.insert(oxidase_config::DNS_ADDRESS_DISCOVERY_FEATURE.to_owned());
+            required.insert(oxidase_config::UPSTREAM_DEADLINES_FEATURE.to_owned());
+        }
         required
     }
 

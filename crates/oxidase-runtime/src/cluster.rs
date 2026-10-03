@@ -4,21 +4,27 @@
 //! tasks. Preparation is therefore side-effect free: the server may activate a
 //! health supervisor only after the containing snapshot has committed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oxidase_config::{
     ActiveHealthSpec, ClusterEndpointSpec, ClusterHealthSpec, ClusterProtocol, ClusterSpec,
     LoadBalancePolicy, PassiveHealthSpec,
 };
-use oxidase_core::ResourceId;
+use oxidase_core::{ContentDigestBuilder, ResourceId};
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::PreparedUpstreamTls;
+use crate::discovery::{
+    DiscoveryErrorCode, DiscoveryReconcileOutcome, DiscoveryResolutionState,
+    DiscoveryRuntimeStatus, DnsAddressRecord, DnsFamily, DnsObservation,
+    normalize_discovery_address, validate_discovery_address,
+};
 
 const HEALTH_UNKNOWN_ELIGIBLE: u8 = 0;
 const HEALTH_HEALTHY: u8 = 1;
@@ -343,6 +349,15 @@ impl EndpointRuntimeState {
 pub struct PreparedEndpoint {
     spec: ClusterEndpointSpec,
     state: Arc<EndpointRuntimeState>,
+    dynamic: Option<DynamicEndpointIdentity>,
+}
+
+#[derive(Debug)]
+struct DynamicEndpointIdentity {
+    target: SocketAddr,
+    incarnation: u64,
+    logical_target: String,
+    owner: Arc<()>,
 }
 
 impl PreparedEndpoint {
@@ -380,6 +395,28 @@ impl PreparedEndpoint {
     pub fn active_requests(&self) -> u64 {
         self.state.active_requests()
     }
+
+    /// The already-validated address for a dynamic attempt. Static endpoints
+    /// retain their existing resolution path and return `None`.
+    #[must_use]
+    pub fn dial_target(&self) -> Option<SocketAddr> {
+        self.dynamic.as_ref().map(|identity| identity.target)
+    }
+
+    /// Remove/readd creates a new incarnation even for the same physical IP.
+    #[must_use]
+    pub fn incarnation(&self) -> u64 {
+        self.dynamic
+            .as_ref()
+            .map_or(0, |identity| identity.incarnation)
+    }
+
+    #[must_use]
+    pub fn logical_target(&self) -> Option<&str> {
+        self.dynamic
+            .as_ref()
+            .map(|identity| identity.logical_target.as_str())
+    }
 }
 
 /// Side-effect-free prepared Cluster resource.
@@ -390,11 +427,77 @@ impl PreparedEndpoint {
 pub struct PreparedCluster {
     spec: ClusterSpec,
     upstream_tls: Option<Arc<PreparedUpstreamTls>>,
-    endpoints: Vec<Arc<PreparedEndpoint>>,
+    membership: Arc<Mutex<EndpointMembership>>,
     runtime: Arc<ClusterRuntimeState>,
     round_robin_sequence: AtomicU64,
-    weighted_state: Mutex<Vec<i64>>,
     supervisor_activated: AtomicBool,
+    policy_retired: Mutex<watch::Sender<bool>>,
+}
+
+struct EndpointMembership {
+    owner: Arc<()>,
+    endpoints: Arc<[Arc<PreparedEndpoint>]>,
+    weighted_state: Vec<i64>,
+    generation: u64,
+    active: bool,
+    retired: bool,
+    query_sequence: u64,
+    query: Option<QueryRound>,
+    families: [FamilyState; 2],
+    valid_until: BTreeMap<SocketAddr, tokio::time::Instant>,
+    stale_targets: BTreeSet<SocketAddr>,
+    admission_counters: BTreeMap<SocketAddr, Weak<AdmissionCounter>>,
+    last_success_unix_ms: Option<u64>,
+    next_refresh: Option<tokio::time::Instant>,
+}
+
+#[derive(Default)]
+struct FamilyState {
+    records: Vec<DnsAddressRecord>,
+    outcome: Option<DiscoveryResolutionState>,
+    transient: Option<DiscoveryErrorCode>,
+}
+
+struct QueryRound {
+    sequence: u64,
+    name_revoked: bool,
+}
+
+type AdmissionOwner = (Option<Arc<()>>, Option<watch::Receiver<bool>>);
+
+/// One commit-owned refresh round. Drop releases the one-round slot; callbacks
+/// from a retired owner or another sequence cannot update current membership.
+pub struct DiscoveryQueryLease {
+    membership: Weak<Mutex<EndpointMembership>>,
+    owner: Arc<()>,
+    sequence: u64,
+}
+
+impl fmt::Debug for DiscoveryQueryLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryQueryLease")
+            .field("sequence", &self.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DiscoveryQueryLease {
+    fn drop(&mut self) {
+        if let Some(membership) = self.membership.upgrade() {
+            let mut membership = membership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if Arc::ptr_eq(&membership.owner, &self.owner)
+                && membership
+                    .query
+                    .as_ref()
+                    .is_some_and(|query| query.sequence == self.sequence)
+            {
+                membership.query = None;
+            }
+        }
+    }
 }
 
 impl fmt::Debug for PreparedCluster {
@@ -408,7 +511,7 @@ impl fmt::Debug for PreparedCluster {
                 "upstream_tls",
                 &self.upstream_tls.as_ref().map(|tls| tls.digest()),
             )
-            .field("endpoints", &self.endpoints)
+            .field("endpoints", &self.endpoints())
             .finish_non_exhaustive()
     }
 }
@@ -441,14 +544,15 @@ impl PreparedCluster {
             || Arc::new(ClusterRuntimeState::default()),
             |previous| Arc::clone(&previous.runtime),
         );
+        let previous_endpoints = same_protocol.map(Self::endpoints);
         let mut reused = 0;
         let endpoints = spec
             .endpoints
             .iter()
             .cloned()
             .map(|endpoint| {
-                let previous_endpoint = same_protocol.and_then(|previous| {
-                    previous.endpoints.iter().find(|candidate| {
+                let previous_endpoint = previous_endpoints.as_ref().and_then(|previous| {
+                    previous.iter().find(|candidate| {
                         candidate.name() == endpoint.name && candidate.url() == &endpoint.url
                     })
                 });
@@ -468,19 +572,36 @@ impl PreparedCluster {
                 Arc::new(PreparedEndpoint {
                     spec: endpoint,
                     state,
+                    dynamic: None,
                 })
             })
             .collect::<Vec<_>>();
-        let weighted_state = Mutex::new(vec![0; endpoints.len()]);
+        let (policy_retired, _) = watch::channel(false);
+        let membership = Arc::new(Mutex::new(EndpointMembership {
+            owner: Arc::new(()),
+            weighted_state: vec![0; endpoints.len()],
+            endpoints: endpoints.into(),
+            generation: 0,
+            active: spec.discovery.is_none(),
+            retired: false,
+            query_sequence: 0,
+            query: None,
+            families: [FamilyState::default(), FamilyState::default()],
+            valid_until: BTreeMap::new(),
+            stale_targets: BTreeSet::new(),
+            admission_counters: BTreeMap::new(),
+            last_success_unix_ms: None,
+            next_refresh: None,
+        }));
         (
             Self {
                 spec,
                 upstream_tls,
-                endpoints,
+                membership,
                 runtime,
                 round_robin_sequence: AtomicU64::new(0),
-                weighted_state,
                 supervisor_activated: AtomicBool::new(false),
+                policy_retired: Mutex::new(policy_retired),
             },
             reused,
         )
@@ -522,8 +643,13 @@ impl PreparedCluster {
     }
 
     #[must_use]
-    pub fn endpoints(&self) -> &[Arc<PreparedEndpoint>] {
-        &self.endpoints
+    pub fn endpoints(&self) -> Arc<[Arc<PreparedEndpoint>]> {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        Arc::clone(&membership.endpoints)
     }
 
     #[must_use]
@@ -553,6 +679,410 @@ impl PreparedCluster {
         self.supervisor_activated.load(Ordering::Acquire)
     }
 
+    /// The manager calls this only after the actual retired task has stopped.
+    pub fn deactivate_supervisor(&self) {
+        self.supervisor_activated.store(false, Ordering::Release);
+    }
+
+    /// Activate a committed discovery owner, never from a DNS callback. An
+    /// already-active resource is unchanged; explicitly resuming a retired
+    /// resource creates a fresh fenced session and a cold initial address set.
+    #[must_use]
+    pub fn activate_discovery_policy(&self) -> bool {
+        if self.spec.discovery.is_none() {
+            return false;
+        }
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if membership.active && !membership.retired {
+            return false;
+        }
+        membership.owner = Arc::new(());
+        membership.active = true;
+        membership.retired = false;
+        membership.query = None;
+        membership.families = [FamilyState::default(), FamilyState::default()];
+        membership.valid_until.clear();
+        membership.stale_targets.clear();
+        membership.last_success_unix_ms = None;
+        membership.next_refresh = None;
+        if !membership.endpoints.is_empty() {
+            membership.endpoints = Arc::from([]);
+            membership.weighted_state.clear();
+            membership.generation = membership.generation.saturating_add(1);
+        }
+        let (retired, _) = watch::channel(false);
+        *self
+            .policy_retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retired;
+        true
+    }
+
+    /// Stop issuing new dynamic attempts and fence outstanding observations.
+    /// Existing leases retain only their endpoint/permit and may finish.
+    pub fn retire_discovery_policy(&self) {
+        if self.spec.discovery.is_none() {
+            return;
+        }
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        membership.retired = true;
+        membership.query = None;
+        membership.next_refresh = None;
+        if self.spec.discovery.is_some() {
+            let held = membership
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.state.admission.active() > 0)
+                .map(|endpoint| {
+                    (
+                        endpoint.dial_target(),
+                        Arc::downgrade(&endpoint.state.admission),
+                    )
+                })
+                .filter_map(|(target, counter)| target.map(|target| (target, counter)))
+                .collect::<Vec<_>>();
+            membership.admission_counters.extend(held);
+            membership.active = false;
+            membership.families = [FamilyState::default(), FamilyState::default()];
+            membership.valid_until.clear();
+            membership.stale_targets.clear();
+            if !membership.endpoints.is_empty() {
+                membership.endpoints = Arc::from([]);
+                membership.weighted_state.clear();
+                membership.generation = membership.generation.saturating_add(1);
+            }
+        }
+        let _ = self
+            .policy_retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_replace(true);
+        self.runtime.endpoint_released.notify_waiters();
+    }
+
+    /// This receiver is scoped to one activation session; resuming the same
+    /// PreparedCluster cannot make an old receiver become live again.
+    #[must_use]
+    pub fn discovery_retirement(&self) -> watch::Receiver<bool> {
+        self.policy_retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscribe()
+    }
+
+    /// One bounded refresh round per committed policy owner. It is not a
+    /// background task and carries no configuration publication capability.
+    pub fn begin_discovery_query(&self) -> Option<DiscoveryQueryLease> {
+        self.spec.discovery.as_ref()?;
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !membership.active || membership.retired || membership.query.is_some() {
+            return None;
+        }
+        let sequence = membership.query_sequence.checked_add(1)?;
+        membership.query_sequence = sequence;
+        membership.query = Some(QueryRound {
+            sequence,
+            name_revoked: false,
+        });
+        Some(DiscoveryQueryLease {
+            membership: Arc::downgrade(&self.membership),
+            owner: Arc::clone(&membership.owner),
+            sequence,
+        })
+    }
+
+    /// Record the committed supervisor's schedule while its round/session is
+    /// still current. Observation metadata does not renew endpoint lifetimes.
+    pub fn set_discovery_refresh(
+        &self,
+        query: &DiscoveryQueryLease,
+        next: tokio::time::Instant,
+    ) -> bool {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if membership.active
+            && !membership.retired
+            && Arc::ptr_eq(&membership.owner, &query.owner)
+            && membership
+                .query
+                .as_ref()
+                .is_some_and(|round| round.sequence == query.sequence)
+        {
+            membership.next_refresh = Some(next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a structured family result. The membership lock is also the
+    /// business-lease issuance gate, so removal and acquisition are linearized.
+    pub fn reconcile_dns(
+        &self,
+        query: &DiscoveryQueryLease,
+        family: DnsFamily,
+        observation: DnsObservation,
+        now: tokio::time::Instant,
+    ) -> DiscoveryReconcileOutcome {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(plan) = &self.spec.discovery else {
+            return Self::reconcile_receipt(&membership, false, false);
+        };
+        let valid_query = membership.active
+            && !membership.retired
+            && Arc::ptr_eq(&membership.owner, &query.owner)
+            && membership
+                .query
+                .as_ref()
+                .is_some_and(|round| round.sequence == query.sequence && !round.name_revoked);
+        if !valid_query {
+            return Self::reconcile_receipt(&membership, false, false);
+        }
+        let generation = membership.generation;
+        let index = family_index(family);
+        match observation {
+            DnsObservation::Positive { addresses } => {
+                if addresses.len() > 512 {
+                    membership.families[index] = FamilyState::error(
+                        DiscoveryResolutionState::LimitExceeded,
+                        DiscoveryErrorCode::LimitExceeded,
+                    );
+                } else {
+                    let mut normalized = BTreeMap::new();
+                    let mut rejected = false;
+                    let mut invalid = false;
+                    for record in addresses {
+                        // A mapped AAAA may already be normalized by the
+                        // resolver's strict RR-type parser.
+                        let same_family = family == DnsFamily::Aaaa || record.address.is_ipv4();
+                        if !same_family {
+                            invalid = true;
+                            break;
+                        }
+                        if validate_discovery_address(
+                            record.address,
+                            plan.port,
+                            &plan.address_policy,
+                        )
+                        .is_err()
+                        {
+                            rejected = true;
+                            continue;
+                        }
+                        let address = normalize_discovery_address(record.address);
+                        normalized
+                            .entry(address)
+                            .and_modify(|expiry: &mut tokio::time::Instant| {
+                                *expiry = (*expiry).min(record.fresh_until)
+                            })
+                            .or_insert(record.fresh_until);
+                    }
+                    let records = normalized
+                        .into_iter()
+                        // Deduplicate first: a TTL0 duplicate cannot be
+                        // upgraded by a duplicate with a longer lifetime.
+                        .filter(|(_, fresh_until)| *fresh_until > now)
+                        .map(|(address, fresh_until)| DnsAddressRecord {
+                            address,
+                            fresh_until,
+                        })
+                        .collect::<Vec<_>>();
+                    if invalid {
+                        membership.families[index] = FamilyState::error(
+                            DiscoveryResolutionState::InvalidAnswer,
+                            DiscoveryErrorCode::InvalidAnswer,
+                        );
+                    } else if records.len() > usize::from(plan.limits.max_endpoints) {
+                        membership.families[index] = FamilyState::error(
+                            DiscoveryResolutionState::LimitExceeded,
+                            DiscoveryErrorCode::LimitExceeded,
+                        );
+                    } else if records.is_empty() && rejected {
+                        membership.families[index] = FamilyState::error(
+                            DiscoveryResolutionState::PolicyRejected,
+                            DiscoveryErrorCode::PolicyRejected,
+                        );
+                    } else {
+                        membership.families[index] = FamilyState {
+                            records,
+                            outcome: Some(DiscoveryResolutionState::Fresh),
+                            transient: None,
+                        };
+                        membership.last_success_unix_ms = Some(unix_time_millis());
+                    }
+                }
+            }
+            DnsObservation::NameNotFound => {
+                membership.families = [
+                    FamilyState::empty(DiscoveryResolutionState::NameNotFound),
+                    FamilyState::empty(DiscoveryResolutionState::NameNotFound),
+                ];
+                if let Some(round) = &mut membership.query {
+                    round.name_revoked = true;
+                }
+            }
+            DnsObservation::NoData => {
+                membership.families[index] = FamilyState::empty(DiscoveryResolutionState::NoData)
+            }
+            DnsObservation::TransientFailure { code } if code.allows_stale() => {
+                membership.families[index].outcome =
+                    Some(DiscoveryResolutionState::TransientFailure);
+                membership.families[index].transient = Some(code);
+            }
+            DnsObservation::TransientFailure { code } => {
+                let outcome = match code {
+                    DiscoveryErrorCode::PolicyRejected => DiscoveryResolutionState::PolicyRejected,
+                    DiscoveryErrorCode::InvalidAnswer => DiscoveryResolutionState::InvalidAnswer,
+                    DiscoveryErrorCode::LimitExceeded => DiscoveryResolutionState::LimitExceeded,
+                    _ => DiscoveryResolutionState::TransientFailure,
+                };
+                membership.families[index] = FamilyState::error(outcome, code);
+            }
+            DnsObservation::InvalidAnswer => {
+                membership.families[index] = FamilyState::error(
+                    DiscoveryResolutionState::InvalidAnswer,
+                    DiscoveryErrorCode::InvalidAnswer,
+                )
+            }
+            DnsObservation::PolicyRejected => {
+                membership.families[index] = FamilyState::error(
+                    DiscoveryResolutionState::PolicyRejected,
+                    DiscoveryErrorCode::PolicyRejected,
+                )
+            }
+            DnsObservation::LimitExceeded => {
+                membership.families[index] = FamilyState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                )
+            }
+        }
+        let eligible = membership
+            .families
+            .iter()
+            .flat_map(|family| {
+                family
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        now < record.fresh_until
+                            || (family
+                                .transient
+                                .is_some_and(DiscoveryErrorCode::allows_stale)
+                                && record
+                                    .fresh_until
+                                    .checked_add(plan.refresh.stale_if_error)
+                                    .is_some_and(|expiry| now < expiry))
+                    })
+                    .map(|record| record.address)
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        if eligible > usize::from(plan.limits.max_endpoints) {
+            // Retained expired bookkeeping is not membership. Reject this
+            // family's overflow without discarding valid other-family peers.
+            membership.families[index] = FamilyState::error(
+                DiscoveryResolutionState::LimitExceeded,
+                DiscoveryErrorCode::LimitExceeded,
+            );
+        }
+        self.refresh_membership_locked(&mut membership, now);
+        let mut receipt =
+            Self::reconcile_receipt(&membership, true, generation != membership.generation);
+        receipt.observation_error_code = membership.families[index].transient;
+        drop(membership);
+        self.runtime.endpoint_released.notify_waiters();
+        receipt
+    }
+
+    /// Checks exact current membership for health and idle-pool ownership. An
+    /// already-issued business lease does not need this check to finish.
+    #[must_use]
+    pub fn contains_endpoint(&self, endpoint: &Arc<PreparedEndpoint>) -> bool {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        !membership.retired
+            && membership
+                .endpoints
+                .iter()
+                .any(|current| Arc::ptr_eq(current, endpoint))
+    }
+
+    pub fn record_active_health_for(
+        &self,
+        endpoint: &Arc<PreparedEndpoint>,
+        succeeded: bool,
+        now: Instant,
+    ) {
+        let Some(plan) = &self.spec.health.active else {
+            return;
+        };
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        if !membership.retired
+            && membership
+                .endpoints
+                .iter()
+                .any(|current| Arc::ptr_eq(current, endpoint))
+        {
+            endpoint.state.record_active_health(succeeded, plan, now);
+        }
+    }
+
+    pub fn record_passive_success_for(&self, endpoint: &Arc<PreparedEndpoint>) {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        if !membership.retired
+            && membership
+                .endpoints
+                .iter()
+                .any(|current| Arc::ptr_eq(current, endpoint))
+        {
+            endpoint.state.record_passive_success();
+        }
+    }
+
+    pub fn record_passive_failure_for(&self, endpoint: &Arc<PreparedEndpoint>, now: Instant) {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        if !membership.retired
+            && membership
+                .endpoints
+                .iter()
+                .any(|current| Arc::ptr_eq(current, endpoint))
+        {
+            endpoint
+                .state
+                .record_passive_failure(self.spec.health.passive.as_ref(), now);
+        }
+    }
+
     /// Selects one currently eligible endpoint according to the compiled policy.
     #[must_use]
     pub fn select_endpoint(&self, now: Instant) -> Option<Arc<PreparedEndpoint>> {
@@ -570,7 +1100,15 @@ impl PreparedCluster {
         now: Instant,
         excluded: &BTreeSet<String>,
     ) -> Option<Arc<PreparedEndpoint>> {
-        let eligible = self
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        if self.spec.discovery.is_some() && (!membership.active || membership.retired) {
+            return None;
+        }
+        let eligible = membership
             .endpoints
             .iter()
             .enumerate()
@@ -587,10 +1125,12 @@ impl PreparedCluster {
                 let sequence = self.round_robin_sequence.fetch_add(1, Ordering::Relaxed);
                 eligible[sequence as usize % eligible.len()]
             }
-            LoadBalancePolicy::WeightedRoundRobin => self.select_weighted(&eligible),
-            LoadBalancePolicy::LeastRequests => self.select_least_requests(&eligible),
+            LoadBalancePolicy::WeightedRoundRobin => {
+                Self::select_weighted(&mut membership, &eligible)
+            }
+            LoadBalancePolicy::LeastRequests => Self::select_least_requests(&membership, &eligible),
         };
-        Some(Arc::clone(&self.endpoints[selected]))
+        Some(Arc::clone(&membership.endpoints[selected]))
     }
 
     /// Acquires Cluster and endpoint concurrency permits without consuming a
@@ -606,6 +1146,70 @@ impl PreparedCluster {
         &self,
         excluded: &BTreeSet<String>,
     ) -> Result<ClusterRequestPermit, ClusterAdmissionError> {
+        let (owner, retired) = self.admission_owner(None)?;
+        self.acquire_excluding_owned(excluded, owner, retired).await
+    }
+
+    /// Retry in the original attempt's policy session. A resumed resource may
+    /// serve new requests but cannot give an old logical request new authority.
+    pub async fn acquire_excluding_for(
+        &self,
+        excluded: &BTreeSet<String>,
+        previous: &Arc<PreparedEndpoint>,
+    ) -> Result<ClusterRequestPermit, ClusterAdmissionError> {
+        let (owner, retired) = self.admission_owner(Some(previous))?;
+        self.acquire_excluding_owned(excluded, owner, retired).await
+    }
+
+    fn admission_owner(
+        &self,
+        previous: Option<&Arc<PreparedEndpoint>>,
+    ) -> Result<AdmissionOwner, ClusterAdmissionError> {
+        let membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.spec.discovery.is_some() {
+            if !membership.active
+                || membership.retired
+                || previous.is_some_and(|endpoint| {
+                    endpoint
+                        .dynamic
+                        .as_ref()
+                        .is_none_or(|identity| !Arc::ptr_eq(&identity.owner, &membership.owner))
+                })
+            {
+                return Err(ClusterAdmissionError::Unavailable);
+            }
+            // Subscribe while holding the ownership gate so retirement/restart
+            // cannot substitute a different session's watch receiver.
+            Ok((
+                Some(Arc::clone(&membership.owner)),
+                Some(
+                    self.policy_retired
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .subscribe(),
+                ),
+            ))
+        } else if previous.is_some_and(|endpoint| {
+            !membership
+                .endpoints
+                .iter()
+                .any(|current| Arc::ptr_eq(current, endpoint))
+        }) {
+            Err(ClusterAdmissionError::Unavailable)
+        } else {
+            Ok((None, None))
+        }
+    }
+
+    async fn acquire_excluding_owned(
+        &self,
+        excluded: &BTreeSet<String>,
+        owner: Option<Arc<()>>,
+        mut retired: Option<watch::Receiver<bool>>,
+    ) -> Result<ClusterRequestPermit, ClusterAdmissionError> {
         let queue_timeout = self.spec.limits.queue_timeout;
         let deadline = if queue_timeout.is_zero() {
             None
@@ -616,24 +1220,34 @@ impl PreparedCluster {
                     .ok_or(ClusterAdmissionError::Overloaded)?,
             )
         };
-        let cluster = acquire_counter(
+        let admission = acquire_counter(
             Arc::clone(&self.runtime.admission),
             self.spec.limits.max_in_flight,
             deadline,
-        )
-        .await
+        );
+        let cluster = if let Some(retired) = &mut retired {
+            tokio::select! {
+                biased;
+                _ = retired.changed() => return Err(ClusterAdmissionError::Unavailable),
+                result = admission => result,
+            }
+        } else {
+            admission.await
+        }
         .map_err(|()| ClusterAdmissionError::Overloaded)?;
 
         loop {
             // Register before scanning all endpoints so a release racing the
             // scan leaves a Notify permit instead of being lost.
             let released = self.runtime.endpoint_released.notified();
-            match self.try_acquire_endpoint(excluded, Instant::now()) {
-                EndpointAcquire::Acquired(endpoint, endpoint_permit) => {
+            match self.try_acquire_endpoint_owned(excluded, Instant::now(), owner.as_ref()) {
+                EndpointAcquire::Acquired(endpoint, endpoint_permit, generation) => {
                     return Ok(ClusterRequestPermit {
                         endpoint,
                         _cluster: cluster,
                         _endpoint: endpoint_permit,
+                        generation,
+                        owner,
                     });
                 }
                 EndpointAcquire::Unavailable => {
@@ -644,7 +1258,17 @@ impl PreparedCluster {
             let Some(deadline) = deadline else {
                 return Err(ClusterAdmissionError::Overloaded);
             };
-            if tokio::time::timeout_at(deadline, released).await.is_err() {
+            let waiting = tokio::time::timeout_at(deadline, released);
+            let finished = if let Some(retired) = &mut retired {
+                tokio::select! {
+                    biased;
+                    _ = retired.changed() => return Err(ClusterAdmissionError::Unavailable),
+                    result = waiting => result,
+                }
+            } else {
+                waiting.await
+            };
+            if finished.is_err() {
                 return Err(ClusterAdmissionError::Overloaded);
             }
         }
@@ -666,6 +1290,9 @@ impl PreparedCluster {
         if !Arc::ptr_eq(&current._cluster.counter, &self.runtime.admission) {
             return false;
         }
+        let Ok((owner, mut retired)) = self.admission_owner(Some(&current.endpoint)) else {
+            return false;
+        };
         let mut excluded = excluded.clone();
         excluded.insert(current.endpoint.name().to_owned());
         let queue_timeout = self.spec.limits.queue_timeout;
@@ -680,10 +1307,12 @@ impl PreparedCluster {
 
         loop {
             let released = self.runtime.endpoint_released.notified();
-            match self.try_acquire_endpoint(&excluded, Instant::now()) {
-                EndpointAcquire::Acquired(endpoint, endpoint_permit) => {
+            match self.try_acquire_endpoint_owned(&excluded, Instant::now(), owner.as_ref()) {
+                EndpointAcquire::Acquired(endpoint, endpoint_permit, generation) => {
                     let old_endpoint = std::mem::replace(&mut current._endpoint, endpoint_permit);
                     current.endpoint = endpoint;
+                    current.generation = generation;
+                    current.owner = owner;
                     drop(old_endpoint);
                     return true;
                 }
@@ -693,7 +1322,17 @@ impl PreparedCluster {
             let Some(deadline) = deadline else {
                 return false;
             };
-            if tokio::time::timeout_at(deadline, released).await.is_err() {
+            let waiting = tokio::time::timeout_at(deadline, released);
+            let finished = if let Some(retired) = &mut retired {
+                tokio::select! {
+                    biased;
+                    _ = retired.changed() => return false,
+                    result = waiting => result,
+                }
+            } else {
+                waiting.await
+            };
+            if finished.is_err() {
                 return false;
             }
         }
@@ -709,6 +1348,31 @@ impl PreparedCluster {
         excluded: &BTreeSet<String>,
         current_name: &str,
     ) -> Option<ClusterEndpointReservation> {
+        if self.spec.discovery.is_some() {
+            return None;
+        }
+        self.reserve_retry_endpoint_owned(excluded, current_name, None, None)
+            .await
+    }
+
+    /// Session-fenced status retry; does not cancel or consume the old attempt.
+    pub async fn reserve_retry_endpoint_for(
+        &self,
+        excluded: &BTreeSet<String>,
+        current: &Arc<PreparedEndpoint>,
+    ) -> Option<ClusterEndpointReservation> {
+        let (owner, retired) = self.admission_owner(Some(current)).ok()?;
+        self.reserve_retry_endpoint_owned(excluded, current.name(), owner, retired)
+            .await
+    }
+
+    async fn reserve_retry_endpoint_owned(
+        &self,
+        excluded: &BTreeSet<String>,
+        current_name: &str,
+        owner: Option<Arc<()>>,
+        mut retired: Option<watch::Receiver<bool>>,
+    ) -> Option<ClusterEndpointReservation> {
         let mut excluded = excluded.clone();
         excluded.insert(current_name.to_owned());
         let queue_timeout = self.spec.limits.queue_timeout;
@@ -719,19 +1383,31 @@ impl PreparedCluster {
         };
         loop {
             let released = self.runtime.endpoint_released.notified();
-            match self.try_acquire_endpoint(&excluded, Instant::now()) {
-                EndpointAcquire::Acquired(endpoint, endpoint_permit) => {
+            match self.try_acquire_endpoint_owned(&excluded, Instant::now(), owner.as_ref()) {
+                EndpointAcquire::Acquired(endpoint, endpoint_permit, generation) => {
                     return Some(ClusterEndpointReservation {
                         endpoint,
                         endpoint_permit,
                         cluster_counter: Arc::clone(&self.runtime.admission),
+                        generation,
+                        owner,
                     });
                 }
                 EndpointAcquire::Unavailable => return None,
                 EndpointAcquire::Saturated => {}
             }
             let deadline = deadline?;
-            if tokio::time::timeout_at(deadline, released).await.is_err() {
+            let waiting = tokio::time::timeout_at(deadline, released);
+            let finished = if let Some(retired) = &mut retired {
+                tokio::select! {
+                    biased;
+                    _ = retired.changed() => return None,
+                    result = waiting => result,
+                }
+            } else {
+                waiting.await
+            };
+            if finished.is_err() {
                 return None;
             }
         }
@@ -750,6 +1426,9 @@ impl PreparedCluster {
     /// Applies one active-health observation. Unknown endpoint names are ignored
     /// so a retiring supervisor cannot mutate a replacement endpoint by index.
     pub fn record_active_health(&self, endpoint_name: &str, succeeded: bool, now: Instant) {
+        if self.spec.discovery.is_some() {
+            return;
+        }
         let Some(plan) = &self.spec.health.active else {
             return;
         };
@@ -759,12 +1438,18 @@ impl PreparedCluster {
     }
 
     pub fn record_passive_success(&self, endpoint_name: &str) {
+        if self.spec.discovery.is_some() {
+            return;
+        }
         if let Some(endpoint) = self.endpoint(endpoint_name) {
             endpoint.state.record_passive_success();
         }
     }
 
     pub fn record_passive_failure(&self, endpoint_name: &str, now: Instant) {
+        if self.spec.discovery.is_some() {
+            return;
+        }
         if let Some(endpoint) = self.endpoint(endpoint_name) {
             endpoint
                 .state
@@ -803,6 +1488,12 @@ impl PreparedCluster {
 
     #[must_use]
     pub fn status(&self, now: Instant) -> ClusterRuntimeStatus {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = tokio::time::Instant::now();
+        self.refresh_membership_locked(&mut membership, observed);
         ClusterRuntimeStatus {
             cluster: self.name().to_owned(),
             protocol: self.spec.protocol.as_str().to_owned(),
@@ -813,7 +1504,8 @@ impl PreparedCluster {
             retry_exhausted: self.runtime.retry_exhausted.load(Ordering::Relaxed),
             overload_rejections: self.runtime.overload_rejections.load(Ordering::Relaxed),
             unavailable_rejections: self.runtime.unavailable_rejections.load(Ordering::Relaxed),
-            endpoints: self
+            discovery: self.discovery_status_locked(&membership, observed),
+            endpoints: membership
                 .endpoints
                 .iter()
                 .map(|endpoint| EndpointStatusSnapshot {
@@ -824,28 +1516,282 @@ impl PreparedCluster {
         }
     }
 
-    fn endpoint(&self, name: &str) -> Option<&Arc<PreparedEndpoint>> {
-        self.endpoints
+    fn endpoint(&self, name: &str) -> Option<Arc<PreparedEndpoint>> {
+        self.endpoints()
             .iter()
             .find(|endpoint| endpoint.name() == name)
+            .cloned()
     }
 
-    fn select_weighted(&self, eligible: &[usize]) -> usize {
-        let mut current = self
-            .weighted_state
+    #[must_use]
+    pub fn discovery_status(&self) -> Option<DiscoveryRuntimeStatus> {
+        self.spec.discovery.as_ref()?;
+        let now = tokio::time::Instant::now();
+        let mut membership = self
+            .membership
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, now);
+        self.discovery_status_locked(&membership, now)
+    }
+
+    fn discovery_status_locked(
+        &self,
+        membership: &EndpointMembership,
+        now: tokio::time::Instant,
+    ) -> Option<DiscoveryRuntimeStatus> {
+        let plan = self.spec.discovery.as_ref()?;
+        Some(DiscoveryRuntimeStatus {
+            name: plan.name.clone(),
+            resolution: membership.resolution(),
+            generation: membership.generation,
+            endpoint_count: membership.endpoints.len(),
+            eligible_endpoints: membership
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.state.is_eligible(Instant::now()))
+                .count(),
+            in_flight_query: membership.query.is_some(),
+            last_success_unix_ms: membership.last_success_unix_ms,
+            next_expiry_ms: membership.valid_until.values().min().map(|expiry| {
+                u64::try_from(expiry.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
+            }),
+            next_refresh_ms: membership.next_refresh.map(|next| {
+                u64::try_from(next.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
+            }),
+            error_code: membership.error_code(),
+            retired_admission_counters: membership
+                .admission_counters
+                .iter()
+                .filter(|(target, _)| !membership.valid_until.contains_key(target))
+                .count(),
+        })
+    }
+
+    #[must_use]
+    pub fn next_discovery_expiry(&self) -> Option<tokio::time::Instant> {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        membership.valid_until.values().copied().min()
+    }
+
+    fn reconcile_receipt(
+        membership: &EndpointMembership,
+        applied: bool,
+        changed: bool,
+    ) -> DiscoveryReconcileOutcome {
+        DiscoveryReconcileOutcome {
+            applied,
+            changed,
+            generation: membership.generation,
+            endpoint_count: membership.endpoints.len(),
+            next_expiry: membership.valid_until.values().copied().min(),
+            error_code: membership.error_code(),
+            observation_error_code: None,
+        }
+    }
+
+    /// Remove expirations even when the resolver task is delayed. This lock is
+    /// held through endpoint admission; no retained snapshot may mint leases.
+    fn refresh_membership_locked(
+        &self,
+        membership: &mut EndpointMembership,
+        now: tokio::time::Instant,
+    ) {
+        let Some(plan) = &self.spec.discovery else {
+            return;
+        };
+        membership.admission_counters.retain(|_, counter| {
+            counter
+                .upgrade()
+                .is_some_and(|counter| counter.active() > 0)
+        });
+        if !membership.active || membership.retired {
+            return;
+        }
+        let mut desired = BTreeMap::<SocketAddr, (tokio::time::Instant, bool)>::new();
+        for family in &mut membership.families {
+            family.records.retain(|record| {
+                record
+                    .fresh_until
+                    .checked_add(plan.refresh.stale_if_error)
+                    .is_some_and(|expiry| now < expiry)
+                    || now < record.fresh_until
+            });
+            for record in &family.records {
+                let (expiry, stale) = if now < record.fresh_until {
+                    (record.fresh_until, false)
+                } else if family
+                    .transient
+                    .is_some_and(DiscoveryErrorCode::allows_stale)
+                {
+                    let Some(expiry) = record.fresh_until.checked_add(plan.refresh.stale_if_error)
+                    else {
+                        continue;
+                    };
+                    if now >= expiry {
+                        continue;
+                    }
+                    (expiry, true)
+                } else {
+                    continue;
+                };
+                let Ok(target) =
+                    validate_discovery_address(record.address, plan.port, &plan.address_policy)
+                else {
+                    continue;
+                };
+                desired
+                    .entry(target)
+                    .and_modify(|current| {
+                        current.0 = current.0.max(expiry);
+                        current.1 &= stale;
+                    })
+                    .or_insert((expiry, stale));
+            }
+        }
+        let mut previous = membership
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                endpoint
+                    .dial_target()
+                    .map(|target| (target, Arc::clone(endpoint)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (target, endpoint) in &previous {
+            if endpoint.state.admission.active() > 0 {
+                membership
+                    .admission_counters
+                    .insert(*target, Arc::downgrade(&endpoint.state.admission));
+            }
+        }
+        let cap = usize::from(plan.limits.max_endpoints).saturating_add(
+            usize::try_from(self.runtime.admission.active())
+                .unwrap_or(usize::MAX)
+                .max(self.spec.limits.max_in_flight as usize),
+        );
+        let new_counters = desired
+            .keys()
+            .filter(|target| {
+                !membership.admission_counters.contains_key(target)
+                    && !previous.contains_key(target)
+            })
+            .count();
+        if desired.len() > usize::from(plan.limits.max_endpoints)
+            || membership
+                .admission_counters
+                .len()
+                .saturating_add(new_counters)
+                > cap
+        {
+            desired.clear();
+            membership.families = [
+                FamilyState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                ),
+                FamilyState::error(
+                    DiscoveryResolutionState::LimitExceeded,
+                    DiscoveryErrorCode::LimitExceeded,
+                ),
+            ];
+        }
+        let changed = desired.len() != previous.len()
+            || desired.keys().any(|target| !previous.contains_key(target));
+        let mut endpoints = Vec::with_capacity(desired.len());
+        for target in desired.keys() {
+            if let Some(endpoint) = previous.remove(target) {
+                endpoints.push(endpoint);
+                continue;
+            }
+            let Ok(previous_incarnation) = self.runtime.endpoint_incarnations.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |incarnation| incarnation.checked_add(1),
+            ) else {
+                desired.clear();
+                endpoints.clear();
+                membership.families = [
+                    FamilyState::error(
+                        DiscoveryResolutionState::LimitExceeded,
+                        DiscoveryErrorCode::LimitExceeded,
+                    ),
+                    FamilyState::error(
+                        DiscoveryResolutionState::LimitExceeded,
+                        DiscoveryErrorCode::LimitExceeded,
+                    ),
+                ];
+                break;
+            };
+            let admission = membership
+                .admission_counters
+                .get(target)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(AdmissionCounter::default()));
+            let state = Arc::new(EndpointRuntimeState::new_at_with_admission(
+                Instant::now(),
+                admission,
+            ));
+            let mut identity = ContentDigestBuilder::new("oxidase/discovery-endpoint/v1");
+            identity
+                .field_bytes("cluster", self.spec.id.as_str())
+                .field_bytes("target", &plan.name)
+                .field_bytes("address", target.to_string());
+            endpoints.push(Arc::new(PreparedEndpoint {
+                spec: ClusterEndpointSpec {
+                    name: format!("discovered-{}", identity.finish().to_hex()),
+                    url: plan.origin.clone(),
+                    weight: 1,
+                    source: plan.source.clone(),
+                    name_source: plan.source.clone(),
+                    url_source: plan
+                        .spans
+                        .get("origin")
+                        .cloned()
+                        .unwrap_or_else(|| plan.source.clone()),
+                    weight_source: plan.source.clone(),
+                },
+                state,
+                dynamic: Some(DynamicEndpointIdentity {
+                    target: *target,
+                    incarnation: previous_incarnation + 1,
+                    logical_target: plan.name.clone(),
+                    owner: Arc::clone(&membership.owner),
+                }),
+            }));
+        }
+        if changed || endpoints.len() != membership.endpoints.len() {
+            membership.endpoints = endpoints.into();
+            membership.weighted_state = vec![0; membership.endpoints.len()];
+            membership.generation = membership.generation.saturating_add(1);
+        }
+        membership.valid_until = desired
+            .iter()
+            .map(|(target, (expiry, _))| (*target, *expiry))
+            .collect();
+        membership.stale_targets = desired
+            .iter()
+            .filter_map(|(target, (_, stale))| stale.then_some(*target))
+            .collect();
+    }
+
+    fn select_weighted(membership: &mut EndpointMembership, eligible: &[usize]) -> usize {
+        let current = &mut membership.weighted_state;
         for (index, value) in current.iter_mut().enumerate() {
             if !eligible.contains(&index) {
                 *value = 0;
             }
         }
         let total = eligible.iter().fold(0_i64, |total, index| {
-            total + i64::from(self.endpoints[*index].weight())
+            total + i64::from(membership.endpoints[*index].weight())
         });
         let mut selected = eligible[0];
         for index in eligible {
-            current[*index] += i64::from(self.endpoints[*index].weight());
+            current[*index] += i64::from(membership.endpoints[*index].weight());
             if current[*index] > current[selected] {
                 selected = *index;
             }
@@ -854,8 +1800,13 @@ impl PreparedCluster {
         selected
     }
 
-    fn eligible_indices(&self, excluded: &BTreeSet<String>, now: Instant) -> Vec<usize> {
-        self.endpoints
+    fn eligible_indices(
+        membership: &EndpointMembership,
+        excluded: &BTreeSet<String>,
+        now: Instant,
+    ) -> Vec<usize> {
+        membership
+            .endpoints
             .iter()
             .enumerate()
             .filter(|(_, endpoint)| {
@@ -865,24 +1816,60 @@ impl PreparedCluster {
             .collect()
     }
 
+    #[cfg(test)]
     fn try_acquire_endpoint(&self, excluded: &BTreeSet<String>, now: Instant) -> EndpointAcquire {
-        let eligible = self.eligible_indices(excluded, now);
+        let Ok((owner, _)) = self.admission_owner(None) else {
+            return EndpointAcquire::Unavailable;
+        };
+        self.try_acquire_endpoint_owned(excluded, now, owner.as_ref())
+    }
+
+    fn try_acquire_endpoint_owned(
+        &self,
+        excluded: &BTreeSet<String>,
+        now: Instant,
+        owner: Option<&Arc<()>>,
+    ) -> EndpointAcquire {
+        let mut membership = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_membership_locked(&mut membership, tokio::time::Instant::now());
+        if self.spec.discovery.is_some()
+            && (!membership.active
+                || membership.retired
+                || owner.is_none_or(|owner| !Arc::ptr_eq(owner, &membership.owner)))
+        {
+            return EndpointAcquire::Unavailable;
+        }
+        let eligible = Self::eligible_indices(&membership, excluded, now);
         if eligible.is_empty() {
             return EndpointAcquire::Unavailable;
         }
         match self.spec.load_balance {
-            LoadBalancePolicy::RoundRobin => self.try_acquire_round_robin(&eligible),
-            LoadBalancePolicy::WeightedRoundRobin => self.try_acquire_weighted(&eligible),
-            LoadBalancePolicy::LeastRequests => self.try_acquire_least_requests(&eligible),
+            LoadBalancePolicy::RoundRobin => self.try_acquire_round_robin(&membership, &eligible),
+            LoadBalancePolicy::WeightedRoundRobin => {
+                self.try_acquire_weighted(&mut membership, &eligible)
+            }
+            LoadBalancePolicy::LeastRequests => {
+                self.try_acquire_least_requests(&membership, &eligible)
+            }
         }
     }
 
-    fn try_endpoint_permit(&self, index: usize) -> Option<AdmissionPermit> {
-        let permit = self.endpoints[index].state.admission.try_acquire(
+    fn try_endpoint_permit(
+        &self,
+        membership: &EndpointMembership,
+        index: usize,
+    ) -> Option<AdmissionPermit> {
+        let permit = membership.endpoints[index].state.admission.try_acquire(
             u64::from(self.spec.limits.max_in_flight_per_endpoint),
             Some(Arc::clone(&self.runtime.endpoint_released)),
         )?;
-        if self.endpoints[index].state.is_eligible(Instant::now()) {
+        if membership.endpoints[index]
+            .state
+            .is_eligible(Instant::now())
+        {
             Some(permit)
         } else {
             drop(permit);
@@ -890,30 +1877,43 @@ impl PreparedCluster {
         }
     }
 
-    fn acquired_endpoint(&self, index: usize, permit: AdmissionPermit) -> EndpointAcquire {
-        self.endpoints[index].state.selected();
-        EndpointAcquire::Acquired(Arc::clone(&self.endpoints[index]), permit)
+    fn acquired_endpoint(
+        membership: &EndpointMembership,
+        index: usize,
+        permit: AdmissionPermit,
+    ) -> EndpointAcquire {
+        membership.endpoints[index].state.selected();
+        EndpointAcquire::Acquired(
+            Arc::clone(&membership.endpoints[index]),
+            permit,
+            membership.generation,
+        )
     }
 
-    fn try_acquire_round_robin(&self, eligible: &[usize]) -> EndpointAcquire {
+    fn try_acquire_round_robin(
+        &self,
+        membership: &EndpointMembership,
+        eligible: &[usize],
+    ) -> EndpointAcquire {
         // Reserve a unique starting slot before probing. Concurrent requests do
         // not all observe the same cursor even when endpoint capacity is > 1.
         let sequence = self.round_robin_sequence.fetch_add(1, Ordering::Relaxed);
         let start = sequence as usize % eligible.len();
         for offset in 0..eligible.len() {
             let index = eligible[(start + offset) % eligible.len()];
-            if let Some(permit) = self.try_endpoint_permit(index) {
-                return self.acquired_endpoint(index, permit);
+            if let Some(permit) = self.try_endpoint_permit(membership, index) {
+                return Self::acquired_endpoint(membership, index, permit);
             }
         }
         EndpointAcquire::Saturated
     }
 
-    fn try_acquire_weighted(&self, eligible: &[usize]) -> EndpointAcquire {
-        let mut current = self
-            .weighted_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn try_acquire_weighted(
+        &self,
+        membership: &mut EndpointMembership,
+        eligible: &[usize],
+    ) -> EndpointAcquire {
+        let current = &mut membership.weighted_state;
         for (index, value) in current.iter_mut().enumerate() {
             if !eligible.contains(&index) {
                 *value = 0;
@@ -921,52 +1921,67 @@ impl PreparedCluster {
         }
         let mut candidates = eligible.to_vec();
         candidates.sort_by(|left, right| {
-            let left_score = current[*left] + i64::from(self.endpoints[*left].weight());
-            let right_score = current[*right] + i64::from(self.endpoints[*right].weight());
+            let left_score = current[*left] + i64::from(membership.endpoints[*left].weight());
+            let right_score = current[*right] + i64::from(membership.endpoints[*right].weight());
             right_score.cmp(&left_score).then_with(|| left.cmp(right))
         });
         for index in candidates {
-            let Some(permit) = self.try_endpoint_permit(index) else {
+            let Some(permit) = self.try_endpoint_permit(membership, index) else {
                 continue;
             };
             let total = eligible.iter().fold(0_i64, |total, endpoint| {
-                total + i64::from(self.endpoints[*endpoint].weight())
+                total + i64::from(membership.endpoints[*endpoint].weight())
             });
             for endpoint in eligible {
-                current[*endpoint] += i64::from(self.endpoints[*endpoint].weight());
+                membership.weighted_state[*endpoint] +=
+                    i64::from(membership.endpoints[*endpoint].weight());
             }
-            current[index] -= total;
-            return self.acquired_endpoint(index, permit);
+            membership.weighted_state[index] -= total;
+            return Self::acquired_endpoint(membership, index, permit);
         }
         EndpointAcquire::Saturated
     }
 
-    fn try_acquire_least_requests(&self, eligible: &[usize]) -> EndpointAcquire {
+    fn try_acquire_least_requests(
+        &self,
+        membership: &EndpointMembership,
+        eligible: &[usize],
+    ) -> EndpointAcquire {
         let mut candidates = eligible.to_vec();
         candidates.sort_by(|left, right| {
-            let left_active = self.endpoints[*left].active_requests().saturating_add(1);
-            let right_active = self.endpoints[*right].active_requests().saturating_add(1);
-            let left_score = u128::from(left_active) * u128::from(self.endpoints[*right].weight());
-            let right_score = u128::from(right_active) * u128::from(self.endpoints[*left].weight());
+            let left_active = membership.endpoints[*left]
+                .active_requests()
+                .saturating_add(1);
+            let right_active = membership.endpoints[*right]
+                .active_requests()
+                .saturating_add(1);
+            let left_score =
+                u128::from(left_active) * u128::from(membership.endpoints[*right].weight());
+            let right_score =
+                u128::from(right_active) * u128::from(membership.endpoints[*left].weight());
             left_score.cmp(&right_score).then_with(|| left.cmp(right))
         });
         for index in candidates {
-            if let Some(permit) = self.try_endpoint_permit(index) {
-                return self.acquired_endpoint(index, permit);
+            if let Some(permit) = self.try_endpoint_permit(membership, index) {
+                return Self::acquired_endpoint(membership, index, permit);
             }
         }
         EndpointAcquire::Saturated
     }
 
-    fn select_least_requests(&self, eligible: &[usize]) -> usize {
+    fn select_least_requests(membership: &EndpointMembership, eligible: &[usize]) -> usize {
         let mut selected = eligible[0];
         for index in eligible.iter().copied().skip(1) {
-            let candidate = self.endpoints[index].active_requests().saturating_add(1);
-            let incumbent = self.endpoints[selected].active_requests().saturating_add(1);
+            let candidate = membership.endpoints[index]
+                .active_requests()
+                .saturating_add(1);
+            let incumbent = membership.endpoints[selected]
+                .active_requests()
+                .saturating_add(1);
             let candidate_score =
-                u128::from(candidate) * u128::from(self.endpoints[selected].weight());
+                u128::from(candidate) * u128::from(membership.endpoints[selected].weight());
             let incumbent_score =
-                u128::from(incumbent) * u128::from(self.endpoints[index].weight());
+                u128::from(incumbent) * u128::from(membership.endpoints[index].weight());
             if candidate_score < incumbent_score {
                 selected = index;
             }
@@ -999,6 +2014,85 @@ fn health_policy_compatible(previous: &ClusterHealthSpec, next: &ClusterHealthSp
     active_matches && passive_matches
 }
 
+const fn family_index(family: DnsFamily) -> usize {
+    match family {
+        DnsFamily::A => 0,
+        DnsFamily::Aaaa => 1,
+    }
+}
+
+fn same_admission_owner(left: Option<&Arc<()>>, right: Option<&Arc<()>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        _ => false,
+    }
+}
+
+impl FamilyState {
+    fn empty(outcome: DiscoveryResolutionState) -> Self {
+        Self {
+            outcome: Some(outcome),
+            ..Self::default()
+        }
+    }
+
+    fn error(outcome: DiscoveryResolutionState, code: DiscoveryErrorCode) -> Self {
+        Self {
+            records: Vec::new(),
+            outcome: Some(outcome),
+            transient: Some(code),
+        }
+    }
+}
+
+impl EndpointMembership {
+    fn error_code(&self) -> Option<DiscoveryErrorCode> {
+        self.families.iter().find_map(|family| family.transient)
+    }
+
+    fn resolution(&self) -> DiscoveryResolutionState {
+        if self.retired {
+            return DiscoveryResolutionState::Retired;
+        }
+        if !self.endpoints.is_empty() {
+            if !self.stale_targets.is_empty() {
+                return DiscoveryResolutionState::Stale;
+            }
+            return if self
+                .families
+                .iter()
+                .all(|family| family.outcome == Some(DiscoveryResolutionState::Fresh))
+            {
+                DiscoveryResolutionState::Fresh
+            } else {
+                DiscoveryResolutionState::Partial
+            };
+        }
+        for state in [
+            DiscoveryResolutionState::NameNotFound,
+            DiscoveryResolutionState::PolicyRejected,
+            DiscoveryResolutionState::LimitExceeded,
+            DiscoveryResolutionState::InvalidAnswer,
+            DiscoveryResolutionState::TransientFailure,
+            DiscoveryResolutionState::NoData,
+        ] {
+            if self
+                .families
+                .iter()
+                .any(|family| family.outcome == Some(state))
+            {
+                return state;
+            }
+        }
+        if self.families.iter().any(|family| family.outcome.is_some()) {
+            DiscoveryResolutionState::Expired
+        } else {
+            DiscoveryResolutionState::Unresolved
+        }
+    }
+}
+
 /// Admission failure before request-body consumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterAdmissionError {
@@ -1018,7 +2112,7 @@ impl fmt::Display for ClusterAdmissionError {
 impl std::error::Error for ClusterAdmissionError {}
 
 enum EndpointAcquire {
-    Acquired(Arc<PreparedEndpoint>, AdmissionPermit),
+    Acquired(Arc<PreparedEndpoint>, AdmissionPermit, u64),
     Unavailable,
     Saturated,
 }
@@ -1030,6 +2124,20 @@ pub struct ClusterEndpointReservation {
     endpoint: Arc<PreparedEndpoint>,
     endpoint_permit: AdmissionPermit,
     cluster_counter: Arc<AdmissionCounter>,
+    generation: u64,
+    owner: Option<Arc<()>>,
+}
+
+impl ClusterEndpointReservation {
+    #[must_use]
+    pub fn endpoint(&self) -> &Arc<PreparedEndpoint> {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl fmt::Debug for ClusterEndpointReservation {
@@ -1047,6 +2155,8 @@ pub struct ClusterRequestPermit {
     endpoint: Arc<PreparedEndpoint>,
     _cluster: AdmissionPermit,
     _endpoint: AdmissionPermit,
+    generation: u64,
+    owner: Option<Arc<()>>,
 }
 
 impl fmt::Debug for ClusterRequestPermit {
@@ -1064,16 +2174,30 @@ impl ClusterRequestPermit {
         &self.endpoint
     }
 
+    /// Member generation fixed at this attempt's admission linearization point.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn dial_target(&self) -> Option<SocketAddr> {
+        self.endpoint.dial_target()
+    }
+
     /// Commits an already admitted replacement while preserving the single
     /// Cluster permit. Call only after the old upload/attempt no longer uses
     /// its endpoint. A reservation from another runtime admission owner is
     /// rejected and released without touching this request.
     pub fn retarget_reserved(&mut self, reservation: ClusterEndpointReservation) -> bool {
-        if !Arc::ptr_eq(&self._cluster.counter, &reservation.cluster_counter) {
+        if !Arc::ptr_eq(&self._cluster.counter, &reservation.cluster_counter)
+            || !same_admission_owner(self.owner.as_ref(), reservation.owner.as_ref())
+        {
             return false;
         }
         let old_endpoint = std::mem::replace(&mut self._endpoint, reservation.endpoint_permit);
         self.endpoint = reservation.endpoint;
+        self.generation = reservation.generation;
         drop(old_endpoint);
         true
     }
@@ -1096,6 +2220,8 @@ pub struct ClusterRuntimeStatus {
     pub retry_exhausted: u64,
     pub overload_rejections: u64,
     pub unavailable_rejections: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryRuntimeStatus>,
     pub endpoints: Vec<EndpointStatusSnapshot>,
 }
 
@@ -1123,6 +2249,7 @@ pub struct EndpointRuntimeStatus {
 
 #[derive(Default)]
 struct ClusterRuntimeState {
+    endpoint_incarnations: AtomicU64,
     admission: Arc<AdmissionCounter>,
     retries: Arc<AdmissionCounter>,
     endpoint_released: Arc<Notify>,
@@ -1261,8 +2388,12 @@ mod tests {
         }
     }
 
-    fn cluster(policy: LoadBalancePolicy, endpoints: Vec<ClusterEndpointSpec>) -> ClusterSpec {
+    pub(super) fn cluster(
+        policy: LoadBalancePolicy,
+        endpoints: Vec<ClusterEndpointSpec>,
+    ) -> ClusterSpec {
         ClusterSpec {
+            discovery: None,
             id: ResourceId::new("cluster:test"),
             protocol: ClusterProtocol::Auto,
             tls: None,
@@ -1370,9 +2501,10 @@ mod tests {
         );
         assert_eq!(
             cluster
-                .weighted_state
+                .membership
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .weighted_state
                 .len(),
             2,
             "weighted selection stores one accumulator per endpoint"
@@ -1396,7 +2528,7 @@ mod tests {
                 .name(),
             "b"
         );
-        let endpoint_b = &cluster.endpoints[1];
+        let endpoint_b = &cluster.endpoints()[1];
         let _active = endpoint_b
             .state
             .admission
@@ -1420,23 +2552,23 @@ mod tests {
         let now = Instant::now();
         cluster.record_active_health("a", false, now);
         assert_eq!(
-            cluster.endpoints[0].health_state(now),
+            cluster.endpoints()[0].health_state(now),
             EndpointHealthState::UnknownEligible
         );
         cluster.record_active_health("a", false, now);
         assert_eq!(
-            cluster.endpoints[0].health_state(now),
+            cluster.endpoints()[0].health_state(now),
             EndpointHealthState::Unhealthy
         );
         assert!(cluster.select_endpoint(now).is_none());
         cluster.record_active_health("a", true, now);
         assert_eq!(
-            cluster.endpoints[0].health_state(now),
+            cluster.endpoints()[0].health_state(now),
             EndpointHealthState::Unhealthy
         );
         cluster.record_active_health("a", true, now);
         assert_eq!(
-            cluster.endpoints[0].health_state(now),
+            cluster.endpoints()[0].health_state(now),
             EndpointHealthState::Healthy
         );
         let runtime = &cluster.status(now).endpoints[0].runtime;
@@ -1456,11 +2588,11 @@ mod tests {
         cluster.record_passive_failure("a", now);
         cluster.record_passive_failure("a", now);
         assert_eq!(
-            cluster.endpoints[0].health_state(now),
+            cluster.endpoints()[0].health_state(now),
             EndpointHealthState::PassivelyEjected
         );
         assert_eq!(
-            cluster.endpoints[0].health_state(now + Duration::from_secs(11)),
+            cluster.endpoints()[0].health_state(now + Duration::from_secs(11)),
             EndpointHealthState::UnknownEligible
         );
 
@@ -1470,7 +2602,7 @@ mod tests {
         cluster.record_active_health("a", true, later);
         cluster.record_active_health("a", true, later);
         assert_eq!(
-            cluster.endpoints[0].health_state(later),
+            cluster.endpoints()[0].health_state(later),
             EndpointHealthState::Healthy
         );
         let runtime = &cluster.status(later).endpoints[0].runtime;
@@ -1585,7 +2717,7 @@ mod tests {
         ));
         drop(first);
         assert_eq!(cluster.active_requests(), 0);
-        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 0);
         let second = cluster.acquire().await.expect("drop releases both permits");
         drop(second);
     }
@@ -1601,7 +2733,7 @@ mod tests {
         );
         spec.limits.max_in_flight_per_endpoint = 1;
         let cluster = PreparedCluster::prepare(spec, None).0;
-        let saturated = cluster.endpoints[0]
+        let saturated = cluster.endpoints()[0]
             .state
             .admission
             .try_acquire(1, None)
@@ -1612,8 +2744,8 @@ mod tests {
             .await
             .expect("capacity on the other endpoint is used");
         assert_eq!(admitted.endpoint().name(), "b");
-        assert_eq!(cluster.endpoints[0].state.selections(), 0);
-        assert_eq!(cluster.endpoints[1].state.selections(), 1);
+        assert_eq!(cluster.endpoints()[0].state.selections(), 0);
+        assert_eq!(cluster.endpoints()[1].state.selections(), 1);
         drop(admitted);
         drop(saturated);
     }
@@ -1662,11 +2794,11 @@ mod tests {
         assert!(cluster.retarget_excluding(&mut current, &attempted).await);
         assert_eq!(current.endpoint().name(), "b");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 0);
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         drop(current);
         assert_eq!(cluster.active_requests(), 0);
-        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 0);
     }
 
     #[tokio::test]
@@ -1681,7 +2813,7 @@ mod tests {
         spec.limits.max_in_flight = 1;
         spec.limits.max_in_flight_per_endpoint = 1;
         let cluster = PreparedCluster::prepare(spec, None).0;
-        let saturated = cluster.endpoints[1]
+        let saturated = cluster.endpoints()[1]
             .state
             .admission
             .try_acquire(1, None)
@@ -1693,8 +2825,8 @@ mod tests {
         assert!(!cluster.retarget_excluding(&mut current, &attempted).await);
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         drop(saturated);
         drop(current);
     }
@@ -1712,7 +2844,7 @@ mod tests {
         spec.limits.max_in_flight_per_endpoint = 1;
         spec.limits.queue_timeout = Duration::from_secs(10);
         let cluster = PreparedCluster::prepare(spec, None).0;
-        let saturated = cluster.endpoints[1]
+        let saturated = cluster.endpoints()[1]
             .state
             .admission
             .try_acquire(1, None)
@@ -1728,7 +2860,7 @@ mod tests {
         assert!(cancelled.is_err());
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
         drop(saturated);
         drop(current);
     }
@@ -1761,23 +2893,23 @@ mod tests {
             "a",
             "reservation cannot mutate the original attempt"
         );
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         assert!(current.retarget_reserved(reservation));
         assert_eq!(current.endpoint().name(), "b");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 0);
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         drop(current);
         assert_eq!(cluster.active_requests(), 0);
-        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 0);
     }
 
     #[tokio::test]
     async fn unavailable_or_saturated_reservation_leaves_the_current_attempt_untouched() {
         let cluster = retry_reservation_cluster(Duration::ZERO);
         let current = cluster.acquire().await.expect("current admitted");
-        let saturated = cluster.endpoints[1]
+        let saturated = cluster.endpoints()[1]
             .state
             .admission
             .try_acquire(1, None)
@@ -1790,7 +2922,7 @@ mod tests {
         );
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
         drop(saturated);
         assert!(
             cluster
@@ -1802,7 +2934,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(current.endpoint().name(), "a");
-        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 0);
         drop(current);
     }
 
@@ -1814,11 +2946,11 @@ mod tests {
             .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
             .await
             .expect("replacement");
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         drop(reservation);
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
-        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 0);
         assert!(
             cluster
                 .reserve_retry_endpoint(&BTreeSet::new(), current.endpoint().name())
@@ -1826,7 +2958,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            cluster.endpoints[1].active_requests(),
+            cluster.endpoints()[1].active_requests(),
             0,
             "temporary successful reservation also releases on drop"
         );
@@ -1842,13 +2974,13 @@ mod tests {
             .reserve_retry_endpoint(&BTreeSet::new(), "a")
             .await
             .expect("foreign reservation");
-        assert_eq!(foreign.endpoints[1].active_requests(), 1);
+        assert_eq!(foreign.endpoints()[1].active_requests(), 1);
         assert!(!current.retarget_reserved(reservation));
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
         assert_eq!(foreign.active_requests(), 0);
-        assert_eq!(foreign.endpoints[1].active_requests(), 0);
+        assert_eq!(foreign.endpoints()[1].active_requests(), 0);
         drop(current);
     }
 
@@ -1856,7 +2988,7 @@ mod tests {
     async fn cancelled_retry_reservation_wait_keeps_original_permit_owned() {
         let cluster = retry_reservation_cluster(Duration::from_secs(10));
         let current = cluster.acquire().await.expect("current admitted");
-        let saturated = cluster.endpoints[1]
+        let saturated = cluster.endpoints()[1]
             .state
             .admission
             .try_acquire(1, None)
@@ -1869,8 +3001,8 @@ mod tests {
         assert!(cancelled.is_err());
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
-        assert_eq!(cluster.endpoints[1].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 1);
         drop(saturated);
         assert!(
             cluster
@@ -1883,7 +3015,7 @@ mod tests {
         assert_eq!(cluster.active_requests(), 0);
         assert!(
             cluster
-                .endpoints
+                .endpoints()
                 .iter()
                 .all(|endpoint| endpoint.active_requests() == 0)
         );
@@ -1911,7 +3043,7 @@ mod tests {
             .expect("released endpoint admits the waiter");
         drop(second);
         assert_eq!(cluster.active_requests(), 0);
-        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 0);
     }
 
     #[tokio::test]
@@ -1939,8 +3071,8 @@ mod tests {
         );
         assert_eq!(current.endpoint().name(), "a");
         assert_eq!(cluster.active_requests(), 1);
-        assert_eq!(cluster.endpoints[0].active_requests(), 1);
-        assert_eq!(cluster.endpoints[1].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 1);
+        assert_eq!(cluster.endpoints()[1].active_requests(), 0);
         drop(current);
         assert_eq!(cluster.active_requests(), 0);
     }
@@ -1963,7 +3095,7 @@ mod tests {
         let _ = waiting.await;
         drop(first);
         assert_eq!(cluster.active_requests(), 0);
-        assert_eq!(cluster.endpoints[0].active_requests(), 0);
+        assert_eq!(cluster.endpoints()[0].active_requests(), 0);
     }
 
     #[test]
@@ -2026,8 +3158,8 @@ mod tests {
         let (second, reused) = PreparedCluster::prepare(policy_update, Some(&first));
         assert_eq!(reused, 2);
         assert!(Arc::ptr_eq(
-            first.endpoints[0].runtime_state(),
-            second.endpoints[0].runtime_state()
+            first.endpoints()[0].runtime_state(),
+            second.endpoints()[0].runtime_state()
         ));
         assert_eq!(second.status(Instant::now()).retry_attempts, 1);
 
@@ -2041,12 +3173,12 @@ mod tests {
         let (third, reused) = PreparedCluster::prepare(url_update, Some(&second));
         assert_eq!(reused, 1);
         assert!(!Arc::ptr_eq(
-            second.endpoints[0].runtime_state(),
-            third.endpoints[0].runtime_state()
+            second.endpoints()[0].runtime_state(),
+            third.endpoints()[0].runtime_state()
         ));
         assert!(Arc::ptr_eq(
-            second.endpoints[1].runtime_state(),
-            third.endpoints[1].runtime_state()
+            second.endpoints()[1].runtime_state(),
+            third.endpoints()[1].runtime_state()
         ));
 
         let mut protocol_update = cluster(
@@ -2060,8 +3192,8 @@ mod tests {
         let (fourth, reused) = PreparedCluster::prepare(protocol_update, Some(&third));
         assert_eq!(reused, 0);
         assert!(!Arc::ptr_eq(
-            third.endpoints[1].runtime_state(),
-            fourth.endpoints[1].runtime_state()
+            third.endpoints()[1].runtime_state(),
+            fourth.endpoints()[1].runtime_state()
         ));
     }
 
@@ -2090,12 +3222,12 @@ mod tests {
         let (second, reused) = PreparedCluster::prepare(next_spec, Some(&first));
         assert_eq!(reused, 0, "health generation must not be shared");
         assert!(!Arc::ptr_eq(
-            first.endpoints[0].runtime_state(),
-            second.endpoints[0].runtime_state()
+            first.endpoints()[0].runtime_state(),
+            second.endpoints()[0].runtime_state()
         ));
         assert!(Arc::ptr_eq(
-            &first.endpoints[0].runtime_state().admission,
-            &second.endpoints[0].runtime_state().admission
+            &first.endpoints()[0].runtime_state().admission,
+            &second.endpoints()[0].runtime_state().admission
         ));
 
         let old_request = first.acquire().await.expect("old request is admitted");
@@ -2272,5 +3404,705 @@ mod tests {
             retry_elapsed.as_millis(),
             health_elapsed.as_millis(),
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_membership_tests {
+    use super::*;
+    use oxidase_config::{
+        DnsAddressPolicy, DnsDiscoveryLimits, DnsDiscoverySpec, DnsRecordType, DnsRefreshSpec,
+        DnsResolverSource, DnsResolverSpec,
+    };
+    use oxidase_core::SourceSpan;
+
+    fn dynamic_spec() -> ClusterSpec {
+        let mut spec = super::tests::cluster(LoadBalancePolicy::RoundRobin, Vec::new());
+        spec.discovery = Some(DnsDiscoverySpec {
+            name: "service.example.test.".to_owned(),
+            record: DnsRecordType::AAndAaaa,
+            port: 8080,
+            origin: "http://service.example.test/base"
+                .parse()
+                .expect("logical origin"),
+            resolver: DnsResolverSpec {
+                source: DnsResolverSource::System,
+                query_timeout: Duration::from_secs(2),
+            },
+            refresh: DnsRefreshSpec {
+                min_interval: Duration::from_secs(1),
+                max_interval: Duration::from_secs(60),
+                jitter_percent: 10,
+                stale_if_error: Duration::from_secs(10),
+            },
+            limits: DnsDiscoveryLimits {
+                max_endpoints: 8,
+                max_targets: 8,
+            },
+            address_policy: DnsAddressPolicy::default(),
+            source: SourceSpan::synthetic("discovery.dns"),
+            spans: BTreeMap::new(),
+        });
+        spec
+    }
+
+    fn dynamic() -> PreparedCluster {
+        let cluster = PreparedCluster::prepare(dynamic_spec(), None).0;
+        assert!(cluster.activate_discovery_policy());
+        cluster
+    }
+
+    fn positive(addresses: &[&str], ttl: Duration) -> DnsObservation {
+        let fresh_until = tokio::time::Instant::now() + ttl;
+        DnsObservation::Positive {
+            addresses: addresses
+                .iter()
+                .map(|address| DnsAddressRecord {
+                    address: address.parse().expect("fixture IP"),
+                    fresh_until,
+                })
+                .collect(),
+        }
+    }
+
+    fn observe(
+        cluster: &PreparedCluster,
+        family: DnsFamily,
+        observation: DnsObservation,
+    ) -> DiscoveryReconcileOutcome {
+        let query = cluster.begin_discovery_query().expect("single query slot");
+        cluster.reconcile_dns(&query, family, observation, tokio::time::Instant::now())
+    }
+
+    #[tokio::test]
+    async fn prepare_is_inactive_and_one_query_round_is_raii_owned() {
+        let cluster = PreparedCluster::prepare(dynamic_spec(), None).0;
+        assert!(cluster.begin_discovery_query().is_none());
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert_eq!(cluster.active_requests(), 0);
+        assert!(cluster.activate_discovery_policy());
+        assert!(!cluster.activate_discovery_policy());
+        let query = cluster
+            .begin_discovery_query()
+            .expect("committed owner query");
+        assert!(cluster.begin_discovery_query().is_none());
+        assert!(cluster.discovery_status().expect("status").in_flight_query);
+        drop(query);
+        assert!(!cluster.discovery_status().expect("status").in_flight_query);
+        assert!(cluster.begin_discovery_query().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_fixes_address_origin_and_generation_and_expiry_cannot_wait_for_supervisor() {
+        let cluster = dynamic();
+        let observed = observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(2)),
+        );
+        let lease = cluster.acquire().await.expect("fresh endpoint");
+        assert_eq!(
+            lease.dial_target(),
+            Some("198.51.100.1:8080".parse().expect("target"))
+        );
+        assert_eq!(
+            lease.endpoint().url().as_str(),
+            "http://service.example.test/base"
+        );
+        assert_eq!(lease.generation(), observed.generation);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert!(cluster.endpoints().is_empty());
+        assert_eq!(
+            lease.dial_target(),
+            Some("198.51.100.1:8080".parse().expect("fixed lease"))
+        );
+        assert_eq!(cluster.active_requests(), 1);
+        drop(lease);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn record_reorder_duplicates_and_ttl_refresh_reuse_generation_state_and_incarnation() {
+        let cluster = dynamic();
+        let first = observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.2", "198.51.100.1"], Duration::from_secs(5)),
+        );
+        let endpoints = cluster.endpoints();
+        cluster.record_passive_success_for(&endpoints[0]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let refreshed = observe(
+            &cluster,
+            DnsFamily::A,
+            positive(
+                &["198.51.100.1", "198.51.100.1", "198.51.100.2"],
+                Duration::from_secs(10),
+            ),
+        );
+        let current = cluster.endpoints();
+        assert_eq!(first.generation, refreshed.generation);
+        assert!(!refreshed.changed);
+        assert!(Arc::ptr_eq(&endpoints, &current));
+        assert!(Arc::ptr_eq(
+            endpoints[0].runtime_state(),
+            current[0].runtime_state()
+        ));
+        assert_eq!(endpoints[0].incarnation(), current[0].incarnation());
+        assert_eq!(
+            current[0].runtime_state().status(Instant::now()).successes,
+            1
+        );
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            cluster.endpoints().len(),
+            2,
+            "old expiry does not invalidate a refreshed record"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn family_nodata_is_independent_and_nxdomain_fences_the_whole_round() {
+        let cluster = dynamic();
+        let query = cluster.begin_discovery_query().expect("query");
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+            tokio::time::Instant::now(),
+        );
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::Aaaa,
+            positive(&["2001:db8::1"], Duration::from_secs(30)),
+            tokio::time::Instant::now(),
+        );
+        drop(query);
+        assert_eq!(cluster.endpoints().len(), 2);
+        observe(&cluster, DnsFamily::A, DnsObservation::NoData);
+        assert_eq!(cluster.endpoints().len(), 1);
+        assert!(
+            cluster.endpoints()[0]
+                .dial_target()
+                .expect("AAAA target")
+                .is_ipv6()
+        );
+        let query = cluster.begin_discovery_query().expect("next query");
+        cluster.reconcile_dns(
+            &query,
+            DnsFamily::A,
+            DnsObservation::NameNotFound,
+            tokio::time::Instant::now(),
+        );
+        let late = cluster.reconcile_dns(
+            &query,
+            DnsFamily::Aaaa,
+            positive(&["2001:db8::2"], Duration::from_secs(30)),
+            tokio::time::Instant::now(),
+        );
+        assert!(!late.applied);
+        assert!(cluster.endpoints().is_empty());
+        assert_eq!(
+            cluster.discovery_status().expect("status").resolution,
+            DiscoveryResolutionState::NameNotFound
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_deadline_is_fixed_and_zero_ttl_cannot_seed_stale_reuse() {
+        let cluster = dynamic();
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(2)),
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(cluster.endpoints().is_empty());
+        for code in [
+            DiscoveryErrorCode::Timeout,
+            DiscoveryErrorCode::Refused,
+            DiscoveryErrorCode::Refused,
+            DiscoveryErrorCode::ServerFailure,
+            DiscoveryErrorCode::Refused,
+        ] {
+            observe(
+                &cluster,
+                DnsFamily::A,
+                DnsObservation::TransientFailure { code },
+            );
+            assert_eq!(cluster.endpoints().len(), 1);
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        assert!(
+            cluster.endpoints().is_empty(),
+            "repeated failures never renew expiry+grace"
+        );
+        observe(
+            &cluster,
+            DnsFamily::A,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::ServerFailure,
+            },
+        );
+        assert!(cluster.endpoints().is_empty());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.2"], Duration::ZERO),
+        );
+        observe(
+            &cluster,
+            DnsFamily::A,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::Network,
+            },
+        );
+        assert!(
+            cluster.endpoints().is_empty(),
+            "TTL0 never supplies future fresh/stale leases"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_filters_each_address_and_bad_answers_do_not_enable_stale() {
+        let cluster = dynamic();
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(
+                &["127.0.0.1", "198.51.100.1", "169.254.0.1"],
+                Duration::from_secs(30),
+            ),
+        );
+        assert_eq!(cluster.endpoints().len(), 1);
+        assert_eq!(
+            cluster.acquire().await.expect("safe address").dial_target(),
+            Some("198.51.100.1:8080".parse().expect("target"))
+        );
+        observe(&cluster, DnsFamily::A, DnsObservation::InvalidAnswer);
+        assert!(cluster.endpoints().is_empty());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::Timeout,
+            },
+        );
+        assert!(cluster.endpoints().is_empty());
+        observe(
+            &cluster,
+            DnsFamily::Aaaa,
+            positive(&["::ffff:127.0.0.1"], Duration::from_secs(30)),
+        );
+        assert_eq!(
+            cluster.discovery_status().expect("status").error_code,
+            Some(DiscoveryErrorCode::Timeout)
+        );
+        assert!(cluster.endpoints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_readd_has_fresh_incarnation_and_health_but_reuses_nonzero_physical_admission() {
+        let mut spec = dynamic_spec();
+        spec.limits.max_in_flight = 2;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let lease = cluster.acquire().await.expect("old lease");
+        let old = Arc::clone(lease.endpoint());
+        observe(&cluster, DnsFamily::A, DnsObservation::NoData);
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let new = Arc::clone(&cluster.endpoints()[0]);
+        assert!(new.incarnation() > old.incarnation());
+        assert!(!Arc::ptr_eq(old.runtime_state(), new.runtime_state()));
+        assert!(Arc::ptr_eq(&old.state.admission, &new.state.admission));
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Overloaded)
+        ));
+        for _ in 0..3 {
+            cluster.record_active_health_for(&old, false, Instant::now());
+            cluster.record_passive_failure_for(&old, Instant::now());
+        }
+        cluster.record_passive_failure(new.name(), Instant::now());
+        assert_eq!(
+            new.health_state(Instant::now()),
+            EndpointHealthState::UnknownEligible
+        );
+        assert_eq!(
+            new.state.status(Instant::now()).failures,
+            0,
+            "name callbacks are static-only"
+        );
+        drop(lease);
+        assert!(cluster.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn retirement_and_resume_fence_old_queries_watchers_and_new_attempts() {
+        let cluster = dynamic();
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let old_lease = cluster.acquire().await.expect("issued lease");
+        let old_query = cluster.begin_discovery_query().expect("old query");
+        let old_retirement = cluster.discovery_retirement();
+        cluster.retire_discovery_policy();
+        assert!(*old_retirement.borrow());
+        assert!(matches!(
+            cluster.acquire().await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert_eq!(
+            cluster.active_requests(),
+            1,
+            "issued attempt survives retirement"
+        );
+        assert!(cluster.activate_discovery_policy());
+        assert!(!*cluster.discovery_retirement().borrow());
+        assert!(
+            *old_retirement.borrow(),
+            "old watch cannot resume with new session"
+        );
+        assert!(
+            !cluster
+                .reconcile_dns(
+                    &old_query,
+                    DnsFamily::A,
+                    positive(&["198.51.100.2"], Duration::from_secs(30)),
+                    tokio::time::Instant::now()
+                )
+                .applied
+        );
+        assert!(cluster.endpoints().is_empty());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        assert!(cluster.endpoints()[0].incarnation() > old_lease.endpoint().incarnation());
+        drop(old_query);
+        drop(old_lease);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_admission_rechecks_membership_after_removal_and_wakes_on_replacement() {
+        let mut spec = dynamic_spec();
+        spec.limits.max_in_flight = 2;
+        spec.limits.max_in_flight_per_endpoint = 1;
+        spec.limits.queue_timeout = Duration::from_secs(5);
+        let cluster = Arc::new(PreparedCluster::prepare(spec, None).0);
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let old = cluster.acquire().await.expect("saturated A");
+        let waiter_cluster = Arc::clone(&cluster);
+        let waiter = tokio::spawn(async move { waiter_cluster.acquire().await });
+        while cluster.active_requests() < 2 {
+            tokio::task::yield_now().await;
+        }
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.2"], Duration::from_secs(30)),
+        );
+        let new = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("membership change wakes waiter")
+            .expect("waiter task")
+            .expect("B admission");
+        assert_eq!(
+            new.dial_target(),
+            Some("198.51.100.2:8080".parse().expect("B"))
+        );
+        assert_eq!(
+            old.dial_target(),
+            Some("198.51.100.1:8080".parse().expect("A still fixed"))
+        );
+        drop(new);
+        drop(old);
+        assert_eq!(cluster.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_endpoint_snapshot_cannot_mint_a_lease_after_removal_linearization() {
+        let cluster = Arc::new(dynamic());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let removed = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let cluster_ref = &cluster;
+            let ready_ref = &ready;
+            let removed_ref = &removed;
+            let requester = scope.spawn(move || {
+                let old_view = cluster_ref.endpoints();
+                ready_ref.wait();
+                removed_ref.wait();
+                assert_eq!(old_view.len(), 1, "old inspection view remains immutable");
+                assert!(matches!(
+                    cluster_ref.try_acquire_endpoint(&BTreeSet::new(), Instant::now()),
+                    EndpointAcquire::Unavailable
+                ));
+            });
+            ready.wait();
+            observe(&cluster, DnsFamily::A, DnsObservation::NoData);
+            removed.wait();
+            requester.join().expect("barrier requester");
+        });
+    }
+
+    #[tokio::test]
+    async fn physical_counter_tombstones_are_bounded_and_churn_cannot_revive_old_health() {
+        let mut spec = dynamic_spec();
+        spec.discovery.as_mut().expect("DNS").limits.max_endpoints = 1;
+        spec.limits.max_in_flight = 2;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        let first = cluster.acquire().await.expect("first active");
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.2"], Duration::from_secs(30)),
+        );
+        let second = cluster.acquire().await.expect("second active");
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.3"], Duration::from_secs(30)),
+        );
+        let reservation = cluster
+            .reserve_retry_endpoint_for(&BTreeSet::new(), first.endpoint())
+            .await
+            .expect("replacement reservation without another Cluster slot");
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.4"], Duration::from_secs(30)),
+        );
+        let status = cluster.discovery_status().expect("bounded status");
+        assert_eq!(status.error_code, Some(DiscoveryErrorCode::LimitExceeded));
+        assert!(cluster.endpoints().is_empty());
+        assert!(status.retired_admission_counters <= 3);
+        drop(reservation);
+        drop(first);
+        drop(second);
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("released status")
+                .retired_admission_counters,
+            0
+        );
+        for index in 0..1000 {
+            let address = format!("198.51.{}.{}", (index / 250) + 1, index % 250 + 1);
+            observe(
+                &cluster,
+                DnsFamily::A,
+                positive(&[&address], Duration::from_secs(30)),
+            );
+            let lease = cluster.acquire().await.expect("bounded churn lease");
+            drop(lease);
+        }
+        assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("final bounded status")
+                .retired_admission_counters,
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_other_family_does_not_consume_membership_quota_or_discard_fresh_peer() {
+        let mut spec = dynamic_spec();
+        spec.discovery.as_mut().expect("DNS").limits.max_endpoints = 1;
+        let cluster = PreparedCluster::prepare(spec, None).0;
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::Aaaa,
+            positive(&["2001:db8::1"], Duration::from_secs(1)),
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let receipt = observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(30)),
+        );
+        assert_eq!(
+            receipt.observation_error_code, None,
+            "expired retained AAAA is not eligible membership"
+        );
+        assert_eq!(
+            cluster
+                .acquire()
+                .await
+                .expect("fresh A remains available")
+                .dial_target(),
+            Some("198.51.100.1:8080".parse().expect("A"))
+        );
+        let failed_stale = observe(
+            &cluster,
+            DnsFamily::Aaaa,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::Timeout,
+            },
+        );
+        assert_eq!(
+            failed_stale.observation_error_code,
+            Some(DiscoveryErrorCode::LimitExceeded)
+        );
+        assert_eq!(
+            cluster.endpoints().len(),
+            1,
+            "stale overflow cannot evict the fresh other family"
+        );
+        assert!(cluster.endpoints()[0].dial_target().expect("A").is_ipv4());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ttl0_duplicate_cannot_borrow_a_longer_duplicate_lifetime() {
+        let cluster = dynamic();
+        let now = tokio::time::Instant::now();
+        let address = "198.51.100.1".parse().expect("IP");
+        observe(
+            &cluster,
+            DnsFamily::A,
+            DnsObservation::Positive {
+                addresses: vec![
+                    DnsAddressRecord {
+                        address,
+                        fresh_until: now,
+                    },
+                    DnsAddressRecord {
+                        address,
+                        fresh_until: now + Duration::from_secs(60),
+                    },
+                ],
+            },
+        );
+        assert!(cluster.endpoints().is_empty());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::Timeout,
+            },
+        );
+        assert!(cluster.endpoints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn received_family_error_does_not_inherit_another_family_failure() {
+        let cluster = dynamic();
+        observe(
+            &cluster,
+            DnsFamily::Aaaa,
+            DnsObservation::TransientFailure {
+                code: DiscoveryErrorCode::Network,
+            },
+        );
+        let receipt = observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        assert_eq!(receipt.observation_error_code, None);
+        assert_eq!(receipt.error_code, Some(DiscoveryErrorCode::Network));
+        assert_eq!(receipt.endpoint_count, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_cluster_queue_and_old_retry_cannot_join_resumed_session() {
+        let mut spec = dynamic_spec();
+        spec.limits.max_in_flight = 1;
+        spec.limits.queue_timeout = Duration::from_secs(30);
+        let cluster = Arc::new(PreparedCluster::prepare(spec, None).0);
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        let mut old = cluster.acquire().await.expect("old session");
+        let old_endpoint = Arc::clone(old.endpoint());
+        let waiter_cluster = Arc::clone(&cluster);
+        let (started, received) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started.send(()).expect("waiter observer");
+            waiter_cluster.acquire().await
+        });
+        received.await.expect("waiter started");
+        cluster.retire_discovery_policy();
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.2"], Duration::from_secs(60)),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("retirement does not wait 30s queue timeout")
+            .expect("waiter task");
+        assert!(matches!(result, Err(ClusterAdmissionError::Unavailable)));
+        assert!(matches!(
+            cluster
+                .acquire_excluding_for(&BTreeSet::new(), &old_endpoint)
+                .await,
+            Err(ClusterAdmissionError::Unavailable)
+        ));
+        assert!(
+            cluster
+                .reserve_retry_endpoint_for(&BTreeSet::new(), &old_endpoint)
+                .await
+                .is_none()
+        );
+        assert!(!cluster.retarget_excluding(&mut old, &BTreeSet::new()).await);
+        assert_eq!(
+            old.dial_target(),
+            Some("198.51.100.1:8080".parse().expect("old fixed"))
+        );
+        drop(old);
+        assert_eq!(
+            cluster
+                .acquire()
+                .await
+                .expect("new session admitted")
+                .dial_target(),
+            Some("198.51.100.2:8080".parse().expect("new fixed"))
+        );
+        assert_eq!(cluster.active_requests(), 0);
     }
 }

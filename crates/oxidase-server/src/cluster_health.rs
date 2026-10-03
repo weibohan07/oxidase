@@ -4,8 +4,9 @@
 //! [`ClusterHealthManager::activate_snapshot`] only after publishing a snapshot;
 //! failed candidates therefore cannot leak health-check tasks.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 #[cfg(test)]
@@ -17,6 +18,7 @@ use http::{Method, Request, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Empty};
 use oxidase_config::ActiveHealthSpec;
+use oxidase_core::ResourceId;
 use oxidase_runtime::{PreparedCluster, PreparedEndpoint, RuntimeSnapshot};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -36,19 +38,31 @@ const MAX_CONCURRENT_CLUSTER_PROBES: usize = 32;
 /// tasks; normal shutdown first asks tasks to stop cooperatively.
 pub(crate) struct ClusterHealthManager {
     client: Arc<HealthClient>,
-    shutdown: watch::Sender<bool>,
+    supervisors: BTreeMap<ResourceId, HealthSupervisor>,
     tasks: JoinSet<()>,
     #[cfg(test)]
     counters: Arc<SupervisorTaskCounters>,
 }
 
+struct HealthSupervisor {
+    owner: Weak<PreparedCluster>,
+    cancel: watch::Sender<bool>,
+    task: tokio::task::AbortHandle,
+}
+
+impl HealthSupervisor {
+    fn stop(&self) {
+        let _ = self.cancel.send(true);
+        self.task.abort();
+    }
+}
+
 impl ClusterHealthManager {
     pub(crate) fn new() -> Result<Self, String> {
         let client = Arc::new(HealthClient::new()?);
-        let (shutdown, _) = watch::channel(false);
         Ok(Self {
             client,
-            shutdown,
+            supervisors: BTreeMap::new(),
             tasks: JoinSet::new(),
             #[cfg(test)]
             counters: Arc::new(SupervisorTaskCounters::default()),
@@ -57,39 +71,67 @@ impl ClusterHealthManager {
 
     /// Activates active-health supervisors for one committed snapshot.
     ///
-    /// Unchanged Clusters retain the same `Arc<PreparedCluster>` and its
-    /// activation latch, so publishing the same prepared resource never starts
-    /// a duplicate supervisor.
+    /// Unchanged resources retain exactly one manager-owned supervisor. Removed
+    /// or replaced resources stop immediately even when an old request still
+    /// pins their snapshot; a resource latch cannot prevent explicit resume.
     pub(crate) fn activate_snapshot(&mut self, snapshot: &RuntimeSnapshot) -> usize {
         self.reap_finished();
         self.client.reconcile_snapshot(snapshot);
+        self.supervisors.retain(|id, supervisor| {
+            let keep = snapshot.resources.clusters.get(id).is_some_and(|cluster| {
+                cluster.spec().health.active.is_some()
+                    && supervisor
+                        .owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, cluster))
+                    && !supervisor.task.is_finished()
+            });
+            if !keep {
+                supervisor.stop();
+            }
+            keep
+        });
         let mut activated = 0;
         for cluster in snapshot.resources.clusters.values() {
-            if cluster.spec().health.active.is_none() || !cluster.try_activate_supervisor() {
+            if cluster.spec().health.active.is_none() || self.supervisors.contains_key(cluster.id())
+            {
                 continue;
             }
             activated += 1;
+            let (cancel, receiver) = watch::channel(false);
             let task = run_cluster_supervisor(
                 Arc::downgrade(cluster),
                 Arc::clone(&self.client),
-                self.shutdown.subscribe(),
+                receiver,
                 #[cfg(test)]
                 Arc::clone(&self.counters),
             );
-            self.tasks.spawn(task);
+            let task = self.tasks.spawn(task);
+            self.supervisors.insert(
+                cluster.id().clone(),
+                HealthSupervisor {
+                    owner: Arc::downgrade(cluster),
+                    cancel,
+                    task,
+                },
+            );
         }
         activated
     }
 
     /// Stops all health work and waits for task termination.
     pub(crate) async fn shutdown(&mut self) {
-        let _ = self.shutdown.send(true);
-        self.client.admission.close();
+        for supervisor in self.supervisors.values() {
+            let _ = supervisor.cancel.send(true);
+        }
         while self.tasks.join_next().await.is_some() {}
+        self.supervisors.clear();
     }
 
     fn reap_finished(&mut self) {
         while self.tasks.try_join_next().is_some() {}
+        self.supervisors
+            .retain(|_, supervisor| !supervisor.task.is_finished());
     }
 
     #[cfg(test)]
@@ -100,7 +142,9 @@ impl ClusterHealthManager {
 
 impl Drop for ClusterHealthManager {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
+        for supervisor in self.supervisors.values() {
+            supervisor.stop();
+        }
         self.client.admission.close();
         self.tasks.abort_all();
     }
@@ -143,6 +187,11 @@ impl HealthClient {
         let Ok(_permit) = self.admission.acquire().await else {
             return None;
         };
+        // The endpoint may have been withdrawn while waiting for fair local
+        // quota. Never issue a new physical probe for an unleased old member.
+        if !cluster.contains_endpoint(endpoint) {
+            return None;
+        }
         #[cfg(test)]
         self.peak_concurrency.fetch_max(
             (MAX_CONCURRENT_HEALTH_PROBES - self.admission.available_permits()) as u64,
@@ -298,7 +347,8 @@ async fn run_cluster_supervisor(
         // every endpoint at once. Completion advances the finite endpoint
         // iterator, so a large set cannot starve behind a fixed first batch.
         let round = async {
-            let mut probes = stream::iter(cluster.endpoints().iter().cloned())
+            let endpoints = cluster.endpoints();
+            let mut probes = stream::iter(endpoints.iter().cloned())
                 .map(|endpoint| {
                     let cluster = &cluster;
                     let client = &client;
@@ -311,7 +361,7 @@ async fn run_cluster_supervisor(
                 .buffer_unordered(MAX_CONCURRENT_CLUSTER_PROBES);
             while let Some((endpoint, outcome)) = probes.next().await {
                 if let Some(succeeded) = outcome {
-                    cluster.record_active_health(endpoint.name(), succeeded, Instant::now());
+                    cluster.record_active_health_for(&endpoint, succeeded, Instant::now());
                 }
             }
         };
@@ -728,6 +778,200 @@ listeners:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removed_cluster_stops_supervisor_even_when_an_old_snapshot_is_pinned() {
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let old = prepare_snapshot(
+            &fixture,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            1,
+            1,
+        );
+        let mut manager = ClusterHealthManager::new().expect("manager");
+        assert_eq!(manager.activate_snapshot(&old), 1);
+        wait_until(|| fixture.requests.load(Ordering::Relaxed) > 0).await;
+        let mut removed = old.clone();
+        removed.resources.clusters.clear();
+        assert_eq!(manager.activate_snapshot(&removed), 0);
+        wait_until(|| manager.counters().active.load(Ordering::Relaxed) == 0).await;
+        assert!(
+            old.resources.clusters.values().next().is_some(),
+            "held old snapshot remains valid"
+        );
+        let before = fixture.requests.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            fixture.requests.load(Ordering::Relaxed),
+            before,
+            "old pinned owner cannot keep probing after removal"
+        );
+        assert!(manager.supervisors.is_empty());
+        assert_eq!(
+            manager.client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        manager.shutdown().await;
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_health_policy_cancels_old_owner_and_same_arc_resume_restarts_once() {
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let old = prepare_snapshot(
+            &fixture,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            1,
+            1,
+        );
+        let old_cluster = old.resources.clusters.values().next().expect("old cluster");
+        let mut manager = ClusterHealthManager::new().expect("manager");
+        assert_eq!(manager.activate_snapshot(&old), 1);
+        wait_until(|| {
+            old_cluster.status(Instant::now()).endpoints[0]
+                .runtime
+                .active_health_successes
+                > 0
+        })
+        .await;
+        let (replacement, _) = RuntimeSnapshot::prepare_reusing(
+            compile_gateway(
+                &fixture,
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+                1,
+                1,
+            ),
+            Some(&old),
+        )
+        .expect("replacement policy");
+        let current_cluster = replacement
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("new cluster");
+        assert!(!Arc::ptr_eq(old_cluster, current_cluster));
+        assert_eq!(manager.activate_snapshot(&replacement), 1);
+        assert_eq!(manager.activate_snapshot(&replacement), 0);
+        wait_until(|| {
+            manager.counters().finished.load(Ordering::Relaxed) == 1
+                && current_cluster.status(Instant::now()).endpoints[0]
+                    .runtime
+                    .active_health_successes
+                    > 0
+        })
+        .await;
+        let old_success = old_cluster.status(Instant::now()).endpoints[0]
+            .runtime
+            .active_health_successes;
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        assert_eq!(
+            old_cluster.status(Instant::now()).endpoints[0]
+                .runtime
+                .active_health_successes,
+            old_success
+        );
+        assert_eq!(manager.counters().active.load(Ordering::Relaxed), 1);
+        manager.shutdown().await;
+        assert_eq!(manager.counters().active.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            manager.client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        let current_success = current_cluster.status(Instant::now()).endpoints[0]
+            .runtime
+            .active_health_successes;
+        assert_eq!(
+            manager.activate_snapshot(&replacement),
+            1,
+            "explicit resume must not be blocked by a one-shot resource latch"
+        );
+        assert_eq!(manager.activate_snapshot(&replacement), 0);
+        wait_until(|| {
+            current_cluster.status(Instant::now()).endpoints[0]
+                .runtime
+                .active_health_successes
+                > current_success
+        })
+        .await;
+        assert_eq!(manager.counters().started.load(Ordering::Relaxed), 3);
+        manager.shutdown().await;
+        assert_eq!(manager.counters().finished.load(Ordering::Relaxed), 3);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_endpoint_is_rechecked_after_local_health_admission_wait() {
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let old = prepare_snapshot(
+            &fixture,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            1,
+            1,
+        );
+        let old_endpoint = Arc::clone(
+            &old.resources
+                .clusters
+                .values()
+                .next()
+                .expect("old")
+                .endpoints()[0],
+        );
+        let (replacement, _) = RuntimeSnapshot::prepare_reusing(
+            compile_gateway(
+                &fixture,
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+                1,
+                1,
+            ),
+            Some(&old),
+        )
+        .expect("changed policy");
+        let cluster = Arc::clone(
+            replacement
+                .resources
+                .clusters
+                .values()
+                .next()
+                .expect("current"),
+        );
+        assert!(!cluster.contains_endpoint(&old_endpoint));
+        let client = Arc::new(super::HealthClient::new().expect("client"));
+        client.reconcile_snapshot(&replacement);
+        let quota = client
+            .admission
+            .acquire_many(MAX_CONCURRENT_HEALTH_PROBES as u32)
+            .await
+            .expect("hold global health quota");
+        let caller = Arc::clone(&client);
+        let plan = cluster.spec().health.active.clone().expect("health");
+        let probe = tokio::spawn(async move { caller.probe(&cluster, &old_endpoint, &plan).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !probe.is_finished(),
+            "health wait is outside endpoint timeout"
+        );
+        drop(quota);
+        assert_eq!(
+            probe.await.expect("probe cancelled at membership boundary"),
+            None
+        );
+        assert_eq!(
+            fixture.requests.load(Ordering::Relaxed),
+            0,
+            "no new probe may issue for the removed Arc after quota admission"
+        );
+        assert_eq!(
+            client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn health_timeout_is_independent_and_records_failure() {
         let fixture = HealthFixture::spawn(StatusCode::OK).await;
         fixture.set_delay(Duration::from_millis(100));
@@ -911,7 +1155,8 @@ listeners:
             .values()
             .next()
             .expect("cluster");
-        let endpoint = cluster.endpoints()[0].name();
+        let endpoints = cluster.endpoints();
+        let endpoint = endpoints[0].name();
         cluster.record_active_health(endpoint, true, Instant::now());
         let calls = Arc::new(AtomicU64::new(0));
         let lookup_calls = Arc::clone(&calls);

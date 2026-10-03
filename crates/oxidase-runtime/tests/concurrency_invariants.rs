@@ -39,6 +39,7 @@ fn cluster_spec(endpoints: Vec<ClusterEndpointSpec>) -> ClusterSpec {
         protocol: ClusterProtocol::Auto,
         tls: None,
         endpoints,
+        discovery: None,
         load_balance: LoadBalancePolicy::RoundRobin,
         health: ClusterHealthSpec {
             active: None,

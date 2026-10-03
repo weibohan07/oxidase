@@ -5,6 +5,8 @@ mod admin_audit;
 mod body;
 mod cluster_health;
 mod connection;
+mod discovery_manager;
+mod dns_resolver;
 mod ingress;
 mod leaves;
 mod metrics;
@@ -23,6 +25,7 @@ mod upstream_transport;
 pub mod fuzzing;
 
 pub use body::{BoxError, GatewayBody, GatewayBodyPlan};
+pub use discovery_manager::{validate_discovery_bootstrap, validate_discovery_policy_bootstrap};
 pub use metrics::Metrics;
 pub use server::{
     AdminEndpoint, GatewayServer, ReloadError, ReloadHandle, ReloadReport, RunningServer,

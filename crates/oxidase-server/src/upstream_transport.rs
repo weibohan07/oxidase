@@ -275,6 +275,7 @@ pub(crate) struct DirectConnector {
     tls: Option<(TlsPeerIdentity, Arc<ClientConfig>)>,
     timeouts: TransportTimeouts,
     http1_upgrade_override: bool,
+    endpoint_incarnation: u64,
     warm: Arc<WarmTransport>,
     connect_admission: Option<Arc<tokio::sync::Semaphore>>,
 }
@@ -328,6 +329,7 @@ impl DirectConnector {
             tls,
             timeouts,
             http1_upgrade_override: false,
+            endpoint_incarnation: 0,
             warm: Arc::new(WarmTransport::default()),
             connect_admission: None,
         })
@@ -344,11 +346,22 @@ impl DirectConnector {
             self.timeouts,
         );
         let mut digest = ContentDigestBuilder::new("oxidase/upstream-pool-purpose/v1");
-        digest.field_digest("transport", base.0).field_u64(
-            "http1_upgrade_override",
-            u64::from(self.http1_upgrade_override),
-        );
+        digest
+            .field_digest("transport", base.0)
+            .field_u64("endpoint_incarnation", self.endpoint_incarnation)
+            .field_u64(
+                "http1_upgrade_override",
+                u64::from(self.http1_upgrade_override),
+            );
         PoolIdentity(digest.finish())
+    }
+
+    /// Dynamic remove/readd is a new transport incarnation, even at the same
+    /// SocketAddr. Membership generation is deliberately not a pool key: a
+    /// TTL refresh or unrelated address change must preserve compatible pools.
+    pub(crate) fn with_endpoint_incarnation(mut self, incarnation: u64) -> Self {
+        self.endpoint_incarnation = incarnation;
+        self
     }
 
     pub(crate) fn for_http1_upgrade(mut self) -> Self {
@@ -431,11 +444,14 @@ impl DirectConnector {
         endpoint: &str,
     ) -> bool {
         if (self.protocol != cluster.protocol() && !self.http1_upgrade_override)
-            || !cluster
-                .spec()
-                .endpoints
-                .iter()
-                .any(|candidate| candidate.name == endpoint && candidate.url == self.origin.url)
+            || !cluster.endpoints().iter().any(|candidate| {
+                candidate.name() == endpoint
+                    && candidate.url() == &self.origin.url
+                    && candidate.incarnation() == self.endpoint_incarnation
+                    && candidate
+                        .dial_target()
+                        .is_none_or(|target| target == self.target.address())
+            })
             || self.timeouts != TransportTimeouts::for_cluster(cluster)
         {
             return false;

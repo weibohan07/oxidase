@@ -47,6 +47,7 @@ use crate::body::{
 };
 use crate::cluster_health::ClusterHealthManager;
 use crate::connection::TrackedExecutor;
+use crate::discovery_manager::{DiscoveryManager, PreparedDiscoveryOwners};
 use crate::ingress::{ConnectionRequestBudget, IdleIo, ListenerIngressState, RequestAdmission};
 use crate::leaves::{HyperLeaves, ProxyClient};
 use crate::metrics::{
@@ -107,6 +108,8 @@ pub struct GatewayServer {
     store: Arc<SnapshotStore>,
     proxy: Arc<ProxyClient>,
     health: ClusterHealthManager,
+    discovery: DiscoveryManager,
+    prepared_discovery: PreparedDiscoveryOwners,
     metrics: Arc<Metrics>,
     listeners: Vec<BoundListener>,
     admin: Option<BoundAdmin>,
@@ -459,6 +462,12 @@ impl GatewayServer {
         snapshot: RuntimeSnapshot,
         origin: RuntimeOrigin,
     ) -> Result<Self, ServerError> {
+        let discovery = DiscoveryManager::new();
+        let preparation = discovery.preparation_for(&snapshot);
+        let prepared_discovery = tokio::task::spawn_blocking(move || preparation.prepare())
+            .await
+            .map_err(|error| ServerError::Task(error.to_string()))?
+            .map_err(|diagnostics| ServerError::Reload(ReloadError::new(diagnostics)))?;
         let mut listeners = Vec::new();
         for configured in &snapshot.listeners {
             let listener =
@@ -494,6 +503,8 @@ impl GatewayServer {
             store: Arc::new(SnapshotStore::new_with_origin(snapshot, origin)),
             proxy,
             health,
+            discovery,
+            prepared_discovery,
             metrics: Arc::new(Metrics::default()),
             listeners,
             admin,
@@ -661,6 +672,14 @@ impl GatewayServer {
             .and_then(|admin| admin.candidates.clone());
         let audit = self.admin.as_ref().and_then(|admin| admin.audit.clone());
         let preparation_gate = Arc::clone(&reload.compile_gate);
+        self.discovery
+            .activate_snapshot(
+                &self.store.pin(),
+                &self.proxy,
+                &self.metrics,
+                self.prepared_discovery,
+            )
+            .await;
         self.health.activate_snapshot(&self.store.pin());
         let (completion_sender, mut completions) = mpsc::unbounded_channel();
         let mut listeners = BTreeMap::new();
@@ -725,6 +744,7 @@ impl GatewayServer {
                                 proxy: &self.proxy,
                                 metrics: &self.metrics,
                                 health: &mut self.health,
+                                discovery: &mut self.discovery,
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
                                 expected_etag: &expected_version,
@@ -782,6 +802,7 @@ impl GatewayServer {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
                             self.health.shutdown().await;
+                            self.discovery.shutdown().await;
                             let _ = response.send(());
                             return Ok(());
                         }
@@ -820,6 +841,7 @@ impl GatewayServer {
                                     self.store.set_serving_state(ServingState::Draining);
                                     stop_all_listeners(&mut listeners).await;
                                     self.health.shutdown().await;
+                                    self.discovery.shutdown().await;
                                     self.store.set_serving_state(ServingState::Drained);
                                     if let Some(operation) = &operation {
                                         finish_runtime_commit(operation, &self.store.published()).await;
@@ -844,6 +866,7 @@ impl GatewayServer {
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
                             self.health.shutdown().await;
+                            self.discovery.shutdown().await;
                             return Ok(());
                         }
                     }
@@ -1521,6 +1544,11 @@ async fn apply_reload(
     generation: &mut u64,
     environment: ReloadEnvironment<'_>,
 ) -> Result<ReloadReport, ServerError> {
+    let preparation = environment.discovery.preparation_for(&snapshot);
+    let prepared_discovery = tokio::task::spawn_blocking(move || preparation.prepare())
+        .await
+        .map_err(|error| ServerError::Task(error.to_string()))?
+        .map_err(|diagnostics| ServerError::Reload(ReloadError::new(diagnostics)))?;
     let retained = snapshot
         .listeners
         .iter()
@@ -1627,6 +1655,15 @@ async fn apply_reload(
         .proxy
         .reconcile_snapshot(&environment.store.pin());
     environment
+        .discovery
+        .activate_snapshot(
+            &environment.store.pin(),
+            environment.proxy,
+            environment.metrics,
+            prepared_discovery,
+        )
+        .await;
+    environment
         .health
         .activate_snapshot(&environment.store.pin());
     let listeners_added = prepared
@@ -1685,6 +1722,7 @@ struct ReloadEnvironment<'a> {
     proxy: &'a Arc<ProxyClient>,
     metrics: &'a Arc<Metrics>,
     health: &'a mut ClusterHealthManager,
+    discovery: &'a mut DiscoveryManager,
     drain_timeout: Duration,
     completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
     expected_etag: &'a str,
@@ -2957,7 +2995,7 @@ async fn validate_admin_candidate(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             checked_work.checkpoint()?;
-            oxidase_runtime::prepare_bundle_archive_controlled(
+            let prepared = oxidase_runtime::prepare_bundle_archive_controlled(
                 &archive,
                 &bundle_path,
                 &deployment_root,
@@ -2965,6 +3003,13 @@ async fn validate_admin_candidate(
                 &checked_work,
             )
             .map_err(candidate_preparation_error)?;
+            crate::validate_discovery_bootstrap(&prepared.snapshot).map_err(|diagnostics| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "discovery.resolver_prepare",
+                    "cannot prepare the local DNS resolver inputs",
+                )
+                .with_diagnostics(diagnostics)
+            })?;
             checked_work.checkpoint()
         })
         .await
@@ -7998,6 +8043,7 @@ listeners:
         let proxy = std::sync::Arc::new(ProxyClient::new().expect("proxy prepares"));
         let mut health =
             crate::cluster_health::ClusterHealthManager::new().expect("health manager prepares");
+        let mut discovery = crate::discovery_manager::DiscoveryManager::new();
         let (completion, _) = tokio::sync::mpsc::unbounded_channel();
         let (response, received) = oneshot::channel();
         let cancelled_receiver = std::sync::Arc::new(std::sync::Mutex::new(Some(received)));
@@ -8015,6 +8061,7 @@ listeners:
                 proxy: &proxy,
                 metrics: &metrics,
                 health: &mut health,
+                discovery: &mut discovery,
                 drain_timeout: Duration::from_millis(100),
                 completion: &completion,
                 expected_etag: &before,
