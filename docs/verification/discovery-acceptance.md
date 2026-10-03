@@ -73,6 +73,84 @@ test pass after the repair. The repaired head still needs fresh complete gates,
 its own Hosted checks and actual Linux qualification. Raw local/Hosted failures
 are retained as `artifacts/discovery-6d-220bb73-*-failure.log.gz`.
 
+### Executed 6D ASan property campaigns
+
+Both campaigns actually ran on clean, frozen implementation
+`9812a2db26d3f973e74cdae4c6eab7f13a9833b7`, macOS aarch64, with offline Cargo,
+cargo-fuzz 0.13.2 and nightly Rust 1.100.0 (2026-08-29). They use dev/debug
+assertions plus AddressSanitizer, a ten-second per-input timeout, 2048 MiB RSS
+limit and fresh seed/corpus directories. The report includes exact commands,
+tool versions, head/dirty/source/lock hashes and original libFuzzer statistics.
+
+| Target | Seed | Actual fuzz seconds | Executions | Corpus files initial/final | New units added | Peak fuzzer RSS MiB | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| discovery_runtime | 600401 | 61 | 1050 | 2 / 289 | 290 | 244 | PASS |
+| portable_discovery | 600402 | 61 | 238 | 2 / 59 | 61 | 445 | PASS |
+
+Exit codes are zero; crash, timeout and OOM flags are false; failure artifact
+directories are empty. Source-set hash
+`d62be291a05d5913479cdea658d35c18f1f677caa18e406f511de31036d350a5`, both
+lockfiles and HEAD are identical before/after. Raw receipts and logs are
+`artifacts/discovery-6d-asan-{runtime,portable}-9812a2d.{json,log.gz}`.
+Corpus minimization means new-units-added is not final-file-count minus initial.
+These are local property campaigns, not Hosted fuzz, a wire parser audit,
+gateway memory observations or a promise that all possible inputs are safe.
+
+### First actual Linux process campaign and independent review
+
+[Run `37148441986`](https://github.com/weibohan07/oxidase/actions/runs/37148441986)
+actually executed both separated-process campaigns on implementation `9812a2d`,
+Ubuntu x86_64, kernel 6.17.0-1022-azure, Rust/Cargo 1.99.0. Its qualification job
+completed SUCCESS; unrelated external-conformance jobs were skipped rather than
+represented as executed suites. Artifact `11283750224`, 2,836,679 bytes, service
+digest `sha256:339a2cf4321b6269bd727940dc8b7ba7b61732c53deea810fe931ce5799d2e82`,
+is preserved in `artifacts/discovery-6d-linux-37148441986-raw.tar.gz` with summaries.
+The recorded dirty state is only the workflow's generated `discovery-results/`
+directory, not a tracked-source modification.
+
+Discovery used 600 seconds steady, concurrency 8, seed 600601; protocol used 120
+seconds steady, concurrency 6, seed 600602. Each has 30 seconds warm-up, 120 seconds
+cooldown, nominal 1-second samples, 3-second control interval and 32768-byte payloads.
+Actual total observed durations were 750.325 / 270.313 seconds, with distinct
+gateway/generator/DNS/upstream PIDs. Discovery had 335621 requests, 75092 complete
+responses, 4786 intentional cancellations, 255743 expected unavailable responses
+and 1475 actual retries. Protocol had 36028 requests, 7742 complete gRPC responses,
+515 cancellations and 20 Upgrade tunnels. Both reported zero unexpected errors.
+
+Independent recomputation of the original 648 / 253 samples found:
+
+| Gateway-PID curve | Discovery | Protocol |
+| --- | --- | --- |
+| RSS post-warm / peak / final KiB | 24168 / 25812 / 25132 | 23792 / 24688 / 24416 |
+| Steady RSS slope KiB/s | +1.92879 | +4.82625 |
+| RSS quarter medians KiB | 24700 / 25122 / 25480 / 25548 | 24196 / 24376 / 24498 / 24532 |
+| FD post-warm / peak / final | 28 / 30 / 16 | 23 / 27 / 14 |
+| Steady FD slope FD/s | -0.000196954 | +0.000968006 |
+
+All final *measured* active requests/connections/streams/tunnels, discovery
+supervisors, cluster/retry permits and retired-admission counters were zero.
+Pool count, health-task count and old snapshots stayed null: their reclamation
+was not measured by this public process view. RSS retained 964 / 624 KiB above
+post-warm baseline despite cooldown reduction; small positive drift is visible,
+not a leak-free plateau or long-term reliability conclusion. Actual sample intervals
+vary because controller work is not a fixed-frequency sampling clock.
+
+Before/after-DNS runtime objects matched in all 164 / 33 changes; actual H1/H2
+ALPN, positive and negative answers, TCP fallback, CNAME, health transitions,
+conditional signed activation/rollback, held gRPC trailers, Upgrade bytes and
+cancellation Drop acknowledgements were observed. The Linux campaign had no
+positive AAAA, timeout or mid-body-error events; those are independent wire-test
+evidence, not campaign coverage.
+
+The review also identified a proof-strength limitation: eight expected-B calls
+did not explicitly assert status 200, so non-200 replies skipped peer validation.
+The artifact proves an actual B response and no mismatched *successful* peer,
+not eight independently successful B streams. The assertion is strengthened with
+a regression rejecting non-200, partial and cancelled responses, and the ordinary
+stable/Rust 1.88 process smoke passes with `successful_new_b_streams: 8`.
+A fresh campaign remains mandatory; this original SUCCESS run is retained,
+not retroactively given the stronger guarantee.
+
 ## Protected 6A delivery receipt
 
 PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without
