@@ -4,7 +4,7 @@ Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-dns-srv-discovery` (phase 6C)
+- active milestone branch: `hardening/v0.4-discovery-qualification` (phase 6D)
 - public starting point: completed secure-control-plane merge `ebfb754`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed

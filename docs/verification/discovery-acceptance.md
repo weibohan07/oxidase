@@ -20,8 +20,8 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 | --- | --- | --- |
 | 6A transport identity/deadlines | normally merged through protected PR #16 | final head `39caf68` PR run `37131533884` PASS; merged main `aaece2a` push run `37131852985` PASS |
 | 6B A/AAAA discovery | normally merged through protected PR #17 | final head `bd58363` PR run `37137424130` PASS; merged main `890a802` push run `37138029438` PASS |
-| 6C SRV discovery | in progress from protected main `890a802` | no final-head implementation/Hosted acceptance yet |
-| 6D integration/qualification | not implemented by this branch | NOT RUN |
+| 6C SRV discovery | normally merged through protected PR #18 | final head `b27974a` PR run `37143336854` PASS; merged main `a1a06b0` push run `37143737883` PASS |
+| 6D integration/qualification | in progress from protected main `a1a06b0` | final-head integration/Hosted/fuzz/Linux acceptance not yet recorded |
 
 ## Protected 6A delivery receipt
 
@@ -57,7 +57,26 @@ secure-admin check/test), retained in
 test-token permission warnings are not silently removed. The recorded manual
 benchmark/fuzz/Linux qualification limitations remain separate from these gates.
 
-## 6C executable contract (final gates tracked separately)
+## Protected 6C delivery receipt
+
+PR [#18](https://github.com/weibohan07/oxidase/pull/18) was normally merged without
+an administrator override. Base: `890a802dd74e58de8bf3e316422e771f59172621`;
+final head: `b27974afc8565bae369eb7e4e49a0b20c9ffa42d`;
+merge: `a1a06b0d89fa8303233ac31a46be86dce747d397`.
+[Final-head PR run `37143336854`](https://github.com/weibohan07/oxidase/actions/runs/37143336854)
+and independent [merged-main push run `37143737883`](https://github.com/weibohan07/oxidase/actions/runs/37143737883)
+each completed with all four required jobs SUCCESS. Main remained strict/up-to-date,
+with force pushes/deletion disabled. This is separate from the ADR-only Draft run.
+
+All nine locked local release commands were rerun on exact final head `b27974a`
+and PASS. Raw receipt:
+`artifacts/discovery-6c-b27974a-final-gates.log.gz`. The six actual CLI examples
+also passed on its unchanged implementation ancestor `3c031c8`; their retained
+log is not represented as a new final-head execution. The SRV component-expiry,
+partial-positive scheduling and long-SOA suppression findings were fixed with
+regressions before merge. ASan and Linux process campaigns still belong to 6D.
+
+## 6C executable contract
 
 Draft [PR #18](https://github.com/weibohan07/oxidase/pull/18) starts at protected
 main `890a802dd74e58de8bf3e316422e771f59172621`. Its ADR/receipt-only head
