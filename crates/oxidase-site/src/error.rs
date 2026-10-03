@@ -35,6 +35,8 @@ impl std::error::Error for SiteCompileFailure {
 
 #[derive(Debug, Error)]
 pub enum SiteCompileError {
+    #[error("Site preparation interrupted ({code})")]
+    Interrupted { code: &'static str },
     #[error("cannot access `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -103,6 +105,11 @@ impl SiteCompileError {
     #[must_use]
     pub fn diagnostic(&self) -> Diagnostic {
         match self {
+            Self::Interrupted { code } => Diagnostic::new(
+                code,
+                "Site preparation was cancelled or its deadline elapsed",
+                SourceSpan::synthetic("site.preparation"),
+            ),
             Self::Diagnostic(diagnostic) => diagnostic.as_ref().clone(),
             Self::Io { path, source } => Diagnostic::new(
                 "site.io",

@@ -438,6 +438,7 @@ impl PortableRuntimePlanV1 {
                 },
                 source: bundle_source,
             },
+            admin: gateway_plan.admin,
             dependencies: dependencies.clone(),
             summary_dependencies: Vec::new(),
             graph,

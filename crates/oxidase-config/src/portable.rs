@@ -17,13 +17,15 @@ use thiserror::Error;
 use url::Url;
 
 use crate::compiler::{
-    ActiveHealthSpec, CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec,
-    ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec, ClusterTlsSpec,
-    ClusterTlsTrustSpec, CompiledGateway, CompiledListener, CompiledResources, Http1Settings,
-    Http2Settings, HttpListenerSpec, HttpVersion, ListenerLimits, ListenerProtocol,
-    LoadBalancePolicy, PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec,
-    RetrySpec, SecretSpec, SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec,
-    TrustStoreSpec,
+    ActiveHealthSpec, AdminAuditDestination, AdminAuditSpec, AdminAuthMode, AdminAuthSpec,
+    AdminBundleTrustSpec, AdminCandidateLimits, AdminHistoryLimits, AdminHttpsListenSpec,
+    AdminListenSpec, AdminPermissions, AdminSpec, AdminStorageSpec, AdminUnixListenSpec,
+    CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec, ClusterHealthSpec,
+    ClusterLimits, ClusterProtocol, ClusterSpec, ClusterTlsSpec, ClusterTlsTrustSpec,
+    CompiledGateway, CompiledListener, CompiledResources, Http1Settings, Http2Settings,
+    HttpListenerSpec, HttpVersion, ListenerLimits, ListenerProtocol, LoadBalancePolicy,
+    PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec, RetrySpec, SecretSpec,
+    SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec, TrustStoreSpec,
 };
 
 pub const PORTABLE_GATEWAY_CONFIG_SCHEMA_V1: &str = "oxidase.gateway-config/v1";
@@ -32,6 +34,7 @@ pub const PORTABLE_GATEWAY_CONFIG_SCHEMA_V1: &str = "oxidase.gateway-config/v1";
 #[serde(deny_unknown_fields)]
 pub struct PortableGatewayConfigV1 {
     pub schema_version: String,
+    pub admin: Option<PortableAdminV1>,
     pub listeners: BTreeMap<String, PortableListenerV1>,
     pub certificates: BTreeMap<String, PortableCertificateV1>,
     pub secrets: BTreeMap<String, PortableSecretV1>,
@@ -66,6 +69,11 @@ impl PortableGatewayConfigV1 {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, PortableConfigError>>()?;
+        let admin = gateway
+            .admin
+            .as_ref()
+            .map(|admin| PortableAdminV1::from_compiled(admin, source_root))
+            .transpose()?;
         let certificates = gateway
             .resources
             .certificates
@@ -109,6 +117,7 @@ impl PortableGatewayConfigV1 {
 
         let mut portable = Self {
             schema_version: PORTABLE_GATEWAY_CONFIG_SCHEMA_V1.to_owned(),
+            admin,
             listeners,
             certificates,
             secrets,
@@ -121,6 +130,9 @@ impl PortableGatewayConfigV1 {
     }
 
     fn normalize_source_spans(&mut self, source_root: &Path) -> Result<(), PortableConfigError> {
+        if let Some(admin) = self.admin.as_mut() {
+            admin.normalize_source_spans(source_root)?;
+        }
         for certificate in self.certificates.values_mut() {
             normalize_span(&mut certificate.cert_chain_source, source_root)?;
             normalize_span(&mut certificate.private_key_source, source_root)?;
@@ -228,6 +240,11 @@ impl PortableGatewayConfigV1 {
             let cluster = source.compile(id.clone(), &resources)?;
             resources.clusters.insert(id, cluster);
         }
+        let admin = self
+            .admin
+            .as_ref()
+            .map(|source| source.compile(&resources, deployment_root))
+            .transpose()?;
 
         let mut site_ids = Vec::with_capacity(self.site_ids.len());
         let mut seen_sites = BTreeSet::new();
@@ -263,6 +280,7 @@ impl PortableGatewayConfigV1 {
             resources,
             listeners,
             site_ids,
+            admin,
         })
     }
 
@@ -276,6 +294,10 @@ impl PortableGatewayConfigV1 {
             field: &str,
         ) -> Result<(), PortableConfigError> {
             span.map_or(Ok(()), |span| check(span, field))
+        }
+
+        if let Some(admin) = &self.admin {
+            admin.validate_source_spans()?;
         }
 
         for (id, certificate) in &self.certificates {
@@ -469,6 +491,7 @@ fn normalize_optional_span(
 pub struct PortableGatewayPlanV1 {
     pub resources: CompiledResources,
     pub listeners: Vec<CompiledListener>,
+    pub admin: Option<AdminSpec>,
     /// Site IDs whose separately decoded Site sections must be supplied.
     pub site_ids: Vec<ResourceId>,
 }
@@ -554,6 +577,696 @@ impl PortableDurationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PortableAdminV1 {
+    pub listen: PortableAdminListenV1,
+    pub auth: PortableAdminAuthV1,
+    pub storage: PortableAdminStorageV1,
+    pub bundle_trust: PortableAdminBundleTrustV1,
+    pub permissions: PortableAdminPermissionsV1,
+    pub candidates: PortableAdminCandidateLimitsV1,
+    pub history: PortableAdminHistoryLimitsV1,
+    #[serde(default)]
+    pub audit: PortableAdminAuditV1,
+    pub source: SourceSpan,
+}
+
+impl PortableAdminV1 {
+    fn from_compiled(source: &AdminSpec, source_root: &Path) -> Result<Self, PortableConfigError> {
+        Ok(Self {
+            listen: PortableAdminListenV1::from_compiled(&source.listen, source_root)?,
+            auth: PortableAdminAuthV1::from_compiled(&source.auth),
+            storage: PortableAdminStorageV1 {
+                directory: PortablePathRefV1::from_path(
+                    &source.storage.directory,
+                    source_root,
+                    "admin.storage.directory",
+                )?,
+                directory_source: source.storage.directory_source.clone(),
+                source: source.storage.source.clone(),
+            },
+            bundle_trust: PortableAdminBundleTrustV1 {
+                deployment_root: PortablePathRefV1::from_path(
+                    &source.bundle_trust.deployment_root,
+                    source_root,
+                    "admin.bundle_trust.deployment_root",
+                )?,
+                deployment_root_source: source.bundle_trust.deployment_root_source.clone(),
+                verification_keys: source
+                    .bundle_trust
+                    .verification_keys
+                    .iter()
+                    .map(|path| {
+                        PortablePathRefV1::from_path(
+                            path,
+                            source_root,
+                            "admin.bundle_trust.verification_keys",
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                verification_key_sources: source.bundle_trust.verification_key_sources.clone(),
+                source: source.bundle_trust.source.clone(),
+            },
+            permissions: PortableAdminPermissionsV1::from_compiled(source.permissions),
+            candidates: PortableAdminCandidateLimitsV1 {
+                max_count: source.candidates.max_count,
+                max_bytes: source.candidates.max_bytes,
+                max_candidate_bytes: source.candidates.max_candidate_bytes,
+                source: source.candidates.source.clone(),
+            },
+            history: PortableAdminHistoryLimitsV1 {
+                max_snapshots: source.history.max_snapshots,
+                max_bytes: source.history.max_bytes,
+                source: source.history.source.clone(),
+            },
+            audit: PortableAdminAuditV1 {
+                destination: match &source.audit.destination {
+                    AdminAuditDestination::Stderr => "stderr",
+                    AdminAuditDestination::Stdout => "stdout",
+                    AdminAuditDestination::File(_) => "file",
+                }
+                .to_owned(),
+                file: match &source.audit.destination {
+                    AdminAuditDestination::File(path) => Some(PortablePathRefV1::from_path(
+                        path,
+                        source_root,
+                        "admin.audit.file",
+                    )?),
+                    _ => None,
+                },
+                queue_capacity: source.audit.queue_capacity,
+                source: source.audit.source.clone(),
+            },
+            source: source.source.clone(),
+        })
+    }
+
+    fn compile(
+        &self,
+        resources: &CompiledResources,
+        deployment_root: &Path,
+    ) -> Result<AdminSpec, PortableConfigError> {
+        let listen = self.listen.compile(resources, deployment_root)?;
+        let auth = self.auth.compile(resources, &listen)?;
+        let permissions = self.permissions.compile()?;
+        let storage_directory = self
+            .storage
+            .directory
+            .compile(deployment_root, "admin.storage.directory")?;
+        if !storage_directory.is_absolute() {
+            return Err(invalid(
+                "admin.storage.directory",
+                "admin storage directory must resolve to an absolute path",
+            ));
+        }
+        let storage = AdminStorageSpec {
+            directory: storage_directory,
+            directory_source: self.storage.directory_source.clone(),
+            source: self.storage.source.clone(),
+        };
+        if self.bundle_trust.verification_keys.len()
+            != self.bundle_trust.verification_key_sources.len()
+        {
+            return Err(invalid(
+                "admin.bundle_trust.verification_keys",
+                "verification key paths and source spans have different lengths",
+            ));
+        }
+        if self.bundle_trust.verification_keys.len() > 32 {
+            return Err(invalid(
+                "admin.bundle_trust.verification_keys",
+                "at most 32 Bundle verification keys are supported",
+            ));
+        }
+        if (permissions.stage || permissions.activate || permissions.rollback)
+            && self.bundle_trust.verification_keys.is_empty()
+        {
+            return Err(invalid(
+                "admin.bundle_trust.verification_keys",
+                "stage, activate, and rollback permissions require a verification key",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let bundle_deployment_root = self
+            .bundle_trust
+            .deployment_root
+            .compile(deployment_root, "admin.bundle_trust.deployment_root")?;
+        if !bundle_deployment_root.is_absolute() {
+            return Err(invalid(
+                "admin.bundle_trust.deployment_root",
+                "Bundle deployment root must resolve to an absolute path",
+            ));
+        }
+        let verification_keys = self
+            .bundle_trust
+            .verification_keys
+            .iter()
+            .map(|path| {
+                let path = path.compile(deployment_root, "admin.bundle_trust.verification_keys")?;
+                if !seen.insert(path.clone()) {
+                    return Err(invalid(
+                        "admin.bundle_trust.verification_keys",
+                        "duplicate Bundle verification key path",
+                    ));
+                }
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>, PortableConfigError>>()?;
+        let bundle_trust = AdminBundleTrustSpec {
+            deployment_root: bundle_deployment_root,
+            deployment_root_source: self.bundle_trust.deployment_root_source.clone(),
+            verification_keys,
+            verification_key_sources: self.bundle_trust.verification_key_sources.clone(),
+            source: self.bundle_trust.source.clone(),
+        };
+        if self.candidates.max_count == 0
+            || self.candidates.max_bytes == 0
+            || self.candidates.max_candidate_bytes == 0
+            || self.candidates.max_candidate_bytes > self.candidates.max_bytes
+        {
+            return Err(invalid(
+                "admin.candidates",
+                "candidate limits must be positive and one candidate cannot exceed total storage",
+            ));
+        }
+        if self.history.max_snapshots == 0 || self.history.max_bytes == 0 {
+            return Err(invalid(
+                "admin.history",
+                "history limits must be greater than zero",
+            ));
+        }
+        if self.history.max_bytes < self.candidates.max_candidate_bytes {
+            return Err(invalid(
+                "admin.history.max_bytes",
+                "history must hold at least one maximum-sized candidate",
+            ));
+        }
+        Ok(AdminSpec {
+            listen,
+            auth,
+            storage,
+            bundle_trust,
+            permissions,
+            candidates: AdminCandidateLimits {
+                max_count: self.candidates.max_count,
+                max_bytes: self.candidates.max_bytes,
+                max_candidate_bytes: self.candidates.max_candidate_bytes,
+                source: self.candidates.source.clone(),
+            },
+            history: AdminHistoryLimits {
+                max_snapshots: self.history.max_snapshots,
+                max_bytes: self.history.max_bytes,
+                source: self.history.source.clone(),
+            },
+            audit: self.audit.compile(deployment_root)?,
+            source: self.source.clone(),
+        })
+    }
+
+    fn normalize_source_spans(&mut self, source_root: &Path) -> Result<(), PortableConfigError> {
+        self.listen.normalize_source_spans(source_root)?;
+        normalize_span(&mut self.auth.mode_source, source_root)?;
+        normalize_optional_span(&mut self.auth.token_secret_source, source_root)?;
+        normalize_span(&mut self.auth.source, source_root)?;
+        normalize_span(&mut self.storage.directory_source, source_root)?;
+        normalize_span(&mut self.storage.source, source_root)?;
+        for source in &mut self.bundle_trust.verification_key_sources {
+            normalize_span(source, source_root)?;
+        }
+        normalize_span(&mut self.bundle_trust.deployment_root_source, source_root)?;
+        normalize_span(&mut self.bundle_trust.source, source_root)?;
+        normalize_span(&mut self.candidates.source, source_root)?;
+        normalize_span(&mut self.history.source, source_root)?;
+        normalize_span(&mut self.audit.source, source_root)?;
+        normalize_span(&mut self.source, source_root)
+    }
+
+    fn validate_source_spans(&self) -> Result<(), PortableConfigError> {
+        let check = |span: &SourceSpan, field: &str| {
+            span.validate_portable()
+                .map_err(|message| invalid(field, message))
+        };
+        self.listen.validate_source_spans()?;
+        check(&self.auth.mode_source, "admin.auth.mode")?;
+        if let Some(source) = &self.auth.token_secret_source {
+            check(source, "admin.auth.token_secret")?;
+        }
+        check(&self.auth.source, "admin.auth")?;
+        check(&self.storage.directory_source, "admin.storage.directory")?;
+        check(&self.storage.source, "admin.storage")?;
+        for (index, source) in self
+            .bundle_trust
+            .verification_key_sources
+            .iter()
+            .enumerate()
+        {
+            check(
+                source,
+                &format!("admin.bundle_trust.verification_keys[{index}]"),
+            )?;
+        }
+        check(
+            &self.bundle_trust.deployment_root_source,
+            "admin.bundle_trust.deployment_root",
+        )?;
+        check(&self.bundle_trust.source, "admin.bundle_trust")?;
+        check(&self.candidates.source, "admin.candidates")?;
+        check(&self.history.source, "admin.history")?;
+        check(&self.audit.source, "admin.audit")?;
+        check(&self.source, "admin")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminAuditV1 {
+    pub destination: String,
+    pub file: Option<PortablePathRefV1>,
+    pub queue_capacity: u32,
+    pub source: SourceSpan,
+}
+
+impl Default for PortableAdminAuditV1 {
+    fn default() -> Self {
+        Self {
+            destination: "stderr".to_owned(),
+            file: None,
+            queue_capacity: 128,
+            source: SourceSpan::synthetic("admin.audit"),
+        }
+    }
+}
+
+impl PortableAdminAuditV1 {
+    fn compile(&self, deployment_root: &Path) -> Result<AdminAuditSpec, PortableConfigError> {
+        if !(2..=4096).contains(&self.queue_capacity) {
+            return Err(invalid(
+                "admin.audit.queue_capacity",
+                "audit queue capacity must be within 2..=4096",
+            ));
+        }
+        let destination = match (self.destination.as_str(), &self.file) {
+            ("stderr", None) => AdminAuditDestination::Stderr,
+            ("stdout", None) => AdminAuditDestination::Stdout,
+            ("file", Some(file)) => {
+                let path = file.compile(deployment_root, "admin.audit.file")?;
+                if !path.is_absolute() {
+                    return Err(invalid(
+                        "admin.audit.file",
+                        "audit file must resolve to an absolute path",
+                    ));
+                }
+                AdminAuditDestination::File(path)
+            }
+            _ => {
+                return Err(invalid(
+                    "admin.audit",
+                    "audit destination and optional file are inconsistent",
+                ));
+            }
+        };
+        Ok(AdminAuditSpec {
+            destination,
+            queue_capacity: self.queue_capacity,
+            source: self.source.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PortableAdminListenV1 {
+    Unix {
+        path: PortablePathRefV1,
+        mode: u32,
+        path_source: SourceSpan,
+        mode_source: SourceSpan,
+        source: SourceSpan,
+    },
+    Https {
+        bind: String,
+        certificate: String,
+        client_auth: Box<PortableClientAuthV1>,
+        bind_source: SourceSpan,
+        certificate_source: SourceSpan,
+        source: SourceSpan,
+    },
+}
+
+impl PortableAdminListenV1 {
+    fn from_compiled(
+        source: &AdminListenSpec,
+        source_root: &Path,
+    ) -> Result<Self, PortableConfigError> {
+        Ok(match source {
+            AdminListenSpec::Unix(unix) => Self::Unix {
+                path: PortablePathRefV1::from_path(
+                    &unix.path,
+                    source_root,
+                    "admin.listen.unix.path",
+                )?,
+                mode: unix.mode,
+                path_source: unix.path_source.clone(),
+                mode_source: unix.mode_source.clone(),
+                source: unix.source.clone(),
+            },
+            AdminListenSpec::Https(https) => Self::Https {
+                bind: https.bind.to_string(),
+                certificate: https.certificate.to_string(),
+                client_auth: Box::new(PortableClientAuthV1::from_compiled(&https.client_auth)),
+                bind_source: https.bind_source.clone(),
+                certificate_source: https.certificate_source.clone(),
+                source: https.source.clone(),
+            },
+        })
+    }
+
+    fn compile(
+        &self,
+        resources: &CompiledResources,
+        deployment_root: &Path,
+    ) -> Result<AdminListenSpec, PortableConfigError> {
+        match self {
+            Self::Unix {
+                path,
+                mode,
+                path_source,
+                mode_source,
+                source,
+            } => {
+                let path = path.compile(deployment_root, "admin.listen.unix.path")?;
+                if !path.is_absolute() {
+                    return Err(invalid(
+                        "admin.listen.unix.path",
+                        "Unix socket path must resolve to an absolute path",
+                    ));
+                }
+                if *mode > 0o777 {
+                    return Err(invalid(
+                        "admin.listen.unix.mode",
+                        "Unix socket mode cannot set special permission bits",
+                    ));
+                }
+                Ok(AdminListenSpec::Unix(Box::new(AdminUnixListenSpec {
+                    path,
+                    mode: *mode,
+                    path_source: path_source.clone(),
+                    mode_source: mode_source.clone(),
+                    source: source.clone(),
+                })))
+            }
+            Self::Https {
+                bind,
+                certificate,
+                client_auth,
+                bind_source,
+                certificate_source,
+                source,
+            } => {
+                let bind = bind.parse().map_err(|error| {
+                    invalid(
+                        "admin.listen.https.bind",
+                        format!("invalid socket address: {error}"),
+                    )
+                })?;
+                let certificate =
+                    resource_id(certificate, "certificate", "admin.listen.https.certificate")?;
+                if !resources.certificates.contains_key(&certificate) {
+                    return Err(invalid(
+                        "admin.listen.https.certificate",
+                        "referenced Certificate does not exist",
+                    ));
+                }
+                Ok(AdminListenSpec::Https(Box::new(AdminHttpsListenSpec {
+                    bind,
+                    certificate,
+                    client_auth: client_auth.compile(resources)?,
+                    bind_source: bind_source.clone(),
+                    certificate_source: certificate_source.clone(),
+                    source: source.clone(),
+                })))
+            }
+        }
+    }
+
+    fn normalize_source_spans(&mut self, source_root: &Path) -> Result<(), PortableConfigError> {
+        match self {
+            Self::Unix {
+                path_source,
+                mode_source,
+                source,
+                ..
+            } => {
+                normalize_span(path_source, source_root)?;
+                normalize_span(mode_source, source_root)?;
+                normalize_span(source, source_root)
+            }
+            Self::Https {
+                client_auth,
+                bind_source,
+                certificate_source,
+                source,
+                ..
+            } => {
+                normalize_span(bind_source, source_root)?;
+                normalize_span(certificate_source, source_root)?;
+                normalize_span(&mut client_auth.mode_source, source_root)?;
+                normalize_optional_span(&mut client_auth.trust_store_source, source_root)?;
+                normalize_span(&mut client_auth.source, source_root)?;
+                normalize_span(source, source_root)
+            }
+        }
+    }
+
+    fn validate_source_spans(&self) -> Result<(), PortableConfigError> {
+        let check = |span: &SourceSpan, field: &str| {
+            span.validate_portable()
+                .map_err(|message| invalid(field, message))
+        };
+        match self {
+            Self::Unix {
+                path_source,
+                mode_source,
+                source,
+                ..
+            } => {
+                check(path_source, "admin.listen.unix.path")?;
+                check(mode_source, "admin.listen.unix.mode")?;
+                check(source, "admin.listen.unix")
+            }
+            Self::Https {
+                client_auth,
+                bind_source,
+                certificate_source,
+                source,
+                ..
+            } => {
+                check(bind_source, "admin.listen.https.bind")?;
+                check(certificate_source, "admin.listen.https.certificate")?;
+                check(
+                    &client_auth.mode_source,
+                    "admin.listen.https.client_auth.mode",
+                )?;
+                if let Some(span) = &client_auth.trust_store_source {
+                    check(span, "admin.listen.https.client_auth.trust_store")?;
+                }
+                check(&client_auth.source, "admin.listen.https.client_auth")?;
+                check(source, "admin.listen.https")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminAuthV1 {
+    pub mode: String,
+    pub token_secret: Option<String>,
+    pub mode_source: SourceSpan,
+    pub token_secret_source: Option<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+impl PortableAdminAuthV1 {
+    fn from_compiled(source: &AdminAuthSpec) -> Self {
+        Self {
+            mode: match source.mode {
+                AdminAuthMode::Bearer => "bearer",
+                AdminAuthMode::Mtls => "mtls",
+                AdminAuthMode::BearerAndMtls => "bearer_and_mtls",
+                AdminAuthMode::UnsafeNone => "unsafe_none",
+            }
+            .to_owned(),
+            token_secret: source.token_secret.as_ref().map(ToString::to_string),
+            mode_source: source.mode_source.clone(),
+            token_secret_source: source.token_secret_source.clone(),
+            source: source.source.clone(),
+        }
+    }
+
+    fn compile(
+        &self,
+        resources: &CompiledResources,
+        listen: &AdminListenSpec,
+    ) -> Result<AdminAuthSpec, PortableConfigError> {
+        let mode = match self.mode.as_str() {
+            "bearer" => AdminAuthMode::Bearer,
+            "mtls" => AdminAuthMode::Mtls,
+            "bearer_and_mtls" => AdminAuthMode::BearerAndMtls,
+            "unsafe_none" => AdminAuthMode::UnsafeNone,
+            _ => {
+                return Err(invalid(
+                    "admin.auth.mode",
+                    "unsupported authentication mode",
+                ));
+            }
+        };
+        let needs_token = matches!(mode, AdminAuthMode::Bearer | AdminAuthMode::BearerAndMtls);
+        if needs_token != self.token_secret.is_some() {
+            return Err(invalid(
+                "admin.auth.token_secret",
+                "token_secret must be present exactly for bearer authentication modes",
+            ));
+        }
+        let token_secret = self
+            .token_secret
+            .as_deref()
+            .map(|source| {
+                let id = resource_id(source, "secret", "admin.auth.token_secret")?;
+                if !resources.secrets.contains_key(&id) {
+                    return Err(invalid(
+                        "admin.auth.token_secret",
+                        "referenced Secret does not exist",
+                    ));
+                }
+                Ok(id)
+            })
+            .transpose()?;
+        let needs_mtls = matches!(mode, AdminAuthMode::Mtls | AdminAuthMode::BearerAndMtls);
+        match (listen, needs_mtls) {
+            (AdminListenSpec::Unix(_), true) => {
+                return Err(invalid(
+                    "admin.auth.mode",
+                    "mTLS authentication requires an HTTPS listener",
+                ));
+            }
+            (AdminListenSpec::Https(https), true)
+                if https.client_auth.mode != ClientAuthMode::Required =>
+            {
+                return Err(invalid(
+                    "admin.listen.https.client_auth.mode",
+                    "mTLS authentication requires client_auth.mode `required`",
+                ));
+            }
+            _ => {}
+        }
+        if mode == AdminAuthMode::UnsafeNone {
+            let allowed = match listen {
+                AdminListenSpec::Unix(_) => true,
+                AdminListenSpec::Https(https) => {
+                    https.bind.ip().is_loopback() && https.client_auth.mode == ClientAuthMode::None
+                }
+            };
+            if !allowed {
+                return Err(invalid(
+                    "admin.auth.mode",
+                    "unsafe_none requires a Unix socket or loopback HTTPS without client auth",
+                ));
+            }
+        }
+        Ok(AdminAuthSpec {
+            mode,
+            token_secret,
+            mode_source: self.mode_source.clone(),
+            token_secret_source: self.token_secret_source.clone(),
+            source: self.source.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminStorageV1 {
+    pub directory: PortablePathRefV1,
+    pub directory_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminBundleTrustV1 {
+    pub deployment_root: PortablePathRefV1,
+    pub deployment_root_source: SourceSpan,
+    pub verification_keys: Vec<PortablePathRefV1>,
+    pub verification_key_sources: Vec<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminPermissionsV1 {
+    pub read: bool,
+    pub stage: bool,
+    pub activate: bool,
+    pub rollback: bool,
+    pub drain: bool,
+    pub reload_source: bool,
+}
+
+impl PortableAdminPermissionsV1 {
+    fn from_compiled(source: AdminPermissions) -> Self {
+        Self {
+            read: source.read,
+            stage: source.stage,
+            activate: source.activate,
+            rollback: source.rollback,
+            drain: source.drain,
+            reload_source: source.reload_source,
+        }
+    }
+
+    fn compile(&self) -> Result<AdminPermissions, PortableConfigError> {
+        if !self.read
+            && !self.stage
+            && !self.activate
+            && !self.rollback
+            && !self.drain
+            && !self.reload_source
+        {
+            return Err(invalid(
+                "admin.permissions",
+                "at least one admin operation must be permitted",
+            ));
+        }
+        Ok(AdminPermissions {
+            read: self.read,
+            stage: self.stage,
+            activate: self.activate,
+            rollback: self.rollback,
+            drain: self.drain,
+            reload_source: self.reload_source,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminCandidateLimitsV1 {
+    pub max_count: u32,
+    pub max_bytes: u64,
+    pub max_candidate_bytes: u64,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminHistoryLimitsV1 {
+    pub max_snapshots: u32,
+    pub max_bytes: u64,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortablePathRefV1 {
     pub base: String,
     pub path: String,
@@ -566,6 +1279,12 @@ impl PortablePathRefV1 {
         field: &str,
     ) -> Result<Self, PortableConfigError> {
         if let Ok(relative) = path.strip_prefix(source_root) {
+            if relative.as_os_str().is_empty() {
+                return Ok(Self {
+                    base: "deployment_root".to_owned(),
+                    path: ".".to_owned(),
+                });
+            }
             return Ok(Self {
                 base: "deployment_root".to_owned(),
                 path: normalized_relative_path(relative, field)?,
@@ -608,6 +1327,9 @@ impl PortablePathRefV1 {
                 Ok(path)
             }
             "deployment_root" => {
+                if self.path == "." {
+                    return Ok(deployment_root.to_path_buf());
+                }
                 let relative = normalized_relative_path(Path::new(&self.path), field)?;
                 Ok(deployment_root.join(relative))
             }
@@ -2103,6 +2825,76 @@ mod tests {
 
     use super::*;
     use crate::Compiler;
+
+    #[test]
+    fn portable_admin_roundtrip_preserves_policy_without_secret_bytes() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::create_dir_all(directory.path().join("secrets")).expect("secret directory exists");
+        fs::write(
+            directory.path().join("secrets/admin-token"),
+            b"distinctive-secret-bytes-never-in-the-bundle",
+        )
+        .expect("secret fixture is written");
+        fs::write(
+            &config,
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    admin-token:
+      file: secrets/admin-token
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+      mode: "0600"
+  auth:
+    mode: bearer
+    token_secret: admin-token
+  storage:
+    directory: /var/lib/oxidase-test/admin
+  bundle_trust:
+    verification_keys: [keys/operator.pub]
+  permissions:
+    read: true
+    stage: true
+  candidates:
+    max_count: 2
+    max_bytes: 16MiB
+    max_candidate_bytes: 8MiB
+  history:
+    max_snapshots: 3
+    max_bytes: 32MiB
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        )
+        .expect("config fixture is written");
+        let gateway = Compiler::compile_path(&config).expect("Gateway compiles");
+        let portable =
+            PortableGatewayConfigV1::from_compiled(&gateway).expect("portable Gateway is exported");
+        let portable_admin = portable.admin.as_ref().expect("portable admin exists");
+        assert_eq!(
+            portable_admin.bundle_trust.deployment_root.base,
+            "deployment_root"
+        );
+        assert_eq!(portable_admin.bundle_trust.deployment_root.path, ".");
+        let encoded = serde_json::to_string(&portable).expect("portable Gateway serializes");
+        assert!(!encoded.contains("distinctive-secret-bytes-never-in-the-bundle"));
+        let plan = portable
+            .compile_at(directory.path())
+            .expect("portable admin policy compiles");
+        let admin = plan.admin.expect("portable admin policy exists");
+        assert_eq!(admin.auth.mode, AdminAuthMode::Bearer);
+        assert_eq!(admin.candidates.max_candidate_bytes, 8 * 1_024 * 1_024);
+        assert_eq!(admin.bundle_trust.verification_keys.len(), 1);
+        assert_eq!(admin.bundle_trust.deployment_root, directory.path());
+        assert_eq!(admin.auth.mode_source.field_path, "admin.auth.mode");
+    }
 
     fn compiled_gateway() -> (tempfile::TempDir, CompiledGateway) {
         let directory = tempdir().expect("temporary directory is available");

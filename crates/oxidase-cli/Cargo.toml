@@ -16,7 +16,12 @@ fuzzing = []
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 oxidase-bundle = { path = "../oxidase-bundle" }
 oxidase-config = { path = "../oxidase-config" }
 oxidase-core = { path = "../oxidase-core" }
@@ -27,8 +32,15 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
+zeroize.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pki-types.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

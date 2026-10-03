@@ -33,6 +33,18 @@ cannot leak captures or rewrites into its siblings.
 
 ## Current v0.3 alpha
 
+The v0.4 secure-control-plane phase adds authenticated Unix/HTTPS administration,
+signed Bundle stage/validate/activate/rollback, bounded operation receipts and
+JSONL audit delivery. A single manager arbitrates source reload, Bundle publication,
+and drain using a runtime epoch/revision ETag. Post-publication persistence faults
+are explicitly recovery-required, not reported as an unchanged deployment.
+Admin credentials and static permissions remain one fixed bootstrap; changing it
+requires restart. See [Admin API](docs/admin-api.md),
+[recovery contract](docs/control-plane-recovery.md), and the
+[test-only example](examples/secure-admin-gateway/README.md).
+The workspace remains `0.3.0-alpha.1`; DNS discovery, OpenTelemetry, and packaging
+are not part of this phase. This is not a production-readiness claim.
+
 The runnable inbound data plane supports cleartext HTTP/1.1 plus HTTPS over TLS
 1.2/1.3 with ALPN-selected HTTP/1.1 or HTTP/2. Every current Service node runs on
 either selected protocol. Proxy remains streaming over pooled HTTP/1.1, HTTPS, and

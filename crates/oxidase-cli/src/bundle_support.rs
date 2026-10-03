@@ -1,21 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use oxidase_bundle::{
     AssetDescriptor, AssetReferenceBase, AssetStorage, BuildMetadata, BundleArchive, BundleBuilder,
-    BundleCapabilities, BundleDiff, BundleError, BundleInspection, BundleLimits, BundleManifest,
-    BundleSigningKey, BundleVerification, BundleVerificationKey, InspectionVerbosity,
-    SensitiveReference, SensitiveReferenceKind, SignatureRequirement, SignatureVerification,
-    SourceOrigin, StableSection,
+    BundleDiff, BundleError, BundleInspection, BundleLimits, BundleManifest, BundleSigningKey,
+    BundleVerification, BundleVerificationKey, InspectionVerbosity, SensitiveReference,
+    SensitiveReferenceKind, SignatureRequirement, SignatureVerification, SourceOrigin,
+    StableSection,
 };
 use oxidase_config::{BundleAssetMode, CompiledGateway};
 use oxidase_core::{ContentDigest, ContentHasher};
 use oxidase_runtime::{
-    MAX_PRIVATE_KEY_BYTES, PORTABLE_RUNTIME_PLAN_SCHEMA_V1, PortableRuntimeError,
-    PortableRuntimePlanV1, RuntimeSnapshot,
+    BundleActivationError, MAX_PRIVATE_KEY_BYTES, PORTABLE_RUNTIME_PLAN_SCHEMA_V1,
+    PortableRuntimeError, PortableRuntimePlanV1, RuntimeSnapshot, bundle_runtime_capabilities,
+    prepare_bundle_archive,
 };
 use oxidase_site::{AssetSource, PortableAssetInputV1, PortableSiteError};
 use serde::Serialize;
@@ -25,6 +26,7 @@ const RUNTIME_SECTION: &str = "runtime";
 #[derive(Debug)]
 pub(crate) enum BundleCliError {
     Archive(BundleError),
+    Activation(BundleActivationError),
     Runtime(PortableRuntimeError),
     Io { code: &'static str, message: String },
     Invalid { code: &'static str, message: String },
@@ -36,6 +38,7 @@ impl BundleCliError {
             Self::Runtime(PortableRuntimeError::Preparation(error)) => {
                 Some(error.diagnostics().to_vec())
             }
+            Self::Activation(error) => error.structured_diagnostics(),
             _ => None,
         }
     }
@@ -43,6 +46,7 @@ impl BundleCliError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::Archive(error) => error.code(),
+            Self::Activation(error) => error.code(),
             Self::Runtime(error) => error.code(),
             Self::Io { code, .. } | Self::Invalid { code, .. } => code,
         }
@@ -51,6 +55,7 @@ impl BundleCliError {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::Archive(error) => error.to_string(),
+            Self::Activation(error) => error.message(),
             Self::Runtime(error) => error.to_string(),
             Self::Io { message, .. } | Self::Invalid { message, .. } => message.clone(),
         }
@@ -59,6 +64,7 @@ impl BundleCliError {
     pub(crate) const fn offset(&self) -> Option<u64> {
         match self {
             Self::Archive(error) => error.offset(),
+            Self::Activation(error) => error.offset(),
             Self::Runtime(_) | Self::Io { .. } | Self::Invalid { .. } => None,
         }
     }
@@ -73,6 +79,12 @@ impl From<BundleError> for BundleCliError {
 impl From<PortableRuntimeError> for BundleCliError {
     fn from(value: PortableRuntimeError) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<BundleActivationError> for BundleCliError {
+    fn from(value: BundleActivationError) -> Self {
+        Self::Activation(value)
     }
 }
 
@@ -112,18 +124,7 @@ struct CachedAssetResolver<'a> {
     pinned_file: &'a Arc<File>,
     display_path: &'a Arc<PathBuf>,
     deployment_root: &'a Path,
-    reference_mode: ReferenceAssetMode,
     cache: BTreeMap<String, (ContentDigest, u64, AssetSource)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReferenceAssetMode {
-    /// Verify external bytes without retaining a second full-size spool. This
-    /// is safe only for semantic validation whose compiled Site is discarded.
-    ValidateOnly,
-    /// Copy verified bytes to an immutable temporary backing file before the
-    /// Site can be published and serve them.
-    PinImmutable,
 }
 
 impl<'a> CachedAssetResolver<'a> {
@@ -132,14 +133,12 @@ impl<'a> CachedAssetResolver<'a> {
         pinned_file: &'a Arc<File>,
         display_path: &'a Arc<PathBuf>,
         deployment_root: &'a Path,
-        reference_mode: ReferenceAssetMode,
     ) -> Self {
         Self {
             archive,
             pinned_file,
             display_path,
             deployment_root,
-            reference_mode,
             cache: BTreeMap::new(),
         }
     }
@@ -393,7 +392,7 @@ pub(crate) fn verify_bundle(
             SignatureRequirement::RequireAnyTrusted
         },
     )?;
-    archive.verify_capabilities(&runtime_capabilities())?;
+    archive.verify_capabilities(&bundle_runtime_capabilities())?;
     let plan = decode_runtime_plan(&archive)?;
     validate_sensitive_references(archive.manifest(), &plan)?;
     validate_asset_set(archive.manifest(), &plan)?;
@@ -409,13 +408,8 @@ pub(crate) fn verify_bundle(
                 })?,
         );
     let display_path = Arc::new(path.to_path_buf());
-    let mut resolver = CachedAssetResolver::new(
-        &archive,
-        &pinned_file,
-        &display_path,
-        &deployment_root,
-        ReferenceAssetMode::ValidateOnly,
-    );
+    let mut resolver =
+        CachedAssetResolver::new(&archive, &pinned_file, &display_path, &deployment_root);
     let content_digest: ContentDigest = archive.content_digest().into();
     plan.validate_with_assets(content_digest, &deployment_root, |key, digest, length| {
         resolver.resolve(key, digest, length)
@@ -463,16 +457,6 @@ pub(crate) fn load_bundle_snapshot(
     let archive = BundleArchive::read_path(path, &BundleLimits::default())?;
     archive.verify()?;
     let deployment_root = resolve_deployment_root(deployment_root, path)?;
-    let pinned_file =
-        Arc::new(
-            archive
-                .try_clone_backing_file()?
-                .ok_or_else(|| BundleCliError::Invalid {
-                    code: "bundle.backing_missing",
-                    message: "path-backed Bundle did not retain a verified file handle".to_owned(),
-                })?,
-        );
-    let display_path = Arc::new(path.to_path_buf());
     let trusted = read_verification_keys(verification_keys)?;
     let requirement = if allow_unsigned {
         SignatureRequirement::AllowUnsigned
@@ -488,31 +472,10 @@ pub(crate) fn load_bundle_snapshot(
         });
     }
     let verification = archive.verify_ed25519(&trusted, requirement)?;
-    let capabilities = runtime_capabilities();
-    archive.verify_capabilities(&capabilities)?;
-    let plan = decode_runtime_plan(&archive)?;
-    validate_sensitive_references(archive.manifest(), &plan)?;
-    validate_asset_set(archive.manifest(), &plan)?;
-    validate_reference_sensitive_isolation(archive.manifest(), &deployment_root)?;
-    let dependencies = runtime_dependencies(path, archive.manifest(), &deployment_root)?;
-    let content_digest: ContentDigest = archive.content_digest().into();
-    let mut resolver = CachedAssetResolver::new(
-        &archive,
-        &pinned_file,
-        &display_path,
-        &deployment_root,
-        ReferenceAssetMode::PinImmutable,
-    );
-    let (snapshot, _reuse) = plan.prepare_with_assets(
-        content_digest,
-        &deployment_root,
-        dependencies,
-        |key, digest, length| resolver.resolve(key, digest, length),
-        None,
-    )?;
+    let prepared = prepare_bundle_archive(&archive, path, &deployment_root, None)?;
     let inspection = archive.inspect(InspectionVerbosity::Safe);
     Ok(LoadedBundle {
-        snapshot,
+        snapshot: prepared.snapshot,
         verification,
         inspection,
     })
@@ -591,26 +554,12 @@ fn resolve_asset(
                     PortableSiteError::asset_resolution_with_code(error.code(), error.message())
                 },
             )?;
-            match resolver.reference_mode {
-                ReferenceAssetMode::ValidateOnly => {
-                    validate_external_asset(&path, digest, length).map_err(|error| {
-                        PortableSiteError::asset_resolution_with_code(error.code(), error.message())
-                    })?;
-                    // `PortableRuntimePlanV1::validate_with_assets` compiles and
-                    // immediately drops this Site; it never executes the path.
-                    Ok(AssetSource::File(path))
-                }
-                ReferenceAssetMode::PinImmutable => {
-                    let (file, origin) =
-                        verify_external_asset(&path, digest, length).map_err(|error| {
-                            PortableSiteError::asset_resolution_with_code(
-                                error.code(),
-                                error.message(),
-                            )
-                        })?;
-                    Ok(AssetSource::pinned_with_origin(file, origin, path, 0))
-                }
-            }
+            validate_external_asset(&path, digest, length).map_err(|error| {
+                PortableSiteError::asset_resolution_with_code(error.code(), error.message())
+            })?;
+            // `validate_with_assets` compiles and immediately drops this Site;
+            // it never executes the path returned here.
+            Ok(AssetSource::File(path))
         }
     }
 }
@@ -921,38 +870,6 @@ fn origin_overflow() -> BundleCliError {
     }
 }
 
-fn runtime_capabilities() -> BundleCapabilities {
-    BundleCapabilities {
-        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
-        supported_features: BTreeSet::from(["portable-runtime".to_owned()]),
-        supported_sections: BTreeMap::from([(
-            RUNTIME_SECTION.to_owned(),
-            PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
-        )]),
-    }
-}
-
-fn runtime_dependencies(
-    bundle_path: &Path,
-    manifest: &BundleManifest,
-    deployment_root: &Path,
-) -> Result<Vec<PathBuf>, BundleCliError> {
-    let mut dependencies = BTreeSet::from([bundle_path.to_path_buf()]);
-    for asset in manifest.assets.values() {
-        if let AssetStorage::Reference { base, path, .. } = &asset.storage {
-            dependencies.insert(resolve_reference(*base, path, deployment_root)?);
-        }
-    }
-    for reference in manifest.sensitive_references.values() {
-        dependencies.insert(resolve_reference(
-            reference.base,
-            &reference.runtime_path,
-            deployment_root,
-        )?);
-    }
-    Ok(dependencies.into_iter().collect())
-}
-
 fn read_verification_keys(paths: &[PathBuf]) -> Result<Vec<BundleVerificationKey>, BundleCliError> {
     paths
         .iter()
@@ -961,49 +878,18 @@ fn read_verification_keys(paths: &[PathBuf]) -> Result<Vec<BundleVerificationKey
         .map_err(Into::into)
 }
 
-fn verify_external_asset(
-    path: &Path,
-    expected_digest: ContentDigest,
-    expected_length: u64,
-) -> Result<(File, File), BundleCliError> {
-    let mut pinned = tempfile::NamedTempFile::new().map_err(|error| BundleCliError::Io {
-        code: "bundle.asset_reference_io",
-        message: format!("cannot create immutable external Asset backing: {error}"),
-    })?;
-    let origin = copy_and_verify_external_asset(
-        path,
-        expected_digest,
-        expected_length,
-        Some(pinned.as_file_mut()),
-    )?;
-    pinned
-        .as_file()
-        .sync_data()
-        .map_err(|error| BundleCliError::Io {
-            code: "bundle.asset_reference_io",
-            message: format!("cannot flush immutable external Asset backing: {error}"),
-        })?;
-    let immutable = File::open(pinned.path()).map_err(|error| BundleCliError::Io {
-        code: "bundle.asset_reference_io",
-        message: format!("cannot open immutable external Asset backing: {error}"),
-    })?;
-    drop(pinned);
-    Ok((immutable, origin))
-}
-
 fn validate_external_asset(
     path: &Path,
     expected_digest: ContentDigest,
     expected_length: u64,
 ) -> Result<(), BundleCliError> {
-    copy_and_verify_external_asset(path, expected_digest, expected_length, None).map(drop)
+    copy_and_verify_external_asset(path, expected_digest, expected_length).map(drop)
 }
 
 fn copy_and_verify_external_asset(
     path: &Path,
     expected_digest: ContentDigest,
     expected_length: u64,
-    immutable_copy: Option<&mut File>,
 ) -> Result<File, BundleCliError> {
     let file = open_external_asset(path).map_err(|error| BundleCliError::Io {
         code: "bundle.asset_reference_io",
@@ -1013,13 +899,7 @@ fn copy_and_verify_external_asset(
         code: "bundle.asset_reference_io",
         message: format!("cannot inspect external Bundle Asset handle: {error}"),
     })?;
-    copy_and_verify_opened_external_asset(
-        file,
-        metadata,
-        expected_digest,
-        expected_length,
-        immutable_copy,
-    )
+    copy_and_verify_opened_external_asset(file, metadata, expected_digest, expected_length)
 }
 
 fn copy_and_verify_opened_external_asset(
@@ -1027,7 +907,6 @@ fn copy_and_verify_opened_external_asset(
     metadata: std::fs::Metadata,
     expected_digest: ContentDigest,
     expected_length: u64,
-    mut immutable_copy: Option<&mut File>,
 ) -> Result<File, BundleCliError> {
     if !metadata.is_file() || metadata.len() != expected_length {
         return Err(BundleCliError::Invalid {
@@ -1046,13 +925,6 @@ fn copy_and_verify_opened_external_asset(
         })?;
         if read == 0 {
             break;
-        }
-        if let Some(copy) = immutable_copy.as_deref_mut() {
-            copy.write_all(&buffer[..read])
-                .map_err(|error| BundleCliError::Io {
-                    code: "bundle.asset_reference_io",
-                    message: format!("cannot pin external Bundle Asset: {error}"),
-                })?;
         }
         hasher.update(&buffer[..read]);
         length = length
@@ -1247,10 +1119,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CachedAssetResolver, RUNTIME_SECTION, ReferenceAssetMode, build_bundle,
-        copy_and_verify_opened_external_asset, decode_runtime_plan, inspect_bundle,
-        load_bundle_snapshot, open_external_asset, resolve_asset_reference, sign_bundle,
-        validate_asset_set, validate_sensitive_references, verify_bundle,
+        CachedAssetResolver, RUNTIME_SECTION, build_bundle, copy_and_verify_opened_external_asset,
+        decode_runtime_plan, inspect_bundle, load_bundle_snapshot, open_external_asset,
+        resolve_asset_reference, sign_bundle, validate_asset_set, validate_sensitive_references,
+        verify_bundle,
     };
 
     fn write_site_gateway(root: &Path, asset_mode: &str) -> PathBuf {
@@ -1555,13 +1427,8 @@ listeners:
                 .expect("path Bundle is pinned"),
         );
         let display_path = Arc::new(bundle.clone());
-        let mut validation_resolver = CachedAssetResolver::new(
-            &archive,
-            &pinned_bundle,
-            &display_path,
-            &deployment_root,
-            ReferenceAssetMode::ValidateOnly,
-        );
+        let mut validation_resolver =
+            CachedAssetResolver::new(&archive, &pinned_bundle, &display_path, &deployment_root);
         assert!(matches!(
             validation_resolver
                 .resolve(content_key, expected_digest, expected_length)
@@ -1680,7 +1547,6 @@ listeners:
             opened_metadata,
             ContentDigest::of_bytes(old_bytes),
             old_bytes.len() as u64,
-            None,
         )
         .expect("verification remains pinned to the opened inode");
         let origin_metadata = origin.metadata().expect("origin handle stats");

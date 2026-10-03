@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,14 +27,14 @@ use oxidase_source::{FieldSpanIndex, SourceDocument, field_path_child};
 use crate::API_VERSION;
 use crate::diagnostic::{CompileError, Diagnostic};
 use crate::source::{
-    ActiveHealthSource, BodySource, BundleSource, CertificateSource, ClientAuthSource,
-    ClusterEndpointSource, ClusterSource, ClusterTlsSource, ConfigTestSource, ErrorClassSource,
-    GatewaySource, HeadersSource, Http1SettingsSource, Http2SettingsSource, HttpListenerSource,
-    HttpVersionSource, InlineServiceSource, ListenerLimitsSource, ListenerProtocolSource,
-    ListenerSource, PassiveHealthSource, PredicateSource, RateLimitKeySource, RedirectQuerySource,
-    RequestTransformSource, ResourcesSource, ResponseTransformSource, RetryRequestBodySource,
-    RetrySource, SecretSource, ServiceSource, SiteSource, StatusRangeSource, TlsListenerSource,
-    TrustStoreSource,
+    ActiveHealthSource, AdminAuthSource, AdminListenSource, AdminSource, BodySource, BundleSource,
+    CertificateSource, ClientAuthSource, ClusterEndpointSource, ClusterSource, ClusterTlsSource,
+    ConfigTestSource, ErrorClassSource, GatewaySource, HeadersSource, Http1SettingsSource,
+    Http2SettingsSource, HttpListenerSource, HttpVersionSource, InlineServiceSource,
+    ListenerLimitsSource, ListenerProtocolSource, ListenerSource, PassiveHealthSource,
+    PredicateSource, RateLimitKeySource, RedirectQuerySource, RequestTransformSource,
+    ResourcesSource, ResponseTransformSource, RetryRequestBodySource, RetrySource, SecretSource,
+    ServiceSource, SiteSource, StatusRangeSource, TlsListenerSource, TrustStoreSource,
 };
 
 #[derive(Clone)]
@@ -42,6 +43,8 @@ pub struct CompiledGateway {
     pub config_version: ConfigVersion,
     /// Packaging policy consumed by `oxidase bundle build`.
     pub bundle: BundleSpec,
+    /// Optional authenticated management-plane transport and authorization policy.
+    pub admin: Option<AdminSpec>,
     /// Complete filesystem dependency set used by preparation and reload.
     pub dependencies: Vec<PathBuf>,
     /// Inspection-safe dependency set with secret and private-key paths removed.
@@ -61,6 +64,7 @@ impl fmt::Debug for CompiledGateway {
             .field("source", &self.source)
             .field("config_version", &self.config_version)
             .field("bundle_asset_mode", &self.bundle.assets.mode)
+            .field("admin_enabled", &self.admin.is_some())
             .field("dependency_count", &self.dependencies.len())
             .field("service_node_count", &self.graph.len())
             .field("certificate_count", &self.resources.certificates.len())
@@ -73,6 +77,118 @@ impl fmt::Debug for CompiledGateway {
             .field("warning_count", &self.warnings.len())
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminSpec {
+    pub listen: AdminListenSpec,
+    pub auth: AdminAuthSpec,
+    pub storage: AdminStorageSpec,
+    pub bundle_trust: AdminBundleTrustSpec,
+    pub permissions: AdminPermissions,
+    pub candidates: AdminCandidateLimits,
+    pub history: AdminHistoryLimits,
+    pub audit: AdminAuditSpec,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuditSpec {
+    pub destination: AdminAuditDestination,
+    pub queue_capacity: u32,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuditDestination {
+    Stderr,
+    Stdout,
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminStorageSpec {
+    pub directory: PathBuf,
+    pub directory_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminBundleTrustSpec {
+    /// Deployment root used to resolve external references in staged Bundles.
+    pub deployment_root: PathBuf,
+    pub deployment_root_source: SourceSpan,
+    pub verification_keys: Vec<PathBuf>,
+    pub verification_key_sources: Vec<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdminListenSpec {
+    Unix(Box<AdminUnixListenSpec>),
+    Https(Box<AdminHttpsListenSpec>),
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminUnixListenSpec {
+    pub path: PathBuf,
+    pub mode: u32,
+    pub path_source: SourceSpan,
+    pub mode_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHttpsListenSpec {
+    pub bind: SocketAddr,
+    pub certificate: ResourceId,
+    pub client_auth: ClientAuthSpec,
+    pub bind_source: SourceSpan,
+    pub certificate_source: SourceSpan,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuthSpec {
+    pub mode: AdminAuthMode,
+    pub token_secret: Option<ResourceId>,
+    pub mode_source: SourceSpan,
+    pub token_secret_source: Option<SourceSpan>,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAuthMode {
+    Bearer,
+    Mtls,
+    BearerAndMtls,
+    UnsafeNone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AdminPermissions {
+    pub read: bool,
+    pub stage: bool,
+    pub activate: bool,
+    pub rollback: bool,
+    pub drain: bool,
+    pub reload_source: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminCandidateLimits {
+    pub max_count: u32,
+    pub max_bytes: u64,
+    pub max_candidate_bytes: u64,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHistoryLimits {
+    pub max_snapshots: u32,
+    pub max_bytes: u64,
+    pub source: SourceSpan,
 }
 
 impl CompiledGateway {
@@ -632,12 +748,22 @@ pub struct Compiler;
 
 impl Compiler {
     pub fn compile_path(path: impl AsRef<Path>) -> Result<CompiledGateway, CompileError> {
+        Self::compile_path_controlled(path, || Ok(()))
+    }
+
+    /// Cooperative source preparation. The callback is checked before each
+    /// imported document and read chunk; no runtime implementation enters IR.
+    pub fn compile_path_controlled(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Result<(), CompileError>,
+    ) -> Result<CompiledGateway, CompileError> {
         let requested = path.as_ref();
+        checkpoint()?;
         let path = canonical_input(requested).map_err(|error| {
             error.with_discovered_dependencies(candidate_dependencies(requested))
         })?;
         let mut loader = Loader::default();
-        if let Err(error) = loader.load(&path) {
+        if let Err(error) = loader.load(&path, &mut checkpoint) {
             return Err(error.with_discovered_dependencies(loader.discovered_dependencies()));
         }
         let discovered_dependencies = loader.discovered_dependencies();
@@ -647,14 +773,17 @@ impl Compiler {
         discovered_dependencies.sort();
         discovered_dependencies.dedup();
         let result = (|| {
+            checkpoint()?;
             validate_document_identity(&merged)?;
             let bundle = compile_bundle(&merged)?;
-            let (resources, warnings) = compile_resources(&merged)?;
+            let (resources, mut warnings) = compile_resources(&merged)?;
+            let admin = compile_admin(&merged, &resources, &mut warnings)?;
             let summary_dependencies = summary_dependencies(&merged);
 
             let mut builder = ProgramBuilder::new(&merged, &resources);
             let listeners = builder.compile_listeners()?;
             builder.compile_all_named()?;
+            checkpoint()?;
             let graph = Arc::new(ServiceGraph::new(builder.nodes));
             for listener in &listeners {
                 ServiceProgram::new(listener.service.clone(), Arc::clone(&graph))
@@ -672,6 +801,7 @@ impl Compiler {
                 source: path,
                 config_version: ConfigVersion::new(format!("v2-sha256-{}", merged.hash)),
                 bundle,
+                admin,
                 dependencies: merged.dependencies,
                 summary_dependencies,
                 graph,
@@ -713,6 +843,58 @@ fn canonical_input(path: &Path) -> Result<PathBuf, CompileError> {
             span(path, ""),
         ))
     })
+}
+
+fn read_config_source_controlled(
+    path: &Path,
+    checkpoint: &mut dyn FnMut() -> Result<(), CompileError>,
+) -> Result<String, CompileError> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let failure = |code, message| CompileError::one(Diagnostic::new(code, message, span(path, "")));
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(
+            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+        );
+    }
+    checkpoint()?;
+    let mut file = options
+        .open(path)
+        .map_err(|_| failure("config.read", "cannot open configuration source"))?;
+    if !file
+        .metadata()
+        .map_err(|_| failure("config.read", "cannot inspect configuration source"))?
+        .is_file()
+    {
+        return Err(failure(
+            "config.read",
+            "configuration source must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        checkpoint()?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| failure("config.read", "cannot read configuration source"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAX_BYTES {
+            return Err(failure(
+                "config.source_limit",
+                "configuration document exceeds 16 MiB",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    checkpoint()?;
+    String::from_utf8(bytes)
+        .map_err(|_| failure("config.read", "configuration source must be UTF-8"))
 }
 
 fn candidate_dependencies(path: &Path) -> Vec<PathBuf> {
@@ -801,9 +983,21 @@ struct Loader {
 }
 
 impl Loader {
-    fn load(&mut self, path: &Path) -> Result<(), CompileError> {
+    fn load(
+        &mut self,
+        path: &Path,
+        checkpoint: &mut dyn FnMut() -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
         self.discovered_dependencies
             .extend(candidate_dependencies(path));
+        checkpoint()?;
+        if self.stack.len() >= 128 || self.documents.len() >= 4096 {
+            return Err(CompileError::one(Diagnostic::new(
+                "config.source_limit",
+                "configuration import depth/count exceeds the bounded source limit",
+                span(path, "imports"),
+            )));
+        }
         if let Some(position) = self.stack.iter().position(|candidate| candidate == path) {
             let chain = self.import_chain[position..].to_vec();
             let primary = chain
@@ -823,14 +1017,9 @@ impl Loader {
         if self.loaded.contains(path) {
             return Ok(());
         }
-        let source = fs::read_to_string(path).map_err(|error| {
-            CompileError::one(Diagnostic::new(
-                "config.read",
-                format!("cannot read configuration: {error}"),
-                span(path, ""),
-            ))
-        })?;
+        let source = read_config_source_controlled(path, checkpoint)?;
         let document: SourceDocument<GatewaySource> = parse_yaml_document(path, &source, "")?;
+        checkpoint()?;
 
         self.stack.push(path.to_path_buf());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -856,7 +1045,7 @@ impl Loader {
                 )
             })?;
             self.import_chain.push(reference);
-            let result = self.load(&import);
+            let result = self.load(&import, checkpoint);
             self.import_chain.pop();
             result?;
         }
@@ -919,6 +1108,9 @@ impl Loader {
             });
             if let Some(bundle) = document.bundle {
                 merge_bundle(&mut merged, bundle, &file, Arc::clone(&spans));
+            }
+            if let Some(admin) = document.admin {
+                merge_admin(&mut merged, admin, &file, Arc::clone(&spans));
             }
             merge_resources(&mut merged, document.resources, &file, Arc::clone(&spans));
             for (name, service) in document.services {
@@ -996,6 +1188,18 @@ impl Loader {
                 .dependency_candidates
                 .extend(candidate_dependencies(&resolved));
         }
+        if let Some(located) = &merged.admin {
+            let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+            for declared in &located.value.bundle_trust.verification_keys {
+                let resolved = resolve_declared_path(directory, declared);
+                merged
+                    .dependencies
+                    .extend(candidate_dependencies(&resolved));
+                merged
+                    .dependency_candidates
+                    .extend(candidate_dependencies(&resolved));
+            }
+        }
         merged.dependencies.sort();
         merged.dependencies.dedup();
         merged.dependency_candidates.sort();
@@ -1047,6 +1251,7 @@ struct MergedSource {
     api_versions: Vec<Located<String>>,
     kinds: Vec<Located<String>>,
     bundle: Option<Located<BundleSource>>,
+    admin: Option<Located<AdminSource>>,
     certificates: BTreeMap<String, Located<CertificateSource>>,
     secrets: BTreeMap<String, Located<SecretSource>>,
     trust_stores: BTreeMap<String, Located<TrustStoreSource>>,
@@ -1056,6 +1261,39 @@ struct MergedSource {
     listeners: Vec<Located<ListenerSource>>,
     tests: Vec<Located<ConfigTestSource>>,
     merge_errors: Vec<Diagnostic>,
+}
+
+fn merge_admin(
+    merged: &mut MergedSource,
+    admin: AdminSource,
+    file: &Path,
+    spans: Arc<FieldSpanIndex>,
+) {
+    let located = Located {
+        value: admin,
+        file: file.to_path_buf(),
+        field_path: "admin".to_owned(),
+        spans,
+    };
+    if let Some(previous) = &merged.admin {
+        let first = previous.span();
+        let duplicate = located.span();
+        merged.merge_errors.push(
+            Diagnostic::new(
+                "admin.duplicate_settings",
+                "the import graph may define only one top-level `admin` block",
+                duplicate.clone(),
+            )
+            .with_label("first admin settings", first.clone())
+            .with_related("previous admin settings", first.clone())
+            .with_reference_chain([
+                DiagnosticReference::new("first admin settings", first),
+                DiagnosticReference::new("duplicate admin settings", duplicate),
+            ]),
+        );
+    } else {
+        merged.admin = Some(located);
+    }
 }
 
 fn merge_bundle(
@@ -1307,6 +1545,554 @@ fn compile_bundle(merged: &MergedSource) -> Result<BundleSpec, CompileError> {
         },
         source: located.span(),
     })
+}
+
+fn compile_admin(
+    merged: &MergedSource,
+    resources: &CompiledResources,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<Option<AdminSpec>, CompileError> {
+    let Some(located) = &merged.admin else {
+        return Ok(None);
+    };
+    let context = SourceContext {
+        file: &located.file,
+        spans: Some(located.spans.as_ref()),
+    };
+    let listen_path = format!("{}.listen", located.field_path);
+    let listen = match &located.value.listen {
+        AdminListenSource::Unix(source) => {
+            let source = &source.unix;
+            let field_path = format!("{listen_path}.unix");
+            let path_path = format!("{field_path}.path");
+            let mode_path = format!("{field_path}.mode");
+            if source.path.as_os_str().is_empty() || !source.path.is_absolute() {
+                return Err(diagnostic_at(
+                    "admin.unix_path",
+                    "admin Unix socket path must be a non-empty absolute path",
+                    context,
+                    &path_path,
+                ));
+            }
+            if source.path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            }) {
+                return Err(diagnostic_at(
+                    "admin.unix_path",
+                    "admin Unix socket path must not contain `.` or `..` components",
+                    context,
+                    &path_path,
+                ));
+            }
+            let mode = parse_unix_mode(&source.mode, &context.span(&mode_path))?;
+            AdminListenSpec::Unix(Box::new(AdminUnixListenSpec {
+                path: source.path.clone(),
+                mode,
+                path_source: context.span(&path_path),
+                mode_source: context.span(&mode_path),
+                source: context.span(&field_path),
+            }))
+        }
+        AdminListenSource::Https(source) => {
+            let source = &source.https;
+            let field_path = format!("{listen_path}.https");
+            let bind_path = format!("{field_path}.bind");
+            let certificate_path = format!("{field_path}.certificate");
+            let bind = source.bind.parse::<SocketAddr>().map_err(|error| {
+                diagnostic_at(
+                    "admin.bind",
+                    format!("invalid admin HTTPS bind address: {error}"),
+                    context,
+                    &bind_path,
+                )
+            })?;
+            let certificate =
+                certificate_reference(&source.certificate, resources, context, &certificate_path)?;
+            AdminListenSpec::Https(Box::new(AdminHttpsListenSpec {
+                bind,
+                certificate,
+                client_auth: compile_client_auth(
+                    &source.client_auth,
+                    resources,
+                    context,
+                    &format!("{field_path}.client_auth"),
+                )?,
+                bind_source: context.span(&bind_path),
+                certificate_source: context.span(&certificate_path),
+                source: context.span(&field_path),
+            }))
+        }
+    };
+    let auth = compile_admin_auth(
+        &located.value.auth,
+        &listen,
+        resources,
+        context,
+        &format!("{}.auth", located.field_path),
+        warnings,
+    )?;
+
+    let permissions_source = &located.value.permissions;
+    let permissions = AdminPermissions {
+        read: permissions_source.read,
+        stage: permissions_source.stage,
+        activate: permissions_source.activate,
+        rollback: permissions_source.rollback,
+        drain: permissions_source.drain,
+        reload_source: permissions_source.reload_source,
+    };
+    if !permissions.read
+        && !permissions.stage
+        && !permissions.activate
+        && !permissions.rollback
+        && !permissions.drain
+        && !permissions.reload_source
+    {
+        return Err(diagnostic_at(
+            "admin.permissions_empty",
+            "admin permissions must enable at least one operation",
+            context,
+            &format!("{}.permissions", located.field_path),
+        ));
+    }
+
+    let directory = located.file.parent().unwrap_or_else(|| Path::new("."));
+    let storage_path = format!("{}.storage", located.field_path);
+    let storage_directory_path = format!("{storage_path}.directory");
+    if located.value.storage.directory.as_os_str().is_empty() {
+        return Err(diagnostic_at(
+            "admin.storage_directory",
+            "admin storage directory cannot be empty",
+            context,
+            &storage_directory_path,
+        ));
+    }
+    if !located.value.storage.directory.is_absolute() {
+        return Err(diagnostic_at(
+            "admin.storage_directory",
+            "admin storage directory must be an absolute local path",
+            context,
+            &storage_directory_path,
+        ));
+    }
+    let storage = AdminStorageSpec {
+        directory: located.value.storage.directory.clone(),
+        directory_source: context.span(&storage_directory_path),
+        source: context.span(&storage_path),
+    };
+
+    let bundle_trust_path = format!("{}.bundle_trust", located.field_path);
+    let deployment_root_path = format!("{bundle_trust_path}.deployment_root");
+    let verification_keys_path = format!("{bundle_trust_path}.verification_keys");
+    if located.value.bundle_trust.verification_keys.len() > 32 {
+        return Err(diagnostic_at(
+            "admin.bundle_verification_key_count",
+            "at most 32 Bundle verification keys are supported",
+            context,
+            &verification_keys_path,
+        ));
+    }
+    if (permissions.stage || permissions.activate || permissions.rollback)
+        && located.value.bundle_trust.verification_keys.is_empty()
+    {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "admin.bundle_verification_keys_required",
+                "stage, activate, and rollback permissions require at least one Bundle verification key",
+                context.span(&verification_keys_path),
+            )
+            .with_help("configure an Ed25519 public key path under admin.bundle_trust.verification_keys"),
+        ));
+    }
+    let mut seen_keys = BTreeMap::<PathBuf, SourceSpan>::new();
+    let mut verification_keys =
+        Vec::with_capacity(located.value.bundle_trust.verification_keys.len());
+    let mut verification_key_sources =
+        Vec::with_capacity(located.value.bundle_trust.verification_keys.len());
+    for (index, declared) in located
+        .value
+        .bundle_trust
+        .verification_keys
+        .iter()
+        .enumerate()
+    {
+        let field_path = format!("{verification_keys_path}[{index}]");
+        if declared.as_os_str().is_empty() {
+            return Err(diagnostic_at(
+                "admin.bundle_verification_key",
+                "Bundle verification key path cannot be empty",
+                context,
+                &field_path,
+            ));
+        }
+        let resolved = resolve_declared_path(directory, declared);
+        let source = context.span(&field_path);
+        if let Some(previous) = seen_keys.insert(resolved.clone(), source.clone()) {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "admin.bundle_verification_key_duplicate",
+                    "duplicate Bundle verification key path",
+                    source,
+                )
+                .with_label("first key path", previous),
+            ));
+        }
+        verification_keys.push(resolved);
+        verification_key_sources.push(context.span(&field_path));
+    }
+    if located
+        .value
+        .bundle_trust
+        .deployment_root
+        .as_ref()
+        .is_some_and(|path| {
+            path.as_os_str().is_empty()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+        })
+    {
+        return Err(diagnostic_at(
+            "admin.bundle_deployment_root",
+            "Bundle deployment_root must be non-empty and must not contain `.` or `..` components",
+            context,
+            &deployment_root_path,
+        ));
+    }
+    let gateway_source_root = merged.root.parent().unwrap_or_else(|| Path::new("."));
+    let deployment_root = located
+        .value
+        .bundle_trust
+        .deployment_root
+        .as_ref()
+        .map_or_else(
+            || gateway_source_root.to_path_buf(),
+            |declared| resolve_declared_path(gateway_source_root, declared),
+        );
+    let bundle_trust = AdminBundleTrustSpec {
+        deployment_root,
+        deployment_root_source: context.span(&deployment_root_path),
+        verification_keys,
+        verification_key_sources,
+        source: context.span(&bundle_trust_path),
+    };
+
+    let candidates_path = format!("{}.candidates", located.field_path);
+    validate_positive(
+        located.value.candidates.max_count,
+        "admin.candidate_count",
+        "admin candidate max_count",
+        context.span(&format!("{candidates_path}.max_count")),
+    )?;
+    let candidate_max_bytes = parse_byte_size(
+        &located.value.candidates.max_bytes,
+        &context.span(&format!("{candidates_path}.max_bytes")),
+    )?;
+    let max_candidate_bytes = parse_byte_size(
+        &located.value.candidates.max_candidate_bytes,
+        &context.span(&format!("{candidates_path}.max_candidate_bytes")),
+    )?;
+    if max_candidate_bytes > candidate_max_bytes {
+        return Err(diagnostic_at(
+            "admin.candidate_limits",
+            "max_candidate_bytes cannot exceed the candidate store max_bytes",
+            context,
+            &format!("{candidates_path}.max_candidate_bytes"),
+        ));
+    }
+    let candidates = AdminCandidateLimits {
+        max_count: located.value.candidates.max_count,
+        max_bytes: candidate_max_bytes,
+        max_candidate_bytes,
+        source: context.span(&candidates_path),
+    };
+
+    let history_path = format!("{}.history", located.field_path);
+    validate_positive(
+        located.value.history.max_snapshots,
+        "admin.history_count",
+        "admin history max_snapshots",
+        context.span(&format!("{history_path}.max_snapshots")),
+    )?;
+    let history_max_bytes = parse_byte_size(
+        &located.value.history.max_bytes,
+        &context.span(&format!("{history_path}.max_bytes")),
+    )?;
+    if history_max_bytes < candidates.max_candidate_bytes {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "admin.history_capacity",
+                "history max_bytes must hold at least one maximum-sized candidate",
+                context.span(&format!("{history_path}.max_bytes")),
+            )
+            .with_label(
+                "maximum candidate size is configured here",
+                context.span(&format!("{candidates_path}.max_candidate_bytes")),
+            )
+            .with_help("increase history.max_bytes or reduce candidates.max_candidate_bytes"),
+        ));
+    }
+    let history = AdminHistoryLimits {
+        max_snapshots: located.value.history.max_snapshots,
+        max_bytes: history_max_bytes,
+        source: context.span(&history_path),
+    };
+
+    let audit_path = format!("{}.audit", located.field_path);
+    let audit_source = &located.value.audit;
+    if !(2..=4096).contains(&audit_source.queue_capacity) {
+        return Err(diagnostic_at(
+            "admin.audit_queue_capacity",
+            "audit queue_capacity must be within 2..=4096",
+            context,
+            &format!("{audit_path}.queue_capacity"),
+        ));
+    }
+    let audit_destination = match audit_source.destination.as_str() {
+        "stdout" | "stderr" if audit_source.file.is_none() => {
+            if audit_source.destination == "stdout" {
+                AdminAuditDestination::Stdout
+            } else {
+                AdminAuditDestination::Stderr
+            }
+        }
+        "file" => {
+            let file = audit_source
+                .file
+                .as_ref()
+                .filter(|path| {
+                    path.is_absolute()
+                        && !path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                })
+                .ok_or_else(|| {
+                    diagnostic_at(
+                        "admin.audit_file",
+                        "file audit destination requires an absolute file path without `.` or `..`",
+                        context,
+                        &format!("{audit_path}.file"),
+                    )
+                })?;
+            AdminAuditDestination::File(file.clone())
+        }
+        "stdout" | "stderr" => {
+            return Err(diagnostic_at(
+                "admin.audit_file_inert",
+                "audit.file is only allowed for destination: file",
+                context,
+                &format!("{audit_path}.file"),
+            ));
+        }
+        _ => {
+            return Err(diagnostic_at(
+                "admin.audit_destination",
+                "audit destination must be stdout, stderr, or file",
+                context,
+                &format!("{audit_path}.destination"),
+            ));
+        }
+    };
+    let audit = AdminAuditSpec {
+        destination: audit_destination,
+        queue_capacity: audit_source.queue_capacity,
+        source: context.span(&audit_path),
+    };
+
+    Ok(Some(AdminSpec {
+        listen,
+        auth,
+        storage,
+        bundle_trust,
+        permissions,
+        candidates,
+        history,
+        audit,
+        source: located.span(),
+    }))
+}
+
+fn compile_admin_auth(
+    source: &AdminAuthSource,
+    listen: &AdminListenSpec,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<AdminAuthSpec, CompileError> {
+    let mode_path = format!("{field_path}.mode");
+    let token_path = format!("{field_path}.token_secret");
+    let mode = match source.mode.as_str() {
+        "bearer" => AdminAuthMode::Bearer,
+        "mtls" => AdminAuthMode::Mtls,
+        "bearer_and_mtls" => AdminAuthMode::BearerAndMtls,
+        "unsafe_none" => AdminAuthMode::UnsafeNone,
+        value => {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "admin.auth_mode",
+                    format!("unsupported admin authentication mode `{value}`"),
+                    context.span(&mode_path),
+                )
+                .with_help("use `bearer`, `mtls`, `bearer_and_mtls`, or explicit `unsafe_none`"),
+            ));
+        }
+    };
+    let needs_token = matches!(mode, AdminAuthMode::Bearer | AdminAuthMode::BearerAndMtls);
+    match (needs_token, source.token_secret.as_deref()) {
+        (true, None) => {
+            return Err(diagnostic_at(
+                "admin.token_required",
+                "the selected admin authentication mode requires token_secret",
+                context,
+                field_path,
+            )
+            .map_diagnostics(|diagnostic| {
+                diagnostic.with_help("reference a file-backed Secret resource")
+            }));
+        }
+        (false, Some(_)) => {
+            return Err(diagnostic_at(
+                "admin.token_inert",
+                "token_secret is only valid for bearer authentication modes",
+                context,
+                &token_path,
+            ));
+        }
+        _ => {}
+    }
+    let token_secret = source
+        .token_secret
+        .as_deref()
+        .map(|name| secret_reference(name, resources, context, &token_path))
+        .transpose()?;
+
+    let needs_mtls = matches!(mode, AdminAuthMode::Mtls | AdminAuthMode::BearerAndMtls);
+    match (listen, needs_mtls) {
+        (AdminListenSpec::Unix(_), true) => {
+            return Err(diagnostic_at(
+                "admin.mtls_transport",
+                "mTLS admin authentication requires an HTTPS admin listener",
+                context,
+                &mode_path,
+            ));
+        }
+        (AdminListenSpec::Https(https), true)
+            if https.client_auth.mode != ClientAuthMode::Required =>
+        {
+            return Err(CompileError::one(
+                Diagnostic::new(
+                    "admin.mtls_required",
+                    "mTLS admin authentication requires client_auth.mode `required`",
+                    context.span(&mode_path),
+                )
+                .with_label(
+                    "client certificate requirement is configured here",
+                    https.client_auth.mode_source.clone(),
+                )
+                .with_help("set admin.listen.https.client_auth.mode to `required`"),
+            ));
+        }
+        _ => {}
+    }
+    if mode == AdminAuthMode::UnsafeNone {
+        let safe_transport = match listen {
+            AdminListenSpec::Unix(_) => true,
+            AdminListenSpec::Https(https) => {
+                https.bind.ip().is_loopback() && https.client_auth.mode == ClientAuthMode::None
+            }
+        };
+        if !safe_transport {
+            return Err(diagnostic_at(
+                "admin.unsafe_auth_scope",
+                "unsafe_none is limited to Unix sockets or loopback HTTPS without client auth",
+                context,
+                &mode_path,
+            ));
+        }
+        warnings.push(
+            Diagnostic::warning(
+                "admin.unsafe_auth",
+                "admin authentication is explicitly disabled for development use",
+                context.span(&mode_path),
+            )
+            .with_help("configure bearer, mTLS, or bearer_and_mtls before deployment"),
+        );
+    }
+
+    Ok(AdminAuthSpec {
+        mode,
+        token_secret,
+        mode_source: context.span(&mode_path),
+        token_secret_source: source
+            .token_secret
+            .as_ref()
+            .map(|_| context.span(&token_path)),
+        source: context.span(field_path),
+    })
+}
+
+fn secret_reference(
+    name: &str,
+    resources: &CompiledResources,
+    context: SourceContext<'_>,
+    field_path: &str,
+) -> Result<ResourceId, CompileError> {
+    let id = ResourceId::new(format!("secret:{name}"));
+    if resources.secrets.contains_key(&id) {
+        Ok(id)
+    } else {
+        Err(diagnostic_at(
+            "admin.secret_reference",
+            format!("Secret resource `{name}` does not exist"),
+            context,
+            field_path,
+        )
+        .map_diagnostics(|diagnostic| {
+            diagnostic.with_help("define a file-backed Secret under `resources.secrets`")
+        }))
+    }
+}
+
+fn parse_unix_mode(source: &str, span: &SourceSpan) -> Result<u32, CompileError> {
+    let digits = source.strip_prefix("0o").unwrap_or(source);
+    if !(3..=4).contains(&digits.len()) || !digits.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "admin.unix_mode",
+                format!("invalid Unix socket mode `{source}`"),
+                span.clone(),
+            )
+            .with_help("use an octal permission string such as `0660`"),
+        ));
+    }
+    let mode = u32::from_str_radix(digits, 8).map_err(|_| {
+        CompileError::one(Diagnostic::new(
+            "admin.unix_mode",
+            format!("invalid Unix socket mode `{source}`"),
+            span.clone(),
+        ))
+    })?;
+    if mode > 0o777 {
+        return Err(CompileError::one(
+            Diagnostic::new(
+                "admin.unix_mode",
+                "Unix socket mode cannot set special permission bits",
+                span.clone(),
+            )
+            .with_help("use permissions between `0000` and `0777`"),
+        ));
+    }
+    Ok(mode)
 }
 
 fn compile_resources(
@@ -3884,6 +4670,67 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{CompiledResources, Compiler, MergedSource, ProgramBuilder};
+
+    #[test]
+    fn controlled_source_reads_stop_before_the_next_chunk_and_keep_dependencies() {
+        let directory = tempdir().expect("test directory");
+        let path = directory.path().join("source.yaml");
+        fs::write(&path, "# comment\n".repeat(32 * 1024)).expect("large source text");
+        let mut checks = 0;
+        let error = Compiler::compile_path_controlled(&path, || {
+            checks += 1;
+            if checks == 5 {
+                Err(super::CompileError::one(super::Diagnostic::new(
+                    "candidate.cancelled",
+                    "test cancellation",
+                    SourceSpan::synthetic("source"),
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("cancel before parsing the complete file");
+        assert_eq!(checks, 5);
+        assert_eq!(error.diagnostics[0].code, "candidate.cancelled");
+        assert!(
+            error
+                .discovered_dependencies
+                .contains(&path.canonicalize().expect("canonical source"))
+        );
+    }
+
+    #[test]
+    fn source_document_size_and_regular_file_bounds_are_enforced() {
+        let directory = tempdir().expect("test directory");
+        let path = directory.path().join("large.yaml");
+        let file = fs::File::create(&path).expect("test file");
+        file.set_len(16 * 1024 * 1024 + 1).expect("sparse fixture");
+        assert_eq!(
+            Compiler::compile_path(&path)
+                .expect_err("too large")
+                .diagnostics[0]
+                .code,
+            "config.source_limit"
+        );
+        #[cfg(unix)]
+        {
+            let pipe = directory.path().join("source.fifo");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&pipe)
+                    .status()
+                    .expect("POSIX test FIFO fixture")
+                    .success()
+            );
+            assert_eq!(
+                Compiler::compile_path(&pipe)
+                    .expect_err("never block waiting for FIFO data")
+                    .diagnostics[0]
+                    .code,
+                "config.read"
+            );
+        }
+    }
 
     fn write_config(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempdir().expect("temporary directory is available");
@@ -6543,5 +7390,463 @@ listeners:
         let error = Compiler::compile_path(path).expect_err("unknown field must fail");
         assert_eq!(error.diagnostics[0].code, "source.parse");
         assert!(error.diagnostics[0].message.contains("accepted_but_inert"));
+    }
+
+    #[test]
+    fn compiles_strict_unix_admin_policy_and_tracks_external_references() {
+        let (directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    admin-token:
+      file: secrets/admin-token
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+      mode: "0660"
+  auth:
+    mode: bearer
+    token_secret: admin-token
+  storage:
+    directory: /var/lib/oxidase-test/admin
+  bundle_trust:
+    verification_keys:
+      - trust/operator-a.pub
+      - trust/operator-b.pub
+  permissions:
+    read: true
+    stage: true
+    activate: true
+    rollback: true
+    drain: true
+    reload_source: true
+  candidates:
+    max_count: 3
+    max_bytes: 32MiB
+    max_candidate_bytes: 8MiB
+  history:
+    max_snapshots: 4
+    max_bytes: 64MiB
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("admin config compiles");
+        let admin = gateway.admin.expect("admin policy exists");
+        let super::AdminListenSpec::Unix(listen) = admin.listen else {
+            panic!("expected Unix admin listener")
+        };
+        assert_eq!(listen.path, std::path::Path::new("/run/oxidase/admin.sock"));
+        assert_eq!(listen.mode, 0o660);
+        assert_eq!(admin.auth.mode, super::AdminAuthMode::Bearer);
+        assert_eq!(
+            admin.auth.token_secret.as_ref().map(ToString::to_string),
+            Some("secret:admin-token".to_owned())
+        );
+        assert_eq!(admin.candidates.max_count, 3);
+        assert_eq!(admin.history.max_snapshots, 4);
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("temp root canonicalizes");
+        assert_eq!(
+            admin.storage.directory,
+            std::path::Path::new("/var/lib/oxidase-test/admin")
+        );
+        assert_eq!(
+            admin.bundle_trust.verification_keys,
+            vec![
+                root.join("trust/operator-a.pub"),
+                root.join("trust/operator-b.pub")
+            ]
+        );
+        assert!(
+            !gateway
+                .dependencies
+                .contains(&std::path::PathBuf::from("/var/lib/oxidase-test/admin")),
+            "mutable Admin state must not trigger source reload"
+        );
+        assert!(
+            gateway
+                .dependencies
+                .contains(&root.join("trust/operator-a.pub"))
+        );
+        assert_eq!(admin.auth.mode_source.field_path, "admin.auth.mode");
+    }
+
+    #[test]
+    fn compiles_https_admin_with_combined_bearer_and_mtls() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    admin:
+      cert_chain: admin.pem
+      private_key: admin-key.pem
+  trust_stores:
+    operators:
+      ca_bundle: operators.pem
+  secrets:
+    admin-token:
+      file: admin-token
+admin:
+  listen:
+    https:
+      bind: 127.0.0.1:7590
+      certificate: admin
+      client_auth:
+        mode: required
+        trust_store: operators
+  auth:
+    mode: bearer_and_mtls
+    token_secret: admin-token
+  storage:
+    directory: /var/lib/oxidase-test/admin
+  bundle_trust:
+    verification_keys: [operator.pub]
+  permissions:
+    activate: true
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("combined admin auth compiles");
+        let admin = gateway.admin.expect("admin exists");
+        let super::AdminListenSpec::Https(listen) = admin.listen else {
+            panic!("expected HTTPS admin listener")
+        };
+        assert_eq!(
+            listen.bind,
+            "127.0.0.1:7590"
+                .parse()
+                .expect("fixture socket address parses")
+        );
+        assert_eq!(listen.client_auth.mode, super::ClientAuthMode::Required);
+        assert_eq!(admin.auth.mode, super::AdminAuthMode::BearerAndMtls);
+    }
+
+    #[test]
+    fn rejects_insecure_or_inert_admin_auth_and_bundle_policy() {
+        let cases = [
+            (
+                "auth:\n    mode: none",
+                "admin.auth_mode",
+                "admin.auth.mode",
+            ),
+            (
+                "auth:\n    mode: bearer",
+                "admin.token_required",
+                "admin.auth",
+            ),
+            (
+                "auth:\n    mode: mtls",
+                "admin.mtls_transport",
+                "admin.auth.mode",
+            ),
+            (
+                "auth:\n    mode: unsafe_none\n    token_secret: token",
+                "admin.token_inert",
+                "admin.auth.token_secret",
+            ),
+        ];
+        for (auth, code, field_path) in cases {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  secrets:
+    token:
+      file: token
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin.sock
+  {auth}
+  storage:
+    directory: /var/lib/oxidase-test/admin
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid admin auth fails");
+            assert_eq!(error.diagnostics[0].code, code, "auth: {auth}");
+            assert_eq!(error.diagnostics[0].primary.field_path, field_path);
+        }
+
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/admin
+  permissions:
+    stage: true
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("unsigned staging must fail closed");
+        assert_eq!(
+            error.diagnostics[0].code,
+            "admin.bundle_verification_keys_required"
+        );
+        assert_eq!(
+            error.diagnostics[0].primary.field_path,
+            "admin.bundle_trust.verification_keys"
+        );
+    }
+
+    #[test]
+    fn unsafe_admin_auth_is_explicit_loopback_or_unix_only_and_warns() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/admin
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("explicit Unix development mode works");
+        assert_eq!(gateway.warnings.len(), 1);
+        assert_eq!(gateway.warnings[0].code, "admin.unsafe_auth");
+    }
+
+    #[test]
+    fn validates_admin_storage_and_history_capacity_at_exact_fields() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: relative-state
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("relative storage root fails");
+        assert_eq!(error.diagnostics[0].code, "admin.storage_directory");
+        assert_eq!(
+            error.diagnostics[0].primary.field_path,
+            "admin.storage.directory"
+        );
+
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/admin
+  candidates:
+    max_candidate_bytes: 2MiB
+    max_bytes: 4MiB
+  history:
+    max_bytes: 1MiB
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("undersized history fails");
+        assert_eq!(error.diagnostics[0].code, "admin.history_capacity");
+        assert_eq!(
+            error.diagnostics[0].primary.field_path,
+            "admin.history.max_bytes"
+        );
+        assert_eq!(error.diagnostics[0].labels.len(), 1);
+    }
+
+    #[test]
+    fn admin_audit_policy_is_bounded_strict_and_has_exact_diagnostics() {
+        for (audit, expected) in [
+            (
+                "destination: file\n    file: relative.jsonl",
+                "admin.audit_file",
+            ),
+            (
+                "destination: stdout\n    file: /var/log/oxidase.jsonl",
+                "admin.audit_file_inert",
+            ),
+            ("destination: syslog", "admin.audit_destination"),
+            ("queue_capacity: 1", "admin.audit_queue_capacity"),
+            ("queue_capacity: 4097", "admin.audit_queue_capacity"),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase/admin
+  audit:
+    {audit}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid audit policy is rejected");
+            assert_eq!(error.diagnostics[0].code, expected);
+            assert!(
+                error.diagnostics[0]
+                    .primary
+                    .field_path
+                    .starts_with("admin.audit.")
+            );
+        }
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase/admin
+  audit:
+    destination: file
+    file: /var/log/oxidase/audit.jsonl
+    queue_capacity: 32
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("safe audit plan compiles");
+        let audit = &gateway.admin.as_ref().expect("admin").audit;
+        assert!(matches!(
+            audit.destination,
+            super::AdminAuditDestination::File(_)
+        ));
+        assert_eq!(audit.queue_capacity, 32);
+        assert_eq!(audit.source.field_path, "admin.audit");
+        assert!(
+            !gateway
+                .dependencies
+                .iter()
+                .any(|path| path == std::path::Path::new("/var/log/oxidase/audit.jsonl")),
+            "mutable audit output must not trigger watcher reload"
+        );
+    }
+
+    #[test]
+    fn strict_admin_source_rejects_unknown_fields_and_duplicate_import_blocks() {
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/admin.sock
+      accepted_but_inert: true
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/admin
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(path).expect_err("unknown admin field fails");
+        assert_eq!(error.diagnostics[0].code, "source.parse");
+
+        let directory = tempdir().expect("temporary directory is available");
+        write_file(
+            directory.path(),
+            "child.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/child.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/child-state
+"#,
+        );
+        write_file(
+            directory.path(),
+            "oxidase.yaml",
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+imports: [child.yaml]
+admin:
+  listen:
+    unix:
+      path: /tmp/root.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase-test/root-state
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    service:
+      type: respond
+"#,
+        );
+        let error = Compiler::compile_path(directory.path().join("oxidase.yaml"))
+            .expect_err("duplicate admin blocks fail");
+        assert_eq!(error.diagnostics[0].code, "admin.duplicate_settings");
+        assert_eq!(error.diagnostics[0].labels.len(), 1);
     }
 }

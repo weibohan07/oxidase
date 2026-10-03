@@ -62,9 +62,16 @@ alpha release.
 
 ## Deployment obligations
 
-The current read-only management listener is disabled unless `--admin-bind` is
-provided. Bind it only to loopback or a separately protected management network;
-v0.3 does not provide management authentication. Configure finite TLS, HTTP, body,
+The compatibility `--admin-bind` management listener is loopback-only and read-only.
+The top-level Admin listener supports Unix or HTTPS with bearer, verified mTLS, or
+both, using one fixed coherent startup bootstrap and independent static permissions.
+Data-plane activation cannot replace its verifier/permissions or remove its prepared
+token. Explicit startup reconfiguration is required to rotate Admin credentials.
+Provision private trusted socket/storage/audit directories and signed immutable
+Bundles; retain journal and audit evidence when an operation becomes
+recovery-required. Publication and required completion belong to the manager even
+after client disconnect. See [Admin API](docs/admin-api.md) and
+[recovery](docs/control-plane-recovery.md). Configure finite TLS, HTTP, body,
 Cluster, and drain deadlines appropriate to the workload. Run the process with a
 dedicated account, read-only configuration where practical, and operating-system
 resource limits. These controls supplement, but do not replace, Oxidase's protocol
@@ -80,8 +87,9 @@ application role or authorize a request, and upstream certificate verification
 cannot be disabled.
 
 Oxidase does not currently provide CRL/OCSP revocation, certificate pinning, a
-SPIFFE policy engine, automatic certificate-to-role mapping, bearer-token
-administration, ACME, a WAF, arbitrary CONNECT, HTTP/3, h2c ingress, H2 WebSocket,
+SPIFFE policy engine, automatic certificate-to-role mapping, multi-user Admin role
+tables, online Admin transport/credential rebinding, ACME, a WAF, arbitrary CONNECT,
+HTTP/3, h2c ingress, H2 WebSocket,
 gRPC-Web, dynamic service discovery, or a distributed control plane. It has not
 completed a long-duration Linux resource qualification. Do not infer these
 properties from the presence of related TLS, Proxy, Cluster, or soak code.

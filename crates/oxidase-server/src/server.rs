@@ -10,26 +10,37 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use oxidase_config::{Http1Settings, Http2Settings, HttpVersion, ListenerLimits, ListenerProtocol};
+use oxidase_bundle::{BundleCapabilities, BundleVerificationKey};
+use oxidase_config::{
+    AdminListenSpec, Http1Settings, Http2Settings, HttpVersion, ListenerLimits, ListenerProtocol,
+};
 use oxidase_core::{
     Diagnostic, RequestFrame, RequestMetadata, ServiceOutcome, SourceSpan, TlsConnectionMetadata,
 };
 use oxidase_runtime::{
-    ClusterRuntimeStatus, Executor, PreparedListenerPlan, ResourceReuse, RuntimeSnapshot,
-    SnapshotStore, verified_client_metadata,
+    CandidateSignaturePolicy, CandidateStore, CandidateStoreLimits, CandidateWorkControl,
+    ClusterRuntimeStatus, Executor, OperationReceipt, PORTABLE_RUNTIME_PLAN_SCHEMA_V1,
+    PreparedListenerPlan, PreparedTlsListener, PublishedRuntime, ResourceReuse, RuntimeOrigin,
+    RuntimeSnapshot, ServingState, SnapshotStore, verified_client_metadata,
 };
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
+use crate::admin::{
+    AdminPeerIdentity, AdminSecurityPolicy, DEFAULT_ADMIN_REQUEST_BODY_BYTES,
+    allowed_admin_methods, classify_admin_route, validate_mutation_header_shape,
+};
+use crate::admin_audit::{AdminAuditEvent, AdminAuditSink};
 use crate::body::{
     DownstreamTimeoutSignal, GatewayBody, GatewayBodyPlan,
     instrument_response_body_with_snapshot_timeout, timeout_request_body,
@@ -59,6 +70,7 @@ const DEFAULT_HTTP1_MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 const HTTP1_REQUEST_LINE_AND_FRAMING_ALLOWANCE: usize = 1024;
 const MAX_CONCURRENT_TLS_HANDSHAKES_PER_LISTENER: usize = 128;
 const MAX_CONCURRENT_ADMIN_CONNECTIONS: usize = 256;
+const ADMIN_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn http1_builder(header_read_timeout: Duration) -> http1::Builder {
     http1_builder_with_limits(
@@ -102,9 +114,271 @@ pub struct GatewayServer {
 }
 
 struct BoundAdmin {
-    listener: TcpListener,
-    local_address: SocketAddr,
+    transport: BoundAdminTransport,
+    endpoint: AdminEndpoint,
+    security: Arc<AdminSecurityPolicy>,
+    tls: Option<PreparedTlsListener>,
+    candidates: Option<Arc<CandidateStore>>,
+    candidate_upload_directory: Option<PathBuf>,
+    candidate_deployment_root: Option<PathBuf>,
+    max_candidate_bytes: u64,
+    audit: Option<AdminAuditSink>,
 }
+
+#[derive(Clone)]
+struct AdminControlPlane {
+    candidates: Arc<CandidateStore>,
+    reload: ReloadHandle,
+    deployment_root: PathBuf,
+    max_candidate_bytes: u64,
+    mutation_gate: Arc<Semaphore>,
+    audit: Option<AdminAuditSink>,
+    operation_tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+}
+
+#[derive(Clone)]
+struct ManagedAdminOperation {
+    context: oxidase_runtime::CandidateOperationContext,
+    work: CandidateWorkControl,
+    deadline: std::time::Instant,
+    observed_id: Arc<Mutex<Option<String>>>,
+    audit: SharedOperationAudit,
+}
+
+type SharedOperationAudit = Arc<
+    Mutex<
+        Option<(
+            crate::admin_audit::AdminAuditPermit,
+            AdminAuditEvent,
+            AdminAuditSink,
+        )>,
+    >,
+>;
+
+async fn begin_managed_operation(
+    control: &AdminControlPlane,
+    managed: &ManagedAdminOperation,
+    action: oxidase_runtime::AuditAction,
+    target: Option<oxidase_bundle::BundleDigest>,
+    body_digest: Option<oxidase_bundle::BundleDigest>,
+) -> Result<oxidase_runtime::OperationBegin, oxidase_runtime::CandidateStoreError> {
+    let (response, received) = oneshot::channel();
+    let required_audit = managed
+        .audit
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
+    control
+        .reload
+        .control
+        .send(Control::BeginOperation {
+            store: Arc::clone(&control.candidates),
+            context: managed.context.clone(),
+            action,
+            target,
+            body_digest,
+            required_audit,
+            work: managed.work.clone(),
+            response,
+        })
+        .await
+        .map_err(|_| {
+            oxidase_runtime::CandidateStoreError::new(
+                "candidate.manager_closed",
+                "publication manager is closed",
+            )
+        })?;
+    let begin = received.await.map_err(|_| {
+        oxidase_runtime::CandidateStoreError::new(
+            "candidate.manager_closed",
+            "publication manager is closed",
+        )
+    })??;
+    *managed
+        .observed_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(begin.receipt.operation_id.clone());
+    Ok(begin)
+}
+
+fn operation_receipt_response(
+    receipt: &OperationReceipt,
+    published: &PublishedRuntime,
+    replayed: bool,
+    method: &Method,
+) -> Response<GatewayBody> {
+    operation_receipt_diagnostics_response(receipt, published, replayed, &[], method)
+}
+
+fn operation_receipt_diagnostics_response(
+    receipt: &OperationReceipt,
+    published: &PublishedRuntime,
+    replayed: bool,
+    diagnostics: &[Diagnostic],
+    method: &Method,
+) -> Response<GatewayBody> {
+    use oxidase_runtime::OperationPhase;
+    let status = match receipt.phase {
+        OperationPhase::Committed => StatusCode::OK,
+        OperationPhase::RecoveryRequired | OperationPhase::Accepted | OperationPhase::Preparing => {
+            StatusCode::ACCEPTED
+        }
+        OperationPhase::Cancelled => StatusCode::REQUEST_TIMEOUT,
+        OperationPhase::Failed
+            if receipt.error_code.as_deref().is_some_and(|code| {
+                matches!(code, "admin.precondition_failed" | "candidate.precondition")
+            }) =>
+        {
+            StatusCode::PRECONDITION_FAILED
+        }
+        OperationPhase::Failed
+            if receipt.error_code.as_deref() == Some("admin.source_unavailable") =>
+        {
+            StatusCode::CONFLICT
+        }
+        OperationPhase::Failed
+            if receipt.error_code.as_deref().is_some_and(|code| {
+                matches!(code, "candidate.capacity" | "admin.preparation_busy")
+            }) =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        OperationPhase::Failed => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    let mut response = admin_json_value_response(
+        status,
+        &serde_json::json!({
+            "schema_version":"oxidase.admin/v1", "operation_id":receipt.operation_id,
+            "phase":receipt.phase, "digest":receipt.target_digest, "operation":receipt,
+            "current_revision":published.runtime_revision, "current_etag":published.etag(),
+            "current_config_version":published.snapshot.config_version.as_str(),
+            "code":receipt.error_code, "idempotent_replay":replayed,
+            "diagnostics":safe_admin_diagnostics(diagnostics)
+        }),
+        method,
+    );
+    response.extensions_mut().insert(AdminReplay(replayed));
+    response
+}
+
+#[derive(Clone, Copy)]
+struct AdminReplay(bool);
+
+fn safe_admin_span(span: &SourceSpan) -> serde_json::Value {
+    serde_json::json!({"file":"<source>","field_path":safe_admin_field_path(&span.field_path),"start":{"byte":span.start_byte,"line":span.line,"column":span.column},"end":{"byte":span.end_byte,"line":span.end_line,"column":span.end_column}})
+}
+
+fn safe_admin_field_path(path: &str) -> String {
+    let root = path.split(['.', '[']).next().unwrap_or_default();
+    if path.len() > 512
+        || !path.is_ascii()
+        || !matches!(
+            root,
+            "resources"
+                | "services"
+                | "listeners"
+                | "defaults"
+                | "profiles"
+                | "response"
+                | "templates"
+                | "errors"
+                | "visibility"
+                | "inputs"
+                | "params"
+                | "admin"
+                | "bundle"
+                | "request"
+                | "site"
+                | "asset"
+        )
+    {
+        return "<field>".to_owned();
+    }
+    let mut result = String::new();
+    let mut quoted = None;
+    for character in path.chars() {
+        if let Some(quote) = quoted {
+            if character == quote {
+                result.push_str("<key>\"");
+                quoted = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            result.push('"');
+            quoted = Some(character);
+        } else if character.is_ascii_alphanumeric()
+            || matches!(character, '.' | '[' | ']' | '_' | '-')
+        {
+            result.push(character);
+        } else {
+            return "<field>".to_owned();
+        }
+    }
+    if quoted.is_some() {
+        "<field>".to_owned()
+    } else {
+        result
+    }
+}
+
+fn safe_admin_diagnostics(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
+    diagnostics.iter().take(64).map(|diagnostic| serde_json::json!({
+        "code":diagnostic.code,"severity":diagnostic.severity.to_string(),"message":"candidate validation failed",
+        "primary":safe_admin_span(&diagnostic.primary),
+        "labels":diagnostic.labels.iter().take(16).map(|label| serde_json::json!({"message":"related location","span":safe_admin_span(&label.span)})).collect::<Vec<_>>(),
+        "related":diagnostic.related.iter().take(16).map(|label| serde_json::json!({"message":"related location","span":safe_admin_span(&label.span)})).collect::<Vec<_>>(),
+        "notes":[],"help":null,
+        "reference_chain":diagnostic.reference_chain.iter().take(16).map(|reference| serde_json::json!({"message":"reference","span":reference.span.as_ref().map(safe_admin_span)})).collect::<Vec<_>>()
+    })).collect()
+}
+
+fn candidate_preparation_error(
+    error: oxidase_runtime::BundleActivationError,
+) -> oxidase_runtime::CandidateStoreError {
+    let diagnostics = error.structured_diagnostics().unwrap_or_default();
+    oxidase_runtime::CandidateStoreError::new(error.code(), "candidate validation failed")
+        .with_diagnostics(diagnostics)
+}
+
+async fn finish_operation_error(
+    control: &AdminControlPlane,
+    operation_id: String,
+    error: oxidase_runtime::CandidateStoreError,
+) -> Option<OperationReceipt> {
+    let store = Arc::clone(&control.candidates);
+    tokio::task::spawn_blocking(move || {
+        let result = if matches!(
+            error.code(),
+            "candidate.cancelled" | "candidate.deadline" | "admin.operation_cancelled"
+        ) {
+            store.finish_cancelled(&operation_id, error.code())
+        } else {
+            store.finish_failed(&operation_id, error.code())
+        };
+        result.unwrap_or_else(|failure| {
+            store.force_uncommitted_recovery_receipt(&operation_id, failure.code())
+        })
+    })
+    .await
+    .ok()
+}
+
+enum BoundAdminTransport {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(crate::admin::unix_socket::BoundUnixAdmin),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminEndpoint {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+trait AdminIo: AsyncRead + AsyncWrite {}
+impl<T> AdminIo for T where T: AsyncRead + AsyncWrite {}
+type BoxAdminIo = Box<dyn AdminIo + Unpin + Send + 'static>;
 
 struct ActiveListener {
     configured_address: SocketAddr,
@@ -127,14 +401,45 @@ struct ListenerCompletion {
 }
 
 enum Control {
+    BeginOperation {
+        store: Arc<CandidateStore>,
+        context: oxidase_runtime::CandidateOperationContext,
+        action: oxidase_runtime::AuditAction,
+        target: Option<oxidase_bundle::BundleDigest>,
+        body_digest: Option<oxidase_bundle::BundleDigest>,
+        required_audit: bool,
+        work: CandidateWorkControl,
+        response: oneshot::Sender<
+            Result<oxidase_runtime::OperationBegin, oxidase_runtime::CandidateStoreError>,
+        >,
+    },
     Reload {
         snapshot: Box<RuntimeSnapshot>,
         reuse: ResourceReuse,
+        expected_version: String,
+        origin: RuntimeOrigin,
+        watched_source: bool,
+        deadline: std::time::Instant,
+        operation: Option<CommitOperation>,
         response: oneshot::Sender<Result<ReloadReport, ServerError>>,
+    },
+    Drain {
+        expected_version: String,
+        deadline: std::time::Instant,
+        operation: Option<CommitOperation>,
+        response: oneshot::Sender<Result<(), ServerError>>,
     },
     Shutdown {
         response: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone)]
+struct CommitOperation {
+    store: Arc<CandidateStore>,
+    operation_id: String,
+    work: CandidateWorkControl,
+    audit: SharedOperationAudit,
 }
 
 struct BoundListener {
@@ -147,6 +452,13 @@ struct BoundListener {
 
 impl GatewayServer {
     pub async fn bind(snapshot: RuntimeSnapshot) -> Result<Self, ServerError> {
+        Self::bind_with_origin(snapshot, RuntimeOrigin::Source).await
+    }
+
+    pub async fn bind_with_origin(
+        snapshot: RuntimeSnapshot,
+        origin: RuntimeOrigin,
+    ) -> Result<Self, ServerError> {
         let mut listeners = Vec::new();
         for configured in &snapshot.listeners {
             let listener =
@@ -174,21 +486,33 @@ impl GatewayServer {
                 local_address,
             });
         }
+        let admin = bind_configured_admin(&snapshot).await?;
         let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
         proxy.reconcile_snapshot(&snapshot);
         let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
         Ok(Self {
-            store: Arc::new(SnapshotStore::new(snapshot)),
+            store: Arc::new(SnapshotStore::new_with_origin(snapshot, origin)),
             proxy,
             health,
             metrics: Arc::new(Metrics::default()),
             listeners,
-            admin: None,
+            admin,
             drain_timeout: Duration::from_secs(10),
         })
     }
 
     pub async fn with_admin_listener(mut self, bind: SocketAddr) -> Result<Self, ServerError> {
+        if self.admin.is_some() {
+            return Err(ServerError::AdminConfiguration(
+                "the snapshot already defines an administration listener".to_owned(),
+            ));
+        }
+        if !bind.ip().is_loopback() {
+            return Err(ServerError::AdminConfiguration(
+                "the legacy unauthenticated administration listener is restricted to loopback"
+                    .to_owned(),
+            ));
+        }
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|source| ServerError::Bind {
@@ -205,15 +529,67 @@ impl GatewayServer {
                 source,
             })?;
         self.admin = Some(BoundAdmin {
-            listener,
-            local_address,
+            transport: BoundAdminTransport::Tcp(listener),
+            endpoint: AdminEndpoint::Tcp(local_address),
+            security: Arc::new(AdminSecurityPolicy::legacy_loopback_read_only()),
+            tls: None,
+            candidates: None,
+            candidate_upload_directory: None,
+            candidate_deployment_root: None,
+            max_candidate_bytes: DEFAULT_ADMIN_REQUEST_BODY_BYTES,
+            audit: None,
+        });
+        Ok(self)
+    }
+
+    /// Enables the explicit development-only Unix administration transport.
+    /// Production configuration should use the top-level authenticated
+    /// `admin` block, which is prepared automatically with the snapshot.
+    #[cfg(unix)]
+    pub async fn with_admin_unix_listener(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        mode: u32,
+    ) -> Result<Self, ServerError> {
+        if self.admin.is_some() {
+            return Err(ServerError::AdminConfiguration(
+                "the snapshot already defines an administration listener".to_owned(),
+            ));
+        }
+        let listener = crate::admin::unix_socket::BoundUnixAdmin::bind(path.as_ref(), mode)
+            .await
+            .map_err(|source| ServerError::AdminUnixBind {
+                path: path.as_ref().to_path_buf(),
+                source_span: Box::new(SourceSpan::synthetic("serve.admin_unix")),
+                source,
+            })?;
+        let endpoint = AdminEndpoint::Unix(listener.path().to_path_buf());
+        self.admin = Some(BoundAdmin {
+            transport: BoundAdminTransport::Unix(listener),
+            endpoint,
+            security: Arc::new(AdminSecurityPolicy::legacy_loopback_read_only()),
+            tls: None,
+            candidates: None,
+            candidate_upload_directory: None,
+            candidate_deployment_root: None,
+            max_candidate_bytes: DEFAULT_ADMIN_REQUEST_BODY_BYTES,
+            audit: None,
         });
         Ok(self)
     }
 
     #[must_use]
     pub fn admin_address(&self) -> Option<SocketAddr> {
-        self.admin.as_ref().map(|admin| admin.local_address)
+        self.admin.as_ref().and_then(|admin| match admin.endpoint {
+            AdminEndpoint::Tcp(address) => Some(address),
+            #[cfg(unix)]
+            AdminEndpoint::Unix(_) => None,
+        })
+    }
+
+    #[must_use]
+    pub fn admin_endpoint(&self) -> Option<&AdminEndpoint> {
+        self.admin.as_ref().map(|admin| &admin.endpoint)
     }
 
     #[must_use]
@@ -232,6 +608,7 @@ impl GatewayServer {
     pub fn spawn(self) -> RunningServer {
         let addresses = self.local_addresses();
         let admin_address = self.admin_address();
+        let admin_endpoint = self.admin_endpoint().cloned();
         let store = self.store.clone();
         let metrics = self.metrics.clone();
         let reload_dependencies = Arc::new(Mutex::new(ReloadDependencyState::new(
@@ -239,21 +616,25 @@ impl GatewayServer {
         )));
         let compile_gate = Arc::new(Semaphore::new(1));
         let (control, receiver) = mpsc::channel(8);
-        let task = tokio::spawn(self.run(receiver));
+        let reload = ReloadHandle {
+            store,
+            metrics,
+            control: control.clone(),
+            dependencies: reload_dependencies,
+            compile_gate,
+            #[cfg(test)]
+            preparation_delay: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            preparation_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            preparation_pause: Arc::new(Mutex::new(None)),
+        };
+        let task = tokio::spawn(self.run(receiver, reload.clone()));
         RunningServer {
             addresses,
-            reload: ReloadHandle {
-                store,
-                metrics,
-                control: control.clone(),
-                dependencies: reload_dependencies,
-                compile_gate,
-                #[cfg(test)]
-                preparation_delay: Arc::new(Mutex::new(None)),
-                #[cfg(test)]
-                preparation_started: Arc::new(tokio::sync::Notify::new()),
-            },
+            reload,
             admin_address,
+            admin_endpoint,
             control,
             task,
         }
@@ -268,7 +649,18 @@ impl GatewayServer {
         running.shutdown().await
     }
 
-    async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Result<(), ServerError> {
+    async fn run(
+        mut self,
+        mut control: mpsc::Receiver<Control>,
+        reload: ReloadHandle,
+    ) -> Result<(), ServerError> {
+        let bootstrap = self.admin.as_ref().map(|admin| Arc::clone(&admin.security));
+        let journal = self
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.candidates.clone());
+        let audit = self.admin.as_ref().and_then(|admin| admin.audit.clone());
+        let preparation_gate = Arc::clone(&reload.compile_gate);
         self.health.activate_snapshot(&self.store.pin());
         let (completion_sender, mut completions) = mpsc::unbounded_channel();
         let mut listeners = BTreeMap::new();
@@ -295,6 +687,7 @@ impl GatewayServer {
                 self.store.clone(),
                 self.metrics.clone(),
                 self.drain_timeout,
+                reload,
             )
         });
 
@@ -302,7 +695,31 @@ impl GatewayServer {
             tokio::select! {
                 command = control.recv() => {
                     match command {
-                        Some(Control::Reload { snapshot, reuse, response }) => {
+                        Some(Control::BeginOperation { store, context, action, target, body_digest, required_audit, work, response }) => {
+                            let expected = context.if_match.clone();
+                            let actual = self.store.published().etag();
+                            let worker_store = Arc::clone(&store);
+                            let result = if response.is_closed() { Err(oxidase_runtime::CandidateStoreError::new("candidate.cancelled", "operation caller was cancelled")) } else if let Err(error) = work.checkpoint() { Err(error) } else {
+                                match store.replay_operation(&context, action, target, body_digest) {
+                                    Ok(Some(receipt)) => Ok(oxidase_runtime::OperationBegin { receipt, replayed:true }),
+                                    Ok(None) if expected.as_deref() != Some(actual.as_str()) => Err(oxidase_runtime::CandidateStoreError::new("candidate.precondition", "current runtime condition is stale")),
+                                    Ok(None) => tokio::task::spawn_blocking(move || if required_audit { worker_store.begin_operation_audited(&context,action,target,body_digest) } else { worker_store.begin_operation(&context, action, target, body_digest) }).await.map_err(|_| oxidase_runtime::CandidateStoreError::new("candidate.operation_worker", "operation journal worker failed")).and_then(|result| result),
+                                    Err(error) => Err(error),
+                                }
+                            };
+                            let _ = response.send(result);
+                        }
+                        Some(Control::Reload { snapshot, reuse, expected_version, origin, watched_source, deadline, operation, response }) => {
+                            let mut operation = operation;
+                            let initial = self.store.published();
+                            let automatic = if operation.is_none() && origin == RuntimeOrigin::Source && expected_version == initial.etag() && !response.is_closed() && std::time::Instant::now() < deadline && (!watched_source || (initial.origin == RuntimeOrigin::Source && initial.serving_state == ServingState::Running)) {
+                                if let Some(journal) = &journal {
+                                    match prepare_source_commit_operation(journal, audit.as_ref(), &initial, deadline).await {
+                                        Ok(created) => { operation = Some(created); Ok(()) },
+                                        Err(error) => Err(error),
+                                    }
+                                } else { Ok(()) }
+                            } else { Ok(()) };
                             let environment = ReloadEnvironment {
                                 store: &self.store,
                                 proxy: &self.proxy,
@@ -310,22 +727,118 @@ impl GatewayServer {
                                 health: &mut self.health,
                                 drain_timeout: self.drain_timeout,
                                 completion: &completion_sender,
+                                expected_etag: &expected_version,
+                                deadline,
+                                operation: operation.as_ref(),
+                                response: &response,
+                                #[cfg(test)]
+                                after_publish: None,
                             };
-                            let result = apply_reload(
-                                *snapshot,
-                                reuse,
-                                &mut listeners,
-                                &mut generation,
-                                environment,
-                            ).await;
+                            let published = self.store.published();
+                            let result = if let Err(error) = automatic { Err(error) } else if expected_version != published.etag() {
+                                Err(ServerError::PreconditionFailed)
+                            } else if response.is_closed() || std::time::Instant::now() >= deadline {
+                                Err(ServerError::OperationCancelled)
+                            } else if watched_source && (published.origin != RuntimeOrigin::Source || published.serving_state != ServingState::Running) {
+                                Err(ServerError::SourceAuthorityLost)
+                            } else {
+                                let compatibility = if let Some(security) = &bootstrap {
+                                    let security = Arc::clone(security);
+                                    let candidate = (*snapshot).clone();
+                                    let admission = Arc::clone(&preparation_gate).try_acquire_owned();
+                                    if let Ok(admission) = admission { tokio::task::spawn_blocking(move || {
+                                        let _admission = admission;
+                                        security.check_candidate(&candidate)
+                                    })
+                                        .await.map_err(|error| ServerError::Task(error.to_string()))
+                                        .and_then(|result| result.map_err(ServerError::AdminPreparation)) } else { Err(ServerError::PreparationBusy) }
+                                } else { Ok(()) };
+                                if let Err(error) = compatibility { Err(error) } else { apply_reload(
+                                    *snapshot,
+                                    reuse,
+                                    origin,
+                                    &mut listeners,
+                                    &mut generation,
+                                    environment,
+                                ).await }
+                            };
+                            if let (Some(operation), Err(error)) = (&operation, &result) {
+                                let store = Arc::clone(&operation.store);
+                                let id = operation.operation_id.clone();
+                                let code = error.diagnostics().first().map(|diagnostic| diagnostic.code).unwrap_or("admin.commit_failed");
+                                let cancelled = matches!(error, ServerError::OperationCancelled);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let result = if cancelled { store.finish_cancelled(&id, code) } else { store.finish_failed(&id, code) };
+                                    result.unwrap_or_else(|error| store.force_uncommitted_recovery_receipt(&id,error.code()))
+                                }).await;
+                                let receipt = operation.store.operation(&operation.operation_id);
+                                finish_operation_audit(&operation.audit, &operation.store, receipt, &self.store.published()).await;
+                            }
                             let _ = response.send(result);
                         }
                         Some(Control::Shutdown { response }) => {
+                            control.close();
+                            reject_pending_admin_commands(&mut control, &self.store).await;
                             stop_all_listeners(&mut listeners).await;
                             stop_admin_listener(&mut admin).await;
                             self.health.shutdown().await;
                             let _ = response.send(());
                             return Ok(());
+                        }
+                        Some(Control::Drain { expected_version, deadline, operation, response }) => {
+                            let published = self.store.published();
+                            let result = if expected_version != published.etag() {
+                                Err(ServerError::PreconditionFailed)
+                            } else if response.is_closed() || std::time::Instant::now() >= deadline {
+                                Err(ServerError::OperationCancelled)
+                            } else if published.serving_state == ServingState::Drained {
+                                if let Some(operation) = &operation {
+                                    let worker = operation.clone();
+                                    let version = published.snapshot.config_version.to_string();
+                                    let revision = published.runtime_revision;
+                                    match tokio::task::spawn_blocking(move || worker.store.complete_unchanged(&worker.operation_id, revision, &version)).await {
+                                        Ok(Ok(receipt)) => { finish_operation_audit(&operation.audit, &operation.store, Some(receipt), &published).await; Ok(()) },
+                                        _ => Err(ServerError::AdminStore("candidate.completion_worker")),
+                                    }
+                                } else { Ok(()) }
+                            } else {
+                                let intent = async {
+                                    if let Some(operation) = &operation {
+                                        operation.work.checkpoint().map_err(|_| ServerError::OperationCancelled)?;
+                                        let operation = operation.clone();
+                                        let published = Arc::clone(&published);
+                                        tokio::task::spawn_blocking(move || operation.store.begin_intent(&operation.operation_id, published.runtime_revision, published.snapshot.config_version.as_str()))
+                                            .await.map_err(|error| ServerError::Task(error.to_string()))?
+                                            .map_err(|error| ServerError::AdminStore(error.code()))?;
+                                    }
+                                    if response.is_closed() || std::time::Instant::now() >= deadline || operation.as_ref().is_some_and(|operation| operation.work.checkpoint().is_err()) {
+                                        return Err(ServerError::OperationCancelled);
+                                    }
+                                    Ok(())
+                                }.await;
+                                if let Err(error) = intent { Err(error) } else {
+                                    self.store.set_serving_state(ServingState::Draining);
+                                    stop_all_listeners(&mut listeners).await;
+                                    self.health.shutdown().await;
+                                    self.store.set_serving_state(ServingState::Drained);
+                                    if let Some(operation) = &operation {
+                                        finish_runtime_commit(operation, &self.store.published()).await;
+                                    }
+                                    Ok(())
+                                }
+                            };
+                            if let (Some(operation), Err(error)) = (&operation, &result) {
+                                let store = Arc::clone(&operation.store);
+                                let id = operation.operation_id.clone();
+                                let code = error.diagnostics().first().map_or("admin.drain_failed", |diagnostic| diagnostic.code);
+                                let cancelled = matches!(error, ServerError::OperationCancelled);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let result = if cancelled { store.finish_cancelled(&id, code) } else { store.finish_failed(&id, code) };
+                                    result.unwrap_or_else(|error| store.force_uncommitted_recovery_receipt(&id,error.code()))
+                                }).await;
+                                finish_operation_audit(&operation.audit, &operation.store, operation.store.operation(&operation.operation_id), &self.store.published()).await;
+                            }
+                            let _ = response.send(result);
                         }
                         None => {
                             stop_all_listeners(&mut listeners).await;
@@ -357,9 +870,168 @@ impl GatewayServer {
     }
 }
 
+async fn bind_configured_admin(
+    snapshot: &RuntimeSnapshot,
+) -> Result<Option<BoundAdmin>, ServerError> {
+    let Some(admin) = snapshot.admin.as_ref() else {
+        return Ok(None);
+    };
+    let bootstrap_snapshot = snapshot.clone();
+    let (security, candidates, audit) = tokio::task::spawn_blocking(move || {
+        let spec = bootstrap_snapshot
+            .admin
+            .as_ref()
+            .expect("compiled Admin exists");
+        let security = Arc::new(
+            AdminSecurityPolicy::prepare(&bootstrap_snapshot)
+                .map_err(ServerError::AdminPreparation)?,
+        );
+        let candidates = prepare_candidate_store(spec)?;
+        let audit = AdminAuditSink::start(&spec.audit).map_err(|_| {
+            ServerError::AdminPreparation(Box::new(Diagnostic::new(
+                "admin.audit_prepare",
+                "cannot prepare the configured audit destination",
+                spec.source.clone(),
+            )))
+        })?;
+        Ok::<_, ServerError>((security, candidates, Some(audit)))
+    })
+    .await
+    .map_err(|error| ServerError::Task(error.to_string()))??;
+    match &admin.listen {
+        AdminListenSpec::Https(https) => {
+            let tls = PreparedTlsListener::prepare_admin(
+                https,
+                &snapshot.resources.certificates,
+                &snapshot.resources.trust_stores,
+            )
+            .map_err(ServerError::AdminPreparation)?;
+            let listener =
+                TcpListener::bind(https.bind)
+                    .await
+                    .map_err(|source| ServerError::Bind {
+                        listener: "@admin".to_owned(),
+                        address: https.bind,
+                        source_span: Box::new(https.bind_source.clone()),
+                        source,
+                    })?;
+            let local_address =
+                listener
+                    .local_addr()
+                    .map_err(|source| ServerError::LocalAddress {
+                        listener: "@admin".to_owned(),
+                        source_span: Box::new(https.bind_source.clone()),
+                        source,
+                    })?;
+            Ok(Some(BoundAdmin {
+                transport: BoundAdminTransport::Tcp(listener),
+                endpoint: AdminEndpoint::Tcp(local_address),
+                security,
+                tls: Some(tls),
+                candidates,
+                candidate_upload_directory: Some(admin.storage.directory.clone()),
+                candidate_deployment_root: Some(admin.bundle_trust.deployment_root.clone()),
+                max_candidate_bytes: admin.candidates.max_candidate_bytes,
+                audit,
+            }))
+        }
+        AdminListenSpec::Unix(unix) => {
+            #[cfg(unix)]
+            {
+                let listener =
+                    crate::admin::unix_socket::BoundUnixAdmin::bind(&unix.path, unix.mode)
+                        .await
+                        .map_err(|source| ServerError::AdminUnixBind {
+                            path: unix.path.clone(),
+                            source_span: Box::new(unix.source.clone()),
+                            source,
+                        })?;
+                let endpoint = AdminEndpoint::Unix(listener.path().to_path_buf());
+                Ok(Some(BoundAdmin {
+                    transport: BoundAdminTransport::Unix(listener),
+                    endpoint,
+                    security,
+                    tls: None,
+                    candidates,
+                    candidate_upload_directory: Some(admin.storage.directory.clone()),
+                    candidate_deployment_root: Some(admin.bundle_trust.deployment_root.clone()),
+                    max_candidate_bytes: admin.candidates.max_candidate_bytes,
+                    audit,
+                }))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = unix;
+                Err(ServerError::AdminConfiguration(
+                    "Unix administration sockets are unavailable on this platform".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn prepare_candidate_store(
+    admin: &oxidase_config::AdminSpec,
+) -> Result<Option<Arc<CandidateStore>>, ServerError> {
+    let trusted_keys = admin
+        .bundle_trust
+        .verification_keys
+        .iter()
+        .zip(&admin.bundle_trust.verification_key_sources)
+        .map(|(path, source)| {
+            BundleVerificationKey::read_file(path).map_err(|error| {
+                ServerError::AdminPreparation(Box::new(Diagnostic::new(
+                    error.code(),
+                    "cannot load an admin Bundle verification key",
+                    source.clone(),
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let limits = CandidateStoreLimits {
+        max_candidates: usize::try_from(admin.candidates.max_count).map_err(|_| {
+            ServerError::AdminConfiguration(
+                "admin candidate count exceeds this platform's address space".to_owned(),
+            )
+        })?,
+        max_total_bytes: admin.candidates.max_bytes,
+        max_candidate_bytes: admin.candidates.max_candidate_bytes,
+        max_history_snapshots: usize::try_from(admin.history.max_snapshots).map_err(|_| {
+            ServerError::AdminConfiguration(
+                "admin history count exceeds this platform's address space".to_owned(),
+            )
+        })?,
+        max_history_bytes: admin.history.max_bytes,
+        ..CandidateStoreLimits::default()
+    };
+    let capabilities = BundleCapabilities {
+        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+        supported_features: BTreeSet::from(["portable-runtime".to_owned()]),
+        supported_sections: BTreeMap::from([(
+            "runtime".to_owned(),
+            PORTABLE_RUNTIME_PLAN_SCHEMA_V1.to_owned(),
+        )]),
+    };
+    CandidateStore::open(
+        admin.storage.directory.clone(),
+        limits,
+        CandidateSignaturePolicy::require_trusted(trusted_keys),
+        capabilities,
+    )
+    .map(Some)
+    .map_err(|error| {
+        ServerError::AdminPreparation(Box::new(Diagnostic::new(
+            error.code(),
+            "cannot prepare the bounded admin candidate store",
+            admin.storage.source.clone(),
+        )))
+    })
+}
+
 pub struct RunningServer {
     addresses: Vec<(String, SocketAddr)>,
     admin_address: Option<SocketAddr>,
+    admin_endpoint: Option<AdminEndpoint>,
     reload: ReloadHandle,
     control: mpsc::Sender<Control>,
     task: JoinHandle<Result<(), ServerError>>,
@@ -374,6 +1046,11 @@ impl RunningServer {
     #[must_use]
     pub const fn admin_address(&self) -> Option<SocketAddr> {
         self.admin_address
+    }
+
+    #[must_use]
+    pub fn admin_endpoint(&self) -> Option<&AdminEndpoint> {
+        self.admin_endpoint.as_ref()
     }
 
     #[must_use]
@@ -412,6 +1089,8 @@ pub struct ReloadHandle {
     preparation_delay: Arc<Mutex<Option<Duration>>>,
     #[cfg(test)]
     preparation_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    preparation_pause: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
 impl ReloadHandle {
@@ -419,32 +1098,177 @@ impl ReloadHandle {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<ReloadReport, ServerError> {
-        let result = self.reload_path_inner(path.as_ref()).await;
+        let result = self.reload_path_inner(path.as_ref(), false, None).await;
         self.metrics.record_reload(result.is_ok());
         result
     }
 
-    async fn reload_path_inner(&self, path: &std::path::Path) -> Result<ReloadReport, ServerError> {
-        let _permit = self
-            .compile_gate
-            .acquire()
+    pub async fn reload_watched_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ReloadReport, ServerError> {
+        let result = self.reload_path_inner(path.as_ref(), true, None).await;
+        self.metrics.record_reload(result.is_ok());
+        result
+    }
+
+    #[cfg(test)]
+    async fn drain_data_plane(&self, expected_version: String) -> Result<(), ServerError> {
+        self.drain_operation(
+            expected_version,
+            None,
+            std::time::Instant::now() + ADMIN_MUTATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn drain_operation(
+        &self,
+        expected_version: String,
+        operation: Option<CommitOperation>,
+        deadline: std::time::Instant,
+    ) -> Result<(), ServerError> {
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Drain {
+                expected_version,
+                deadline,
+                operation,
+                response,
+            })
             .await
             .map_err(|_| ServerError::ControlClosed)?;
-        let current = self.store.pin();
+        received.await.map_err(|_| ServerError::ControlClosed)?
+    }
+
+    #[cfg(test)]
+    async fn activate_prepared(
+        &self,
+        snapshot: RuntimeSnapshot,
+        reuse: ResourceReuse,
+        expected_version: String,
+        origin: RuntimeOrigin,
+    ) -> Result<ReloadReport, ServerError> {
+        self.publish_prepared(
+            snapshot,
+            reuse,
+            expected_version,
+            origin,
+            None,
+            std::time::Instant::now() + ADMIN_MUTATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn publish_prepared(
+        &self,
+        snapshot: RuntimeSnapshot,
+        reuse: ResourceReuse,
+        expected_version: String,
+        origin: RuntimeOrigin,
+        operation: Option<CommitOperation>,
+        deadline: std::time::Instant,
+    ) -> Result<ReloadReport, ServerError> {
+        let published_dependencies = snapshot.dependencies.clone();
+        let (response, received) = oneshot::channel();
+        self.control
+            .send(Control::Reload {
+                snapshot: Box::new(snapshot),
+                reuse,
+                expected_version,
+                origin,
+                watched_source: false,
+                deadline,
+                operation,
+                response,
+            })
+            .await
+            .map_err(|_| ServerError::ControlClosed)?;
+        let report = received.await.map_err(|_| ServerError::ControlClosed)??;
+        self.record_published_dependencies(published_dependencies);
+        Ok(report)
+    }
+
+    async fn reload_path_inner(
+        &self,
+        path: &std::path::Path,
+        watched_source: bool,
+        expected: Option<String>,
+    ) -> Result<ReloadReport, ServerError> {
+        self.reload_path_with_operation(
+            path,
+            watched_source,
+            expected,
+            None,
+            std::time::Instant::now() + ADMIN_MUTATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn reload_path_with_operation(
+        &self,
+        path: &std::path::Path,
+        watched_source: bool,
+        expected: Option<String>,
+        operation: Option<CommitOperation>,
+        deadline: std::time::Instant,
+    ) -> Result<ReloadReport, ServerError> {
+        let published = self.store.published();
+        if watched_source
+            && (published.origin != RuntimeOrigin::Source
+                || published.serving_state != ServingState::Running)
+        {
+            return Err(ServerError::SourceAuthorityLost);
+        }
+        let expected_version = expected.unwrap_or_else(|| published.etag());
+        if expected_version != published.etag() {
+            return Err(ServerError::PreconditionFailed);
+        }
+        let permit = Arc::clone(&self.compile_gate)
+            .try_acquire_owned()
+            .map_err(|_| ServerError::PreparationBusy)?;
+        let current = Arc::clone(&published.snapshot);
         let path = path.to_path_buf();
+        let checked_work = operation
+            .as_ref()
+            .map(|operation| operation.work.clone())
+            .unwrap_or_else(|| CandidateWorkControl::with_deadline(deadline));
         let preparation_delay = self.test_preparation_delay();
         #[cfg(test)]
         let preparation_started = Some(self.preparation_started.clone());
         #[cfg(not(test))]
         let preparation_started: Option<Arc<tokio::sync::Notify>> = None;
+        #[cfg(test)]
+        let preparation_pause = self
+            .preparation_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(not(test))]
+        let preparation_pause: Option<Arc<std::sync::Barrier>> = None;
         let prepared = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            checked_work
+                .checkpoint()
+                .map_err(|_| (ServerError::OperationCancelled, Vec::new()))?;
             if let Some(started) = preparation_started {
                 started.notify_one();
+            }
+            if let Some(pause) = preparation_pause {
+                pause.wait();
             }
             if let Some(delay) = preparation_delay {
                 std::thread::sleep(delay);
             }
-            let mut gateway = match oxidase_config::Compiler::compile_path(path) {
+            let mut gateway = match oxidase_config::Compiler::compile_path_controlled(path, || {
+                checked_work.checkpoint().map_err(|error| {
+                    oxidase_config::CompileError::one(Diagnostic::new(
+                        error.code(),
+                        "source preparation interrupted",
+                        SourceSpan::synthetic("source"),
+                    ))
+                })
+            }) {
                 Ok(gateway) => gateway,
                 Err(error) => {
                     let dependencies = error.discovered_dependencies;
@@ -455,9 +1279,25 @@ impl ReloadHandle {
                 }
             };
             let attempt_dependencies = candidate_gateway_dependencies(&gateway);
+            checked_work.checkpoint().map_err(|_| {
+                (
+                    ServerError::OperationCancelled,
+                    attempt_dependencies.clone(),
+                )
+            })?;
             let mut warnings = std::mem::take(&mut gateway.warnings);
-            match RuntimeSnapshot::prepare_reusing(gateway, Some(&current)) {
+            match RuntimeSnapshot::prepare_reusing_controlled(
+                gateway,
+                Some(&current),
+                &checked_work,
+            ) {
                 Ok((snapshot, reuse)) => {
+                    checked_work.checkpoint().map_err(|_| {
+                        (
+                            ServerError::OperationCancelled,
+                            snapshot.dependencies.clone(),
+                        )
+                    })?;
                     warnings.extend(snapshot.preparation_warnings().iter().cloned());
                     Ok((snapshot, reuse, attempt_dependencies, warnings))
                 }
@@ -491,6 +1331,11 @@ impl ReloadHandle {
             .send(Control::Reload {
                 snapshot: Box::new(snapshot),
                 reuse,
+                expected_version,
+                origin: RuntimeOrigin::Source,
+                watched_source,
+                deadline,
+                operation,
                 response,
             })
             .await
@@ -504,6 +1349,11 @@ impl ReloadHandle {
     #[must_use]
     pub fn current_snapshot(&self) -> Arc<RuntimeSnapshot> {
         self.store.pin()
+    }
+
+    #[must_use]
+    pub fn published_runtime(&self) -> Arc<PublishedRuntime> {
+        self.store.published()
     }
 
     #[must_use]
@@ -553,6 +1403,16 @@ impl ReloadHandle {
     #[cfg(test)]
     async fn wait_test_preparation_started(&self) {
         self.preparation_started.notified().await;
+    }
+
+    #[cfg(test)]
+    fn pause_test_preparation(&self) -> Arc<std::sync::Barrier> {
+        let pause = Arc::new(std::sync::Barrier::new(2));
+        *self
+            .preparation_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        pause
     }
 }
 
@@ -615,6 +1475,7 @@ pub struct ReloadReport {
     pub local_addresses: Vec<(String, SocketAddr)>,
     /// Non-fatal diagnostics emitted while compiling this committed candidate.
     pub warnings: Vec<Diagnostic>,
+    pub operation: Option<OperationReceipt>,
 }
 
 fn start_listener(
@@ -662,6 +1523,7 @@ fn start_listener(
 async fn apply_reload(
     snapshot: RuntimeSnapshot,
     reuse: ResourceReuse,
+    origin: RuntimeOrigin,
     active: &mut BTreeMap<String, ActiveListener>,
     generation: &mut u64,
     environment: ReloadEnvironment<'_>,
@@ -710,6 +1572,41 @@ async fn apply_reload(
         });
     }
 
+    // Final conditions are checked after every socket has been prebound. Intent
+    // records describe only a prepared publication, never a failed bind.
+    let before = environment.store.published();
+    if before.etag() != environment.expected_etag {
+        return Err(ServerError::PreconditionFailed);
+    }
+    if environment.response.is_closed() || std::time::Instant::now() >= environment.deadline {
+        return Err(ServerError::OperationCancelled);
+    }
+    if let Some(operation) = environment.operation {
+        operation
+            .work
+            .checkpoint()
+            .map_err(|_| ServerError::OperationCancelled)?;
+        let operation = operation.clone();
+        let before_revision = before.runtime_revision;
+        let version = snapshot.config_version.to_string();
+        tokio::task::spawn_blocking(move || {
+            operation
+                .store
+                .begin_intent(&operation.operation_id, before_revision, &version)
+        })
+        .await
+        .map_err(|error| ServerError::Task(error.to_string()))?
+        .map_err(|error| ServerError::AdminStore(error.code()))?;
+        if environment.response.is_closed()
+            || std::time::Instant::now() >= environment.deadline
+            || environment
+                .operation
+                .is_some_and(|operation| operation.work.checkpoint().is_err())
+        {
+            return Err(ServerError::OperationCancelled);
+        }
+    }
+
     let to_stop = active
         .keys()
         .filter(|name| !retained.contains(*name))
@@ -728,14 +1625,17 @@ async fn apply_reload(
 
     let previous_version = environment.store.pin().config_version.to_string();
     let current_version = snapshot.config_version.to_string();
-    environment.store.publish(snapshot);
+    environment.store.publish_as(snapshot, origin);
+    #[cfg(test)]
+    if let Some(hook) = environment.after_publish {
+        hook();
+    }
     environment
         .proxy
         .reconcile_snapshot(&environment.store.pin());
     environment
         .health
         .activate_snapshot(&environment.store.pin());
-
     let listeners_added = prepared
         .iter()
         .map(|listener| listener.name.clone())
@@ -760,6 +1660,14 @@ async fn apply_reload(
     // completion through the manager's completion channel.
     drop(retired);
 
+    // Runtime availability does not wait for fsync or audit delivery. The
+    // manager still owns and completes that post-publication bookkeeping.
+    let operation = if let Some(operation) = environment.operation {
+        Some(finish_runtime_commit(operation, &environment.store.published()).await)
+    } else {
+        None
+    };
+
     Ok(ReloadReport {
         previous_version,
         current_version,
@@ -775,6 +1683,7 @@ async fn apply_reload(
             .map(|(name, listener)| (name.clone(), listener.local_address))
             .collect(),
         warnings: Vec::new(),
+        operation,
     })
 }
 
@@ -785,6 +1694,279 @@ struct ReloadEnvironment<'a> {
     health: &'a mut ClusterHealthManager,
     drain_timeout: Duration,
     completion: &'a mpsc::UnboundedSender<ListenerCompletion>,
+    expected_etag: &'a str,
+    deadline: std::time::Instant,
+    operation: Option<&'a CommitOperation>,
+    response: &'a oneshot::Sender<Result<ReloadReport, ServerError>>,
+    #[cfg(test)]
+    after_publish: Option<Box<dyn FnOnce() + Send>>,
+}
+
+async fn reject_pending_admin_commands(
+    control: &mut mpsc::Receiver<Control>,
+    published: &Arc<SnapshotStore>,
+) {
+    while let Ok(command) = control.try_recv() {
+        match command {
+            Control::BeginOperation { response, .. } => {
+                let _ = response.send(Err(oxidase_runtime::CandidateStoreError::new(
+                    "candidate.cancelled",
+                    "server is shutting down",
+                )));
+            }
+            Control::Reload {
+                operation,
+                response,
+                ..
+            } => {
+                cancel_queued_operation(operation, published).await;
+                let _ = response.send(Err(ServerError::OperationCancelled));
+            }
+            Control::Drain {
+                operation,
+                response,
+                ..
+            } => {
+                cancel_queued_operation(operation, published).await;
+                let _ = response.send(Err(ServerError::OperationCancelled));
+            }
+            Control::Shutdown { response } => {
+                let _ = response.send(());
+            }
+        }
+    }
+}
+
+async fn cancel_queued_operation(
+    operation: Option<CommitOperation>,
+    published: &Arc<SnapshotStore>,
+) {
+    if let Some(operation) = operation {
+        operation.work.cancel();
+        let worker = operation.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            worker
+                .store
+                .finish_cancelled(&worker.operation_id, "candidate.cancelled")
+                .unwrap_or_else(|error| {
+                    worker
+                        .store
+                        .force_uncommitted_recovery_receipt(&worker.operation_id, error.code())
+                })
+        })
+        .await
+        .ok();
+        finish_operation_audit(
+            &operation.audit,
+            &operation.store,
+            receipt,
+            &published.published(),
+        )
+        .await;
+    }
+}
+
+async fn finish_runtime_commit(
+    operation: &CommitOperation,
+    published: &PublishedRuntime,
+) -> OperationReceipt {
+    let store = Arc::clone(&operation.store);
+    let operation_id = operation.operation_id.clone();
+    let revision = published.runtime_revision;
+    let version = published.snapshot.config_version.to_string();
+    let receipt = match tokio::task::spawn_blocking(move || {
+        store.complete_committed(&operation_id, revision, &version)
+    })
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            force_operation_recovery(
+                operation.store.clone(),
+                operation.operation_id.clone(),
+                revision,
+                published.snapshot.config_version.to_string(),
+                "candidate.completion_worker",
+            )
+            .await
+        }
+    };
+    finish_operation_audit(&operation.audit, &operation.store, Some(receipt), published)
+        .await
+        .expect("runtime commit has a receipt")
+}
+
+async fn prepare_source_commit_operation(
+    store: &Arc<CandidateStore>,
+    sink: Option<&AdminAuditSink>,
+    published: &PublishedRuntime,
+    deadline: std::time::Instant,
+) -> Result<CommitOperation, ServerError> {
+    let request_id = format!(
+        "source-{}-{}",
+        published.runtime_revision,
+        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut event =
+        AdminAuditEvent::new(&request_id, "unauthenticated", "internal", "reload_source");
+    event.previous_revision = Some(published.runtime_revision.to_string());
+    let permit = if let Some(sink) = sink {
+        let permit = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            sink.prepare_mutation(event.clone()),
+        )
+        .await
+        .map_err(|_| ServerError::AdminStore("admin.audit_deadline"))?
+        .map_err(|error| ServerError::AdminStore(error.code()))?;
+        Some((permit, event, sink.clone()))
+    } else {
+        None
+    };
+    let context = oxidase_runtime::CandidateOperationContext {
+        request_id,
+        principal: "internal:source".to_owned(),
+        if_match: Some(published.etag()),
+        idempotency_key: None,
+    };
+    let worker = Arc::clone(store);
+    let required_audit = permit.is_some();
+    let begin = tokio::task::spawn_blocking(move || {
+        if required_audit {
+            worker.begin_operation_audited(
+                &context,
+                oxidase_runtime::AuditAction::ReloadSource,
+                None,
+                None,
+            )
+        } else {
+            worker.begin_operation(
+                &context,
+                oxidase_runtime::AuditAction::ReloadSource,
+                None,
+                None,
+            )
+        }
+    })
+    .await
+    .map_err(|_| ServerError::AdminStore("candidate.operation_worker"))?
+    .map_err(|error| ServerError::AdminStore(error.code()))?;
+    Ok(CommitOperation {
+        store: Arc::clone(store),
+        operation_id: begin.receipt.operation_id,
+        work: CandidateWorkControl::with_deadline(deadline),
+        audit: Arc::new(Mutex::new(permit)),
+    })
+}
+
+async fn force_operation_recovery(
+    store: Arc<CandidateStore>,
+    id: String,
+    revision: u64,
+    version: String,
+    code: &'static str,
+) -> OperationReceipt {
+    // This path performs durable I/O too; it must not run on a Tokio worker.
+    tokio::task::spawn_blocking(move || store.force_recovery_receipt(&id, revision, &version, code))
+        .await
+        .expect("recovery marker worker must not panic")
+}
+
+async fn finish_operation_audit(
+    audit: &SharedOperationAudit,
+    store: &Arc<CandidateStore>,
+    receipt: Option<OperationReceipt>,
+    published: &PublishedRuntime,
+) -> Option<OperationReceipt> {
+    let owned = audit
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some((permit, mut event, sink)) = owned else {
+        return receipt;
+    };
+    event.operation_id = receipt.as_ref().map(|receipt| receipt.operation_id.clone());
+    event.new_revision = Some(published.runtime_revision.to_string());
+    if let Some(receipt) = &receipt {
+        event.result = if event.result == "replayed" {
+            "replayed"
+        } else {
+            match receipt.phase {
+                oxidase_runtime::OperationPhase::Committed => "committed",
+                oxidase_runtime::OperationPhase::RecoveryRequired => "recovery_required",
+                oxidase_runtime::OperationPhase::Cancelled => "cancelled",
+                _ => "failed",
+            }
+        }
+        .to_owned();
+        event.target_digest = receipt.target_digest.map(|digest| digest.to_string());
+        event.diagnostic_code.clone_from(&receipt.error_code);
+    }
+    let delivered = tokio::time::timeout(Duration::from_secs(5), permit.finish(event)).await;
+    if !matches!(delivered, Ok(Ok(Ok(())))) {
+        sink.fail_closed();
+        if let Some(receipt) = receipt
+            .as_ref()
+            .filter(|receipt| receipt.committed_revision.is_some())
+        {
+            return Some(
+                force_operation_recovery(
+                    Arc::clone(store),
+                    receipt.operation_id.clone(),
+                    receipt.committed_revision.unwrap_or_default(),
+                    receipt
+                        .config_version
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    "admin.audit_completion",
+                )
+                .await,
+            );
+        }
+        if let Some(receipt) = receipt.as_ref().filter(|receipt| {
+            receipt.audit_pending || receipt.phase == oxidase_runtime::OperationPhase::Committed
+        }) {
+            let worker = Arc::clone(store);
+            let id = receipt.operation_id.clone();
+            return tokio::task::spawn_blocking(move || {
+                worker.force_uncommitted_recovery_receipt(&id, "admin.audit_completion")
+            })
+            .await
+            .ok();
+        }
+        return receipt;
+    }
+    if let Some(receipt) = receipt.as_ref().filter(|receipt| receipt.audit_pending) {
+        let worker = Arc::clone(store);
+        let id = receipt.operation_id.clone();
+        match tokio::task::spawn_blocking(move || worker.complete_audit(&id)).await {
+            Ok(Ok(completed)) => return Some(completed),
+            _ if receipt.committed_revision.is_some() => {
+                return Some(
+                    force_operation_recovery(
+                        Arc::clone(store),
+                        receipt.operation_id.clone(),
+                        receipt.committed_revision.unwrap_or_default(),
+                        receipt
+                            .config_version
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        "admin.audit_record_failed",
+                    )
+                    .await,
+                );
+            }
+            _ => {
+                let worker = Arc::clone(store);
+                let id = receipt.operation_id.clone();
+                return tokio::task::spawn_blocking(move || {
+                    worker.force_uncommitted_recovery_receipt(&id, "admin.audit_record_failed")
+                })
+                .await
+                .ok();
+            }
+        }
+    }
+    receipt
 }
 
 async fn stop_all_listeners(active: &mut BTreeMap<String, ActiveListener>) {
@@ -807,10 +1989,28 @@ fn start_admin_listener(
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
     drain_timeout: Duration,
+    reload: ReloadHandle,
 ) -> ActiveAdmin {
+    let control_plane = admin
+        .candidates
+        .as_ref()
+        .zip(admin.candidate_upload_directory.as_ref())
+        .zip(admin.candidate_deployment_root.as_ref())
+        .map(
+            |((candidates, _upload_directory), deployment_root)| AdminControlPlane {
+                candidates: candidates.clone(),
+                reload,
+                deployment_root: deployment_root.clone(),
+                max_candidate_bytes: admin.max_candidate_bytes,
+                mutation_gate: Arc::new(Semaphore::new(1)),
+                audit: admin.audit.clone(),
+                operation_tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
+            },
+        );
     let (shutdown, receiver) = watch::channel(false);
     let task = tokio::spawn(run_admin_listener(
         admin,
+        control_plane,
         store,
         metrics,
         receiver,
@@ -828,6 +2028,7 @@ async fn stop_admin_listener(admin: &mut Option<ActiveAdmin>) {
 
 async fn run_admin_listener(
     admin: BoundAdmin,
+    control_plane: Option<AdminControlPlane>,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
     mut shutdown: watch::Receiver<bool>,
@@ -844,8 +2045,8 @@ async fn run_admin_listener(
                     break;
                 }
             }
-            accepted = admin.listener.accept() => {
-                let Ok((stream, _)) = accepted else {
+            accepted = admin.accept() => {
+                let Ok(stream) = accepted else {
                     tracing::error!("admin listener failed while accepting a connection");
                     break;
                 };
@@ -859,6 +2060,9 @@ async fn run_admin_listener(
                 };
                 let store = store.clone();
                 let metrics = metrics.clone();
+                let security = admin.security.clone();
+                let tls = admin.tls.clone();
+                let control_plane = control_plane.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     let _permit = permit;
@@ -866,6 +2070,9 @@ async fn run_admin_listener(
                         stream,
                         store,
                         metrics,
+                        security,
+                        tls,
+                        control_plane,
                         connection_shutdown,
                     ).await;
                 });
@@ -886,16 +2093,115 @@ async fn run_admin_listener(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
+    if let Some(control) = &control_plane {
+        let mut tasks = control.operation_tasks.lock().await;
+        if tokio::time::timeout(drain_timeout, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+        if let Some(audit) = &control.audit {
+            let _ = tokio::time::timeout(drain_timeout, audit.flush()).await;
+        }
+    }
+}
+
+impl BoundAdmin {
+    async fn accept(&self) -> std::io::Result<BoxAdminIo> {
+        match &self.transport {
+            BoundAdminTransport::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
+            #[cfg(unix)]
+            BoundAdminTransport::Unix(listener) => {
+                let (stream, _) = listener.listener().accept().await?;
+                Ok(Box::new(stream))
+            }
+        }
+    }
 }
 
 async fn serve_admin_connection(
-    stream: TcpStream,
+    stream: BoxAdminIo,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    tls: Option<PreparedTlsListener>,
+    control_plane: Option<AdminControlPlane>,
+    shutdown: watch::Receiver<bool>,
+) {
+    if let Some(tls) = tls {
+        let acceptor = TlsAcceptor::from(tls.server_config);
+        let accepted = tokio::time::timeout(tls.handshake_timeout, acceptor.accept(stream)).await;
+        let stream = match accepted {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "admin TLS handshake failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("admin TLS handshake timed out");
+                return;
+            }
+        };
+        let client = match verified_client_metadata(stream.get_ref().1.peer_certificates()) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "verified admin client metadata is invalid");
+                return;
+            }
+        };
+        let peer = AdminPeerIdentity {
+            verified_client_sha256: client.verified.then_some(client.sha256).flatten(),
+        };
+        serve_admin_http(
+            Box::new(stream),
+            store,
+            metrics,
+            security,
+            peer,
+            control_plane,
+            shutdown,
+        )
+        .await;
+        return;
+    }
+    serve_admin_http(
+        stream,
+        store,
+        metrics,
+        security,
+        AdminPeerIdentity::default(),
+        control_plane,
+        shutdown,
+    )
+    .await;
+}
+
+async fn serve_admin_http(
+    stream: BoxAdminIo,
+    store: Arc<SnapshotStore>,
+    metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    peer: AdminPeerIdentity,
+    control_plane: Option<AdminControlPlane>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let service =
-        service_fn(move |request| handle_admin_request(request, store.clone(), metrics.clone()));
+    let service = service_fn(move |request| {
+        handle_admin_request(
+            request,
+            store.clone(),
+            metrics.clone(),
+            security.clone(),
+            peer.clone(),
+            control_plane.clone(),
+        )
+    });
     let connection = http1_builder(DEFAULT_HTTP1_HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
@@ -915,15 +2221,127 @@ async fn handle_admin_request(
     request: Request<Incoming>,
     store: Arc<SnapshotStore>,
     metrics: Arc<Metrics>,
+    security: Arc<AdminSecurityPolicy>,
+    peer: AdminPeerIdentity,
+    control_plane: Option<AdminControlPlane>,
 ) -> Result<Response<GatewayBody>, Infallible> {
+    let request_id = format!("admin-{}", REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed));
     let method = request.method().clone();
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    let Some(route) = classify_admin_route(request.method(), request.uri().path()) else {
+        if request.uri().path().starts_with("/api/v1/") {
+            let allowed = allowed_admin_methods(request.uri().path());
+            let mut response = admin_code_response(
+                if allowed.is_some() {
+                    StatusCode::METHOD_NOT_ALLOWED
+                } else {
+                    StatusCode::NOT_FOUND
+                },
+                if allowed.is_some() {
+                    "admin.method_not_allowed"
+                } else {
+                    "admin.not_found"
+                },
+                &method,
+            );
+            if let Some(allowed) = allowed {
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, HeaderValue::from_static(allowed));
+            }
+            return Ok(response);
+        }
+        let known_read_path = matches!(
+            request.uri().path(),
+            "/health/live"
+                | "/health/ready"
+                | "/metrics"
+                | "/api/v1/clusters"
+                | "/api/v1/runtime"
+                | "/api/v1/snapshots/current"
+                | "/api/v1/snapshots"
+        );
         return Ok(admin_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+            if known_read_path {
+                StatusCode::METHOD_NOT_ALLOWED
+            } else {
+                StatusCode::NOT_FOUND
+            },
             "text/plain; charset=utf-8",
-            Bytes::from_static(b"Method Not Allowed"),
+            Bytes::from_static(if known_read_path {
+                b"Method Not Allowed"
+            } else {
+                b"Not Found"
+            }),
             &method,
         ));
+    };
+    let published = store.published();
+    let snapshot = Arc::clone(&published.snapshot);
+    let principal = match security.authorize(request.headers(), &peer, route.permission) {
+        Ok(principal) => principal,
+        Err(error) => {
+            if let Some(audit) = control_plane
+                .as_ref()
+                .and_then(|control| control.audit.as_ref())
+            {
+                let authenticated = security
+                    .authenticated_principal(request.headers(), &peer)
+                    .ok();
+                let mut event = AdminAuditEvent::new(
+                    &request_id,
+                    authenticated
+                        .as_ref()
+                        .map_or("unauthenticated", |principal| {
+                            principal.authentication_kind()
+                        }),
+                    authenticated
+                        .as_ref()
+                        .map_or("unauthenticated", |principal| principal.audit_id()),
+                    route.permission.as_str(),
+                );
+                event.result = "rejected".to_owned();
+                event.diagnostic_code = Some(error.code().to_owned());
+                audit.try_record(event);
+            }
+            return Ok(admin_security_response(error, &method));
+        }
+    };
+    tracing::debug!(
+        admin_authentication = principal.authentication_kind(),
+        admin_principal = principal.audit_id(),
+        admin_permission = route.permission.as_str(),
+        "administration request authorized"
+    );
+    if route.mutation {
+        let max_body_bytes = security.max_body_bytes;
+        if let Some(content_type) = route.content_type
+            && let Err(error) =
+                validate_mutation_header_shape(request.headers(), content_type, max_body_bytes)
+        {
+            if let Some(audit) = control_plane
+                .as_ref()
+                .and_then(|control| control.audit.as_ref())
+            {
+                let mut event = AdminAuditEvent::new(
+                    &request_id,
+                    principal.authentication_kind(),
+                    principal.audit_id(),
+                    route.permission.as_str(),
+                );
+                event.result = "rejected".to_owned();
+                event.diagnostic_code = Some(error.code().to_owned());
+                audit.try_record(event);
+            }
+            return Ok(admin_security_response(error, &method));
+        }
+        let Some(control_plane) = control_plane else {
+            return Ok(admin_code_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin.control_unavailable",
+                &method,
+            ));
+        };
+        return Ok(dispatch_admin_mutation(request, principal, control_plane, request_id).await);
     }
     let response = match request.uri().path() {
         "/health/live" => admin_response(
@@ -933,7 +2351,7 @@ async fn handle_admin_request(
             &method,
         ),
         "/health/ready" => {
-            let ready = !store.pin().listeners.is_empty();
+            let ready = store.published().ready();
             admin_response(
                 if ready {
                     StatusCode::OK
@@ -945,13 +2363,43 @@ async fn handle_admin_request(
                 &method,
             )
         }
-        "/metrics" => admin_response(
-            StatusCode::OK,
-            "text/plain; version=0.0.4; charset=utf-8",
-            Bytes::from(metrics.render_prometheus_for(&store.pin())),
+        "/metrics" => {
+            let mut text = metrics.render_prometheus_for(&store.pin());
+            if let Some(audit) = control_plane
+                .as_ref()
+                .and_then(|control| control.audit.as_ref())
+            {
+                text.push_str(&format!("oxidase_admin_audit_dropped_total {}\noxidase_admin_audit_failed_total {}\noxidase_admin_audit_delivered_total {}\noxidase_admin_audit_healthy {}\n", audit.dropped(), audit.failed(), audit.delivered(), u8::from(audit.is_healthy())));
+            }
+            admin_response(
+                StatusCode::OK,
+                "text/plain; version=0.0.4; charset=utf-8",
+                Bytes::from(text),
+                &method,
+            )
+        }
+        "/api/v1/clusters" => cluster_admin_response(&snapshot, &method),
+        "/api/v1/runtime" | "/api/v1/snapshots/current" => {
+            current_runtime_admin_response(&published, &method)
+        }
+        "/api/v1/snapshots" => snapshot_list_admin_response(
+            &published,
+            control_plane.as_ref().map(|control| &control.candidates),
             &method,
         ),
-        "/api/v1/clusters" => cluster_admin_response(&store.pin(), &method),
+        path if path.starts_with("/api/v1/operations/") => {
+            let receipt = control_plane.as_ref().and_then(|control| {
+                control
+                    .candidates
+                    .operation(path.trim_start_matches("/api/v1/operations/"))
+            });
+            match receipt {
+                Some(receipt) => operation_receipt_response(&receipt, &published, false, &method),
+                None => {
+                    admin_code_response(StatusCode::NOT_FOUND, "admin.operation_not_found", &method)
+                }
+            }
+        }
         _ => admin_response(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -960,6 +2408,1159 @@ async fn handle_admin_request(
         ),
     };
     Ok(response)
+}
+
+struct AdminCancellationGuard(CandidateWorkControl);
+
+impl Drop for AdminCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+struct AdminTaskGuard {
+    store: Arc<CandidateStore>,
+    observed_id: Arc<Mutex<Option<String>>>,
+    work: CandidateWorkControl,
+    audit: SharedOperationAudit,
+    published: Arc<SnapshotStore>,
+}
+
+impl Drop for AdminTaskGuard {
+    fn drop(&mut self) {
+        self.work.cancel();
+        let id = self
+            .observed_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(id) = id else {
+            return;
+        };
+        let Some(receipt) = self.store.operation(&id) else {
+            return;
+        };
+        // After intent, only the manager can decide publication and completion.
+        if receipt.phase.is_finished() || receipt.commit_intent {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let audit = Arc::clone(&self.audit);
+        let published = Arc::clone(&self.published);
+        tokio::spawn(async move {
+            let worker = Arc::clone(&store);
+            let receipt = tokio::task::spawn_blocking(move || {
+                worker
+                    .finish_cancelled(&id, "candidate.cancelled")
+                    .unwrap_or_else(|error| {
+                        worker.force_uncommitted_recovery_receipt(&id, error.code())
+                    })
+            })
+            .await
+            .ok();
+            finish_operation_audit(&audit, &store, receipt, &published.published()).await;
+        });
+    }
+}
+
+async fn dispatch_admin_mutation(
+    request: Request<Incoming>,
+    principal: crate::admin::AdminPrincipal,
+    control: AdminControlPlane,
+    request_id: String,
+) -> Response<GatewayBody> {
+    let method = request.method().clone();
+    let Ok(admission) = Arc::clone(&control.mutation_gate).try_acquire_owned() else {
+        if let Some(audit) = &control.audit {
+            let mut event = AdminAuditEvent::new(
+                &request_id,
+                principal.authentication_kind(),
+                principal.audit_id(),
+                "unknown",
+            );
+            event.result = "rejected".to_owned();
+            event.diagnostic_code = Some("admin.mutation_busy".to_owned());
+            audit.try_record(event);
+        }
+        return admin_code_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin.mutation_busy",
+            &method,
+        );
+    };
+    let deadline = std::time::Instant::now() + ADMIN_MUTATION_TIMEOUT;
+    let work = CandidateWorkControl::with_deadline(deadline);
+    let guard = AdminCancellationGuard(work.clone());
+    let operation_id = Arc::new(Mutex::new(None::<String>));
+    let observed_operation = Arc::clone(&operation_id);
+    let published = control.reload.published_runtime();
+    let (response, received) = oneshot::channel();
+    let tasks = Arc::clone(&control.operation_tasks);
+    {
+        let mut tasks = tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _admission = admission;
+            let path = request.uri().path();
+            let action = if path == "/api/v1/candidates" {
+                "stage"
+            } else if path.ends_with("/validate") {
+                "validate"
+            } else if path.ends_with("/activate") {
+                "activate"
+            } else if path.ends_with("/rollback") {
+                "rollback"
+            } else if path.ends_with("/drain") {
+                "drain"
+            } else {
+                "reload_source"
+            };
+            let mut event = AdminAuditEvent::new(
+                &request_id,
+                principal.authentication_kind(),
+                principal.audit_id(),
+                action,
+            );
+            event.previous_revision = Some(published.runtime_revision.to_string());
+            let audit_permit = if let Some(sink) = &control.audit {
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    sink.prepare_mutation(event.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => Some((permit, event.clone(), sink.clone())),
+                    Ok(Err(error)) => {
+                        let _ = response.send(admin_code_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            error.code(),
+                            request.method(),
+                        ));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = response.send(admin_code_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "admin.audit_deadline",
+                            request.method(),
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let audit = Arc::new(Mutex::new(audit_permit));
+            let _bookkeeping = AdminTaskGuard {
+                store: Arc::clone(&control.candidates),
+                observed_id: Arc::clone(&operation_id),
+                work: work.clone(),
+                audit: Arc::clone(&audit),
+                published: Arc::clone(&control.reload.store),
+            };
+            let method = request.method().clone();
+            let managed = ManagedAdminOperation {
+                context: oxidase_runtime::CandidateOperationContext {
+                    request_id,
+                    principal: format!(
+                        "{}:{}",
+                        principal.authentication_kind(),
+                        principal.audit_id()
+                    ),
+                    if_match: request
+                        .headers()
+                        .get(header::IF_MATCH)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                    idempotency_key: request
+                        .headers()
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                },
+                work,
+                deadline,
+                observed_id: Arc::clone(&operation_id),
+                audit: Arc::clone(&audit),
+            };
+            let mut result = handle_admin_mutation(request, control.clone(), managed).await;
+            let id = operation_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let receipt = id
+                .as_deref()
+                .and_then(|id| control.candidates.operation(id));
+            if let Some((_, event, _)) = audit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                event.result = if result
+                    .extensions()
+                    .get::<AdminReplay>()
+                    .is_some_and(|replay| replay.0)
+                {
+                    "replayed"
+                } else if result.status().is_success() {
+                    "committed"
+                } else {
+                    "failed"
+                }
+                .to_owned();
+                event.diagnostic_code = result
+                    .extensions()
+                    .get::<AdminResponseCode>()
+                    .map(|code| code.0.to_owned());
+            }
+            if let Some(receipt) = finish_operation_audit(
+                &audit,
+                &control.candidates,
+                receipt,
+                &control.reload.published_runtime(),
+            )
+            .await
+                && receipt.phase == oxidase_runtime::OperationPhase::RecoveryRequired
+            {
+                result = operation_receipt_response(
+                    &receipt,
+                    &control.reload.published_runtime(),
+                    false,
+                    &method,
+                );
+            }
+            let _ = response.send(result);
+        });
+    }
+    let result = match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), received)
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => admin_code_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin.operation_worker",
+            &method,
+        ),
+        Err(_) => {
+            let id = observed_operation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            admin_json_value_response(
+                if id.is_some() {
+                    StatusCode::ACCEPTED
+                } else {
+                    StatusCode::REQUEST_TIMEOUT
+                },
+                &serde_json::json!({"schema_version":"oxidase.admin/v1","code":"admin.operation_deadline","operation_id":id}),
+                &method,
+            )
+        }
+    };
+    drop(guard);
+    result
+}
+
+async fn handle_admin_mutation(
+    request: Request<Incoming>,
+    control: AdminControlPlane,
+    managed: ManagedAdminOperation,
+) -> Response<GatewayBody> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let deadline = managed.deadline;
+    if managed.context.idempotency_key.is_none()
+        && managed.context.if_match.as_deref()
+            != Some(control.reload.published_runtime().etag().as_str())
+    {
+        return admin_code_response(
+            StatusCode::PRECONDITION_FAILED,
+            "admin.precondition_failed",
+            &method,
+        );
+    }
+    if path == "/api/v1/candidates" {
+        stage_admin_candidate(request.into_body(), &control, &managed, &method).await
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/candidates/", "validate") {
+        if let Err(error) = consume_admin_json_body(request.into_body(), deadline).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            validate_admin_candidate(digest, &control, &managed, &method).await
+        }
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/candidates/", "activate") {
+        if let Err(error) = consume_admin_json_body(request.into_body(), deadline).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            activate_admin_candidate(digest, &control, &managed, false, &method).await
+        }
+    } else if let Some(digest) = admin_action_digest(&path, "/api/v1/snapshots/", "rollback") {
+        if let Err(error) = consume_admin_json_body(request.into_body(), deadline).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            activate_admin_candidate(digest, &control, &managed, true, &method).await
+        }
+    } else if path == "/api/v1/drain" {
+        if let Err(error) = consume_admin_json_body(request.into_body(), deadline).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            execute_runtime_action(
+                &control,
+                &managed,
+                oxidase_runtime::AuditAction::Drain,
+                &method,
+            )
+            .await
+        }
+    } else if path == "/api/v1/reload-source" {
+        if let Err(error) = consume_admin_json_body(request.into_body(), deadline).await {
+            admin_code_response(error.status, error.code, &method)
+        } else {
+            execute_runtime_action(
+                &control,
+                &managed,
+                oxidase_runtime::AuditAction::ReloadSource,
+                &method,
+            )
+            .await
+        }
+    } else {
+        admin_code_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "admin.bundle_activation_unavailable",
+            &method,
+        )
+    }
+}
+
+async fn execute_runtime_action(
+    control: &AdminControlPlane,
+    managed: &ManagedAdminOperation,
+    action: oxidase_runtime::AuditAction,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let begin = match begin_managed_operation(
+        control,
+        managed,
+        action,
+        None,
+        Some(oxidase_bundle::BundleDigest::of_bytes(b"{}")),
+    )
+    .await
+    {
+        Ok(begin) => begin,
+        Err(error) => return admin_candidate_error_response(&error, method),
+    };
+    if begin.replayed || begin.receipt.phase.is_finished() {
+        return operation_receipt_response(
+            &begin.receipt,
+            &control.reload.published_runtime(),
+            begin.replayed,
+            method,
+        );
+    }
+    let id = begin.receipt.operation_id;
+    let operation = CommitOperation {
+        store: Arc::clone(&control.candidates),
+        operation_id: id.clone(),
+        work: managed.work.clone(),
+        audit: Arc::clone(&managed.audit),
+    };
+    let expected = managed.context.if_match.clone().unwrap_or_default();
+    let result = if action == oxidase_runtime::AuditAction::Drain {
+        control
+            .reload
+            .drain_operation(expected, Some(operation), managed.deadline)
+            .await
+    } else if let Some(source) = control.reload.published_runtime().source_origin.clone() {
+        control
+            .reload
+            .reload_path_with_operation(
+                &source,
+                false,
+                Some(expected),
+                Some(operation),
+                managed.deadline,
+            )
+            .await
+            .map(|_| ())
+    } else {
+        Err(ServerError::AdminStore("admin.source_unavailable"))
+    };
+    let diagnostics = result
+        .as_ref()
+        .err()
+        .map(ServerError::diagnostics)
+        .unwrap_or_default();
+    if let Err(error) = result
+        && control
+            .candidates
+            .operation(&id)
+            .is_some_and(|receipt| !receipt.phase.is_finished())
+    {
+        let code = error
+            .diagnostics()
+            .first()
+            .map_or("admin.operation_failed", |diagnostic| diagnostic.code);
+        let _ = finish_operation_error(
+            control,
+            id.clone(),
+            oxidase_runtime::CandidateStoreError::new(code, "runtime operation failed"),
+        )
+        .await;
+    }
+    match control.candidates.operation(&id) {
+        Some(receipt) => operation_receipt_diagnostics_response(
+            &receipt,
+            &control.reload.published_runtime(),
+            false,
+            &diagnostics,
+            method,
+        ),
+        None => admin_code_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin.receipt_missing",
+            method,
+        ),
+    }
+}
+
+fn admin_action_digest(
+    path: &str,
+    prefix: &str,
+    action: &str,
+) -> Option<oxidase_bundle::BundleDigest> {
+    let rest = path.strip_prefix(prefix)?;
+    let (digest, actual_action) = rest.split_once('/')?;
+    if actual_action != action {
+        return None;
+    }
+    serde_json::from_value(serde_json::Value::String(digest.to_owned())).ok()
+}
+
+async fn consume_admin_json_body(
+    mut body: Incoming,
+    deadline: std::time::Instant,
+) -> Result<(), AdminUploadError> {
+    const MAX_JSON_BODY_BYTES: u64 = 64 * 1024;
+    let mut received = 0_u64;
+    let mut bytes = Vec::new();
+    let receive = async {
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| AdminUploadError {
+                status: StatusCode::BAD_REQUEST,
+                code: "admin.request_body",
+            })?;
+            if let Some(data) = frame.data_ref() {
+                received = received
+                    .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+                    .ok_or(AdminUploadError {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        code: "admin.payload_too_large",
+                    })?;
+                if received > MAX_JSON_BODY_BYTES {
+                    return Err(AdminUploadError {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        code: "admin.payload_too_large",
+                    });
+                }
+                bytes.extend_from_slice(data);
+            } else if frame.trailers_ref().is_some() {
+                return Err(AdminUploadError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "admin.request_trailers",
+                });
+            }
+        }
+        Ok::<(), AdminUploadError>(())
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), receive)
+        .await
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "admin.request_timeout",
+        })??;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.invalid_json",
+        })?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        Ok(())
+    } else {
+        Err(AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.unexpected_body",
+        })
+    }
+}
+
+async fn validate_admin_candidate(
+    digest: oxidase_bundle::BundleDigest,
+    control: &AdminControlPlane,
+    managed: &ManagedAdminOperation,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let begin = match begin_managed_operation(
+        control,
+        managed,
+        oxidase_runtime::AuditAction::Validate,
+        Some(digest),
+        None,
+    )
+    .await
+    {
+        Ok(begin) => begin,
+        Err(error) => return admin_candidate_error_response(&error, method),
+    };
+    if begin.replayed || begin.receipt.phase.is_finished() {
+        return operation_receipt_response(
+            &begin.receipt,
+            &control.reload.published_runtime(),
+            begin.replayed,
+            method,
+        );
+    }
+    let id = begin.receipt.operation_id;
+    let bundle_path = control.candidates.candidate_path(digest);
+    let deployment_root = control.deployment_root.clone();
+    let previous = control.reload.current_snapshot();
+    let work = managed.work.clone();
+    let result = async {
+        work.checkpoint()?;
+        if managed.context.if_match.as_deref()
+            != Some(control.reload.published_runtime().etag().as_str())
+        {
+            return Err(oxidase_runtime::CandidateStoreError::new(
+                "candidate.precondition",
+                "current runtime condition is stale",
+            ));
+        }
+        let store = Arc::clone(&control.candidates);
+        let preparing_id = id.clone();
+        tokio::task::spawn_blocking(move || store.mark_preparing(&preparing_id))
+            .await
+            .map_err(|_| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.validation_worker",
+                    "preparation journal worker failed",
+                )
+            })??;
+        let permit = Arc::clone(&control.reload.compile_gate)
+            .try_acquire_owned()
+            .map_err(|_| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.busy",
+                    "preparation worker is occupied",
+                )
+            })?;
+        let (archive, permit) = control
+            .candidates
+            .verified_archive_admitted(digest, work.clone(), permit)
+            .await?;
+        let checked_work = work.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            checked_work.checkpoint()?;
+            oxidase_runtime::prepare_bundle_archive_controlled(
+                &archive,
+                &bundle_path,
+                &deployment_root,
+                Some(&previous),
+                &checked_work,
+            )
+            .map_err(candidate_preparation_error)?;
+            checked_work.checkpoint()
+        })
+        .await
+        .map_err(|_| {
+            oxidase_runtime::CandidateStoreError::new(
+                "candidate.validation_worker",
+                "validation worker failed",
+            )
+        })??;
+        let store = Arc::clone(&control.candidates);
+        let completion_id = id.clone();
+        tokio::task::spawn_blocking(move || store.complete_validation(&completion_id, digest))
+            .await
+            .map_err(|_| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.validation_worker",
+                    "validation completion worker failed",
+                )
+            })??;
+        Ok::<_, oxidase_runtime::CandidateStoreError>(())
+    }
+    .await;
+    let diagnostics = result
+        .as_ref()
+        .err()
+        .map(|error| error.diagnostics().to_vec())
+        .unwrap_or_default();
+    if let Err(error) = result {
+        let _ = finish_operation_error(control, id.clone(), error).await;
+    }
+    match control.candidates.operation(&id) {
+        Some(receipt) => operation_receipt_diagnostics_response(
+            &receipt,
+            &control.reload.published_runtime(),
+            false,
+            &diagnostics,
+            method,
+        ),
+        None => admin_code_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin.receipt_missing",
+            method,
+        ),
+    }
+}
+
+async fn activate_admin_candidate(
+    digest: oxidase_bundle::BundleDigest,
+    control: &AdminControlPlane,
+    managed: &ManagedAdminOperation,
+    rollback: bool,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let begin = match begin_managed_operation(
+        control,
+        managed,
+        if rollback {
+            oxidase_runtime::AuditAction::Rollback
+        } else {
+            oxidase_runtime::AuditAction::Activate
+        },
+        Some(digest),
+        None,
+    )
+    .await
+    {
+        Ok(begin) => begin,
+        Err(error) => return admin_candidate_error_response(&error, method),
+    };
+    if begin.replayed || begin.receipt.phase.is_finished() {
+        return operation_receipt_response(
+            &begin.receipt,
+            &control.reload.published_runtime(),
+            begin.replayed,
+            method,
+        );
+    }
+    let id = begin.receipt.operation_id;
+    let bundle_path = control.candidates.candidate_path(digest);
+    let deployment_root = control.deployment_root.clone();
+    let reload = control.reload.clone();
+    let expected_version = managed.context.if_match.clone().unwrap_or_default();
+    let work = managed.work.clone();
+    let result = async {
+        work.checkpoint()?;
+        control
+            .candidates
+            .ensure_candidate_activatable(digest, rollback)?;
+        let previous = reload.current_snapshot();
+        if reload.published_runtime().etag() != expected_version {
+            return Err(oxidase_runtime::CandidateStoreError::new(
+                "candidate.precondition",
+                "current snapshot changed before candidate preparation",
+            ));
+        }
+        let store = Arc::clone(&control.candidates);
+        let preparing_id = id.clone();
+        tokio::task::spawn_blocking(move || store.mark_preparing(&preparing_id))
+            .await
+            .map_err(|_| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.activation_worker",
+                    "preparation journal worker failed",
+                )
+            })??;
+        let permit = Arc::clone(&reload.compile_gate)
+            .try_acquire_owned()
+            .map_err(|_| {
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.busy",
+                    "preparation worker is occupied",
+                )
+            })?;
+        let (archive, permit) = control
+            .candidates
+            .verified_archive_admitted(digest, work.clone(), permit)
+            .await?;
+        let checked_work = work.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            checked_work.checkpoint()?;
+            oxidase_runtime::prepare_bundle_archive_controlled(
+                &archive,
+                &bundle_path,
+                &deployment_root,
+                Some(&previous),
+                &checked_work,
+            )
+            .map_err(candidate_preparation_error)
+        })
+        .await
+        .map_err(|error| {
+            oxidase_runtime::CandidateStoreError::new(
+                "candidate.activation_worker",
+                format!("candidate activation worker failed: {error}"),
+            )
+        })??;
+        work.checkpoint()?;
+        let operation = CommitOperation {
+            store: Arc::clone(&control.candidates),
+            operation_id: id.clone(),
+            work: work.clone(),
+            audit: Arc::clone(&managed.audit),
+        };
+        let report = reload
+            .publish_prepared(
+                prepared.snapshot,
+                prepared.reuse,
+                expected_version,
+                RuntimeOrigin::Bundle {
+                    digest: digest.into(),
+                },
+                Some(operation),
+                managed.deadline,
+            )
+            .await
+            .map_err(|error| {
+                let diagnostics = error.diagnostics();
+                oxidase_runtime::CandidateStoreError::new(
+                    diagnostics
+                        .first()
+                        .map_or("candidate.activation", |diagnostic| diagnostic.code),
+                    "candidate publication failed",
+                )
+                .with_diagnostics(diagnostics)
+            })?;
+        Ok(report.current_version)
+    }
+    .await;
+    let diagnostics = result
+        .as_ref()
+        .err()
+        .map(|error| error.diagnostics().to_vec())
+        .unwrap_or_default();
+    if let Err(error) = result
+        && control
+            .candidates
+            .operation(&id)
+            .is_some_and(|receipt| !receipt.phase.is_finished())
+    {
+        let _ = finish_operation_error(control, id.clone(), error).await;
+    }
+    match control.candidates.operation(&id) {
+        Some(receipt) => operation_receipt_diagnostics_response(
+            &receipt,
+            &control.reload.published_runtime(),
+            false,
+            &diagnostics,
+            method,
+        ),
+        None => admin_code_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin.receipt_missing",
+            method,
+        ),
+    }
+}
+
+async fn stage_admin_candidate(
+    body: Incoming,
+    control: &AdminControlPlane,
+    managed: &ManagedAdminOperation,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let spool = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(managed.deadline),
+        spool_admin_upload(
+            body,
+            Arc::clone(&control.candidates),
+            control.max_candidate_bytes,
+            managed.work.clone(),
+            managed.deadline,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(spool)) => spool,
+        Ok(Err(error)) => return admin_code_response(error.status, error.code, method),
+        Err(_) => {
+            return admin_code_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "admin.request_timeout",
+                method,
+            );
+        }
+    };
+    let begin = match begin_managed_operation(
+        control,
+        managed,
+        oxidase_runtime::AuditAction::Stage,
+        None,
+        Some(spool.body_digest),
+    )
+    .await
+    {
+        Ok(begin) => begin,
+        Err(error) => return admin_candidate_error_response(&error, method),
+    };
+    if begin.replayed || begin.receipt.phase.is_finished() {
+        return operation_receipt_response(
+            &begin.receipt,
+            &control.reload.published_runtime(),
+            begin.replayed,
+            method,
+        );
+    }
+    let id = begin.receipt.operation_id;
+    let permit = match Arc::clone(&control.reload.compile_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Some(receipt) = finish_operation_error(
+                control,
+                id,
+                oxidase_runtime::CandidateStoreError::new(
+                    "candidate.busy",
+                    "preparation worker is occupied",
+                ),
+            )
+            .await
+            {
+                return operation_receipt_response(
+                    &receipt,
+                    &control.reload.published_runtime(),
+                    false,
+                    method,
+                );
+            }
+            return admin_code_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin.preparation_busy",
+                method,
+            );
+        }
+    };
+    let outcome = control
+        .candidates
+        .stage_spool_for_operation(
+            spool.file,
+            managed.context.clone(),
+            managed.work.clone(),
+            id.clone(),
+            Some(permit),
+        )
+        .await;
+    // The detached operation cannot relinquish shared preparation admission
+    // while the blocking staging worker still owns its spool and work permit.
+    match outcome {
+        Ok(outcome) => {
+            let store = Arc::clone(&control.candidates);
+            let completion_id = id.clone();
+            let digest = outcome.candidate.digest;
+            match tokio::task::spawn_blocking(move || store.finish_staged(&completion_id, digest))
+                .await
+            {
+                Ok(Ok(receipt)) => operation_receipt_response(
+                    &receipt,
+                    &control.reload.published_runtime(),
+                    false,
+                    method,
+                ),
+                _ => {
+                    let published = control.reload.published_runtime();
+                    let worker = Arc::clone(&control.candidates);
+                    let receipt = tokio::task::spawn_blocking(move || {
+                        worker.force_uncommitted_recovery_receipt(&id, "admin.stage_record_failed")
+                    })
+                    .await
+                    .expect("recovery marker worker");
+                    operation_receipt_response(&receipt, &published, false, method)
+                }
+            }
+        }
+        Err(error) => match finish_operation_error(control, id, error.clone()).await {
+            Some(receipt) => operation_receipt_response(
+                &receipt,
+                &control.reload.published_runtime(),
+                false,
+                method,
+            ),
+            None => admin_candidate_error_response(&error, method),
+        },
+    }
+}
+
+struct AdminUploadError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+struct AdminUploadSpool {
+    file: tempfile::NamedTempFile,
+    body_digest: oxidase_bundle::BundleDigest,
+}
+
+async fn spool_admin_upload(
+    mut body: Incoming,
+    store: Arc<CandidateStore>,
+    max_bytes: u64,
+    work: CandidateWorkControl,
+    deadline: std::time::Instant,
+) -> Result<AdminUploadSpool, AdminUploadError> {
+    let worker_store = Arc::clone(&store);
+    let temporary = tokio::task::spawn_blocking(move || worker_store.create_upload_spool())
+        .await
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "admin.upload_worker",
+        })?
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "admin.upload_io",
+        })?;
+    let file = temporary
+        .as_file()
+        .try_clone()
+        .map_err(|_| AdminUploadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "admin.upload_io",
+        })?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut received = 0_u64;
+    let mut hasher = oxidase_core::ContentHasher::new();
+    while let Some(frame) =
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), body.frame())
+            .await
+            .map_err(|_| AdminUploadError {
+                status: StatusCode::REQUEST_TIMEOUT,
+                code: "admin.request_timeout",
+            })?
+    {
+        work.checkpoint().map_err(|_| AdminUploadError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "admin.operation_cancelled",
+        })?;
+        let frame = frame.map_err(|_| AdminUploadError {
+            status: StatusCode::BAD_REQUEST,
+            code: "admin.request_body",
+        })?;
+        if let Some(data) = frame.data_ref() {
+            received = received
+                .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+                .ok_or(AdminUploadError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "admin.payload_too_large",
+                })?;
+            if received > max_bytes {
+                return Err(AdminUploadError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "admin.payload_too_large",
+                });
+            }
+            let worker_store = Arc::clone(&store);
+            tokio::task::spawn_blocking(move || worker_store.reserve_upload_capacity(received))
+                .await
+                .map_err(|_| AdminUploadError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "admin.upload_worker",
+                })?
+                .map_err(|_| AdminUploadError {
+                    status: StatusCode::INSUFFICIENT_STORAGE,
+                    code: "admin.upload_capacity",
+                })?;
+            hasher.update(data);
+            file.write_all(data).await.map_err(|_| AdminUploadError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "admin.upload_io",
+            })?;
+        } else if frame.trailers_ref().is_some() {
+            return Err(AdminUploadError {
+                status: StatusCode::BAD_REQUEST,
+                code: "admin.request_trailers",
+            });
+        }
+    }
+    file.flush().await.map_err(|_| AdminUploadError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "admin.upload_io",
+    })?;
+    file.sync_all().await.map_err(|_| AdminUploadError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "admin.upload_io",
+    })?;
+    drop(file);
+    Ok(AdminUploadSpool {
+        file: temporary,
+        body_digest: hasher.finish().into(),
+    })
+}
+
+fn admin_candidate_error_response(
+    error: &oxidase_runtime::CandidateStoreError,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let status = match error.code() {
+        "candidate.not_found" => StatusCode::NOT_FOUND,
+        "candidate.precondition" => StatusCode::PRECONDITION_FAILED,
+        "candidate.capacity" => StatusCode::SERVICE_UNAVAILABLE,
+        "candidate.limit" => StatusCode::PAYLOAD_TOO_LARGE,
+        "candidate.idempotency_conflict" => StatusCode::CONFLICT,
+        code if code.starts_with("bundle.") => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    tracing::warn!(code = error.code(), "admin candidate operation failed");
+    admin_code_response(status, error.code(), method)
+}
+
+fn admin_code_response(
+    status: StatusCode,
+    code: &'static str,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let mut response = admin_json_value_response(
+        status,
+        &serde_json::json!({
+            "schema_version": "oxidase.admin/v1",
+            "code": code,
+            "diagnostics": [{"code":code,"severity":"error","message":"administration operation rejected","primary":null,"labels":[],"notes":[],"help":null,"reference_chain":[]}]
+        }),
+        method,
+    );
+    response.extensions_mut().insert(AdminResponseCode(code));
+    response
+}
+
+#[derive(Clone, Copy)]
+struct AdminResponseCode(&'static str);
+
+fn admin_json_value_response(
+    status: StatusCode,
+    value: &serde_json::Value,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let mut envelope = value.clone();
+    if let Some(object) = envelope.as_object_mut()
+        && object.get("code").is_some_and(|code| !code.is_null())
+        && !object.contains_key("diagnostics")
+    {
+        object.insert("diagnostics".to_owned(), serde_json::json!([{"code":object["code"],"severity":"error","message":"administration operation rejected","primary":null,"labels":[],"related":[],"notes":[],"help":null,"reference_chain":[]}]));
+    }
+    match serde_json::to_vec(&envelope) {
+        Ok(body) => admin_response(
+            status,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"code\":\"admin.serialization_failed\"}\n"),
+            method,
+        ),
+    }
+}
+
+fn admin_security_response(
+    error: crate::admin::AdminSecurityError,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let mut response = admin_code_response(error.status(), error.code(), method);
+    if error.status() == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"oxidase-admin\""),
+        );
+    }
+    response
+}
+
+#[derive(Serialize)]
+struct RuntimeAdminResponse<'a> {
+    schema_version: &'static str,
+    config_version: &'a str,
+    runtime_revision: u64,
+    etag: String,
+    origin: &'a RuntimeOrigin,
+    serving_state: ServingState,
+    bundle_digest: Option<String>,
+    listener_count: usize,
+    cluster_count: usize,
+    site_count: usize,
+}
+
+fn current_runtime_admin_response(
+    published: &PublishedRuntime,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let snapshot = &published.snapshot;
+    let response = RuntimeAdminResponse {
+        schema_version: "oxidase.admin/v1",
+        config_version: snapshot.config_version.as_str(),
+        runtime_revision: published.runtime_revision,
+        etag: published.etag(),
+        origin: &published.origin,
+        serving_state: published.serving_state,
+        bundle_digest: published.bundle_digest().map(|digest| digest.to_string()),
+        listener_count: snapshot.listeners.len(),
+        cluster_count: snapshot.resources.clusters.len(),
+        site_count: snapshot.resources.sites.len(),
+    };
+    let mut response = json_admin_response(&response, method);
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&published.etag()).expect("runtime ETag is ASCII"),
+    );
+    response
+}
+
+fn snapshot_list_admin_response(
+    published: &PublishedRuntime,
+    candidates: Option<&Arc<CandidateStore>>,
+    method: &Method,
+) -> Response<GatewayBody> {
+    let history = candidates.map_or_else(Vec::new, |store| store.history());
+    let digest = published.bundle_digest().map(|digest| digest.to_string());
+    let rollbackable = digest.as_ref().is_some_and(|digest| {
+        history
+            .iter()
+            .any(|record| record.digest.to_string() == *digest)
+    });
+    admin_json_value_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "schema_version":"oxidase.admin/v1", "current":{
+                "config_version":published.snapshot.config_version.as_str(),
+                "runtime_revision":published.runtime_revision, "etag":published.etag(),
+                "origin":published.origin, "bundle_digest":digest,
+                "serving_state":published.serving_state, "rollbackable":rollbackable
+            }, "history":history
+        }),
+        method,
+    )
+}
+
+fn json_admin_response(value: &impl Serialize, method: &Method) -> Response<GatewayBody> {
+    match serde_json::to_vec(value) {
+        Ok(body) => admin_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            Bytes::from(body),
+            method,
+        ),
+        Err(_) => admin_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":{\"code\":\"admin.serialization_failed\"}}\n"),
+            method,
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -2110,6 +4711,28 @@ impl std::error::Error for ReloadError {}
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("invalid administration listener configuration: {0}")]
+    AdminConfiguration(String),
+    #[error("cannot prepare administration transport: {0}")]
+    AdminPreparation(Box<Diagnostic>),
+    #[error("snapshot activation precondition failed")]
+    PreconditionFailed,
+    #[error("operation was cancelled or expired before publication")]
+    OperationCancelled,
+    #[error("automatic source reload no longer owns the active deployment")]
+    SourceAuthorityLost,
+    #[error("the bounded preparation worker is already in use")]
+    PreparationBusy,
+    #[error("control-plane durable operation failed ({0})")]
+    AdminStore(&'static str),
+    #[cfg(unix)]
+    #[error("cannot bind administration Unix socket `{path}`: {source}")]
+    AdminUnixBind {
+        path: PathBuf,
+        source_span: Box<SourceSpan>,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot bind listener `{listener}` to {address}: {source}")]
     Bind {
         listener: String,
@@ -2148,6 +4771,50 @@ impl ServerError {
     #[must_use]
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         match self {
+            Self::AdminConfiguration(message) => vec![Diagnostic::new(
+                "admin.listener_configuration",
+                message.clone(),
+                SourceSpan::synthetic("admin.listen"),
+            )],
+            Self::AdminPreparation(diagnostic) => vec![diagnostic.as_ref().clone()],
+            Self::PreconditionFailed => vec![Diagnostic::new(
+                "admin.precondition_failed",
+                "snapshot activation precondition failed",
+                SourceSpan::synthetic("admin.if_match"),
+            )],
+            Self::OperationCancelled => vec![Diagnostic::new(
+                "admin.operation_cancelled",
+                "operation was cancelled or expired before publication",
+                SourceSpan::synthetic("admin.operation"),
+            )],
+            Self::SourceAuthorityLost => vec![Diagnostic::new(
+                "reload.source_authority_lost",
+                "automatic source reload cannot replace a Bundle deployment or reopen a drained runtime",
+                SourceSpan::synthetic("serve.watch"),
+            )],
+            Self::PreparationBusy => vec![Diagnostic::new(
+                "admin.preparation_busy",
+                "the bounded preparation worker is already in use",
+                SourceSpan::synthetic("admin.operation"),
+            )],
+            Self::AdminStore(code) => vec![Diagnostic::new(
+                code,
+                "durable operation could not be completed",
+                SourceSpan::synthetic("admin.operation"),
+            )],
+            #[cfg(unix)]
+            Self::AdminUnixBind {
+                path,
+                source_span,
+                source,
+            } => vec![Diagnostic::new(
+                "admin.unix_bind",
+                format!(
+                    "cannot bind administration Unix socket `{}`: {source}",
+                    path.display()
+                ),
+                source_span.as_ref().clone(),
+            )],
             Self::Bind {
                 listener,
                 address,
@@ -2249,6 +4916,32 @@ mod tests {
         assert_eq!(diagnostics[0].code, "server.listener_bind");
         assert_eq!(diagnostics[0].primary.field_path, "listeners[0].bind");
         assert!(diagnostics[0].message.contains("public"));
+    }
+
+    #[test]
+    fn admin_diagnostics_preserve_locations_without_replaying_sensitive_strings() {
+        let mut span = SourceSpan::synthetic("resources.certificates.public.private_key");
+        span.file = "/run/secrets/operator.key".into();
+        span.line = 12;
+        let diagnostic = oxidase_core::Diagnostic::new(
+            "tls.private_key_missing",
+            "secret details /run/secrets/operator.key",
+            span.clone(),
+        )
+        .with_label("raw token and path", span.clone())
+        .with_note("private content")
+        .with_help("/run/secrets/operator.key");
+        let value = serde_json::to_string(&super::safe_admin_diagnostics(&[diagnostic]))
+            .expect("JSON projection");
+        assert!(value.contains("resources.certificates.public.private_key"));
+        assert!(value.contains("\"line\":12"));
+        assert!(!value.contains("operator.key"));
+        assert!(!value.contains("raw token"));
+        assert_eq!(super::safe_admin_field_path("/run/secrets/key"), "<field>");
+        assert_eq!(
+            super::safe_admin_field_path("defaults.by_extension[\"/secret/key\"]"),
+            "defaults.by_extension[\"<key>\"]"
+        );
     }
 
     #[test]
@@ -5156,6 +7849,299 @@ listeners:
         );
 
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn stale_source_preparation_cannot_overwrite_a_bundle_publication() {
+        let directory = tempdir().expect("temporary directory");
+        let config = directory.path().join("source.yaml");
+        let bundle_config = directory.path().join("bundle-fixture.yaml");
+        write_respond_gateway(&config, "initial", None);
+        write_respond_gateway(&bundle_config, "bundle", None);
+        let prepare = |path: &std::path::Path| {
+            RuntimeSnapshot::prepare(Compiler::compile_path(path).expect("fixture compiles"))
+                .expect("fixture prepares")
+        };
+        let running = GatewayServer::bind(prepare(&config))
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let reload = running.reload_handle();
+        let initial_etag = reload.published_runtime().etag();
+        let pause = reload.pause_test_preparation();
+        write_respond_gateway(&config, "stale-source", None);
+        let task = tokio::spawn({
+            let reload = reload.clone();
+            let config = config.clone();
+            async move { reload.reload_watched_path(config).await }
+        });
+        reload.wait_test_preparation_started().await;
+        reload
+            .activate_prepared(
+                prepare(&bundle_config),
+                oxidase_runtime::ResourceReuse::default(),
+                initial_etag.clone(),
+                oxidase_runtime::RuntimeOrigin::Bundle {
+                    digest: oxidase_core::ContentDigest::of_bytes(b"bundle"),
+                },
+            )
+            .await
+            .expect("Bundle publishes while source preparation is paused");
+        assert!(request(address, "/", "").await.ends_with("bundle"));
+        tokio::task::spawn_blocking(move || pause.wait())
+            .await
+            .expect("release preparation");
+        assert!(matches!(
+            task.await.expect("preparation task joins"),
+            Err(super::ServerError::PreconditionFailed)
+        ));
+        assert!(request(address, "/", "").await.ends_with("bundle"));
+        assert!(matches!(
+            reload.reload_watched_path(&config).await,
+            Err(super::ServerError::SourceAuthorityLost)
+        ));
+        assert!(matches!(
+            reload.drain_data_plane(initial_etag).await,
+            Err(super::ServerError::PreconditionFailed)
+        ));
+        running.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn drain_changes_readiness_and_watcher_cannot_reopen_listeners() {
+        let directory = tempdir().expect("temporary directory");
+        let config = directory.path().join("source.yaml");
+        write_respond_gateway(&config, "active", None);
+        let snapshot =
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("fixture compiles"))
+                .expect("prepares");
+        let running = GatewayServer::bind(snapshot)
+            .await
+            .expect("binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("admin bind"))
+            .await
+            .expect("admin binds")
+            .spawn();
+        let address = running.local_addresses()[0].1;
+        let admin = running.admin_address().expect("admin available");
+        let reload = running.reload_handle();
+        reload
+            .drain_data_plane(reload.published_runtime().etag())
+            .await
+            .expect("drain completes");
+        assert_eq!(
+            reload.published_runtime().serving_state,
+            oxidase_runtime::ServingState::Drained
+        );
+        assert!(
+            request(admin, "/health/live", "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request(admin, "/health/ready", "")
+                .await
+                .starts_with("HTTP/1.1 503")
+        );
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert!(matches!(
+            reload.reload_watched_path(&config).await,
+            Err(super::ServerError::SourceAuthorityLost)
+        ));
+        reload
+            .drain_data_plane(reload.published_runtime().etag())
+            .await
+            .expect("repeated drain");
+        running.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn published_runtime_survives_caller_cancellation_and_completion_storage_failure() {
+        let directory = tempdir().expect("temporary directory");
+        let config = directory.path().join("source.yaml");
+        write_respond_gateway(&config, "old", None);
+        let prepare = || {
+            RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("compiles"))
+                .expect("prepares")
+        };
+        let store = std::sync::Arc::new(SnapshotStore::new(prepare()));
+        let path = directory
+            .path()
+            .canonicalize()
+            .expect("canonical test root")
+            .join("journal");
+        let candidates = oxidase_runtime::CandidateStore::open(
+            path.clone(),
+            oxidase_runtime::CandidateStoreLimits::default(),
+            oxidase_runtime::CandidateSignaturePolicy::require_trusted(Vec::new()),
+            oxidase_bundle::BundleCapabilities::default(),
+        )
+        .expect("journal opens");
+        let begin = candidates
+            .begin_operation(
+                &oxidase_runtime::CandidateOperationContext {
+                    request_id: "fault-test".to_owned(),
+                    principal: "internal:test".to_owned(),
+                    if_match: Some(store.published().etag()),
+                    idempotency_key: Some("fault".to_owned()),
+                },
+                oxidase_runtime::AuditAction::ReloadSource,
+                None,
+                None,
+            )
+            .expect("accepted");
+        let operation = super::CommitOperation {
+            store: candidates.clone(),
+            operation_id: begin.receipt.operation_id.clone(),
+            work: oxidase_runtime::CandidateWorkControl::with_deadline(
+                std::time::Instant::now() + Duration::from_secs(30),
+            ),
+            audit: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        write_respond_gateway(&config, "published", None);
+        let prepared = prepare();
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let proxy = std::sync::Arc::new(ProxyClient::new().expect("proxy prepares"));
+        let mut health =
+            crate::cluster_health::ClusterHealthManager::new().expect("health manager prepares");
+        let (completion, _) = tokio::sync::mpsc::unbounded_channel();
+        let (response, received) = oneshot::channel();
+        let cancelled_receiver = std::sync::Arc::new(std::sync::Mutex::new(Some(received)));
+        let before = store.published().etag();
+        let mut listeners = std::collections::BTreeMap::new();
+        let mut generation = 1;
+        let report = super::apply_reload(
+            prepared,
+            oxidase_runtime::ResourceReuse::default(),
+            oxidase_runtime::RuntimeOrigin::Source,
+            &mut listeners,
+            &mut generation,
+            super::ReloadEnvironment {
+                store: &store,
+                proxy: &proxy,
+                metrics: &metrics,
+                health: &mut health,
+                drain_timeout: Duration::from_millis(100),
+                completion: &completion,
+                expected_etag: &before,
+                deadline: std::time::Instant::now() + Duration::from_secs(30),
+                operation: Some(&operation),
+                response: &response,
+                after_publish: Some(Box::new(move || {
+                    // Fault is injected only after the atomic runtime publication.
+                    cancelled_receiver.lock().expect("test lock").take();
+                    std::fs::rename(path.join("state.json"), path.join("saved-state.json"))
+                        .expect("preserve intent");
+                    std::fs::create_dir(path.join("state.json"))
+                        .expect("force completion rename failure");
+                })),
+            },
+        )
+        .await
+        .expect("publication is not misreported as failed");
+        assert_ne!(store.published().etag(), before);
+        let receipt = report.operation.expect("receipt is queryable");
+        assert_eq!(
+            receipt.phase,
+            oxidase_runtime::OperationPhase::RecoveryRequired
+        );
+        assert_eq!(
+            receipt.committed_revision,
+            Some(store.published().runtime_revision)
+        );
+        assert!(candidates.ensure_mutations_allowed().is_err());
+        assert!(
+            request(report.local_addresses[0].1, "/", "")
+                .await
+                .ends_with("published")
+        );
+        super::stop_all_listeners(&mut listeners).await;
+        health.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn required_stage_audit_failure_is_durable_recovery_without_a_runtime_revision() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().expect("canonical fixture");
+        let config = root.join("source.yaml");
+        write_respond_gateway(&config, "unchanged", None);
+        let snapshot = RuntimeSnapshot::prepare(Compiler::compile_path(&config).expect("compiles"))
+            .expect("prepares");
+        let published = SnapshotStore::new(snapshot).published();
+        let path = root.join("journal");
+        let candidates = oxidase_runtime::CandidateStore::open(
+            path.clone(),
+            oxidase_runtime::CandidateStoreLimits::default(),
+            oxidase_runtime::CandidateSignaturePolicy::allow_unsigned_for_development(),
+            oxidase_bundle::BundleCapabilities::default(),
+        )
+        .expect("test-only unsigned journal");
+        let bundle = oxidase_bundle::BundleBuilder::new(oxidase_bundle::BundleManifest::new(
+            oxidase_bundle::BuildMetadata {
+                tool_version: "test".to_owned(),
+                source_commit: None,
+                gateway_api: "oxidase.dev/v1alpha1".to_owned(),
+                oxista_api: "v1".to_owned(),
+            },
+            "0.3.0-alpha.1",
+        ))
+        .build()
+        .expect("test Bundle");
+        let context = oxidase_runtime::CandidateOperationContext {
+            request_id: "audit-fault".to_owned(),
+            principal: "bearer:test".to_owned(),
+            if_match: Some(published.etag()),
+            idempotency_key: None,
+        };
+        let staged = candidates
+            .stage_bytes(&bundle, &context)
+            .await
+            .expect("fixture artifact");
+        let begin = candidates
+            .begin_operation_audited(
+                &context,
+                oxidase_runtime::AuditAction::Stage,
+                Some(staged.candidate.digest),
+                Some(oxidase_bundle::BundleDigest::of_bytes(&bundle)),
+            )
+            .expect("audited receipt");
+        let id = begin.receipt.operation_id;
+        let completed = candidates
+            .finish_staged(&id, staged.candidate.digest)
+            .expect("artifact registered");
+        assert!(completed.audit_pending);
+        let sink = crate::admin_audit::AdminAuditSink::test_completion_failure();
+        let event =
+            crate::admin_audit::AdminAuditEvent::new("audit-fault", "bearer", "bearer", "stage");
+        let permit = sink
+            .prepare_mutation(event.clone())
+            .await
+            .expect("start acknowledged");
+        let audit = std::sync::Arc::new(std::sync::Mutex::new(Some((permit, event, sink))));
+        let receipt =
+            super::finish_operation_audit(&audit, &candidates, Some(completed), &published)
+                .await
+                .expect("queryable outcome");
+        assert_eq!(
+            receipt.phase,
+            oxidase_runtime::OperationPhase::RecoveryRequired
+        );
+        assert_eq!(receipt.committed_revision, None);
+        assert!(candidates.ensure_mutations_allowed().is_err());
+        drop(candidates);
+        let reopened = oxidase_runtime::CandidateStore::open(
+            path,
+            oxidase_runtime::CandidateStoreLimits::default(),
+            oxidase_runtime::CandidateSignaturePolicy::allow_unsigned_for_development(),
+            oxidase_bundle::BundleCapabilities::default(),
+        )
+        .expect("recovery opens for inspection");
+        assert_eq!(
+            reopened.operation(&id).expect("receipt survives").phase,
+            oxidase_runtime::OperationPhase::RecoveryRequired
+        );
+        assert!(reopened.ensure_mutations_allowed().is_err());
     }
 
     #[tokio::test]

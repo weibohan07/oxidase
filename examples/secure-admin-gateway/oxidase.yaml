@@ -1,0 +1,63 @@
+api_version: oxidase.dev/v1alpha1
+kind: gateway
+
+resources:
+  secrets:
+    admin-token:
+      file: tokens/test-only-admin.token
+
+services:
+  public:
+    type: respond
+    body:
+      text: Oxidase authenticated control-plane example
+
+listeners:
+  - name: public
+    bind: 127.0.0.1:8080
+    protocol: http
+    service:
+      ref: public
+
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-admin-example/admin.sock
+      mode: "0600"
+  auth:
+    mode: bearer
+    token_secret: admin-token
+  permissions:
+    read: true
+    stage: true
+    activate: true
+    rollback: true
+    drain: true
+    reload_source: true
+  storage:
+    directory: /tmp/oxidase-admin-example/state
+  bundle_trust:
+    verification_keys:
+      - keys/test-only-operator.pub
+  candidates:
+    max_count: 4
+    max_bytes: 32MiB
+    max_candidate_bytes: 8MiB
+  history:
+    max_snapshots: 3
+    max_bytes: 32MiB
+  audit:
+    destination: file
+    file: /tmp/oxidase-admin-example/audit.jsonl
+    queue_capacity: 128
+
+tests:
+  - name: public-response
+    listener: public
+    request:
+      method: GET
+      host: localhost
+      path: /
+    expect:
+      status: 200
+      service: public

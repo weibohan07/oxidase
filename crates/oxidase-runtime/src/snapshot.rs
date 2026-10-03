@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use oxidase_config::{
-    ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary, RetryBodyMode,
+    AdminSpec, ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
+    RetryBodyMode,
 };
 use oxidase_core::{
     ConfigVersion, ContentDigest, ContentDigestBuilder, Diagnostic, ResourceId, ServiceGraph,
@@ -12,6 +13,7 @@ use oxidase_core::{
 };
 use oxidase_site::{AssetSource, SiteCompileError, SiteCompileFailure, SiteCompiler, SiteSnapshot};
 
+use crate::candidate::CandidateWorkControl;
 use crate::cluster::PreparedCluster;
 use crate::governance::GovernanceRegistry;
 use crate::regular_file::open_regular_file;
@@ -61,6 +63,9 @@ pub struct RuntimeSnapshot {
     pub governance: GovernanceRegistry,
     pub resources: ResourceRegistry,
     pub listeners: Vec<CompiledListener>,
+    /// Immutable compiled management-plane policy. Secret bytes remain in the
+    /// prepared Resource registry and are never copied into this plan.
+    pub admin: Option<AdminSpec>,
     pub prepared_listeners: Vec<PreparedListenerPlan>,
     pub tests: Vec<ConfigTestSource>,
     preparation_warnings: Vec<Diagnostic>,
@@ -84,6 +89,7 @@ impl fmt::Debug for RuntimeSnapshot {
             .field("cluster_count", &self.resources.clusters.len())
             .field("site_count", &self.resources.sites.len())
             .field("listener_count", &self.listeners.len())
+            .field("admin_enabled", &self.admin.is_some())
             .field("test_count", &self.tests.len())
             .field("warning_count", &self.preparation_warnings.len())
             .finish_non_exhaustive()
@@ -102,11 +108,36 @@ impl RuntimeSnapshot {
         Self::prepare_reusing_with_resources(gateway, previous, None)
     }
 
+    /// File scanning and resource boundaries cooperatively observe cancellation
+    /// and the candidate deadline before returning a prepared snapshot.
+    pub fn prepare_reusing_controlled(
+        gateway: CompiledGateway,
+        previous: Option<&Self>,
+        control: &CandidateWorkControl,
+    ) -> Result<(Self, ResourceReuse), PreparationError> {
+        Self::prepare_reusing_with_resources_controlled(gateway, previous, None, control)
+    }
+
     pub(crate) fn prepare_reusing_with_resources(
         gateway: CompiledGateway,
         previous: Option<&Self>,
         portable: Option<&PortablePreparedResources>,
     ) -> Result<(Self, ResourceReuse), PreparationError> {
+        Self::prepare_reusing_with_resources_controlled(
+            gateway,
+            previous,
+            portable,
+            &CandidateWorkControl::default(),
+        )
+    }
+
+    fn prepare_reusing_with_resources_controlled(
+        gateway: CompiledGateway,
+        previous: Option<&Self>,
+        portable: Option<&PortablePreparedResources>,
+        control: &CandidateWorkControl,
+    ) -> Result<(Self, ResourceReuse), PreparationError> {
+        preparation_checkpoint(control, &gateway.dependencies)?;
         let mut summary = gateway.summary();
         let mut sites = BTreeMap::new();
         let mut site_fingerprints = BTreeMap::new();
@@ -137,6 +168,7 @@ impl RuntimeSnapshot {
         );
         if let Some(portable) = portable {
             for (id, candidate) in &portable.sites {
+                preparation_checkpoint(control, &dependencies)?;
                 let snapshot = previous
                     .filter(|previous| {
                         previous.site_fingerprints.get(id) == Some(&candidate.fingerprint)
@@ -154,10 +186,16 @@ impl RuntimeSnapshot {
             summary.sites = sites.keys().map(ToString::to_string).collect();
         } else {
             for (id, source) in &gateway.resources.sites {
+                let mut checkpoint = || {
+                    control
+                        .checkpoint()
+                        .map_err(|error| SiteCompileError::Interrupted { code: error.code() })
+                };
                 let index =
-                    SiteCompiler::scan(&source.root, &source.manifest).map_err(|failure| {
-                        preparation_error_from_site(id, &source.source, &dependencies, failure)
-                    })?;
+                    SiteCompiler::scan_controlled(&source.root, &source.manifest, &mut checkpoint)
+                        .map_err(|failure| {
+                            preparation_error_from_site(id, &source.source, &dependencies, failure)
+                        })?;
                 let fingerprint = index.fingerprint(&source.inputs).map_err(|message| {
                     let mut candidate_dependencies = dependencies.clone();
                     candidate_dependencies.extend(index.dependencies().iter().cloned());
@@ -182,11 +220,12 @@ impl RuntimeSnapshot {
                     reuse.sites += 1;
                     snapshot
                 } else {
-                    let compiled = SiteCompiler::compile_indexed_with_input_spans(
+                    let compiled = SiteCompiler::compile_indexed_with_input_spans_controlled(
                         id.clone(),
                         &index,
                         source.inputs.clone(),
                         source.input_spans.clone(),
+                        &mut checkpoint,
                     )
                     .map_err(|failure| {
                         preparation_error_from_site(id, &source.source, &dependencies, failure)
@@ -197,11 +236,13 @@ impl RuntimeSnapshot {
                 dependencies.extend(site_directories(&snapshot));
                 site_fingerprints.insert(id.clone(), fingerprint);
                 sites.insert(id.clone(), snapshot);
+                preparation_checkpoint(control, &dependencies)?;
             }
         }
         let mut secrets = BTreeMap::new();
         let mut secret_fingerprints = BTreeMap::new();
         for (id, source) in &gateway.resources.secrets {
+            preparation_checkpoint(control, &dependencies)?;
             // Always read and validate the candidate before reuse. A missing,
             // oversized, or unreadable rotation must retain last-known-good.
             let candidate = PreparedSecret::prepare(source).map_err(|failure| {
@@ -227,6 +268,7 @@ impl RuntimeSnapshot {
         let mut trust_stores = BTreeMap::new();
         let mut trust_store_fingerprints = BTreeMap::new();
         for (id, source) in &gateway.resources.trust_stores {
+            preparation_checkpoint(control, &dependencies)?;
             let candidate = portable
                 .and_then(|portable| portable.trust_store_roots.get(id))
                 .map_or_else(
@@ -262,6 +304,7 @@ impl RuntimeSnapshot {
         let mut certificates = BTreeMap::new();
         let mut certificate_fingerprints = BTreeMap::new();
         for (id, source) in &gateway.resources.certificates {
+            preparation_checkpoint(control, &dependencies)?;
             // Even when the public chain digest is unchanged, parse and validate
             // the candidate private key before deciding to reuse the old opaque
             // signing state. An invalid key-only rotation must never commit.
@@ -297,10 +340,13 @@ impl RuntimeSnapshot {
             certificate_fingerprints.insert(id.clone(), fingerprint);
             certificates.insert(id.clone(), certificate);
         }
+        preparation_checkpoint(control, &dependencies)?;
         validate_sensitive_site_asset_isolation(&gateway, &sites, &dependencies)?;
+        preparation_checkpoint(control, &dependencies)?;
         let mut clusters = BTreeMap::new();
         let mut cluster_fingerprints = BTreeMap::new();
         for (id, source) in gateway.resources.clusters {
+            preparation_checkpoint(control, &dependencies)?;
             let upstream_tls = PreparedUpstreamTls::prepare(&source, &trust_stores, &certificates)
                 .map_err(|failure| {
                     preparation_error_from_upstream_tls(&id, &dependencies, failure)
@@ -337,6 +383,7 @@ impl RuntimeSnapshot {
             .listeners
             .iter()
             .map(|listener| {
+                preparation_checkpoint(control, &dependencies)?;
                 PreparedListenerPlan::prepare(listener, &certificates, &trust_stores).map_err(
                     |failure| preparation_error_from_tls_listener(listener, &dependencies, failure),
                 )
@@ -394,6 +441,7 @@ impl RuntimeSnapshot {
             .filter(|path| !sensitive_dependencies.contains(*path))
             .map(|path| path.display().to_string())
             .collect();
+        preparation_checkpoint(control, &dependencies)?;
         Ok((
             Self {
                 config_version,
@@ -408,6 +456,7 @@ impl RuntimeSnapshot {
                     sites,
                 },
                 listeners: gateway.listeners,
+                admin: gateway.admin,
                 prepared_listeners,
                 tests: gateway.tests,
                 preparation_warnings,
@@ -488,6 +537,7 @@ impl fmt::Debug for PreparationError {
 
 #[derive(Debug)]
 pub enum PreparationErrorKind {
+    Interrupted { code: &'static str },
     Secret(SecretPreparationErrorKind),
     TrustStore(TrustStorePreparationErrorKind),
     Certificate(CertificatePreparationErrorKind),
@@ -496,6 +546,26 @@ pub enum PreparationErrorKind {
     Site(Box<SiteCompileError>),
     TlsListener(TlsListenerPreparationErrorKind),
     UpstreamTls(UpstreamTlsPreparationErrorKind),
+}
+
+fn preparation_checkpoint(
+    control: &CandidateWorkControl,
+    dependencies: &[std::path::PathBuf],
+) -> Result<(), PreparationError> {
+    control.checkpoint().map_err(|error| {
+        let mut candidate_dependencies = dependencies.to_vec();
+        normalize_dependencies(&mut candidate_dependencies);
+        PreparationError {
+            resource: ResourceId::new("runtime:preparation"),
+            kind: PreparationErrorKind::Interrupted { code: error.code() },
+            diagnostics: vec![Diagnostic::new(
+                error.code(),
+                "runtime preparation was cancelled or its deadline elapsed",
+                SourceSpan::synthetic("runtime.preparation"),
+            )],
+            candidate_dependencies,
+        }
+    })
 }
 
 fn preparation_error_from_secret(
@@ -972,6 +1042,9 @@ impl std::error::Error for PreparationError {}
 impl fmt::Display for PreparationErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Interrupted { code } => {
+                write!(formatter, "runtime preparation interrupted ({code})")
+            }
             Self::Secret(error) => error.fmt(formatter),
             Self::TrustStore(error) => error.fmt(formatter),
             Self::Certificate(error) => error.fmt(formatter),
@@ -987,25 +1060,69 @@ impl fmt::Display for PreparationErrorKind {
 }
 
 pub struct SnapshotStore {
-    current: ArcSwap<RuntimeSnapshot>,
+    current: ArcSwap<crate::PublishedRuntime>,
 }
 
 impl SnapshotStore {
     #[must_use]
     pub fn new(initial: RuntimeSnapshot) -> Self {
+        Self::new_with_origin(initial, crate::RuntimeOrigin::Source)
+    }
+
+    #[must_use]
+    pub fn new_with_origin(initial: RuntimeSnapshot, origin: crate::RuntimeOrigin) -> Self {
         Self {
-            current: ArcSwap::from_pointee(initial),
+            current: ArcSwap::from_pointee(crate::PublishedRuntime::initial(initial, origin)),
         }
     }
 
     /// Pins one immutable snapshot for the complete request lifetime.
     #[must_use]
     pub fn pin(&self) -> Arc<RuntimeSnapshot> {
+        Arc::clone(&self.current.load().snapshot)
+    }
+
+    #[must_use]
+    pub fn published(&self) -> Arc<crate::PublishedRuntime> {
         self.current.load_full()
     }
 
     pub fn publish(&self, prepared: RuntimeSnapshot) -> Arc<RuntimeSnapshot> {
-        self.current.swap(Arc::new(prepared))
+        self.publish_as(prepared, crate::RuntimeOrigin::Source)
+    }
+
+    /// The connection manager is the only production caller. The snapshot and
+    /// its public identity change in one ArcSwap publication.
+    pub fn publish_as(
+        &self,
+        prepared: RuntimeSnapshot,
+        origin: crate::RuntimeOrigin,
+    ) -> Arc<RuntimeSnapshot> {
+        let snapshot = Arc::new(prepared);
+        let previous = self.current.rcu(|previous| {
+            Arc::new(crate::PublishedRuntime {
+                snapshot: Arc::clone(&snapshot),
+                runtime_revision: previous.runtime_revision.saturating_add(1),
+                runtime_epoch: previous.runtime_epoch,
+                origin: origin.clone(),
+                serving_state: crate::ServingState::Running,
+                source_origin: previous.source_origin.clone(),
+            })
+        });
+        Arc::clone(&previous.snapshot)
+    }
+
+    pub fn set_serving_state(&self, state: crate::ServingState) {
+        self.current.rcu(|previous| {
+            let mut next = (**previous).clone();
+            if state == crate::ServingState::Draining
+                && previous.serving_state == crate::ServingState::Running
+            {
+                next.runtime_revision = next.runtime_revision.saturating_add(1);
+            }
+            next.serving_state = state;
+            Arc::new(next)
+        });
     }
 }
 
@@ -1013,7 +1130,7 @@ impl SnapshotStore {
 mod tests {
     use std::fs;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use oxidase_config::{
         ClusterEndpointSpec, ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec,
@@ -1025,6 +1142,49 @@ mod tests {
     use url::Url;
 
     use super::{PreparationErrorKind, RuntimeSnapshot, cluster_fingerprint};
+    use crate::CandidateWorkControl;
+
+    #[test]
+    fn controlled_preparation_preserves_cancellation_and_deadline_codes() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(
+            &config,
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n",
+        )
+        .expect("config can be written");
+        let cancelled = CandidateWorkControl::default();
+        cancelled.cancel();
+        for (control, code) in [
+            (cancelled, "candidate.cancelled"),
+            (
+                CandidateWorkControl::with_deadline(Instant::now()),
+                "candidate.deadline",
+            ),
+        ] {
+            let error = RuntimeSnapshot::prepare_reusing_controlled(
+                Compiler::compile_path(&config).expect("config compiles"),
+                None,
+                &control,
+            )
+            .expect_err("an interrupted candidate cannot produce a snapshot");
+            assert!(
+                matches!(error.kind, PreparationErrorKind::Interrupted { code: actual } if actual == code)
+            );
+            assert_eq!(error.diagnostics()[0].code, code);
+            assert!(
+                error
+                    .candidate_dependencies
+                    .contains(&config.canonicalize().expect("config is canonicalizable"))
+            );
+        }
+        RuntimeSnapshot::prepare_reusing_controlled(
+            Compiler::compile_path(&config).expect("config compiles"),
+            None,
+            &CandidateWorkControl::default(),
+        )
+        .expect("an active candidate still prepares normally");
+    }
 
     fn write_test_identity(directory: &std::path::Path, names: &[&str]) {
         let GeneratedCertificate { cert, signing_key } = generate_simple_self_signed(
@@ -1097,6 +1257,42 @@ listeners:
         )
         .expect("Secret/Trust gateway can be written");
         config
+    }
+
+    #[test]
+    fn prepared_snapshot_carries_the_compiled_admin_plan() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        let storage = directory.path().join("admin-state");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-runtime-admin-test.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: {}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+                storage.display()
+            ),
+        )
+        .expect("admin Gateway can be written");
+        let gateway = Compiler::compile_path(&config).expect("admin Gateway compiles");
+        let snapshot = RuntimeSnapshot::prepare(gateway).expect("admin snapshot prepares");
+        let admin = snapshot.admin.as_ref().expect("admin plan is retained");
+        assert_eq!(admin.storage.directory, storage);
+        assert!(admin.permissions.read);
+        assert!(admin.auth.token_secret.is_none());
     }
 
     fn write_site_secret_gateway(

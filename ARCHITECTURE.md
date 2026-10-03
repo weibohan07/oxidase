@@ -82,3 +82,18 @@ runtime references; public certificate chains may be carried in the Bundle. The
 loader still executes prepare, validate, commit, and drain, so a Bundle is a
 deployment representation of the program rather than a second runtime or a
 serialization of live state.
+
+The local Admin control plane is not a second publication authority. `SnapshotStore`
+atomically holds `PublishedRuntime` (snapshot, epoch/revision, Source/Bundle origin,
+and serving state); immutable artifacts and retained history are not runtime current.
+The manager performs original-ETag/cancellation/deadline checks after preparation
+and socket prebind, writes intent, publishes, starts prepared listeners, and owns
+durable completion/audit independently of HTTP caller lifetime. Ambiguous storage
+or audit outcomes fail closed for subsequent mutations without fabricating rollback.
+Read-only state and safe pinned data requests remain available.
+
+Admin transport, TLS/Trust, normalized bearer material, permissions, verification
+keys and resource limits form one fixed bootstrap. Data-only Bundles may omit it;
+incompatible supplied Admin settings require restart. Source watcher publication
+also requires Source authority and Running state, so it cannot reclaim a Bundle
+deployment or reopen drained listeners. See ADR 0012 and the recovery contract.

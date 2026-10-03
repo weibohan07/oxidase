@@ -1,0 +1,6 @@
+POST
+/api/v1/candidates/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/activate
+Content-Type: application/json
+If-Match: "boot:1"
+Idempotency-Key: activation-1
+Content-Length: 2

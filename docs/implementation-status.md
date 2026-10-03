@@ -1,11 +1,11 @@
 # Implementation status
 
-Last updated: 2026-08-30
+Last updated: 2026-10-03
 
 ## Baseline
 
-- active milestone branch: `feat/v0.4-portable-bundles`
-- public starting point: v0.4 trust/mTLS merge `8f45b04`
+- active milestone branch: `feat/v0.4-secure-control-plane`
+- public starting point: v0.4 portable-Bundle merge `e018b2e`
 - release line: `0.3.0-alpha.1`; Gateway remains `oxidase.dev/v1alpha1`, Oxista
   remains v1, and production readiness is not claimed
 
@@ -224,8 +224,8 @@ Last updated: 2026-08-30
   and a full non-evictable key map fail closed with 429.
 - Peer and rate-key expiry use ordered bounded indexes rather than scanning the full
   configured capacity for each rotating rejected identity. Completed data-plane and
-  admin connection tasks are reaped between accepts; the current admin listener has
-  a fixed 256-live-connection safety cap pending its source-level control plane.
+  admin connection tasks are reaped between accepts; the admin listener has a fixed
+  256-live-connection safety cap.
 - Concurrency queues are bounded to `max_in_flight`; `queue_timeout: 0ms` is
   fail-fast. Concurrency state reuses the compiler-owned Service identity across
   compatible reloads so old active work remains counted while a new limit governs
@@ -407,6 +407,40 @@ Last updated: 2026-08-30
   signature policy, capability, sensitive reference, or portable section prevents
   publication rather than partially replacing the current snapshot.
 
+## PR5 control-plane consistency and qualification
+
+- The optional top-level `admin` block compiles to portable Admin policy for Unix
+  sockets or HTTPS, bearer/mTLS authentication, independent permissions, local
+  storage limits, and trusted Ed25519 Bundle verification keys. The server has
+  read routes and signed candidate stage/validate/activate/rollback handlers; the
+  CLI has explicit `ctl --unix` and `ctl --https` clients, If-Match/idempotency
+  options, total/connect deadlines, history and operation queries.
+- PublishedRuntime is the single atomic snapshot/revision/origin/serving authority.
+  CandidateStore has no independent runtime current. Manager commit arbitration
+  checks conditions after preparation/prebind; stale watcher work cannot reclaim
+  Source authority after Bundle activation or reopen drain.
+- Candidate artifacts and bounded principal-scoped full-fingerprint receipts use
+  durable intent/completion, next-state persistence, immutable read views, exclusive
+  process locking, safe adopted upload spools, and tombstone-first GC. Valid orphans
+  recover as staged; interrupted intents are explicit recovery-required, not inferred
+  publication. Current external credential/Asset references are validated on rollback.
+  Durable audit-pending markers also close the completion-before-audit crash window;
+  post-rename registration failures close admission before invisible orphan capacity
+  can be reused. Source reads/Asset hashes cooperatively checkpoint every 64 KiB,
+  with 16 MiB text-source and 128/4096 Gateway import depth/count bounds.
+- Admin bootstrap keeps transport/TLS/Trust/token/permissions/keys/limits coherent
+  and independent from data-plane snapshots. Server/ctl share bounded LF/CRLF bearer
+  parsing. JSONL audit has bounded reserved mutation completion and noise drop counts.
+- `ctl` builds TLS trust/identity in a single admitted blocking worker before
+  opening TCP. Total deadlines cover its wait and preparation; cancellation retains
+  admission until actual worker completion instead of blocking the async executor.
+- Store fault-injection tests and actual killed-subprocess recovery were executed;
+  the exact matrix, broader wire/race tests, local gates, fuzz campaigns, final-head
+  required checks, and post-merge main CI are tracked in
+  `docs/verification/control-plane-acceptance.md`. PR #15 retains authoritative
+  final-head and post-merge Hosted receipts; local evidence cannot substitute for
+  those separate runs. Version remains `0.3.0-alpha.1`.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
@@ -415,9 +449,12 @@ Last updated: 2026-08-30
   HTTP/2 extended CONNECT, arbitrary CONNECT tunneling, and WebTransport.
 - Dynamic Cluster discovery, WASM/plugins, Web UI, Kubernetes integration, and a
   general-purpose cache server.
-- Authenticated/staged Admin activation and rollback, DNS/SRV discovery, standard
-  access-log/OpenTelemetry export, and deployment/release packaging remain future
-  v0.4 PRs.
+- Online Admin transport/credential/permission reconfiguration, a multi-user role
+  platform, distributed control-plane transactions, and online ambiguous-journal
+  reconciliation are not implemented. Bootstrap changes and uncertain-intent
+  reconciliation use the documented explicit restart procedure.
+- DNS/SRV discovery, standard access-log/OpenTelemetry export, and deployment/release
+  packaging remain future v0.4 PRs.
 
 ## Known limitations
 
@@ -489,8 +526,30 @@ Last updated: 2026-08-30
   and ordinary add/remove/address transitions are supported.
 - Redirects currently allow only local absolute paths. Intentional cross-origin
   redirects require a future explicit allow policy.
-- The admin listener is CLI-configured rather than part of the gateway source and is
-  not dynamically rebound during config reload.
+- Admin can be configured in Gateway source. The legacy CLI-configured read-only
+  listener is restricted to loopback. The bound Admin transport, authentication
+  mode and Secret identity, permissions, TLS configuration, Bundle verification
+  keys, and candidate-store settings remain fixed at startup; changing these
+  settings requires a restart. A candidate that supplies changed bootstrap policy
+  is rejected with `admin.restart_required`; authentication does not follow an
+  unrelated newly activated data-plane Secret. Static permissions are shared by
+  authenticated identities, not a multi-user role platform.
+- Admin receipt retention is count-bounded (1024 by default), not exactly-once.
+  An old committed receipt reports its committed revision separately from the
+  current process epoch/revision. Unfinished/recovery receipts cannot be evicted
+  to admit more mutations. A new process cannot infer whether an unfinished old
+  publication intent committed and therefore closes mutation pending explicit
+  recovery; it does not automatically resurrect old credentials.
+- Candidate storage locking currently targets supported Unix platforms. Private
+  canonical roots and trusted parent directories are required; a compromised
+  operating system/runtime account is outside this local filesystem trust model.
+- Audit stdout/stderr acknowledgment cannot certify a downstream collector's
+  persistence. Local protected file writes flush/sync; operators manage log capacity
+  and file rotation/restart. Blocking OS I/O cannot be forcibly stopped by a Tokio
+  timeout; owned admission and cooperative checkpoints bound additional work.
+- Signed Admin Bundles can retain explicit absolute runtime references as well as
+  deployment-relative references. `admin.bundle_trust.deployment_root` is an
+  explicit resolution base, not a general filesystem sandbox.
 - Ingress governance is local to one Oxidase process. There is no trusted-proxy
   client-identity policy, distributed rate-limit store, cross-process connection
   budget, or arbitrary Header-derived limiter key. The actual kernel peer address is
@@ -503,6 +562,8 @@ Last updated: 2026-08-30
 
 ## Validation boundary
 
+- Hosted delivery evidence is commit-specific and recorded on PR #15, with the
+  acceptance matrix separating local commands and actual fuzz from those checks.
 - Every milestone PR is required to pass the locked Rust 1.88 check/test, stable
   fmt/Clippy/test/doc/release-build, cargo-deny, and fuzz compile jobs before normal
   protected-main merge. Evidence is commit-specific; a green older workflow is not
@@ -525,9 +586,9 @@ Last updated: 2026-08-30
 
 ## Next concrete work
 
-1. Build the authenticated Admin API with bounded candidate storage, signature-
-   required stage/validate/activate, rollback history, RBAC, and audit redaction.
-2. Add commit-activated DNS/SRV discovery, deterministic endpoint reconciliation,
-   address policy, stale-if-error, and separate upstream phase timeouts.
-3. Add bounded access logs and optional OpenTelemetry, deployment packaging, release
-   artifacts, and commit-specific Linux qualification/fuzz evidence.
+1. Preserve phase-five receipt, recovery, and audit contracts in future work;
+   online reconciliation and multi-principal authorization remain separate design work.
+2. Treat DNS/SRV discovery and separate upstream phase timeouts as a separately
+   authorized later milestone.
+3. Treat access logs/OpenTelemetry, packaging, and Linux qualification as separately
+   authorized later work; none is part of this control-plane completion.

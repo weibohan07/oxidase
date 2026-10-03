@@ -51,6 +51,30 @@ pub fn retry_allows_cause(retry: &RetrySpec, cause: RetryCause) -> bool {
     crate::leaves::retry_allows_cause(retry, cause)
 }
 
+/// Exercises the exact bounded Admin route/header boundary without opening a
+/// listener, reading credentials, or touching candidate storage.
+pub fn classify_admin_request(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    current_etag: &str,
+    max_body_bytes: u64,
+) -> Result<Option<(&'static str, bool)>, &'static str> {
+    let Some(route) = crate::admin::classify_admin_route(method, path) else {
+        return Ok(None);
+    };
+    if let Some(content_type) = route.content_type {
+        crate::admin::validate_mutation_headers(
+            headers,
+            content_type,
+            current_etag,
+            max_body_bytes,
+        )
+        .map_err(|error| error.code())?;
+    }
+    Ok(Some((route.permission.as_str(), route.mutation)))
+}
+
 fn upgrade_error_code(error: UpgradeValidationError) -> &'static str {
     match error {
         UpgradeValidationError::ConnectUnsupported => "connect_unsupported",

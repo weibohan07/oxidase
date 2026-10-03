@@ -1,0 +1,5 @@
+POST
+/api/v1/candidates
+Content-Type: application/vnd.oxidase.bundle
+If-Match: "boot:1"
+Content-Length: 1024

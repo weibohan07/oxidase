@@ -6,9 +6,12 @@ pub mod portable;
 mod source;
 
 pub use compiler::{
-    ActiveHealthSpec, BundleAssetMode, BundleAssetsSpec, BundleAssetsSummary, BundleSpec,
-    BundleSummary, CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec,
-    ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec, ClusterSummary, ClusterTlsSpec,
+    ActiveHealthSpec, AdminAuditDestination, AdminAuditSpec, AdminAuthMode, AdminAuthSpec,
+    AdminBundleTrustSpec, AdminCandidateLimits, AdminHistoryLimits, AdminHttpsListenSpec,
+    AdminListenSpec, AdminPermissions, AdminSpec, AdminStorageSpec, AdminUnixListenSpec,
+    BundleAssetMode, BundleAssetsSpec, BundleAssetsSummary, BundleSpec, BundleSummary,
+    CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec, ClusterHealthSpec,
+    ClusterLimits, ClusterProtocol, ClusterSpec, ClusterSummary, ClusterTlsSpec,
     ClusterTlsTrustSpec, CompiledGateway, CompiledListener, CompiledResources, Compiler,
     GatewaySummary, Http1Settings, Http2Settings, HttpListenerSpec, HttpVersion, ListenerLimits,
     ListenerProtocol, LoadBalancePolicy, PassiveHealthSpec, RetryBodyMode, RetryCause,
@@ -17,8 +20,11 @@ pub use compiler::{
 };
 pub use diagnostic::{CompileError, Diagnostic};
 pub use portable::{
-    PORTABLE_GATEWAY_CONFIG_SCHEMA_V1, PortableConfigError, PortableGatewayConfigV1,
-    PortableGatewayPlanV1, portable_source_display_path,
+    PORTABLE_GATEWAY_CONFIG_SCHEMA_V1, PortableAdminAuditV1, PortableAdminAuthV1,
+    PortableAdminBundleTrustV1, PortableAdminCandidateLimitsV1, PortableAdminHistoryLimitsV1,
+    PortableAdminListenV1, PortableAdminPermissionsV1, PortableAdminStorageV1, PortableAdminV1,
+    PortableConfigError, PortableGatewayConfigV1, PortableGatewayPlanV1,
+    portable_source_display_path,
 };
 pub use source::{ConfigTestSource, ExplainRequestSource, TestExpectationSource};
 

@@ -102,3 +102,17 @@ path = "fuzz_targets/bundle_parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "admin_request"
+path = "fuzz_targets/admin_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "candidate_journal"
+path = "fuzz_targets/candidate_journal.rs"
+test = false
+doc = false
+bench = false

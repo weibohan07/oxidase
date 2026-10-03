@@ -196,6 +196,20 @@ impl BundleArchive {
         read_path_streaming(path.as_ref(), limits)
     }
 
+    /// Verifies the caller's already safely opened inode without resolving its
+    /// path a second time. The verified archive owns an immutable spool.
+    pub fn read_file(file: File, limits: &BundleLimits) -> Result<Self, BundleError> {
+        read_file_streaming(file, limits, || Ok(()))
+    }
+
+    pub fn read_file_with_checkpoint(
+        file: File,
+        limits: &BundleLimits,
+        checkpoint: impl FnMut() -> Result<(), BundleError>,
+    ) -> Result<Self, BundleError> {
+        read_file_streaming(file, limits, checkpoint)
+    }
+
     #[must_use]
     pub const fn manifest(&self) -> &BundleManifest {
         &self.manifest
@@ -486,7 +500,7 @@ impl BundleArchive {
 
 fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchive, BundleError> {
     #[cfg(unix)]
-    let mut file = {
+    let file = {
         use rustix::fs::{Mode, OFlags};
 
         let descriptor = rustix::fs::open(
@@ -503,7 +517,16 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
         File::from(descriptor)
     };
     #[cfg(not(unix))]
-    let mut file = File::open(path).map_err(|error| BundleError::io(error, "open bundle"))?;
+    let file = File::open(path).map_err(|error| BundleError::io(error, "open bundle"))?;
+    read_file_streaming(file, limits, || Ok(()))
+}
+
+fn read_file_streaming(
+    mut file: File,
+    limits: &BundleLimits,
+    mut checkpoint: impl FnMut() -> Result<(), BundleError>,
+) -> Result<BundleArchive, BundleError> {
+    checkpoint()?;
     let metadata = file
         .metadata()
         .map_err(|error| BundleError::io(error, "stat opened bundle"))?;
@@ -513,6 +536,10 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
             "bundle path is not a regular file",
         ));
     }
+    // Reject a FIFO/device before attempting an unsupported seek. Safe path
+    // and opened-FD entrypoints must use the same InvalidModel classification.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| BundleError::io(error, "seek opened bundle"))?;
     let encoded_size = metadata.len();
     check_limit("bundle bytes", encoded_size, limits.max_bundle_bytes, 0)?;
     if encoded_size < HEADER_LEN as u64 {
@@ -613,6 +640,7 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
         &mut file_hasher,
         &mut pinned_file,
     )?;
+    checkpoint()?;
     let manifest = serde_json::from_slice::<BundleManifest>(&manifest_bytes).map_err(|error| {
         BundleError::new(
             BundleErrorKind::InvalidManifest,
@@ -645,6 +673,7 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
     let mut buffer = [0_u8; 64 * 1024];
     let mut previous_blob_digest = None;
     for _ in 0..blob_count {
+        checkpoint()?;
         let declared_digest = BundleDigest::from_bytes(read_stream_field::<32>(
             &mut file,
             &mut unsigned_remaining,
@@ -691,6 +720,7 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
         let mut blob_hasher = ContentHasher::new();
         let mut remaining = length;
         while remaining > 0 {
+            checkpoint()?;
             let wanted = usize::try_from(remaining.min(buffer.len() as u64))
                 .expect("bounded by fixed buffer length");
             file.read_exact(&mut buffer[..wanted])
@@ -756,6 +786,7 @@ fn read_path_streaming(path: &Path, limits: &BundleLimits) -> Result<BundleArchi
         .map_err(|error| BundleError::io(error, "pin signature envelope"))?;
     file_hasher.update(&signature_bytes);
     let signatures = parse_signatures(&signature_bytes, flags)?;
+    checkpoint()?;
     validate_model(&manifest, &blobs, &signatures, limits)?;
     pinned_file
         .as_file()
@@ -2767,14 +2798,18 @@ mod tests {
         assert_eq!(read_pinned(&new, new_digest), b"new-inode-content");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn path_reader_rejects_fifo_without_blocking() {
-        use rustix::fs::{CWD, Mode, mkfifoat};
-
         let directory = tempfile::tempdir().expect("temporary directory");
         let fifo = directory.path().join("candidate.oxb");
-        mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).expect("test FIFO is created");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("POSIX test FIFO fixture")
+                .success()
+        );
         let error = BundleArchive::read_path(&fifo, &BundleLimits::default())
             .expect_err("a Bundle must be a regular file");
         assert_eq!(error.kind(), BundleErrorKind::InvalidModel);
