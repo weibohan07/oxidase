@@ -209,6 +209,41 @@ the raw archive and both summaries are retained as
 `artifacts/discovery-6d-linux-37150296893-*`. This run precedes the planned-stop
 tool repair above and cannot replace fresh qualification of that source.
 
+### Review after complete gates: stop/result delivery cannot race
+
+Frozen `b71a569` passed all nine locked local commands and fourteen actual CLI
+example invocations. Those raw receipts are retained as
+`artifacts/discovery-6d-b71a569-*`, but do not override the following independently
+identified qualification-tool defect: an already-completed worker result was
+still sent in a `select!` with the stop signal. A full channel could deterministically
+discard a real error; comparing only received outcomes did not prove that every
+started operation was observed. This does not establish the original `ca0ffc9`
+failure's cause. The repair must collect completed results concurrently with
+bounded worker joins and compare an independent started-operation count.
+
+The associated Linux dispatch `37151772274` was explicitly cancelled rather than
+accepted. Its old `always()` protocol step nevertheless started after discovery
+cancellation; the workflow now permits independent protocol execution after a
+failure but not after explicit cancellation. It still uploads available original
+evidence. The final repair, exact-head required checks and a fresh completed Linux
+campaign remain separate acceptance prerequisites.
+
+Ordinary-test evidence retention also now covers pre-output timeout/spawn failures
+and contradictory post-success parse/assertion failures through an unwind guard,
+not only nonzero child exits. A real Tokio timeout and a contradictory original
+receipt exercise those boundaries; normal successful test directories are cleaned
+up. Neither qualification failure nor a missing measurement is changed to PASS.
+The completed repair passes all 22 process-tool unit tests and all three ordinary
+process tests on stable and Rust 1.88, with denied-warning Clippy. Both same-source
+35-second full-control campaigns pass, with started/recorded totals 15291 / 15029,
+zero worker/Upgrade/unexpected faults, eight complete new-B streams and measured
+final public gauges zero. Discovery observes 99 actual retries. These regressions
+include a capacity-one full result channel, a stop signal and an actual opaque
+DATA validator error: the error must be delivered and cause FAIL, while closed
+receivers and panicked workers also fail. Raw evidence is retained under
+`artifacts/discovery-6d-result-delivery-*`; final complete gates and the fresh
+Linux campaign remain independent requirements.
+
 ## Protected 6A delivery receipt
 
 PR [#16](https://github.com/weibohan07/oxidase/pull/16) was normally merged without

@@ -1,0 +1,122 @@
+{
+  "commit": "b71a5692ca0898ba57e5c822465b4d5379d97f7f",
+  "head_after": "b71a5692ca0898ba57e5c822465b4d5379d97f7f",
+  "result": "PASS",
+  "results": [
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 0.7362827909999999
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 4.342445417
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 97.755524792
+    },
+    {
+      "command": [
+        "cargo",
+        "doc",
+        "--workspace",
+        "--no-deps",
+        "--locked"
+      ],
+      "environment": {
+        "RUSTDOCFLAGS": "-D warnings"
+      },
+      "exit_code": 0,
+      "elapsed_seconds": 3.6504170000000014
+    },
+    {
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 0.6090454579999932
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--release",
+        "--locked"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 9.114917749999993
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.88.0",
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--locked"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 5.254847249999991
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.88.0",
+        "test",
+        "--workspace",
+        "--locked"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 105.73759687500001
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "fuzz/Cargo.toml",
+        "--bins",
+        "--locked"
+      ],
+      "environment": {},
+      "exit_code": 0,
+      "elapsed_seconds": 0.37268491700000594
+    }
+  ],
+  "finished": "2026-10-03T20:34:01.869Z"
+}
