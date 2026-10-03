@@ -87,7 +87,22 @@ pub struct AdminSpec {
     pub permissions: AdminPermissions,
     pub candidates: AdminCandidateLimits,
     pub history: AdminHistoryLimits,
+    pub audit: AdminAuditSpec,
     pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuditSpec {
+    pub destination: AdminAuditDestination,
+    pub queue_capacity: u32,
+    pub source: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuditDestination {
+    Stderr,
+    Stdout,
+    File(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -1757,6 +1772,70 @@ fn compile_admin(
         source: context.span(&history_path),
     };
 
+    let audit_path = format!("{}.audit", located.field_path);
+    let audit_source = &located.value.audit;
+    if !(2..=4096).contains(&audit_source.queue_capacity) {
+        return Err(diagnostic_at(
+            "admin.audit_queue_capacity",
+            "audit queue_capacity must be within 2..=4096",
+            context,
+            &format!("{audit_path}.queue_capacity"),
+        ));
+    }
+    let audit_destination = match audit_source.destination.as_str() {
+        "stdout" | "stderr" if audit_source.file.is_none() => {
+            if audit_source.destination == "stdout" {
+                AdminAuditDestination::Stdout
+            } else {
+                AdminAuditDestination::Stderr
+            }
+        }
+        "file" => {
+            let file = audit_source
+                .file
+                .as_ref()
+                .filter(|path| {
+                    path.is_absolute()
+                        && !path.components().any(|component| {
+                            matches!(
+                                component,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                })
+                .ok_or_else(|| {
+                    diagnostic_at(
+                        "admin.audit_file",
+                        "file audit destination requires an absolute file path without `.` or `..`",
+                        context,
+                        &format!("{audit_path}.file"),
+                    )
+                })?;
+            AdminAuditDestination::File(file.clone())
+        }
+        "stdout" | "stderr" => {
+            return Err(diagnostic_at(
+                "admin.audit_file_inert",
+                "audit.file is only allowed for destination: file",
+                context,
+                &format!("{audit_path}.file"),
+            ));
+        }
+        _ => {
+            return Err(diagnostic_at(
+                "admin.audit_destination",
+                "audit destination must be stdout, stderr, or file",
+                context,
+                &format!("{audit_path}.destination"),
+            ));
+        }
+    };
+    let audit = AdminAuditSpec {
+        destination: audit_destination,
+        queue_capacity: audit_source.queue_capacity,
+        source: context.span(&audit_path),
+    };
+
     Ok(Some(AdminSpec {
         listen,
         auth,
@@ -1765,6 +1844,7 @@ fn compile_admin(
         permissions,
         candidates,
         history,
+        audit,
         source: located.span(),
     }))
 }
@@ -7485,6 +7565,89 @@ listeners:
             "admin.history.max_bytes"
         );
         assert_eq!(error.diagnostics[0].labels.len(), 1);
+    }
+
+    #[test]
+    fn admin_audit_policy_is_bounded_strict_and_has_exact_diagnostics() {
+        for (audit, expected) in [
+            (
+                "destination: file\n    file: relative.jsonl",
+                "admin.audit_file",
+            ),
+            (
+                "destination: stdout\n    file: /var/log/oxidase.jsonl",
+                "admin.audit_file_inert",
+            ),
+            ("destination: syslog", "admin.audit_destination"),
+            ("queue_capacity: 1", "admin.audit_queue_capacity"),
+            ("queue_capacity: 4097", "admin.audit_queue_capacity"),
+        ] {
+            let (_directory, path) = write_config(&format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase/admin
+  audit:
+    {audit}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#
+            ));
+            let error = Compiler::compile_path(path).expect_err("invalid audit policy is rejected");
+            assert_eq!(error.diagnostics[0].code, expected);
+            assert!(
+                error.diagnostics[0]
+                    .primary
+                    .field_path
+                    .starts_with("admin.audit.")
+            );
+        }
+        let (_directory, path) = write_config(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /run/oxidase/admin.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: /var/lib/oxidase/admin
+  audit:
+    destination: file
+    file: /var/log/oxidase/audit.jsonl
+    queue_capacity: 32
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+        );
+        let gateway = Compiler::compile_path(path).expect("safe audit plan compiles");
+        let audit = &gateway.admin.as_ref().expect("admin").audit;
+        assert!(matches!(
+            audit.destination,
+            super::AdminAuditDestination::File(_)
+        ));
+        assert_eq!(audit.queue_capacity, 32);
+        assert_eq!(audit.source.field_path, "admin.audit");
+        assert!(
+            !gateway
+                .dependencies
+                .iter()
+                .any(|path| path == std::path::Path::new("/var/log/oxidase/audit.jsonl")),
+            "mutable audit output must not trigger watcher reload"
+        );
     }
 
     #[test]

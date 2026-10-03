@@ -17,15 +17,15 @@ use thiserror::Error;
 use url::Url;
 
 use crate::compiler::{
-    ActiveHealthSpec, AdminAuthMode, AdminAuthSpec, AdminBundleTrustSpec, AdminCandidateLimits,
-    AdminHistoryLimits, AdminHttpsListenSpec, AdminListenSpec, AdminPermissions, AdminSpec,
-    AdminStorageSpec, AdminUnixListenSpec, CertificateSpec, ClientAuthMode, ClientAuthSpec,
-    ClusterEndpointSpec, ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec,
-    ClusterTlsSpec, ClusterTlsTrustSpec, CompiledGateway, CompiledListener, CompiledResources,
-    Http1Settings, Http2Settings, HttpListenerSpec, HttpVersion, ListenerLimits, ListenerProtocol,
-    LoadBalancePolicy, PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec,
-    RetrySpec, SecretSpec, SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec,
-    TrustStoreSpec,
+    ActiveHealthSpec, AdminAuditDestination, AdminAuditSpec, AdminAuthMode, AdminAuthSpec,
+    AdminBundleTrustSpec, AdminCandidateLimits, AdminHistoryLimits, AdminHttpsListenSpec,
+    AdminListenSpec, AdminPermissions, AdminSpec, AdminStorageSpec, AdminUnixListenSpec,
+    CertificateSpec, ClientAuthMode, ClientAuthSpec, ClusterEndpointSpec, ClusterHealthSpec,
+    ClusterLimits, ClusterProtocol, ClusterSpec, ClusterTlsSpec, ClusterTlsTrustSpec,
+    CompiledGateway, CompiledListener, CompiledResources, Http1Settings, Http2Settings,
+    HttpListenerSpec, HttpVersion, ListenerLimits, ListenerProtocol, LoadBalancePolicy,
+    PassiveHealthSpec, RetryBodyMode, RetryCause, RetryRequestBodySpec, RetrySpec, SecretSpec,
+    SniCertificateSpec, SniPattern, StatusRange, TlsListenerSpec, TrustStoreSpec,
 };
 
 pub const PORTABLE_GATEWAY_CONFIG_SCHEMA_V1: &str = "oxidase.gateway-config/v1";
@@ -585,6 +585,8 @@ pub struct PortableAdminV1 {
     pub permissions: PortableAdminPermissionsV1,
     pub candidates: PortableAdminCandidateLimitsV1,
     pub history: PortableAdminHistoryLimitsV1,
+    #[serde(default)]
+    pub audit: PortableAdminAuditV1,
     pub source: SourceSpan,
 }
 
@@ -635,6 +637,24 @@ impl PortableAdminV1 {
                 max_snapshots: source.history.max_snapshots,
                 max_bytes: source.history.max_bytes,
                 source: source.history.source.clone(),
+            },
+            audit: PortableAdminAuditV1 {
+                destination: match &source.audit.destination {
+                    AdminAuditDestination::Stderr => "stderr",
+                    AdminAuditDestination::Stdout => "stdout",
+                    AdminAuditDestination::File(_) => "file",
+                }
+                .to_owned(),
+                file: match &source.audit.destination {
+                    AdminAuditDestination::File(path) => Some(PortablePathRefV1::from_path(
+                        path,
+                        source_root,
+                        "admin.audit.file",
+                    )?),
+                    _ => None,
+                },
+                queue_capacity: source.audit.queue_capacity,
+                source: source.audit.source.clone(),
             },
             source: source.source.clone(),
         })
@@ -757,6 +777,7 @@ impl PortableAdminV1 {
                 max_bytes: self.history.max_bytes,
                 source: self.history.source.clone(),
             },
+            audit: self.audit.compile(deployment_root)?,
             source: self.source.clone(),
         })
     }
@@ -775,6 +796,7 @@ impl PortableAdminV1 {
         normalize_span(&mut self.bundle_trust.source, source_root)?;
         normalize_span(&mut self.candidates.source, source_root)?;
         normalize_span(&mut self.history.source, source_root)?;
+        normalize_span(&mut self.audit.source, source_root)?;
         normalize_span(&mut self.source, source_root)
     }
 
@@ -809,7 +831,64 @@ impl PortableAdminV1 {
         check(&self.bundle_trust.source, "admin.bundle_trust")?;
         check(&self.candidates.source, "admin.candidates")?;
         check(&self.history.source, "admin.history")?;
+        check(&self.audit.source, "admin.audit")?;
         check(&self.source, "admin")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableAdminAuditV1 {
+    pub destination: String,
+    pub file: Option<PortablePathRefV1>,
+    pub queue_capacity: u32,
+    pub source: SourceSpan,
+}
+
+impl Default for PortableAdminAuditV1 {
+    fn default() -> Self {
+        Self {
+            destination: "stderr".to_owned(),
+            file: None,
+            queue_capacity: 128,
+            source: SourceSpan::synthetic("admin.audit"),
+        }
+    }
+}
+
+impl PortableAdminAuditV1 {
+    fn compile(&self, deployment_root: &Path) -> Result<AdminAuditSpec, PortableConfigError> {
+        if !(2..=4096).contains(&self.queue_capacity) {
+            return Err(invalid(
+                "admin.audit.queue_capacity",
+                "audit queue capacity must be within 2..=4096",
+            ));
+        }
+        let destination = match (self.destination.as_str(), &self.file) {
+            ("stderr", None) => AdminAuditDestination::Stderr,
+            ("stdout", None) => AdminAuditDestination::Stdout,
+            ("file", Some(file)) => {
+                let path = file.compile(deployment_root, "admin.audit.file")?;
+                if !path.is_absolute() {
+                    return Err(invalid(
+                        "admin.audit.file",
+                        "audit file must resolve to an absolute path",
+                    ));
+                }
+                AdminAuditDestination::File(path)
+            }
+            _ => {
+                return Err(invalid(
+                    "admin.audit",
+                    "audit destination and optional file are inconsistent",
+                ));
+            }
+        };
+        Ok(AdminAuditSpec {
+            destination,
+            queue_capacity: self.queue_capacity,
+            source: self.source.clone(),
+        })
     }
 }
 

@@ -37,6 +37,36 @@ pub(crate) struct AdminSource {
     pub candidates: AdminCandidateLimitsSource,
     #[serde(default)]
     pub history: AdminHistoryLimitsSource,
+    #[serde(default)]
+    pub audit: AdminAuditSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminAuditSource {
+    #[serde(default = "default_admin_audit_destination")]
+    pub destination: String,
+    pub file: Option<PathBuf>,
+    #[serde(default = "default_admin_audit_queue_capacity")]
+    pub queue_capacity: u32,
+}
+
+impl Default for AdminAuditSource {
+    fn default() -> Self {
+        Self {
+            destination: default_admin_audit_destination(),
+            file: None,
+            queue_capacity: default_admin_audit_queue_capacity(),
+        }
+    }
+}
+
+fn default_admin_audit_destination() -> String {
+    "stderr".to_owned()
+}
+
+fn default_admin_audit_queue_capacity() -> u32 {
+    128
 }
 
 #[derive(Debug, Clone, Deserialize)]
