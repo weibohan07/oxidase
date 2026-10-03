@@ -252,7 +252,7 @@ impl AdminAuditSink {
             .clone()
             .try_reserve_owned()
             .map_err(|_| AdminAuditError::Capacity)?;
-        let permit = AdminAuditPermit {
+        let mut permit = AdminAuditPermit {
             permit: Some(completion),
             event: event.clone(),
         };
@@ -262,7 +262,14 @@ impl AdminAuditSink {
             protected: true,
             completion: Some(ack),
         });
-        wait.await.map_err(|_| AdminAuditError::Unavailable)??;
+        let acknowledged = wait.await.unwrap_or(Err(AdminAuditError::Unavailable));
+        if let Err(error) = acknowledged {
+            // A known rejected start has not admitted a mutation. Releasing its
+            // completion capacity must not fabricate a later cancellation event.
+            // Caller cancellation while ACK is unknown still runs the Drop guard.
+            drop(permit.permit.take());
+            return Err(error);
+        }
         Ok(permit)
     }
 
@@ -582,6 +589,11 @@ mod tests {
         sink.try_record(event);
         assert_eq!(sink.failed(), 1);
         assert_eq!(sink.dropped(), 1);
+        // Synchronize with the worker after every queued item. The unhealthy
+        // flush contributes one failure itself, but no phantom cancelled record
+        // may have been enqueued by a never-admitted mutation's completion guard.
+        assert_eq!(sink.flush().await, Err(AdminAuditError::Unavailable));
+        assert_eq!(sink.failed(), 2);
     }
 
     #[tokio::test]
