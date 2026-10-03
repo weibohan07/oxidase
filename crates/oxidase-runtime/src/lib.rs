@@ -1,5 +1,7 @@
 //! Transactional Service execution and immutable runtime snapshots.
 
+mod bundle_activation;
+mod candidate;
 mod cluster;
 mod executor;
 mod governance;
@@ -11,6 +13,10 @@ mod tls;
 mod trust;
 mod upstream_tls;
 
+pub use bundle_activation::{
+    BundleActivationError, PreparedBundleActivation, bundle_runtime_capabilities,
+    prepare_bundle_archive,
+};
 pub use executor::{
     BoxLeafFuture, ExecutionObserver, ExecutionReport, ExecutionTrace, Executor,
     ExplainTraceCollector, LeafExecutor, NoopExecutionObserver, NoopTraceSink,
@@ -39,6 +45,12 @@ pub use trust::{PreparedTrustStore, TrustStorePreparationErrorKind};
 pub use upstream_tls::{PreparedUpstreamTls, UpstreamTlsPreparationErrorKind};
 
 pub const RUNTIME_FORMAT_VERSION: u32 = 1;
+pub use candidate::{
+    ActivationOutcome, AuditAction, AuditEvent, AuditResult, CandidateOperationContext,
+    CandidateRecord, CandidateSignaturePolicy, CandidateStatus, CandidateStore,
+    CandidateStoreError, CandidateStoreLimits, CurrentActivation, SnapshotHistoryRecord,
+    StageOutcome, ValidationOutcome,
+};
 pub use cluster::{
     ClusterAdmissionError, ClusterRequestPermit, ClusterRetryPermit, ClusterRuntimeStatus,
     EndpointHealthState, EndpointRuntimeState, EndpointRuntimeStatus, EndpointStatusSnapshot,

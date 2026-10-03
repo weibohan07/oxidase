@@ -1055,6 +1055,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "http",
+ "oxidase-bundle",
  "oxidase-config",
  "oxidase-core",
  "oxidase-site",

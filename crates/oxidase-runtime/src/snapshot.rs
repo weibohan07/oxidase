@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use oxidase_config::{
-    ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary, RetryBodyMode,
+    AdminSpec, ClusterSpec, CompiledGateway, CompiledListener, ConfigTestSource, GatewaySummary,
+    RetryBodyMode,
 };
 use oxidase_core::{
     ConfigVersion, ContentDigest, ContentDigestBuilder, Diagnostic, ResourceId, ServiceGraph,
@@ -61,6 +62,9 @@ pub struct RuntimeSnapshot {
     pub governance: GovernanceRegistry,
     pub resources: ResourceRegistry,
     pub listeners: Vec<CompiledListener>,
+    /// Immutable compiled management-plane policy. Secret bytes remain in the
+    /// prepared Resource registry and are never copied into this plan.
+    pub admin: Option<AdminSpec>,
     pub prepared_listeners: Vec<PreparedListenerPlan>,
     pub tests: Vec<ConfigTestSource>,
     preparation_warnings: Vec<Diagnostic>,
@@ -84,6 +88,7 @@ impl fmt::Debug for RuntimeSnapshot {
             .field("cluster_count", &self.resources.clusters.len())
             .field("site_count", &self.resources.sites.len())
             .field("listener_count", &self.listeners.len())
+            .field("admin_enabled", &self.admin.is_some())
             .field("test_count", &self.tests.len())
             .field("warning_count", &self.preparation_warnings.len())
             .finish_non_exhaustive()
@@ -408,6 +413,7 @@ impl RuntimeSnapshot {
                     sites,
                 },
                 listeners: gateway.listeners,
+                admin: gateway.admin,
                 prepared_listeners,
                 tests: gateway.tests,
                 preparation_warnings,
@@ -1097,6 +1103,42 @@ listeners:
         )
         .expect("Secret/Trust gateway can be written");
         config
+    }
+
+    #[test]
+    fn prepared_snapshot_carries_the_compiled_admin_plan() {
+        let directory = tempdir().expect("temporary directory is available");
+        let config = directory.path().join("oxidase.yaml");
+        let storage = directory.path().join("admin-state");
+        fs::write(
+            &config,
+            format!(
+                r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+admin:
+  listen:
+    unix:
+      path: /tmp/oxidase-runtime-admin-test.sock
+  auth:
+    mode: unsafe_none
+  storage:
+    directory: {}
+listeners:
+  - name: public
+    bind: 127.0.0.1:0
+    service:
+      type: respond
+"#,
+                storage.display()
+            ),
+        )
+        .expect("admin Gateway can be written");
+        let gateway = Compiler::compile_path(&config).expect("admin Gateway compiles");
+        let snapshot = RuntimeSnapshot::prepare(gateway).expect("admin snapshot prepares");
+        let admin = snapshot.admin.as_ref().expect("admin plan is retained");
+        assert_eq!(admin.storage.directory, storage);
+        assert!(admin.permissions.read);
+        assert!(admin.auth.token_secret.is_none());
     }
 
     fn write_site_secret_gateway(

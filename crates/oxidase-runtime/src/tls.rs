@@ -457,6 +457,106 @@ impl fmt::Debug for PreparedTlsListener {
     }
 }
 
+impl PreparedTlsListener {
+    /// Builds the same rustls client-auth boundary used by data listeners for
+    /// the dedicated HTTP/1 administration transport.
+    pub fn prepare_admin(
+        source: &oxidase_config::AdminHttpsListenSpec,
+        certificates: &BTreeMap<ResourceId, Arc<PreparedCertificate>>,
+        trust_stores: &BTreeMap<ResourceId, Arc<PreparedTrustStore>>,
+    ) -> Result<Self, Box<Diagnostic>> {
+        let tls = TlsListenerSpec {
+            default_certificate: source.certificate.clone(),
+            default_certificate_source: source.certificate_source.clone(),
+            sni: Vec::new(),
+            handshake_timeout: Duration::from_secs(5),
+            client_auth: source.client_auth.clone(),
+            source: source.source.clone(),
+        };
+        prepare_tls_listener(
+            &tls,
+            std::slice::from_ref(&HttpVersion::Http1),
+            certificates,
+            trust_stores,
+        )
+        .map_err(|failure| failure.diagnostic)
+    }
+}
+
+fn prepare_tls_listener(
+    tls: &TlsListenerSpec,
+    versions: &[HttpVersion],
+    certificates: &BTreeMap<ResourceId, Arc<PreparedCertificate>>,
+    trust_stores: &BTreeMap<ResourceId, Arc<PreparedTrustStore>>,
+) -> Result<PreparedTlsListener, TlsListenerPreparationFailure> {
+    let resolver = Arc::new(PreparedCertificateResolver::prepare(tls, certificates)?);
+    let provider = Arc::new(default_provider());
+    let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| {
+            TlsListenerPreparationFailure::new(
+                TlsListenerPreparationErrorKind::ServerConfig,
+                "tls.server_config",
+                format!("cannot enable the safe TLS 1.2/1.3 defaults: {error}"),
+                tls.source.clone(),
+            )
+        })?;
+    let builder = match tls.client_auth.mode {
+        ClientAuthMode::None => builder.with_no_client_auth(),
+        ClientAuthMode::Optional | ClientAuthMode::Required => {
+            let trust_id = tls.client_auth.trust_store.as_ref().ok_or_else(|| {
+                TlsListenerPreparationFailure::new(
+                    TlsListenerPreparationErrorKind::TrustStoreUnavailable,
+                    "tls.client_auth_trust_unavailable",
+                    "compiled TLS client authentication has no trust-store reference",
+                    tls.client_auth.source.clone(),
+                )
+            })?;
+            let trust = trust_stores.get(trust_id).ok_or_else(|| {
+                TlsListenerPreparationFailure::new(
+                    TlsListenerPreparationErrorKind::TrustStoreUnavailable,
+                    "tls.client_auth_trust_unavailable",
+                    format!("prepared trust store `{trust_id}` is unavailable"),
+                    tls.client_auth
+                        .trust_store_source
+                        .clone()
+                        .unwrap_or_else(|| tls.client_auth.source.clone()),
+                )
+            })?;
+            let verifier =
+                WebPkiClientVerifier::builder_with_provider(trust.roots(), Arc::clone(&provider));
+            let verifier = if tls.client_auth.mode == ClientAuthMode::Optional {
+                verifier.allow_unauthenticated()
+            } else {
+                verifier
+            }
+            .build()
+            .map_err(|error| {
+                TlsListenerPreparationFailure::new(
+                    TlsListenerPreparationErrorKind::ClientAuthVerifier,
+                    "tls.client_auth_verifier",
+                    format!("cannot build TLS client-certificate verifier: {error}"),
+                    tls.client_auth.source.clone(),
+                )
+            })?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut server_config = builder.with_cert_resolver(resolver.clone());
+    server_config.alpn_protocols = versions
+        .iter()
+        .map(|version| match version {
+            HttpVersion::H2 => b"h2".to_vec(),
+            HttpVersion::Http1 => b"http/1.1".to_vec(),
+        })
+        .collect();
+    Ok(PreparedTlsListener {
+        server_config: Arc::new(server_config),
+        handshake_timeout: tls.handshake_timeout,
+        resolver,
+    })
+}
+
 /// Immutable connection plan installed for new accepts on one listener.
 #[derive(Clone)]
 pub struct PreparedListenerPlan {
@@ -479,78 +579,12 @@ impl PreparedListenerPlan {
         trust_stores: &BTreeMap<ResourceId, Arc<PreparedTrustStore>>,
     ) -> Result<Self, TlsListenerPreparationFailure> {
         let tls = match &source.tls {
-            Some(tls) => {
-                let resolver = Arc::new(PreparedCertificateResolver::prepare(tls, certificates)?);
-                let provider = Arc::new(default_provider());
-                let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
-                    .with_safe_default_protocol_versions()
-                    .map_err(|error| {
-                        TlsListenerPreparationFailure::new(
-                            TlsListenerPreparationErrorKind::ServerConfig,
-                            "tls.server_config",
-                            format!("cannot enable the safe TLS 1.2/1.3 defaults: {error}"),
-                            tls.source.clone(),
-                        )
-                    })?;
-                let builder = match tls.client_auth.mode {
-                    ClientAuthMode::None => builder.with_no_client_auth(),
-                    ClientAuthMode::Optional | ClientAuthMode::Required => {
-                        let trust_id = tls.client_auth.trust_store.as_ref().ok_or_else(|| {
-                            TlsListenerPreparationFailure::new(
-                                TlsListenerPreparationErrorKind::TrustStoreUnavailable,
-                                "tls.client_auth_trust_unavailable",
-                                "compiled TLS client authentication has no trust-store reference",
-                                tls.client_auth.source.clone(),
-                            )
-                        })?;
-                        let trust = trust_stores.get(trust_id).ok_or_else(|| {
-                            TlsListenerPreparationFailure::new(
-                                TlsListenerPreparationErrorKind::TrustStoreUnavailable,
-                                "tls.client_auth_trust_unavailable",
-                                format!("prepared trust store `{trust_id}` is unavailable"),
-                                tls.client_auth
-                                    .trust_store_source
-                                    .clone()
-                                    .unwrap_or_else(|| tls.client_auth.source.clone()),
-                            )
-                        })?;
-                        let verifier = WebPkiClientVerifier::builder_with_provider(
-                            trust.roots(),
-                            Arc::clone(&provider),
-                        );
-                        let verifier = if tls.client_auth.mode == ClientAuthMode::Optional {
-                            verifier.allow_unauthenticated()
-                        } else {
-                            verifier
-                        }
-                        .build()
-                        .map_err(|error| {
-                            TlsListenerPreparationFailure::new(
-                                TlsListenerPreparationErrorKind::ClientAuthVerifier,
-                                "tls.client_auth_verifier",
-                                format!("cannot build TLS client-certificate verifier: {error}"),
-                                tls.client_auth.source.clone(),
-                            )
-                        })?;
-                        builder.with_client_cert_verifier(verifier)
-                    }
-                };
-                let mut server_config = builder.with_cert_resolver(resolver.clone());
-                server_config.alpn_protocols = source
-                    .http
-                    .versions
-                    .iter()
-                    .map(|version| match version {
-                        HttpVersion::H2 => b"h2".to_vec(),
-                        HttpVersion::Http1 => b"http/1.1".to_vec(),
-                    })
-                    .collect();
-                Some(PreparedTlsListener {
-                    server_config: Arc::new(server_config),
-                    handshake_timeout: tls.handshake_timeout,
-                    resolver,
-                })
-            }
+            Some(tls) => Some(prepare_tls_listener(
+                tls,
+                &source.http.versions,
+                certificates,
+                trust_stores,
+            )?),
             None => None,
         };
 
