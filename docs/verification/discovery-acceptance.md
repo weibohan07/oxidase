@@ -19,8 +19,8 @@ Existing ignored manual benchmarks/soak were not counted as executed.
 | Stage | Implementation | Local / Hosted / campaign evidence |
 | --- | --- | --- |
 | 6A transport identity/deadlines | normally merged through protected PR #16 | final head `39caf68` PR run `37131533884` PASS; merged main `aaece2a` push run `37131852985` PASS |
-| 6B A/AAAA discovery | in progress from protected main `aaece2a` | no final-head implementation/Hosted acceptance yet |
-| 6C SRV discovery | not implemented by this branch | NOT RUN |
+| 6B A/AAAA discovery | normally merged through protected PR #17 | final head `bd58363` PR run `37137424130` PASS; merged main `890a802` push run `37138029438` PASS |
+| 6C SRV discovery | in progress from protected main `890a802` | no final-head implementation/Hosted acceptance yet |
 | 6D integration/qualification | not implemented by this branch | NOT RUN |
 
 ## Protected 6A delivery receipt
@@ -35,6 +35,27 @@ both completed successfully with all four required jobs: MSRV 1.88, Stable
 workspace, Dependency policy and Fuzz harness compile smoke. Main remained strict,
 with force pushes/deletion disabled. Earlier failed/local-only receipts below
 remain history, not the final acceptance record.
+
+## Protected 6B delivery receipt
+
+PR [#17](https://github.com/weibohan07/oxidase/pull/17) was normally merged without
+an administrator override. Base: `aaece2a0c263ce58e3ba7d398a33c11892186316`;
+final head: `bd58363b0f4f16468937b357608062ecf25ca79d`;
+merge: `890a802dd74e58de8bf3e316422e771f59172621`.
+[Final-head PR run `37137424130`](https://github.com/weibohan07/oxidase/actions/runs/37137424130)
+and independent [merged-main push run `37138029438`](https://github.com/weibohan07/oxidase/actions/runs/37138029438)
+completed with all four required jobs SUCCESS. Main remained strict/up-to-date,
+with force push/deletion forbidden; the older actual Clippy failure remains
+recorded below rather than replaced by a local or receipt-only green run.
+
+The repaired source also passed all nine locked local gates on that exact
+`bd58363` head. Raw log:
+`artifacts/discovery-6b-bd58363-post-hosted-fix-gates.log.gz`. Six actual locked CLI
+example commands PASS (basic check/test/explain, secure-resilient check,
+secure-admin check/test), retained in
+`artifacts/discovery-6b-bd58363-examples.log.gz`. Expected migration and public
+test-token permission warnings are not silently removed. The recorded manual
+benchmark/fuzz/Linux qualification limitations remain separate from these gates.
 
 ## 6A executable contract and intermediate evidence
 
