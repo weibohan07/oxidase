@@ -272,6 +272,39 @@ class VerifierCorpusTests(unittest.TestCase):
             record["raw"]["cancel_ack"]["operation_id"] = "unrelated:99"
         self.assert_failure(data, "RL_CONTENT")
 
+    def test_cancel_ack_deadline_and_cleanup_are_independent_facts(self):
+        for mutation in (None, "late", "longer_deadline", "drop_after_observation", "cleanup_error", "unjoined", "missing_clock"):
+            with self.subTest(mutation=mutation):
+                data = corpus()
+                bucket, outcome, error = anomaly(data, 2, eof=False, cancelled=True, data_observed=True,
+                                                body_bytes=5, body_sha256=hashlib.sha256(b"xxxxx").hexdigest(),
+                                                fixture_cancel_ack=True)
+                start = bucket["bucket_start_ns"]
+                ack = {"operation_id": "0:2", "termination": "cancelled_after_data",
+                       "body_dropped_after_data": True, "body_bytes": 1024, "dropped_ns": start + 10,
+                       "ack_wait_started_ns": start, "ack_deadline_ns": start + 3 * NS,
+                       "ack_observed_ns": start + 20,
+                       "ack_connection": {"result": "completed", "join_acknowledged": True}}
+                if mutation == "late":
+                    ack["ack_observed_ns"] = ack["ack_deadline_ns"] + 1
+                elif mutation == "longer_deadline":
+                    ack["ack_deadline_ns"] += 1
+                elif mutation == "drop_after_observation":
+                    ack["dropped_ns"] = ack["ack_observed_ns"] + 1
+                elif mutation == "cleanup_error":
+                    ack["ack_connection"]["result"] = "error"
+                elif mutation == "unjoined":
+                    ack["ack_connection"]["join_acknowledged"] = False
+                elif mutation == "missing_clock":
+                    ack["ack_observed_ns"] = None
+                for record in (outcome, error):
+                    record["lane"] = "cancel"
+                    record["raw"]["cancel_ack"] = copy.deepcopy(ack)
+                if mutation is None:
+                    self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
+                else:
+                    self.assert_failure(data, "RL_CONTENT")
+
     def test_fault_window_does_not_allow_healthy_lane(self):
         data = fault_corpus()
         window = data["events.jsonl"][2]

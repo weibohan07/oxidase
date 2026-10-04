@@ -237,6 +237,8 @@ pub(super) struct ResourceResponseFacts {
     /// means no H2 cause was available, not an inferred remote reset.
     pub(super) h2_reason: Option<String>,
     pub(super) h2_error_kind: Option<String>,
+    /// Library-reported initiator at this hop, never inferred from a reason.
+    pub(super) h2_initiator: Option<String>,
     pub(super) cancelled: bool,
     pub(super) data_observed: bool,
     pub(super) fixture_cancel_ack: bool,
@@ -277,6 +279,7 @@ impl ResourceResponseFacts {
             sender_error_category: None,
             h2_reason: None,
             h2_error_kind: None,
+            h2_initiator: None,
             cancelled: false,
             data_observed: false,
             fixture_cancel_ack: false,
@@ -365,6 +368,8 @@ enum ResourceSender {
 pub(super) struct ResourceDataClient {
     sender: Option<ResourceSender>,
     driver: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    // One bounded scalar record per connection. It owns no driver/body/IO.
+    driver_terminal: Arc<Mutex<Option<Value>>>,
     h2: bool,
     targets: Vec<(String, SocketAddr)>,
     local_response: bool,
@@ -423,6 +428,8 @@ impl ResourceDataClient {
         if tls.get_ref().1.alpn_protocol() != Some(expected_alpn) {
             return Err(fail("resource client ALPN mismatch"));
         }
+        let driver_terminal = Arc::new(Mutex::new(None));
+        let terminal = Arc::clone(&driver_terminal);
         let (sender, driver) = if h2 {
             let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
                 .await
@@ -430,9 +437,9 @@ impl ResourceDataClient {
             (
                 ResourceSender::H2(sender),
                 tokio::spawn(async move {
-                    connection
-                        .await
-                        .map_err(|_| "http2_driver_error".to_owned())
+                    let result = connection.await;
+                    record_resource_driver_terminal(&terminal, result.as_ref().err());
+                    result.map_err(|_| "http2_driver_error".to_owned())
                 }),
             )
         } else {
@@ -442,15 +449,16 @@ impl ResourceDataClient {
             (
                 ResourceSender::H1(sender),
                 tokio::spawn(async move {
-                    connection
-                        .await
-                        .map_err(|_| "http1_driver_error".to_owned())
+                    let result = connection.await;
+                    record_resource_driver_terminal(&terminal, result.as_ref().err());
+                    result.map_err(|_| "http1_driver_error".to_owned())
                 }),
             )
         };
         Ok(Self {
             sender: Some(sender),
             driver: Some(driver),
+            driver_terminal,
             h2,
             targets,
             local_response,
@@ -500,6 +508,9 @@ impl ResourceDataClient {
         let Some(mut driver) = self.driver.take() else {
             return json!({"result":"unavailable","code":"driver_unavailable","exit_ns":null,"join_acknowledged":false,"abort_requested":false});
         };
+        // Cancellation of this cleanup future must not detach an unowned
+        // still-running connection task after taking its JoinHandle.
+        let mut abort_on_drop = ResourceDriverAbortOnDrop(Some(driver.abort_handle()));
         let (result, code, join_acknowledged, abort_requested) =
             match tokio::time::timeout(Duration::from_secs(2), &mut driver).await {
                 Ok(Ok(Ok(()))) => ("completed", None, true, false),
@@ -532,7 +543,15 @@ impl ResourceDataClient {
         } else {
             None
         };
-        json!({"result":result,"code":code,"exit_ns":exit_ns,"join_acknowledged":join_acknowledged,"abort_requested":abort_requested})
+        let terminal = self
+            .driver_terminal
+            .lock()
+            .expect("bounded scalar driver terminal")
+            .clone();
+        if join_acknowledged {
+            abort_on_drop.0.take();
+        }
+        json!({"result":result,"code":code,"exit_ns":exit_ns,"join_acknowledged":join_acknowledged,"abort_requested":abort_requested,"terminal":terminal})
     }
 
     async fn cancellation_receipt(&mut self, operation_id: &str) -> Result<Value, SoakError> {
@@ -866,6 +885,16 @@ impl ResourceDataClient {
     }
 }
 
+struct ResourceDriverAbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for ResourceDriverAbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 fn record_h2_error(facts: &mut ResourceResponseFacts, error: &hyper::Error) {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     // The trusted library chain is finite, but keep traversal bounded rather
@@ -873,6 +902,16 @@ fn record_h2_error(facts: &mut ResourceResponseFacts, error: &hyper::Error) {
     for _ in 0..16 {
         let Some(error) = source else { return };
         if let Some(error) = error.downcast_ref::<h2::Error>() {
+            facts.h2_initiator = Some(
+                if error.is_remote() {
+                    "remote"
+                } else if error.is_library() {
+                    "library"
+                } else {
+                    "other"
+                }
+                .into(),
+            );
             facts.h2_error_kind = Some(
                 if error.is_reset() {
                     "reset"
@@ -918,24 +957,164 @@ pub(super) async fn await_fixture_cancel_receipt(
     h1_config: Arc<rustls::ClientConfig>,
     operation_id: &str,
 ) -> Result<Value, SoakError> {
+    await_fixture_cancel_observed(peer, h1_config, operation_id)
+        .await
+        .map_err(|error| fail(error.to_string()))
+}
+
+/// Preserve the actual per-operation Drop witness even if its independent
+/// query connection fails to finish. Neither leg is converted to success.
+pub(super) async fn await_fixture_cancel_observed(
+    peer: SocketAddr,
+    h1_config: Arc<rustls::ClientConfig>,
+    operation_id: &str,
+) -> Result<Value, Box<FixtureCancelFailure>> {
+    let progress = Arc::new(Mutex::new(FixtureCancelFailure::empty("connection")));
     if operation_id.is_empty() || operation_id.len() > 128 {
-        return Err(fail("fixture acknowledgement operation identity invalid"));
+        return Err(Box::new(FixtureCancelFailure::empty("operation_identity")));
+    }
+    let started_ns = super::resource_identity::monotonic_ns()
+        .map_err(|_| Box::new(FixtureCancelFailure::empty("clock")))?;
+    let deadline_ns = started_ns
+        .checked_add(3_000_000_000)
+        .ok_or_else(|| Box::new(FixtureCancelFailure::empty("clock")))?;
+    {
+        let mut facts = progress.lock().expect("bounded cancellation facts");
+        facts.wait_started_ns = Some(started_ns);
+        facts.wait_deadline_ns = Some(deadline_ns);
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     tokio::time::timeout_at(deadline, async {
-        let mut client =
-            ResourceDataClient::connect(peer, h1_config, false, vec![("ack".into(), peer)]).await?;
-        loop {
-            let receipt = client.cancellation_receipt(operation_id).await?;
-            if receipt["body_dropped_after_data"] == true {
-                client.close().await?;
-                return Ok(receipt);
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        let client =
+            ResourceDataClient::connect(peer, h1_config, false, vec![("ack".into(), peer)])
+                .await
+                .map_err(|_| Box::new(FixtureCancelFailure::empty("connection")))?;
+        poll_fixture_cancel_with_progress(client, operation_id, Arc::clone(&progress)).await
     })
     .await
-    .map_err(|_| fail("fixture body drop acknowledgement deadline"))?
+    .unwrap_or_else(|_| {
+        Err(Box::new(
+            progress.lock().expect("bounded cancellation facts").clone(),
+        ))
+    })
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FixtureCancelFailure {
+    pub(super) observed_receipt: Option<Value>,
+    pub(super) receipt_observed_ns: Option<u64>,
+    pub(super) connection_cleanup: Option<Value>,
+    pub(super) wait_started_ns: Option<u64>,
+    pub(super) wait_deadline_ns: Option<u64>,
+    pub(super) stage: &'static str,
+}
+
+impl std::fmt::Display for FixtureCancelFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "fixture cancellation evidence failed during {}; drop_observed={}; timed_witness={}; cleanup_observed={}",
+            self.stage,
+            self.observed_receipt.is_some(),
+            self.receipt_observed_ns.is_some(),
+            self.connection_cleanup.is_some()
+        )
+    }
+}
+
+impl std::error::Error for FixtureCancelFailure {}
+
+impl FixtureCancelFailure {
+    fn empty(stage: &'static str) -> Self {
+        Self {
+            observed_receipt: None,
+            receipt_observed_ns: None,
+            connection_cleanup: None,
+            wait_started_ns: None,
+            wait_deadline_ns: None,
+            stage,
+        }
+    }
+}
+
+#[cfg(test)]
+async fn poll_fixture_cancel_receipt(
+    client: ResourceDataClient,
+    operation_id: &str,
+) -> Result<Value, Box<FixtureCancelFailure>> {
+    poll_fixture_cancel_with_progress(
+        client,
+        operation_id,
+        Arc::new(Mutex::new(FixtureCancelFailure::empty("query"))),
+    )
+    .await
+}
+
+async fn poll_fixture_cancel_with_progress(
+    mut client: ResourceDataClient,
+    operation_id: &str,
+    progress: Arc<Mutex<FixtureCancelFailure>>,
+) -> Result<Value, Box<FixtureCancelFailure>> {
+    loop {
+        progress.lock().expect("bounded cancellation facts").stage = "query";
+        let mut receipt = client
+            .cancellation_receipt(operation_id)
+            .await
+            .map_err(|_| Box::new(progress.lock().expect("bounded cancellation facts").clone()))?;
+        if receipt["body_dropped_after_data"] == true {
+            let observed_ns = super::resource_identity::monotonic_ns().ok();
+            {
+                let mut facts = progress.lock().expect("bounded cancellation facts");
+                facts.observed_receipt = Some(receipt.clone());
+                facts.receipt_observed_ns = observed_ns;
+                // Timeout futures are cooperative: a ready result may be
+                // returned after the timer was due. Never admit a late ACK.
+                if observed_ns.is_none()
+                    || facts
+                        .wait_deadline_ns
+                        .is_some_and(|deadline| observed_ns.is_some_and(|now| now > deadline))
+                {
+                    facts.stage = "ack_deadline";
+                    return Err(Box::new(facts.clone()));
+                }
+                facts.stage = "connection_cleanup";
+            }
+            let cleanup = client.close_receipt().await;
+            progress
+                .lock()
+                .expect("bounded cancellation facts")
+                .connection_cleanup = Some(cleanup.clone());
+            if cleanup["result"] != "completed"
+                || cleanup["join_acknowledged"] != true
+                || observed_ns.is_none()
+            {
+                return Err(Box::new(
+                    progress.lock().expect("bounded cancellation facts").clone(),
+                ));
+            }
+            receipt["ack_observed_ns"] = json!(observed_ns);
+            let window = progress.lock().expect("bounded cancellation facts");
+            receipt["ack_wait_started_ns"] = json!(window.wait_started_ns);
+            receipt["ack_deadline_ns"] = json!(window.wait_deadline_ns);
+            receipt["ack_connection"] = cleanup;
+            return Ok(receipt);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn record_resource_driver_terminal(record: &Mutex<Option<Value>>, error: Option<&hyper::Error>) {
+    let mut facts = ResourceResponseFacts::blank(String::new(), "driver");
+    if let Some(error) = error {
+        record_h2_error(&mut facts, error);
+    }
+    *record.lock().expect("bounded scalar driver terminal") = Some(json!({
+        "completed_ns": super::resource_identity::monotonic_ns().ok(),
+        "result": if error.is_some() { "error" } else { "completed" },
+        "h2_reason": facts.h2_reason,
+        "h2_error_kind": facts.h2_error_kind,
+        "h2_initiator": facts.h2_initiator
+    }));
 }
 
 fn resource_error(facts: &mut ResourceResponseFacts, stage: &str, code: &str) {
@@ -974,10 +1153,11 @@ fn resource_head_facts<B>(
     facts
 }
 
-/// `eof` is an actual clean peer EOF, not an inference from half-close or
-/// registry counts. An exact TLS UnexpectedEof after all verified echoes and
-/// planned client shutdown is recorded separately; graceful TLS closure remains
-/// unproven, while the later resource census can independently check reclamation.
+/// For an accepted tunnel, `eof` is an actual clean peer EOF, not an inference
+/// from half-close or registry counts. For a rejected Upgrade it is completion
+/// of the ordinary HTTP message's bounded framing. An exact TLS UnexpectedEof
+/// after verified echoes and planned shutdown is recorded separately; graceful
+/// TLS closure remains unproven while the census can check reclamation.
 pub(super) async fn measure_resource_upgrade(
     address: SocketAddr,
     h1_config: Arc<rustls::ClientConfig>,
@@ -1021,7 +1201,10 @@ pub(super) async fn measure_resource_upgrade(
             facts.authority = facts.upgrade_headers.get("x-fixture-authority").cloned();
             facts.server_name = facts.upgrade_headers.get("x-fixture-sni").cloned();
             facts.path = facts.upgrade_headers.get("x-fixture-path").cloned();
-            if status != 101 { return Ok::<(),SoakError>(()); }
+            if status != 101 {
+                stage = "response_body";
+                return capture_upgrade_rejection_body(&mut socket, &mut facts, &mut digest).await;
+            }
             if !facts.upgrade_headers.get("upgrade").is_some_and(|value|value.eq_ignore_ascii_case("websocket"))
                 || !facts.upgrade_headers.get("connection").is_some_and(|value|value.eq_ignore_ascii_case("upgrade"))
                 || facts.upgrade_headers.get("sec-websocket-accept").map(String::as_str) != Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") {
@@ -1065,6 +1248,43 @@ pub(super) async fn measure_resource_upgrade(
         Err(_) => resource_error(&mut facts, "clock", "monotonic_unavailable"),
     }
     facts
+}
+
+/// A rejected Upgrade is an ordinary HTTP response, never a trusted tunnel.
+/// Capture only unambiguous, bounded content-length framing under the caller's
+/// original operation deadline. `eof` here means the complete HTTP message;
+/// unlike an accepted tunnel it does not require closing a keep-alive socket.
+async fn capture_upgrade_rejection_body<S: AsyncRead + Unpin>(
+    socket: &mut S,
+    facts: &mut ResourceResponseFacts,
+    digest: &mut Sha256,
+) -> Result<(), SoakError> {
+    facts.content_type = facts.upgrade_headers.get("content-type").cloned();
+    let length = facts
+        .upgrade_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|length| *length <= 64 * 1024)
+        .ok_or_else(|| fail("Upgrade rejection framing unavailable or exceeds bound"))?;
+    if facts.upgrade_headers.contains_key("transfer-encoding") {
+        return Err(fail("Upgrade rejection framing ambiguous"));
+    }
+    let mut buffer = [0u8; 1024];
+    while facts.body_bytes < length {
+        let remaining = (length - facts.body_bytes).min(buffer.len() as u64) as usize;
+        let read = socket
+            .read(&mut buffer[..remaining])
+            .await
+            .map_err(io_error)?;
+        if read == 0 {
+            return Err(fail("Upgrade rejection truncated"));
+        }
+        digest.update(&buffer[..read]);
+        facts.body_bytes += read as u64;
+        facts.data_observed = true;
+    }
+    facts.eof = true;
+    Ok(())
 }
 
 /// The existing gateway cancels the opposite copy on first EOF. A peer TCP
@@ -3778,6 +3998,215 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct H2WriteEvidence {
+        header: [u8; 9],
+        header_bytes: usize,
+        payload_left: usize,
+        frame_type: u8,
+        captured: [u8; 136],
+        captured_bytes: usize,
+        resets_no_error: u64,
+        resets_stream_closed: u64,
+        resets_other: u64,
+        goaways: Vec<Value>,
+        truncated: bool,
+    }
+
+    impl Default for H2WriteEvidence {
+        fn default() -> Self {
+            Self {
+                header: [0; 9],
+                header_bytes: 0,
+                payload_left: 0,
+                frame_type: 0,
+                captured: [0; 136],
+                captured_bytes: 0,
+                resets_no_error: 0,
+                resets_stream_closed: 0,
+                resets_other: 0,
+                goaways: Vec::new(),
+                truncated: false,
+            }
+        }
+    }
+
+    impl H2WriteEvidence {
+        fn observe(&mut self, mut bytes: &[u8]) {
+            while !bytes.is_empty() {
+                if self.header_bytes < 9 {
+                    let take = (9 - self.header_bytes).min(bytes.len());
+                    self.header[self.header_bytes..self.header_bytes + take]
+                        .copy_from_slice(&bytes[..take]);
+                    self.header_bytes += take;
+                    bytes = &bytes[take..];
+                    if self.header_bytes < 9 {
+                        continue;
+                    }
+                    self.payload_left = ((self.header[0] as usize) << 16)
+                        | ((self.header[1] as usize) << 8)
+                        | self.header[2] as usize;
+                    self.frame_type = self.header[3];
+                    self.captured_bytes = 0;
+                }
+                let take = self.payload_left.min(bytes.len());
+                if matches!(self.frame_type, 3 | 7) {
+                    let copy = take.min(self.captured.len() - self.captured_bytes);
+                    self.captured[self.captured_bytes..self.captured_bytes + copy]
+                        .copy_from_slice(&bytes[..copy]);
+                    self.captured_bytes += copy;
+                }
+                self.payload_left -= take;
+                bytes = &bytes[take..];
+                if self.payload_left != 0 {
+                    continue;
+                }
+                if self.frame_type == 3 && self.captured_bytes == 4 {
+                    match u32::from_be_bytes(
+                        self.captured[..4].try_into().expect("four reset bytes"),
+                    ) {
+                        0 => self.resets_no_error += 1,
+                        5 => self.resets_stream_closed += 1,
+                        _ => self.resets_other += 1,
+                    }
+                }
+                if self.frame_type == 7 && self.captured_bytes >= 8 {
+                    if self.goaways.len() < 8 {
+                        self.goaways.push(json!({
+                            "last_stream_id": u32::from_be_bytes(self.captured[..4].try_into().expect("GOAWAY ID")) & 0x7fff_ffff,
+                            "reason": u32::from_be_bytes(self.captured[4..8].try_into().expect("GOAWAY reason")),
+                            "debug_data": String::from_utf8_lossy(&self.captured[8..self.captured_bytes]),
+                            "debug_truncated": (((self.header[0] as usize) << 16) | ((self.header[1] as usize) << 8) | self.header[2] as usize) > self.captured.len(),
+                            "accepted_by_tls_writer_ns": super::super::resource_identity::monotonic_ns().ok()
+                        }));
+                    } else {
+                        self.truncated = true;
+                    }
+                }
+                self.header_bytes = 0;
+            }
+        }
+    }
+
+    struct DrainRequestAfter503 {
+        response_data: Option<Bytes>,
+        request: hyper::body::Incoming,
+        received: Arc<AtomicU64>,
+        ended: bool,
+    }
+
+    impl Body for DrainRequestAfter503 {
+        type Data = Bytes;
+        type Error = hyper::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if let Some(bytes) = self.response_data.take() {
+                return Poll::Ready(Some(Ok(Frame::data(bytes))));
+            }
+            if self.ended {
+                return Poll::Ready(None);
+            }
+            // Explicitly bounded work per poll. Neither buffering nor delaying
+            // the response head is necessary to retain the request through EOS.
+            for _ in 0..32 {
+                match Pin::new(&mut self.request).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(data) = frame.data_ref() {
+                            self.received
+                                .fetch_add(data.len() as u64, Ordering::Release);
+                        }
+                    }
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(None) => {
+                        self.ended = true;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        fn is_end_stream(&self) -> bool {
+            self.ended && self.response_data.is_none()
+        }
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(
+                self.response_data
+                    .as_ref()
+                    .map_or(0, |bytes| bytes.len() as u64),
+            )
+        }
+    }
+
+    /// Test-only plaintext accepted by the TLS writer. Skip every DATA/header
+    /// payload; retain only fixed reset counters and at most eight GOAWAYs.
+    struct H2WriteWitness<I> {
+        inner: I,
+        evidence: Arc<Mutex<H2WriteEvidence>>,
+    }
+
+    impl<I: AsyncRead + Unpin> AsyncRead for H2WriteWitness<I> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+
+    impl<I: AsyncWrite + Unpin> AsyncWrite for H2WriteWitness<I> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if let Poll::Ready(Ok(written)) = result {
+                self.evidence
+                    .lock()
+                    .expect("test-only fixed frame evidence")
+                    .observe(&bytes[..written]);
+            }
+            result
+        }
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bytes);
+            if let Poll::Ready(Ok(mut written)) = result {
+                let mut evidence = self
+                    .evidence
+                    .lock()
+                    .expect("test-only fixed frame evidence");
+                for part in bytes {
+                    let take = written.min(part.len());
+                    evidence.observe(&part[..take]);
+                    written -= take;
+                    if written == 0 {
+                        break;
+                    }
+                }
+            }
+            result
+        }
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     async fn six_fixture_upgrade_receipts(
         address: SocketAddr,
@@ -3860,6 +4289,117 @@ mod tests {
                     .map(String::as_str),
                 Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_upgrade_non101_captures_complete_safe_response_without_capability() {
+        use rustls::pki_types::pem::PemObject as _;
+        for (declared, bytes, transfer_encoding, complete) in [
+            (19, b"service unavailable".as_slice(), false, true),
+            (19, b"service".as_slice(), false, false),
+            (65537, b"".as_slice(), false, false),
+            (19, b"service unavailable".as_slice(), true, false),
+        ] {
+            let identity = identity().expect("isolated test-only TLS identity");
+            let config = client_config(&[&identity], &[b"http/1.1"]).expect("verified H1 client");
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+                identity.private_key_pem.as_bytes(),
+            )
+            .expect("matching test-only key");
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("safe TLS defaults")
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.certificate_der], key)
+            .expect("test-only certificate");
+            tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral actual fixture");
+            let address = listener.local_addr().expect("actual peer");
+            let fixture = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("one actual handshake");
+                let mut socket = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                    .accept(socket)
+                    .await
+                    .expect("verified TLS handshake");
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.expect("actual request head"));
+                    assert!(head.len() <= 16384);
+                }
+                assert!(head.starts_with(b"GET /ws HTTP/1.1\r\n"));
+                let te = if transfer_encoding {
+                    "Transfer-Encoding: chunked\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {declared}\r\n{te}\r\n"
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("actual safe head");
+                socket
+                    .write_all(bytes)
+                    .await
+                    .expect("actual fixture body bytes");
+                socket.shutdown().await.expect("actual TLS write shutdown");
+            });
+            let raw = measure_resource_upgrade(
+                address,
+                config,
+                format!("safe503:{declared}:{transfer_encoding}:{complete}"),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), fixture)
+                .await
+                .expect("every started fixture collected")
+                .expect("fixture did not panic");
+            assert_eq!(raw.status, Some(503));
+            assert!(raw.request_head_sent);
+            assert_eq!(
+                raw.content_type.as_deref(),
+                Some("text/plain; charset=utf-8")
+            );
+            assert_eq!(raw.echo_iterations, 0);
+            assert!(!raw.tunnel_client_shutdown);
+            assert_eq!(raw.tunnel_close_result, None);
+            assert_eq!(raw.upstream_peer, None);
+            if complete {
+                assert_eq!(raw.error_code, None);
+                assert!(
+                    raw.eof,
+                    "complete HTTP message framing, not a trusted tunnel"
+                );
+                assert_eq!(raw.body_bytes, 19);
+                assert_eq!(
+                    raw.body_sha256,
+                    Sha256::digest(bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+            } else {
+                assert!(!raw.eof);
+                assert_eq!(raw.error_stage.as_deref(), Some("response_body"));
+                assert_eq!(
+                    raw.error_code.as_deref(),
+                    Some("transport_or_protocol_error")
+                );
+                assert_eq!(
+                    raw.body_bytes,
+                    if declared == 19 && !transfer_encoding {
+                        bytes.len() as u64
+                    } else {
+                        0
+                    }
+                );
+            }
         }
     }
 
@@ -4195,6 +4735,369 @@ listeners:
     }
 
     #[tokio::test]
+    async fn resource_ipv6_h2_mixed_upload_cancel_keeps_actual_shared_peer_alive() {
+        let directory = tempfile::tempdir().expect("isolated IPv6 test source");
+        let identity = identity().expect("ephemeral test-only TLS");
+        write_identity(directory.path(), &identity).expect("test-only certificate files");
+        let upstream =
+            super::super::fixture::resource_test_fixture_at(&identity, "ipv6", true, "[::1]:0")
+                .await;
+        let source = format!(
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  certificates:\n    ingress:\n      cert_chain: gateway.pem\n      private_key: gateway-key.pem\n  trust_stores:\n    fixture:\n      ca_bundle: gateway.pem\n  clusters:\n    api:\n      protocol: h2\n      endpoints: [\"https://{}/base\"]\n      tls:\n        server_name: gateway.example.test\n        trust:\n          system_roots: false\n          trust_store: fixture\n      timeouts:\n        response_header: 5s\n        response_body_idle: 30s\n        pre_response_total: 8s\nlisteners:\n  - name: secure\n    bind: 127.0.0.1:0\n    protocol: https\n    tls:\n      default_certificate: ingress\n    http:\n      versions: [h2]\n    service:\n      type: proxy\n      cluster: api\n",
+            upstream.address
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded test source");
+        let gateway = oxidase_server::GatewayServer::bind(
+            oxidase_runtime::RuntimeSnapshot::prepare(
+                oxidase_config::Compiler::compile_path(&path).expect("actual config"),
+            )
+            .expect("real immutable plan"),
+        )
+        .await
+        .expect("real gateway")
+        .spawn();
+        let address = gateway.local_addresses()[0].1;
+        let h2 = client_config(&[&identity], &[b"h2"]).expect("H2 verified identity");
+        let ack = client_config(&[&identity], &[b"http/1.1"]).expect("ACK verified identity");
+        let peer = upstream.address;
+        let targets = vec![("ipv6".to_owned(), peer)];
+        let mut warm = ResourceDataClient::connect(address, Arc::clone(&h2), true, targets.clone())
+            .await
+            .expect("actual downstream client");
+        let warmed = warm
+            .measure(ResourceRequest {
+                operation_id: "mixed-warm:0".into(),
+                path: "/resource/payload?b=2&a=1&a=3".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let warm_closed = warm.close_receipt().await;
+        let warm_connections = upstream.actual_h2_connections();
+        let barrier = Arc::new(tokio::sync::Barrier::new(7));
+        let mut pending = tokio::task::JoinSet::new();
+        for worker in 0..7 {
+            let h2 = Arc::clone(&h2);
+            let ack = Arc::clone(&ack);
+            let targets = targets.clone();
+            let barrier = Arc::clone(&barrier);
+            pending.spawn(async move {
+                let mut client = ResourceDataClient::connect(address, h2, true, targets)
+                    .await
+                    .expect("actual mixed downstream");
+                barrier.wait().await;
+                let mut outcomes = Vec::new();
+                let mut acknowledgements = Vec::new();
+                for sequence in 0..32 {
+                    let cancellation = worker == 6;
+                    let grpc = !cancellation && worker % 3 == 1;
+                    let upload_bytes = if !cancellation && worker % 3 == 2 {
+                        1048576
+                    } else {
+                        0
+                    };
+                    let path = if cancellation {
+                        "/resource/cancel"
+                    } else if grpc {
+                        "/resource/grpc"
+                    } else if upload_bytes > 0 {
+                        "/resource/upload"
+                    } else {
+                        "/resource/payload"
+                    };
+                    let operation_id = format!("ipv6-mixed-{worker}:{sequence}");
+                    let raw = client
+                        .measure(ResourceRequest {
+                            operation_id: operation_id.clone(),
+                            path: format!("{path}?b=2&a=1&a=3"),
+                            grpc,
+                            cancel_after_first_data: cancellation,
+                            payload_size: 32768,
+                            upload_bytes,
+                        })
+                        .await;
+                    if cancellation {
+                        acknowledgements.push(
+                            await_fixture_cancel_receipt(peer, Arc::clone(&ack), &operation_id)
+                                .await
+                                .map_err(|error| error.to_string()),
+                        );
+                    }
+                    outcomes.push(raw);
+                }
+                // An actual post-cancel stream, on the same downstream driver.
+                if worker == 6 {
+                    outcomes.push(
+                        client
+                            .measure(ResourceRequest {
+                                operation_id: "ipv6-mixed-sibling:32".into(),
+                                path: "/resource/payload?b=2&a=1&a=3".into(),
+                                grpc: false,
+                                cancel_after_first_data: false,
+                                payload_size: 32768,
+                                upload_bytes: 0,
+                            })
+                            .await,
+                    );
+                }
+                let submitted = client.submitted_requests();
+                let close = client.close_receipt().await;
+                (worker, outcomes, acknowledgements, submitted, close)
+            });
+        }
+        let mut outcomes = Vec::new();
+        let mut join_errors = Vec::new();
+        let collecting = tokio::time::timeout(Duration::from_secs(25), async {
+            while let Some(result) = pending.join_next().await {
+                match result {
+                    Ok(result) => outcomes.push(result),
+                    Err(error) => join_errors.push(error.to_string()),
+                }
+            }
+        })
+        .await;
+        if collecting.is_err() {
+            pending.abort_all();
+            while let Some(result) = pending.join_next().await {
+                if let Err(error) = result {
+                    join_errors.push(error.to_string());
+                }
+            }
+        }
+        let h2_connections = upstream.actual_h2_connections();
+        let connections = upstream.actual_connections();
+        let completed = upstream.completed_resource_bodies();
+        let last_cancel = upstream.actual_cancellation("ipv6-mixed-6:31");
+        gateway.shutdown().await.expect("gateway ownership joined");
+        upstream.stop().await;
+        assert!(
+            collecting.is_ok() && join_errors.is_empty(),
+            "all mixed work collected: {join_errors:?}"
+        );
+        assert_eq!(warmed.status, Some(200));
+        assert!(warmed.eof && warmed.error_code.is_none());
+        assert_eq!(warm_closed["result"], "completed");
+        assert_eq!(
+            warm_connections, 1,
+            "warm actual physical H2, not registry membership"
+        );
+        assert_eq!(
+            h2_connections, 1,
+            "no hidden upstream reconnection on cancellation"
+        );
+        assert_eq!(
+            connections, 33,
+            "one H2 plus thirty-two actual H1 ACK connections"
+        );
+        assert_eq!(
+            completed, 194,
+            "warm plus 192 normal and the healthy sibling"
+        );
+        assert_eq!(
+            last_cancel.expect("actual last operation Drop")["body_bytes"],
+            1024
+        );
+        assert_eq!(outcomes.len(), 7);
+        let hex_sha256 = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let bytes_digest = hex_sha256(&vec![b'x'; 32768]);
+        let mut grpc = vec![0, 0, 0, 128, 0];
+        grpc.extend_from_slice(&vec![b'x'; 32768]);
+        let grpc_digest = hex_sha256(&grpc);
+        let upload_digest = hex_sha256(&vec![b'u'; 1048576]);
+        for (worker, receipts, acknowledgements, submitted, close) in outcomes {
+            assert_eq!(
+                submitted,
+                receipts.len() as u64,
+                "one submitted attempt per operation"
+            );
+            assert_eq!(close["result"], "completed");
+            assert_eq!(close["join_acknowledged"], true);
+            for raw in receipts {
+                assert_eq!(raw.status, Some(200), "actual mixed raw: {raw:?}");
+                assert!(
+                    raw.error_code.is_none()
+                        && raw.h2_reason.is_none()
+                        && raw.h2_error_kind.is_none(),
+                    "actual mixed raw: {raw:?}"
+                );
+                assert_eq!(
+                    raw.upstream_peer.as_deref(),
+                    Some(peer.to_string().as_str())
+                );
+                assert_eq!(raw.server_name.as_deref(), Some("gateway.example.test"));
+                if raw.cancelled {
+                    assert!(raw.data_observed && !raw.eof);
+                    assert_eq!(raw.body_bytes, 1024);
+                } else {
+                    assert!(raw.eof);
+                    let is_grpc = worker % 3 == 1 && worker != 6;
+                    assert_eq!(raw.body_bytes, if is_grpc { 32773 } else { 32768 });
+                    assert_eq!(
+                        raw.body_sha256,
+                        if is_grpc { &grpc_digest } else { &bytes_digest }.as_str()
+                    );
+                    if is_grpc {
+                        assert_eq!(
+                            raw.trailers.get("grpc-status").map(String::as_str),
+                            Some("0")
+                        );
+                        assert_eq!(
+                            raw.trailers.get("grpc-message").map(String::as_str),
+                            Some("ok")
+                        );
+                    } else {
+                        assert!(raw.trailers.is_empty());
+                    }
+                    if worker % 3 == 2 {
+                        assert_eq!(raw.upload.body_bytes, Some(1048576));
+                        assert_eq!(
+                            raw.upload.body_sha256.as_deref(),
+                            Some(upload_digest.as_str())
+                        );
+                        assert!(raw.upload.eof == Some(true) && raw.upload.fixture_ack);
+                    }
+                }
+            }
+            for receipt in acknowledgements {
+                let receipt =
+                    receipt.expect("original 3s actual Drop ACK, without closing shared H2");
+                assert_eq!(receipt["body_dropped_after_data"], true);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_drop_ack_is_not_erased_by_its_query_driver_cleanup_failure() {
+        let directory = tempfile::tempdir().expect("isolated real gateway");
+        let identity = identity().expect("ephemeral fixture TLS");
+        write_identity(directory.path(), &identity).expect("test-only gateway identity");
+        let upstream = super::super::fixture::resource_test_fixture(&identity).await;
+        let source = format!(
+            "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  certificates:\n    ingress:\n      cert_chain: gateway.pem\n      private_key: gateway-key.pem\n  trust_stores:\n    fixture:\n      ca_bundle: gateway.pem\n  clusters:\n    api:\n      protocol: h2\n      endpoints: [\"https://{}/base\"]\n      tls:\n        server_name: gateway.example.test\n        trust:\n          system_roots: false\n          trust_store: fixture\nlisteners:\n  - name: secure\n    bind: 127.0.0.1:0\n    protocol: https\n    tls:\n      default_certificate: ingress\n    http:\n      versions: [h2]\n    service:\n      type: proxy\n      cluster: api\n",
+            upstream.address,
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded test source");
+        let gateway = oxidase_server::GatewayServer::bind(
+            oxidase_runtime::RuntimeSnapshot::prepare(
+                oxidase_config::Compiler::compile_path(&path).expect("actual source"),
+            )
+            .expect("actual snapshot"),
+        )
+        .await
+        .expect("actual gateway")
+        .spawn();
+        let h2 = client_config(&[&identity], &[b"h2"]).expect("verified H2");
+        let h1 = client_config(&[&identity], &[b"http/1.1"]).expect("verified ACK query");
+        let mut client = ResourceDataClient::connect(
+            gateway.local_addresses()[0].1,
+            h2,
+            true,
+            vec![("a".into(), upstream.address)],
+        )
+        .await
+        .expect("actual body client");
+        let operation_id = "observed-ack:1";
+        let raw = client
+            .measure(ResourceRequest {
+                operation_id: operation_id.into(),
+                path: "/resource/cancel".into(),
+                grpc: false,
+                cancel_after_first_data: true,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let mut query = ResourceDataClient::connect(
+            upstream.address,
+            h1,
+            false,
+            vec![("ack".into(), upstream.address)],
+        )
+        .await
+        .expect("actual ACK transport");
+        let actual = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let receipt = query
+                    .cancellation_receipt(operation_id)
+                    .await
+                    .expect("actual ACK JSON");
+                if receipt["body_dropped_after_data"] == true {
+                    break receipt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation-bound Drop was actually observed within the original bound");
+        // An explicit test-only join barrier, not a claim about historical TCP.
+        // Real H1 IO has ended; delaying its owning task must not erase the
+        // previously observed stream Drop. No shared H2 driver is aborted.
+        let driver = query.driver.take().expect("actual ACK driver");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        query.driver = Some(tokio::spawn(async move {
+            let result = driver.await.expect("actual ACK driver joined");
+            gate.notified().await;
+            result
+        }));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            poll_fixture_cancel_receipt(query, operation_id),
+        )
+        .await
+        .expect("cleanup remains within the original bound");
+        let sibling = client
+            .measure(ResourceRequest {
+                operation_id: "ack-cleanup-sibling:2".into(),
+                path: "/resource/payload".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let close = client.close_receipt().await;
+        let actual_h2 = upstream.actual_h2_connections();
+        gateway
+            .shutdown()
+            .await
+            .expect("actual gateway owners joined");
+        upstream.stop().await;
+        assert!(raw.cancelled && raw.data_observed && !raw.eof && raw.error_code.is_none());
+        assert_eq!(actual["operation_id"], operation_id);
+        assert_eq!(actual["body_bytes"], 1024);
+        assert!(sibling.eof && sibling.error_code.is_none() && sibling.status == Some(200));
+        assert_eq!(
+            actual_h2, 1,
+            "healthy sibling used the still-open actual H2 connection"
+        );
+        assert_eq!(close["result"], "completed");
+        let error = result.expect_err("cleanup failure remains a genuine failure");
+        let captured = error;
+        assert_eq!(
+            captured.observed_receipt.as_ref().expect("actual receipt")["operation_id"],
+            operation_id
+        );
+        assert!(captured.receipt_observed_ns.is_some());
+        assert_eq!(captured.stage, "connection_cleanup");
+        assert_eq!(
+            captured
+                .connection_cleanup
+                .as_ref()
+                .expect("actual driver termination")["result"],
+            "timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn resource_h2_reset_reason_is_from_actual_tls_wire_without_retry() {
         use rustls::pki_types::pem::PemObject as _;
         let identity = identity().expect("ephemeral test identity");
@@ -4258,8 +5161,294 @@ listeners:
         assert_eq!(raw.error_code.as_deref(), Some("transport_error"));
         assert_eq!(raw.h2_reason.as_deref(), Some("refused_stream"));
         assert_eq!(raw.h2_error_kind.as_deref(), Some("reset"));
+        assert_eq!(raw.h2_initiator.as_deref(), Some("remote"));
         assert_eq!(submitted, 1, "no retry of refused logical request");
         assert_eq!(driver["join_acknowledged"], true);
+    }
+
+    #[tokio::test]
+    async fn resource_h2_initiator_distinguishes_remote_goaway_from_local_detection() {
+        use rustls::pki_types::pem::PemObject as _;
+        for remote_goaway in [true, false] {
+            let identity = identity().expect("isolated TLS fixture identity");
+            let config = client_config(&[&identity], &[b"h2"]).expect("verified client");
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+                identity.private_key_pem.as_bytes(),
+            )
+            .expect("test-only key");
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("safe TLS defaults")
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.certificate_der], key)
+            .expect("matching certificate");
+            tls.alpn_protocols = vec![b"h2".to_vec()];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral actual fixture");
+            let address = listener.local_addr().expect("actual peer");
+            let fixture = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("one actual client");
+                let socket = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                    .accept(socket)
+                    .await
+                    .expect("verified TLS");
+                let mut connection = h2::server::handshake(socket).await.expect("real H2");
+                let (request, mut respond) = connection
+                    .accept()
+                    .await
+                    .expect("one actual submitted stream")
+                    .expect("valid request");
+                let actual_stream_id = request.body().stream_id().as_u32();
+                if remote_goaway {
+                    connection.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
+                } else {
+                    let head = http::Response::builder()
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, 1)
+                        .body(())
+                        .expect("deliberately inconsistent fixture metadata");
+                    let mut response = respond.send_response(head, false).expect("actual head");
+                    response
+                        .send_data(Bytes::from_static(b"xx"), true)
+                        .expect("actual malformed DATA, not a simulated client error");
+                }
+                while let Some(next) = connection.accept().await {
+                    assert!(next.is_err(), "one logical operation, no replay");
+                }
+                actual_stream_id
+            });
+            let mut client = ResourceDataClient::connect_local(address, config, true)
+                .await
+                .expect("actual TLS/H2 client");
+            let facts = client
+                .measure(ResourceRequest {
+                    operation_id: format!("wire-initiator:{remote_goaway}"),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 1,
+                    upload_bytes: 0,
+                })
+                .await;
+            let submitted = client.submitted_requests();
+            let closed = client.close_receipt().await;
+            let actual_stream_id = tokio::time::timeout(Duration::from_secs(2), fixture)
+                .await
+                .expect("actual fixture exit bound")
+                .expect("all fixture work joined");
+            assert_eq!(actual_stream_id, 1);
+            assert_eq!(submitted, 1, "no logical replay or hidden reconnect");
+            assert_eq!(closed["join_acknowledged"], true);
+            if remote_goaway {
+                // Hyper may cancel the callback without attaching its driver
+                // error. Keep the actual connection cause separate.
+                assert_eq!(closed["terminal"]["h2_reason"], "enhance_your_calm");
+                assert_eq!(closed["terminal"]["h2_error_kind"], "goaway");
+                assert_eq!(closed["terminal"]["h2_initiator"], "remote");
+                assert!(closed["terminal"]["completed_ns"].as_u64().is_some());
+                assert_eq!(facts.error_stage.as_deref(), Some("response_head"));
+            } else {
+                assert_eq!(facts.status, Some(200));
+                assert_eq!(facts.h2_reason.as_deref(), Some("protocol_error"));
+                assert_eq!(facts.h2_initiator.as_deref(), Some("library"));
+                assert_eq!(facts.error_stage.as_deref(), Some("response_body"));
+                assert!(!facts.eof);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_hyper_tls_h2_early_503_exposes_and_isolates_default_reset_guard() {
+        use rustls::pki_types::pem::PemObject as _;
+        for (upload_bytes, drain_request) in [(0, false), (1048576, false), (1048576, true)] {
+            let identity = identity().expect("ephemeral controlled TLS");
+            let config = client_config(&[&identity], &[b"h2"]).expect("verified direct client");
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+                identity.private_key_pem.as_bytes(),
+            )
+            .expect("test-only key");
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("safe TLS")
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.certificate_der], key)
+            .expect("matching key");
+            tls.alpn_protocols = vec![b"h2".to_vec()];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("actual ephemeral direct fixture");
+            let address = listener.local_addr().expect("actual peer");
+            let fixture = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("one connection");
+                let socket = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                    .accept(socket)
+                    .await
+                    .expect("verified TLS");
+                let admitted = Arc::new(AtomicU64::new(0));
+                let admissions = Arc::clone(&admitted);
+                let received = Arc::new(AtomicU64::new(0));
+                let received_bytes = Arc::clone(&received);
+                let service =
+                    hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                        admissions.fetch_add(1, Ordering::Release);
+                        let body = if drain_request {
+                            DrainRequestAfter503 {
+                                response_data: Some(Bytes::from_static(b"Service Unavailable")),
+                                request: request.into_body(),
+                                received: Arc::clone(&received_bytes),
+                                ended: false,
+                            }
+                            .boxed_unsync()
+                        } else {
+                            // Negative library control, not a permitted Gateway
+                            // workload outcome. Do not change its reset limits.
+                            drop(request);
+                            Full::new(Bytes::from_static(b"Service Unavailable"))
+                                .map_err(|never| match never {})
+                                .boxed_unsync()
+                        };
+                        async {
+                            Ok::<_, Infallible>(
+                                http::Response::builder()
+                                    .status(503)
+                                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                                    .body(body)
+                                    .expect("fixed safe response"),
+                            )
+                        }
+                    });
+                let evidence = Arc::new(Mutex::new(H2WriteEvidence::default()));
+                let socket = H2WriteWitness {
+                    inner: socket,
+                    evidence: Arc::clone(&evidence),
+                };
+                let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+                let mut source: Option<&(dyn std::error::Error + 'static)> =
+                    result.as_ref().err().map(|error| error as _);
+                let mut chain = Vec::new();
+                for _ in 0..16 {
+                    let Some(error) = source else { break };
+                    let bounded_display: String = error.to_string().chars().take(512).collect();
+                    let protocol = error.downcast_ref::<h2::Error>().map(|error|
+                        json!({"goaway":error.is_go_away(),"remote":error.is_remote(),"library":error.is_library(),"reason":error.reason().map(|reason|reason.to_string())}));
+                    chain.push(json!({"display":bounded_display,"h2":protocol}));
+                    source = error.source();
+                }
+                let frames = evidence.lock().expect("actual accepted plaintext frames");
+                json!({"admitted":admitted.load(Ordering::Acquire),"received_request_bytes":received.load(Ordering::Acquire),"result":if result.is_ok() {"completed"} else {"error"},"error_chain":chain,"frames":{"resets_no_error":frames.resets_no_error,"resets_stream_closed":frames.resets_stream_closed,"resets_other":frames.resets_other,"goaways":frames.goaways,"truncated":frames.truncated}})
+            });
+            let mut client = ResourceDataClient::connect_local(address, config, true)
+                .await
+                .expect("actual direct TLS/H2 connection");
+            let mut facts = Vec::new();
+            for sequence in 0..super::super::RESOURCE_REQUESTS_PER_CONNECTION {
+                let raw = client
+                    .measure(ResourceRequest {
+                        operation_id: format!("direct-early-{upload_bytes}:{sequence}"),
+                        path: "/resource/respond".into(),
+                        grpc: false,
+                        cancel_after_first_data: false,
+                        payload_size: 19,
+                        upload_bytes,
+                    })
+                    .await;
+                let failed = raw.error_code.is_some();
+                facts.push(raw);
+                if failed {
+                    break;
+                }
+            }
+            let submitted = client.submitted_requests();
+            let close = client.close_receipt().await;
+            let fixture_result = tokio::time::timeout(Duration::from_secs(3), fixture)
+                .await
+                .expect("direct fixture actual exit")
+                .expect("direct fixture joined");
+            let expected: String = Sha256::digest(b"Service Unavailable")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let failures: Vec<_> = facts
+                .iter()
+                .filter(|raw| {
+                    raw.status != Some(503)
+                        || !raw.eof
+                        || raw.body_bytes != 19
+                        || raw.body_sha256 != expected
+                        || raw.error_code.is_some()
+                        || !raw.trailers.is_empty()
+                })
+                .collect();
+            eprintln!(
+                "direct early503 evidence upload={upload_bytes} drain={drain_request} submitted={submitted} terminal={close} fixture={fixture_result}"
+            );
+            let ready_failures: Vec<_> = facts
+                .iter()
+                .filter(|raw| raw.sender_ready == Some(false))
+                .collect();
+            assert!(facts.iter().all(|raw| raw.sender_ready.is_some()));
+            assert_eq!(
+                submitted,
+                facts
+                    .iter()
+                    .filter(|raw| raw.sender_ready == Some(true))
+                    .count() as u64,
+                "each dispatcher-admitted request was submitted once, without replay"
+            );
+            assert_eq!(
+                submitted + ready_failures.len() as u64,
+                facts.len() as u64,
+                "all begun operations include the final non-admitted ready failure"
+            );
+            assert!(ready_failures.len() <= 1);
+            if let Some(raw) = ready_failures.first() {
+                assert_eq!(
+                    raw.operation_id,
+                    facts.last().expect("terminal operation").operation_id
+                );
+                assert_eq!(raw.error_stage.as_deref(), Some("response_head"));
+                assert_eq!(raw.error_code.as_deref(), Some("transport_error"));
+            }
+            if upload_bytes == 1048576 && !drain_request {
+                assert!(
+                    !failures.is_empty(),
+                    "negative control must genuinely exercise the locked library guard"
+                );
+                assert!(submitted < super::super::RESOURCE_REQUESTS_PER_CONNECTION);
+                assert_eq!(fixture_result["frames"]["resets_stream_closed"], 1024);
+                assert_eq!(fixture_result["frames"]["goaways"][0]["reason"], 11);
+                assert_eq!(
+                    fixture_result["frames"]["goaways"][0]["debug_data"],
+                    "too_many_internal_resets"
+                );
+                assert_eq!(fixture_result["frames"]["truncated"], false);
+            } else {
+                assert!(
+                    failures.is_empty(),
+                    "actual single-attempt terminals={failures:?}"
+                );
+                assert_eq!(submitted, super::super::RESOURCE_REQUESTS_PER_CONNECTION);
+                assert_eq!(fixture_result["admitted"], submitted);
+                assert_eq!(
+                    fixture_result["received_request_bytes"],
+                    submitted * u64::try_from(upload_bytes).expect("fixed upload bound")
+                );
+                assert_eq!(fixture_result["frames"]["resets_stream_closed"], 0);
+                assert!(
+                    fixture_result["frames"]["goaways"]
+                        .as_array()
+                        .expect("fixed frame list")
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4353,7 +5542,7 @@ listeners:
             .await
             .expect("actual downstream TLS/H2 connection");
             let mut operations = Vec::new();
-            for sequence in 0..512 {
+            for sequence in 0..super::super::RESOURCE_REQUESTS_PER_CONNECTION {
                 let raw = client
                     .measure(ResourceRequest {
                         operation_id: format!("unavailable-{upload_bytes}:{sequence}"),
@@ -4408,7 +5597,10 @@ listeners:
                 failures.is_empty(),
                 "upload_bytes={upload_bytes}; actual={failures:?}; driver={close}"
             );
-            assert_eq!(operations.len(), 512);
+            assert_eq!(
+                operations.len() as u64,
+                super::super::RESOURCE_REQUESTS_PER_CONNECTION
+            );
             assert_eq!(close["join_acknowledged"], true);
         }
     }
@@ -4459,6 +5651,7 @@ listeners:
         let mut client = ResourceDataClient {
             sender: Some(ResourceSender::H1(sender)),
             driver: Some(driver),
+            driver_terminal: Arc::default(),
             h2: false,
             targets: Vec::new(),
             local_response: true,
@@ -4510,6 +5703,7 @@ listeners:
         let mut client = ResourceDataClient {
             sender: None,
             driver: None,
+            driver_terminal: Arc::default(),
             h2: false,
             targets: Vec::new(),
             local_response: true,
@@ -4552,6 +5746,7 @@ listeners:
         let mut client = ResourceDataClient {
             sender: Some(ResourceSender::H1(sender)),
             driver: Some(driver),
+            driver_terminal: Arc::default(),
             h2: false,
             targets: Vec::new(),
             local_response: true,
@@ -4604,6 +5799,7 @@ listeners:
         let mut client = ResourceDataClient {
             sender: Some(ResourceSender::H1(sender)),
             driver: Some(driver),
+            driver_terminal: Arc::default(),
             h2: false,
             targets: Vec::new(),
             local_response: true,
@@ -4765,6 +5961,7 @@ listeners:
         let local = ResourceDataClient {
             sender: None,
             driver: None,
+            driver_terminal: Arc::default(),
             h2: true,
             targets: Vec::new(),
             local_response: true,
@@ -4790,6 +5987,7 @@ listeners:
         let proxy = ResourceDataClient {
             sender: None,
             driver: None,
+            driver_terminal: Arc::default(),
             h2: true,
             targets: vec![("a".into(), "127.0.0.1:8080".parse().expect("numeric peer"))],
             local_response: false,
@@ -5163,6 +6361,50 @@ listeners:
     }
 
     #[tokio::test]
+    async fn cancelling_driver_cleanup_before_or_after_first_poll_does_not_detach_it() {
+        struct ActualTaskDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for ActualTaskDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        for first_poll in [false, true] {
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+            let driver = tokio::spawn(async move {
+                let _actual_future = ActualTaskDrop(Some(dropped));
+                started.send(()).expect("actual driver first poll");
+                std::future::pending::<Result<(), String>>().await
+            });
+            started_rx.await.expect("real Tokio future is running");
+            let client = ResourceDataClient {
+                sender: None,
+                driver: Some(driver),
+                driver_terminal: Arc::default(),
+                h2: false,
+                targets: Vec::new(),
+                local_response: false,
+                submitted_requests: 0,
+            };
+            let mut cleanup = Box::pin(client.close_receipt());
+            if first_poll {
+                std::future::poll_fn(|cx| {
+                    assert!(cleanup.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            drop(cleanup);
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("actual owned future exited, not only its handle dropped")
+                .expect("actual Drop acknowledged");
+        }
+    }
+
+    #[tokio::test]
     async fn resource_driver_close_receipt_preserves_actual_completion_error_and_cancellation() {
         for expected in ["completed", "error", "cancelled", "panicked"] {
             let driver = tokio::spawn(async move {
@@ -5179,6 +6421,7 @@ listeners:
             let client = ResourceDataClient {
                 sender: None,
                 driver: Some(driver),
+                driver_terminal: Arc::default(),
                 h2: false,
                 targets: Vec::new(),
                 local_response: false,
@@ -5196,6 +6439,7 @@ listeners:
         let unavailable = ResourceDataClient {
             sender: None,
             driver: None,
+            driver_terminal: Arc::default(),
             h2: false,
             targets: Vec::new(),
             local_response: false,
@@ -5227,6 +6471,7 @@ listeners:
             "sender_error_category",
             "h2_reason",
             "h2_error_kind",
+            "h2_initiator",
         ] {
             assert!(raw[key].is_null(), "unavailable {key} is not fabricated");
         }

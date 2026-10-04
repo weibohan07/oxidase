@@ -516,6 +516,8 @@ struct UpstreamState {
     resource_upload_bytes: AtomicU64,
     resource_cancellations: Mutex<VecDeque<ResourceCancelReceipt>>,
     resource_cancel_receipt_evictions: AtomicU64,
+    #[cfg(test)]
+    test_h2_connections: AtomicU64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -676,6 +678,28 @@ impl ResourceTestFixture {
         self.state.retries.load(Ordering::Relaxed)
     }
 
+    pub(super) fn actual_connections(&self) -> u64 {
+        self.state.connections.load(Ordering::Acquire)
+    }
+
+    pub(super) fn actual_h2_connections(&self) -> u64 {
+        self.state.test_h2_connections.load(Ordering::Acquire)
+    }
+
+    pub(super) fn completed_resource_bodies(&self) -> u64 {
+        self.state.resource_completed_bodies.load(Ordering::Acquire)
+    }
+
+    pub(super) fn actual_cancellation(&self, operation_id: &str) -> Option<Value> {
+        self.state
+            .resource_cancellations
+            .lock()
+            .expect("test-only operation receipts")
+            .iter()
+            .find(|receipt| receipt.operation_id == operation_id)
+            .map(|receipt| serde_json::to_value(receipt).expect("scalar cancellation receipt"))
+    }
+
     pub(super) async fn stop(self) {
         let _ = self.stop.send(());
         self.task.await.expect("all real fixture tasks joined");
@@ -708,6 +732,16 @@ pub(super) async fn resource_test_fixture_in_mode(
     id: &'static str,
     resource_mode: bool,
 ) -> ResourceTestFixture {
+    resource_test_fixture_at(identity, id, resource_mode, "127.0.0.1:0").await
+}
+
+#[cfg(test)]
+pub(super) async fn resource_test_fixture_at(
+    identity: &crate::common::TestIdentity,
+    id: &'static str,
+    resource_mode: bool,
+    bind: &str,
+) -> ResourceTestFixture {
     let key = PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
         .expect("ephemeral test-only key");
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -720,9 +754,7 @@ pub(super) async fn resource_test_fixture_in_mode(
     .expect("matching identity");
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tls = Arc::new(tls);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("ephemeral upstream");
+    let listener = TcpListener::bind(bind).await.expect("ephemeral upstream");
     let address = listener.local_addr().expect("actual upstream socket");
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let state = Arc::new(UpstreamState {
@@ -745,8 +777,12 @@ pub(super) async fn resource_test_fixture_in_mode(
                     let state = Arc::clone(&state);
                     connections.spawn(async move {
                         let socket = TlsAcceptor::from(tls).accept(socket).await.expect("verified TLS");
+                        state.connections.fetch_add(1, Ordering::Release);
                         let sni = socket.get_ref().1.server_name().unwrap_or("").to_owned();
                         let h2 = socket.get_ref().1.alpn_protocol() == Some(b"h2");
+                        if h2 {
+                            state.test_h2_connections.fetch_add(1, Ordering::Release);
+                        }
                         let service = service_fn(move |request| serve_route(request, id, address, sni.clone(), Arc::clone(&state)));
                         if h2 {
                             let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket), service).await;

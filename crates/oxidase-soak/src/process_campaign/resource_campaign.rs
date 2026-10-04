@@ -1286,7 +1286,7 @@ async fn worker_loop(
         if raw["cancelled"] == true
             && let Some(peer) = raw["upstream_peer"].as_str().and_then(|p| p.parse().ok())
         {
-            match client::await_fixture_cancel_receipt(
+            match client::await_fixture_cancel_observed(
                 peer,
                 Arc::clone(&plan.ack_config),
                 &format!("{}:{sequence}", plan.worker),
@@ -1298,8 +1298,40 @@ async fn worker_loop(
                     raw["cancel_ack"] = ack;
                 }
                 Err(error) => {
-                    raw["error_stage"] = "fixture_ack".into();
-                    raw["error_code"] = "cancellation_ack_missing".into();
+                    // Keep the operation-bound witness separate from its query
+                    // connection cleanup. A cleanup failure is still a failure,
+                    // but must not erase a Drop that actually happened.
+                    if let Some(mut ack) = error.observed_receipt.clone() {
+                        ack["ack_observed_ns"] = json!(error.receipt_observed_ns);
+                        ack["ack_wait_started_ns"] = json!(error.wait_started_ns);
+                        ack["ack_deadline_ns"] = json!(error.wait_deadline_ns);
+                        ack["ack_connection"] = json!(error.connection_cleanup);
+                        raw["fixture_cancel_ack"] = (ack["body_dropped_after_data"] == true).into();
+                        raw["cancel_ack"] = ack;
+                    }
+                    raw["cancel_ack_observation"] = json!({
+                        "stage": error.stage,
+                        "wait_started_ns": error.wait_started_ns,
+                        "wait_deadline_ns": error.wait_deadline_ns,
+                        "receipt_observed_ns": error.receipt_observed_ns,
+                        "connection_cleanup": error.connection_cleanup,
+                    });
+                    raw["error_stage"] = if error.stage == "ack_deadline" {
+                        "fixture_ack_deadline"
+                    } else if error.observed_receipt.is_some() {
+                        "fixture_ack_cleanup"
+                    } else {
+                        "fixture_ack"
+                    }
+                    .into();
+                    raw["error_code"] = if error.stage == "ack_deadline" {
+                        "cancellation_ack_late"
+                    } else if error.observed_receipt.is_some() {
+                        "cancellation_ack_cleanup_failed"
+                    } else {
+                        "cancellation_ack_missing"
+                    }
+                    .into();
                     raw["error"] = error.to_string().into();
                 }
             }
