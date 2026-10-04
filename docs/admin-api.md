@@ -86,6 +86,7 @@ answers.
 | --- | --- | --- |
 | GET / HEAD | `/health/live`, `/health/ready`, `/metrics` | read |
 | GET / HEAD | `/api/v1/runtime`, `/api/v1/clusters` | read |
+| GET / HEAD | `/api/v1/resources` | read |
 | GET / HEAD | `/api/v1/snapshots/current`, `/api/v1/snapshots` | read |
 | GET / HEAD | `/api/v1/operations/{operation_id}` | read |
 | POST | `/api/v1/candidates` | stage |
@@ -123,6 +124,12 @@ DNS-cache write interface. Dynamic IPs, SRV targets, generation and error messag
 are not metric labels. Explain and Bundle inspection show compiled policy and
 explicitly leave actual endpoint choice to runtime state. None of these views
 becomes a second publication authority.
+
+The separate `oxidase.resources/v1` observation document reports actual object,
+task and IO ownership, not registry lengths. It uses the same read permission and
+does no lifecycle maintenance. The existing runtime identity schema is unchanged.
+See [resource observation](operations/resource-observation.md) for unit, capture,
+capacity, Running/Drained and unavailable-data boundaries.
 
 ## Receipts, execution, and recovery
 
