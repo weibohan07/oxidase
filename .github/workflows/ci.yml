@@ -13,6 +13,8 @@ jobs:
   msrv:
     name: MSRV 1.88
     runs-on: ubuntu-latest
+    env:
+      OXIDASE_RESOURCE_TEST_ARTIFACTS: ${{ runner.temp }}/resource-test-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -21,10 +23,20 @@ jobs:
           shared-key: msrv-1.88
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo test --workspace --locked
+      - run: python3 -m unittest discover -s tools/qualification/tests -p 'test_*.py' -v
+      - name: Preserve failed resource implementation smoke
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: resource-smoke-msrv-${{ github.sha }}
+          path: ${{ runner.temp }}/resource-test-evidence/
+          if-no-files-found: ignore
 
   workspace:
     name: Stable workspace
     runs-on: ubuntu-latest
+    env:
+      OXIDASE_RESOURCE_TEST_ARTIFACTS: ${{ runner.temp }}/resource-test-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,10 +46,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: python3 -m unittest discover -s tools/qualification/tests -p 'test_*.py' -v
       - run: cargo build --workspace --release --locked
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Preserve failed resource implementation smoke
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: resource-smoke-stable-${{ github.sha }}
+          path: ${{ runner.temp }}/resource-test-evidence/
+          if-no-files-found: ignore
 
   dependency-policy:
     name: Dependency policy

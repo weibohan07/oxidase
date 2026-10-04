@@ -6,6 +6,14 @@ mod client;
 mod fixture;
 #[cfg(unix)]
 mod monitor;
+#[cfg(unix)]
+mod resource_campaign;
+#[cfg(unix)]
+mod resource_evidence;
+#[cfg(unix)]
+mod resource_identity;
+#[cfg(unix)]
+mod resource_sampler;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,6 +41,17 @@ pub struct ProcessCli {
 #[derive(Debug, Subcommand)]
 enum ProcessCommand {
     Run(ProcessArguments),
+    ResourceRun(ResourceArguments),
+    #[cfg(unix)]
+    ResourceBuildRecord {
+        #[arg(long)]
+        gateway: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    #[cfg(unix)]
+    #[command(hide = true)]
+    ResourceSampler(resource_sampler::ResourceSamplerArguments),
     #[command(hide = true)]
     FixtureDns {
         #[arg(long)]
@@ -43,6 +62,64 @@ enum ProcessCommand {
         #[arg(long)]
         root: PathBuf,
     },
+}
+
+/// Validation-only resource lanes. Never changes the gateway's own contracts.
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ResourceCampaign {
+    Healthy,
+    Churn,
+    Respond,
+    StaticProxy,
+    DnsOnly,
+    PublishOnly,
+    BackgroundOnly,
+    GrpcOnly,
+    UpgradeOnly,
+    ScrapeOnly,
+}
+
+#[derive(Debug, Parser)]
+struct ResourceArguments {
+    #[arg(long)]
+    gateway: PathBuf,
+    /// Created immediately after a documented locked build on the frozen source.
+    #[arg(long)]
+    build_record: PathBuf,
+    #[arg(long, value_enum, default_value = "healthy")]
+    campaign: ResourceCampaign,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "60m")]
+    duration: Duration,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "3m")]
+    warm_up: Duration,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "15m")]
+    recovery_running: Duration,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "5m")]
+    quiet_running: Duration,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "5m")]
+    post_drain: Duration,
+    #[arg(long, default_value_t = 8)]
+    concurrency: usize,
+    #[arg(long, default_value_t = 700201)]
+    seed: u64,
+    #[arg(long, value_parser = crate::parse_duration, default_value = "5s")]
+    control_interval: Duration,
+    /// Zero disables periodic admin scrape, not independent OS sampling.
+    #[arg(long, default_value_t = 1000)]
+    scrape_interval_ms: u64,
+    #[arg(long, default_value_t = 1000)]
+    sample_interval_ms: u64,
+    #[arg(long, default_value_t = 32768)]
+    payload_size: usize,
+    #[arg(long, default_value_t = 1048576)]
+    upload_size: usize,
+    #[arg(long)]
+    formal: bool,
+    #[arg(long)]
+    observation_disabled: bool,
+    #[arg(long)]
+    output: PathBuf,
 }
 
 /// Workloads exercise existing transport, discovery and administration paths.
@@ -85,6 +162,8 @@ struct Ready {
     pid: u32,
     address: std::net::SocketAddr,
     alternate: Option<std::net::SocketAddr>,
+    #[serde(default)]
+    ipv6: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +177,13 @@ enum FixtureCommand {
         healthy_a: bool,
         healthy_b: bool,
         retry_a: bool,
+    },
+    ResourceFault {
+        mode: String,
+        target: String,
+        delay_ms: u64,
+        after_bytes: u64,
+        case_id: u64,
     },
     Release,
     Status,
@@ -204,6 +290,23 @@ fn json_error(error: serde_json::Error) -> SoakError {
 pub async fn run_cli(cli: ProcessCli) -> Result<(), SoakError> {
     match cli.command {
         ProcessCommand::Run(args) => run(args).await,
+        ProcessCommand::ResourceRun(args) => {
+            #[cfg(unix)]
+            return resource_campaign::run(args).await;
+            #[cfg(not(unix))]
+            {
+                let _ = args;
+                Err(fail(
+                    "resource qualification requires Linux process identity",
+                ))
+            }
+        }
+        #[cfg(unix)]
+        ProcessCommand::ResourceBuildRecord { gateway, output } => {
+            resource_campaign::build_record(&gateway, &output)
+        }
+        #[cfg(unix)]
+        ProcessCommand::ResourceSampler(args) => resource_sampler::run_sampler(args).await,
         ProcessCommand::FixtureDns { root } => fixture::dns(root).await,
         ProcessCommand::FixtureUpstream { root } => fixture::upstream(root).await,
     }

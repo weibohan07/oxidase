@@ -1,16 +1,23 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, header};
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full};
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::process::{Child, Command};
@@ -23,7 +30,7 @@ use super::{
 };
 use crate::common::{XorShift64, client_config, identity, write_identity};
 
-const TOKEN: &str = "test-only-qualification-bearer-token";
+pub(super) const TOKEN: &str = "test-only-qualification-bearer-token";
 type WorkerEvent = (bool, bool, Result<(u16, u64, bool), String>);
 
 struct FixtureModePlan {
@@ -89,20 +96,37 @@ fn fixture_mode_plan(campaign: Campaign, change: usize) -> FixtureModePlan {
     }
 }
 
-struct GatewayProcess {
+pub(super) struct GatewayProcess {
     child: Child,
-    pid: u32,
-    address: SocketAddr,
+    pub(super) pid: u32,
+    pub(super) address: SocketAddr,
     reader: tokio::task::JoinHandle<Result<(), SoakError>>,
 }
 
 impl GatewayProcess {
-    async fn spawn(executable: &Path, root: &Path, results: &Path) -> Result<Self, SoakError> {
+    pub(super) async fn spawn(
+        executable: &Path,
+        root: &Path,
+        results: &Path,
+    ) -> Result<Self, SoakError> {
+        Self::spawn_with_observation(executable, root, results, true).await
+    }
+
+    pub(super) async fn spawn_with_observation(
+        executable: &Path,
+        root: &Path,
+        results: &Path,
+        enabled: bool,
+    ) -> Result<Self, SoakError> {
         let stderr = std::fs::File::create(results.join("gateway.stderr.log")).map_err(io_error)?;
         let mut child = Command::new(executable)
             .arg("serve")
             .arg(root.join("gateway.yaml"))
             .env("RUST_LOG", "warn")
+            .env(
+                "OXIDASE_RESOURCE_OBSERVATION",
+                if enabled { "on" } else { "off" },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
@@ -149,7 +173,7 @@ impl GatewayProcess {
             reader,
         })
     }
-    async fn stop(mut self) -> Result<(), SoakError> {
+    pub(super) async fn stop(mut self) -> Result<(), SoakError> {
         if let Some(status) = self.child.try_wait().map_err(io_error)? {
             return Err(fail(format!(
                 "gateway exited before graceful signal: {status}"
@@ -181,13 +205,691 @@ impl GatewayProcess {
     }
 }
 
+/// Facts recorded by the additive resource qualification client. The offline
+/// verifier compares these bytes/metadata to its own recipe; no `pass` flag is
+/// provided. Missing values remain unavailable rather than fabricated zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ResourceResponseFacts {
+    pub(super) operation_id: String,
+    pub(super) protocol: String,
+    pub(super) started_ns: Option<u64>,
+    pub(super) head_ns: Option<u64>,
+    pub(super) ended_ns: Option<u64>,
+    pub(super) status: Option<u16>,
+    pub(super) eof: bool,
+    pub(super) body_bytes: u64,
+    pub(super) body_sha256: String,
+    pub(super) content_type: Option<String>,
+    pub(super) trailers: BTreeMap<String, String>,
+    pub(super) upstream_peer: Option<String>,
+    pub(super) upstream_name: Option<String>,
+    pub(super) authority: Option<String>,
+    pub(super) server_name: Option<String>,
+    pub(super) path: Option<String>,
+    pub(super) error_stage: Option<String>,
+    pub(super) error_code: Option<String>,
+    pub(super) cancelled: bool,
+    pub(super) data_observed: bool,
+    pub(super) fixture_cancel_ack: bool,
+    pub(super) upload: ResourceUploadFacts,
+    pub(super) diagnostics: Vec<String>,
+    pub(super) fault_case_id: Option<u64>,
+    pub(super) upgrade_headers: BTreeMap<String, String>,
+    pub(super) tunnel_client_shutdown: bool,
+    pub(super) echo_iterations: u8,
+    /// Actual complete Upgrade request-head write, not merely a built request.
+    pub(super) request_head_sent: bool,
+}
+
+impl ResourceResponseFacts {
+    fn blank(operation_id: String, protocol: &str) -> Self {
+        Self {
+            operation_id,
+            protocol: protocol.into(),
+            started_ns: None,
+            head_ns: None,
+            ended_ns: None,
+            status: None,
+            eof: false,
+            body_bytes: 0,
+            body_sha256: String::new(),
+            content_type: None,
+            trailers: BTreeMap::new(),
+            upstream_peer: None,
+            upstream_name: None,
+            authority: None,
+            server_name: None,
+            path: None,
+            error_stage: None,
+            error_code: None,
+            cancelled: false,
+            data_observed: false,
+            fixture_cancel_ack: false,
+            upload: ResourceUploadFacts::default(),
+            diagnostics: Vec::new(),
+            fault_case_id: None,
+            upgrade_headers: BTreeMap::new(),
+            tunnel_client_shutdown: false,
+            echo_iterations: 0,
+            request_head_sent: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct ResourceUploadFacts {
+    pub(super) body_bytes: Option<u64>,
+    pub(super) body_sha256: Option<String>,
+    pub(super) eof: Option<bool>,
+    pub(super) fixture_ack: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResourceRequest {
+    pub(super) operation_id: String,
+    pub(super) path: String,
+    pub(super) grpc: bool,
+    pub(super) cancel_after_first_data: bool,
+    pub(super) payload_size: usize,
+    pub(super) upload_bytes: usize,
+}
+
+struct GeneratedUpload {
+    prefix: Option<Bytes>,
+    remaining: usize,
+}
+
+impl GeneratedUpload {
+    fn new(grpc: bool, length: usize) -> Self {
+        let prefix = grpc.then(|| {
+            let mut prefix = vec![0];
+            prefix.extend_from_slice(&(length as u32).to_be_bytes());
+            Bytes::from(prefix)
+        });
+        Self {
+            prefix,
+            remaining: length,
+        }
+    }
+}
+
+impl Body for GeneratedUpload {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if let Some(prefix) = self.prefix.take() {
+            return Poll::Ready(Some(Ok(Frame::data(prefix))));
+        }
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let length = self.remaining.min(1024);
+        self.remaining -= length;
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'u'; length])))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_none() && self.remaining == 0
+    }
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact((self.remaining + self.prefix.as_ref().map_or(0, Bytes::len)) as u64)
+    }
+}
+
+enum ResourceSender {
+    H1(http1::SendRequest<GeneratedUpload>),
+    H2(http2::SendRequest<GeneratedUpload>),
+}
+
+/// A Rust fixture client only, not another gateway or proxy implementation.
+pub(super) struct ResourceDataClient {
+    sender: Option<ResourceSender>,
+    driver: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    h2: bool,
+    targets: Vec<(String, SocketAddr)>,
+}
+
+impl Drop for ResourceDataClient {
+    fn drop(&mut self) {
+        if let Some(driver) = &self.driver {
+            driver.abort();
+        }
+    }
+}
+
+impl ResourceDataClient {
+    pub(super) async fn connect(
+        address: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+        h2: bool,
+        targets: Vec<(String, SocketAddr)>,
+    ) -> Result<Self, SoakError> {
+        if targets.len() > 3 {
+            return Err(fail("resource peer table must contain at most 3 entries"));
+        }
+        let tcp = TcpStream::connect(address).await.map_err(io_error)?;
+        let name = rustls::pki_types::ServerName::try_from("gateway.example.test".to_owned())
+            .map_err(io_error)?;
+        let tls = TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .map_err(io_error)?;
+        let expected_alpn: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+        if tls.get_ref().1.alpn_protocol() != Some(expected_alpn) {
+            return Err(fail("resource client ALPN mismatch"));
+        }
+        let (sender, driver) = if h2 {
+            let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .map_err(io_error)?;
+            (
+                ResourceSender::H2(sender),
+                tokio::spawn(async move {
+                    connection
+                        .await
+                        .map_err(|_| "http2_driver_error".to_owned())
+                }),
+            )
+        } else {
+            let (sender, connection) = http1::handshake(TokioIo::new(tls))
+                .await
+                .map_err(io_error)?;
+            (
+                ResourceSender::H1(sender),
+                tokio::spawn(async move {
+                    connection
+                        .await
+                        .map_err(|_| "http1_driver_error".to_owned())
+                }),
+            )
+        };
+        Ok(Self {
+            sender: Some(sender),
+            driver: Some(driver),
+            h2,
+            targets,
+        })
+    }
+
+    pub(super) async fn close(self) -> Result<(), SoakError> {
+        let receipt = self.close_receipt().await;
+        if receipt["result"] == "completed"
+            && receipt["join_acknowledged"] == true
+            && receipt["exit_ns"].as_u64().is_some()
+        {
+            Ok(())
+        } else {
+            Err(fail(
+                receipt["code"]
+                    .as_str()
+                    .unwrap_or("resource client driver close failed"),
+            ))
+        }
+    }
+
+    /// Tool-side connection cleanup facts are separate from an upstream logical
+    /// request's deadline. An injected HTTP/1 body failure may correctly produce
+    /// a driver error; callers retain that actual result in the same operation.
+    pub(super) async fn close_receipt(mut self) -> Value {
+        self.sender.take();
+        let Some(mut driver) = self.driver.take() else {
+            return json!({"result":"unavailable","code":"driver_unavailable","exit_ns":null,"join_acknowledged":false,"abort_requested":false});
+        };
+        let (result, code, join_acknowledged, abort_requested) =
+            match tokio::time::timeout(Duration::from_secs(2), &mut driver).await {
+                Ok(Ok(Ok(()))) => ("completed", None, true, false),
+                Ok(Ok(Err(code))) => ("error", Some(code), true, false),
+                Ok(Err(error)) => (
+                    if error.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "panicked"
+                    },
+                    Some("client_driver_join_error".to_owned()),
+                    true,
+                    false,
+                ),
+                Err(_) => {
+                    driver.abort();
+                    let acknowledged = tokio::time::timeout(Duration::from_secs(1), driver)
+                        .await
+                        .is_ok();
+                    (
+                        "timeout",
+                        Some("client_driver_close_timeout".to_owned()),
+                        acknowledged,
+                        true,
+                    )
+                }
+            };
+        let exit_ns = if join_acknowledged {
+            super::resource_identity::monotonic_ns().ok()
+        } else {
+            None
+        };
+        json!({"result":result,"code":code,"exit_ns":exit_ns,"join_acknowledged":join_acknowledged,"abort_requested":abort_requested})
+    }
+
+    async fn cancellation_receipt(&mut self, operation_id: &str) -> Result<Value, SoakError> {
+        let path = "/__resource_cancel_ack";
+        let request = Request::builder()
+            .uri(if self.h2 {
+                format!("https://gateway.example.test{path}")
+            } else {
+                path.to_owned()
+            })
+            .header(header::HOST, "gateway.example.test")
+            .header("x-resource-operation-id", operation_id)
+            .body(GeneratedUpload::new(false, 0))
+            .map_err(io_error)?;
+        let response = match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.send_request(request).await,
+            Some(ResourceSender::H2(sender)) => sender.send_request(request).await,
+            None => return Err(fail("fixture acknowledgement client closed")),
+        }
+        .map_err(io_error)?;
+        if response.status() != http::StatusCode::OK {
+            return Err(fail("fixture acknowledgement rejected"));
+        }
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(io_error)?;
+            if let Some(data) = frame.data_ref() {
+                if bytes
+                    .len()
+                    .checked_add(data.len())
+                    .is_none_or(|size| size > 4096)
+                {
+                    return Err(fail("fixture acknowledgement exceeded bound"));
+                }
+                bytes.extend_from_slice(data);
+            }
+        }
+        let receipt: Value = serde_json::from_slice(&bytes).map_err(json_error)?;
+        if receipt["operation_id"].as_str() != Some(operation_id) {
+            return Err(fail("fixture acknowledgement operation identity mismatch"));
+        }
+        receipt["body_dropped_after_data"]
+            .as_bool()
+            .ok_or_else(|| fail("fixture acknowledgement missing actual body drop fact"))?;
+        Ok(receipt)
+    }
+
+    pub(super) async fn measure(&mut self, request: ResourceRequest) -> ResourceResponseFacts {
+        let mut facts = ResourceResponseFacts::blank(
+            request.operation_id.clone(),
+            if self.h2 { "h2" } else { "http1" },
+        );
+        let mut digest = Sha256::new();
+        match super::resource_identity::monotonic_ns() {
+            Ok(now) => facts.started_ns = Some(now),
+            Err(_) => {
+                resource_error(&mut facts, "clock", "monotonic_unavailable");
+            }
+        }
+        if facts.error_code.is_none() {
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                self.measure_inner(&request, &mut facts, &mut digest),
+            )
+            .await;
+            if result.is_err() {
+                let stage = if facts.status.is_some() {
+                    "response_body"
+                } else {
+                    "response_head"
+                };
+                resource_error(&mut facts, stage, "client_operation_timeout");
+            }
+        }
+        facts.body_sha256 = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        match super::resource_identity::monotonic_ns() {
+            Ok(now) => facts.ended_ns = Some(now),
+            Err(_) => resource_error(&mut facts, "clock", "monotonic_unavailable"),
+        }
+        facts
+    }
+
+    async fn measure_inner(
+        &mut self,
+        request: &ResourceRequest,
+        facts: &mut ResourceResponseFacts,
+        digest: &mut Sha256,
+    ) {
+        if request.operation_id.len() > 128
+            || request.payload_size == 0
+            || request.payload_size > 16 * 1024 * 1024
+            || request.upload_bytes > 16 * 1024 * 1024
+            || !request.path.starts_with("/resource/")
+        {
+            resource_error(facts, "request", "request_parameters_invalid");
+            return;
+        }
+        let mut builder = Request::builder()
+            .uri(if self.h2 {
+                format!("https://gateway.example.test{}", request.path)
+            } else {
+                request.path.clone()
+            })
+            .method(if request.grpc || request.upload_bytes > 0 {
+                http::Method::POST
+            } else {
+                http::Method::GET
+            })
+            .header(header::HOST, "gateway.example.test")
+            .header(
+                header::CONTENT_TYPE,
+                if request.grpc {
+                    "application/grpc"
+                } else {
+                    "application/octet-stream"
+                },
+            )
+            .header("x-resource-operation-id", &request.operation_id)
+            .header("x-resource-upload-length", request.upload_bytes)
+            .header("x-resource-response-length", request.payload_size);
+        if request.grpc {
+            builder = builder.header(header::TE, "trailers");
+        }
+        let built = builder.body(GeneratedUpload::new(request.grpc, request.upload_bytes));
+        let Ok(built) = built else {
+            resource_error(facts, "request", "request_headers_invalid");
+            return;
+        };
+        let response = match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.send_request(built).await,
+            Some(ResourceSender::H2(sender)) => sender.send_request(built).await,
+            None => {
+                resource_error(facts, "response_head", "client_closed");
+                return;
+            }
+        };
+        let Ok(response) = response else {
+            resource_error(facts, "response_head", "transport_error");
+            return;
+        };
+        facts.status = Some(response.status().as_u16());
+        match super::resource_identity::monotonic_ns() {
+            Ok(now) => facts.head_ns = Some(now),
+            Err(_) => resource_error(facts, "clock", "monotonic_unavailable"),
+        }
+        let text = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        facts.content_type = text("content-type");
+        facts.upstream_peer = text("x-fixture-peer");
+        facts.upstream_name = text("x-fixture-upstream");
+        facts.authority = text("x-fixture-authority");
+        facts.server_name = text("x-fixture-sni");
+        facts.path = text("x-fixture-path");
+        facts.fault_case_id = text("x-resource-fault-case-id").and_then(|v| v.parse().ok());
+        facts.upload.body_bytes = text("x-resource-upload-bytes").and_then(|v| v.parse().ok());
+        facts.upload.body_sha256 = text("x-resource-upload-sha256");
+        facts.upload.eof = text("x-resource-upload-eof").and_then(|v| match v.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        });
+        facts.upload.fixture_ack = facts.upload.body_bytes.is_some()
+            && facts.upload.body_sha256.is_some()
+            && facts.upload.eof == Some(true);
+        if facts.status == Some(200) && !self.targets.is_empty() {
+            if !self.targets.iter().any(|(name, peer)| {
+                facts.upstream_name.as_deref() == Some(name.as_str())
+                    && facts.upstream_peer.as_deref() == Some(peer.to_string().as_str())
+            }) {
+                facts.diagnostics.push("physical_peer_mismatch".into());
+            }
+            if facts.authority.as_deref() != Some("gateway.example.test") {
+                facts.diagnostics.push("authority_mismatch".into());
+            }
+            if facts.server_name.as_deref() != Some("gateway.example.test") {
+                facts.diagnostics.push("sni_mismatch".into());
+            }
+            if facts.path.as_deref() != Some(format!("/base{}", request.path).as_str()) {
+                facts.diagnostics.push("path_mismatch".into());
+            }
+        }
+        let mut body = response.into_body();
+        let cap = if facts.status == Some(200) {
+            (request.payload_size + if request.grpc { 5 } else { 0 }) as u64
+        } else {
+            64 * 1024
+        };
+        let mut trailers_seen = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                resource_error(facts, "response_body", "body_error");
+                return;
+            };
+            if let Some(data) = frame.data_ref() {
+                if trailers_seen {
+                    resource_error(facts, "response_body", "data_after_trailers");
+                    return;
+                }
+                let Some(received) = facts.body_bytes.checked_add(data.len() as u64) else {
+                    resource_error(facts, "response_body", "body_limit_or_overflow");
+                    return;
+                };
+                digest.update(data);
+                facts.body_bytes = received;
+                facts.data_observed |= !data.is_empty();
+                if received > cap {
+                    resource_error(facts, "response_body", "body_limit_or_overflow");
+                    return;
+                }
+                if request.cancel_after_first_data && !data.is_empty() {
+                    facts.cancelled = true;
+                    drop(body);
+                    return;
+                }
+            }
+            if let Some(trailers) = frame.trailers_ref() {
+                if trailers_seen {
+                    resource_error(facts, "response_body", "duplicate_trailer_frame");
+                    return;
+                }
+                trailers_seen = true;
+                if trailers.len() > 16 {
+                    resource_error(facts, "trailers", "trailer_limit");
+                    return;
+                }
+                for (name, value) in trailers {
+                    let Ok(value) = value.to_str() else {
+                        resource_error(facts, "trailers", "trailer_value_invalid");
+                        return;
+                    };
+                    if value.len() > 1024
+                        || facts
+                            .trailers
+                            .insert(name.to_string(), value.to_owned())
+                            .is_some()
+                    {
+                        resource_error(facts, "trailers", "duplicate_or_large_trailer");
+                        return;
+                    }
+                }
+            }
+        }
+        facts.eof = true;
+    }
+}
+
+/// Return the fixture's parsed, operation-bound receipt, not an inferred status
+/// or a client-side cancellation flag. Missing/evicted evidence is an error.
+pub(super) async fn await_fixture_cancel_receipt(
+    peer: SocketAddr,
+    h1_config: Arc<rustls::ClientConfig>,
+    operation_id: &str,
+) -> Result<Value, SoakError> {
+    if operation_id.is_empty() || operation_id.len() > 128 {
+        return Err(fail("fixture acknowledgement operation identity invalid"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    tokio::time::timeout_at(deadline, async {
+        let mut client =
+            ResourceDataClient::connect(peer, h1_config, false, vec![("ack".into(), peer)]).await?;
+        loop {
+            let receipt = client.cancellation_receipt(operation_id).await?;
+            if receipt["body_dropped_after_data"] == true {
+                client.close().await?;
+                return Ok(receipt);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| fail("fixture body drop acknowledgement deadline"))?
+}
+
+fn resource_error(facts: &mut ResourceResponseFacts, stage: &str, code: &str) {
+    if facts.error_code.is_none() {
+        facts.error_stage = Some(stage.to_owned());
+        facts.error_code = Some(code.to_owned());
+    }
+}
+
+fn resource_head_facts<B>(
+    response: &http::Response<B>,
+    operation_id: &str,
+    protocol: &str,
+    started_ns: Option<u64>,
+) -> ResourceResponseFacts {
+    let mut facts = ResourceResponseFacts::blank(operation_id.into(), protocol);
+    facts.started_ns = started_ns;
+    facts.head_ns = super::resource_identity::monotonic_ns().ok();
+    facts.status = Some(response.status().as_u16());
+    let value = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    facts.content_type = value("content-type");
+    facts.upstream_peer = value("x-fixture-peer");
+    facts.upstream_name = value("x-fixture-upstream");
+    facts.authority = value("x-fixture-authority");
+    facts.server_name = value("x-fixture-sni");
+    facts.path = value("x-fixture-path");
+    if facts.head_ns.is_none() {
+        resource_error(&mut facts, "clock", "monotonic_unavailable");
+    }
+    facts
+}
+
+/// `eof` is an actual peer EOF after four verified exchanges and client shutdown,
+/// not an inference from the successful half-close or resource registry counts.
+pub(super) async fn measure_resource_upgrade(
+    address: SocketAddr,
+    h1_config: Arc<rustls::ClientConfig>,
+    operation_id: String,
+) -> ResourceResponseFacts {
+    let mut facts = ResourceResponseFacts::blank(operation_id, "upgrade");
+    let mut digest = Sha256::new();
+    let mut stage = "connect";
+    match super::resource_identity::monotonic_ns() {
+        Ok(now) => facts.started_ns = Some(now),
+        Err(_) => resource_error(&mut facts, "clock", "monotonic_unavailable"),
+    }
+    if facts.error_code.is_none() {
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            let tcp = TcpStream::connect(address).await.map_err(io_error)?;
+            stage = "tls";
+            let name = rustls::pki_types::ServerName::try_from("gateway.example.test".to_owned()).map_err(io_error)?;
+            let mut socket = TlsConnector::from(h1_config).connect(name, tcp).await.map_err(io_error)?;
+            if socket.get_ref().1.alpn_protocol() != Some(b"http/1.1") { return Err(fail("Upgrade ALPN mismatch")); }
+            stage = "response_head";
+            socket.write_all(b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.map_err(io_error)?;
+            facts.request_head_sent = true;
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let byte = socket.read_u8().await.map_err(io_error)?;
+                head.push(byte);
+                if head.len() > 16384 { return Err(fail("Upgrade head bound")); }
+            }
+            let text = std::str::from_utf8(&head).map_err(io_error)?;
+            let mut lines = text.split("\r\n");
+            let status = lines.next().and_then(|line| line.strip_prefix("HTTP/1.1 ")).and_then(|line| line.split_once(' ')).and_then(|(code,_)|code.parse::<u16>().ok()).ok_or_else(||fail("Upgrade status invalid"))?;
+            facts.status = Some(status);
+            facts.head_ns = Some(super::resource_identity::monotonic_ns()?);
+            for line in lines.filter(|line|!line.is_empty()) {
+                let (name,value) = line.split_once(':').ok_or_else(||fail("Upgrade header invalid"))?;
+                let name = name.to_ascii_lowercase();
+                if facts.upgrade_headers.len() >= 32 || facts.upgrade_headers.insert(name,value.trim().to_owned()).is_some() { return Err(fail("Upgrade header duplicate or limit")); }
+            }
+            facts.upstream_peer = facts.upgrade_headers.get("x-fixture-peer").cloned();
+            facts.upstream_name = facts.upgrade_headers.get("x-fixture-upstream").cloned();
+            facts.authority = facts.upgrade_headers.get("x-fixture-authority").cloned();
+            facts.server_name = facts.upgrade_headers.get("x-fixture-sni").cloned();
+            facts.path = facts.upgrade_headers.get("x-fixture-path").cloned();
+            if status != 101 { return Ok::<(),SoakError>(()); }
+            if !facts.upgrade_headers.get("upgrade").is_some_and(|value|value.eq_ignore_ascii_case("websocket"))
+                || !facts.upgrade_headers.get("connection").is_some_and(|value|value.eq_ignore_ascii_case("upgrade"))
+                || facts.upgrade_headers.get("sec-websocket-accept").map(String::as_str) != Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") {
+                facts.diagnostics.push("upgrade_handshake_metadata_invalid".into());
+                return Err(fail("Upgrade handshake metadata invalid"));
+            }
+            stage = "tunnel";
+            for _ in 0..4 {
+                let expected = b"qualification-tunnel";
+                socket.write_all(expected).await.map_err(io_error)?;
+                let mut seen = 0;
+                let mut buffer = [0u8; 20];
+                while seen < expected.len() {
+                    let size = socket.read(&mut buffer[..expected.len()-seen]).await.map_err(io_error)?;
+                    if size == 0 { return Err(fail("Upgrade echo truncated")); }
+                    digest.update(&buffer[..size]); facts.body_bytes += size as u64; facts.data_observed = true;
+                    if buffer[..size] != expected[seen..seen+size] { facts.diagnostics.push("upgrade_echo_content_mismatch".into()); return Err(fail("Upgrade echo content mismatch")); }
+                    seen += size;
+                }
+                facts.echo_iterations += 1;
+            }
+            stage = "tunnel_close";
+            socket.shutdown().await.map_err(io_error)?;
+            facts.tunnel_client_shutdown = true;
+            let mut tail = [0u8;1];
+            if socket.read(&mut tail).await.map_err(io_error)? != 0 { return Err(fail("Upgrade trailing data after completed exchange")); }
+            facts.eof = true;
+            Ok(())
+        }).await {
+            Ok(Ok(())) => {},
+            Ok(Err(_)) => resource_error(&mut facts, stage, "transport_or_protocol_error"),
+            Err(_) => resource_error(&mut facts, stage, "client_operation_timeout"),
+        }
+    }
+    facts.body_sha256 = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    match super::resource_identity::monotonic_ns() {
+        Ok(now) => facts.ended_ns = Some(now),
+        Err(_) => resource_error(&mut facts, "clock", "monotonic_unavailable"),
+    }
+    facts
+}
+
 fn parse_listener(line: &str) -> Option<SocketAddr> {
     line.starts_with("listener qualification accepting ")
         .then_some(())?;
     line.rsplit_once(" on ")?.1.parse().ok()
 }
 
-async fn command_json(
+pub(super) async fn command_json(
     executable: &Path,
     args: &[String],
     results: &Path,
@@ -228,7 +930,7 @@ async fn command_json(
     Ok(value)
 }
 
-fn ctl(root: &Path, operation: &[&str]) -> Vec<String> {
+pub(super) fn ctl(root: &Path, operation: &[&str]) -> Vec<String> {
     let mut args = vec![
         "ctl".into(),
         "--unix".into(),
@@ -242,7 +944,7 @@ fn ctl(root: &Path, operation: &[&str]) -> Vec<String> {
     args
 }
 
-async fn admin_read(root: &Path, path: &str) -> Result<Bytes, SoakError> {
+pub(super) async fn admin_read(root: &Path, path: &str) -> Result<Bytes, SoakError> {
     let socket = UnixStream::connect(root.join("admin.sock"))
         .await
         .map_err(io_error)?;
@@ -337,7 +1039,13 @@ async fn record_sample(
     Ok(())
 }
 
-fn source(root: &Path, dns: SocketAddr, port: u16, campaign: Campaign, generation: u64) -> String {
+pub(super) fn source(
+    root: &Path,
+    dns: SocketAddr,
+    port: u16,
+    campaign: Campaign,
+    generation: u64,
+) -> String {
     let declaration = match campaign {
         Campaign::Discovery => {
             format!("name: api.discovery.test\n          record: a_aaaa\n          port: {port}")
@@ -470,7 +1178,7 @@ admin:
     )
 }
 
-async fn bundle(
+pub(super) async fn bundle(
     gateway: &Path,
     root: &Path,
     results: &Path,
@@ -555,19 +1263,22 @@ enum Sender {
     H1(http1::SendRequest<Full<Bytes>>),
     H2(http2::SendRequest<Full<Bytes>>),
 }
-struct DataClient {
+pub(super) struct DataClient {
     sender: Sender,
-    driver: tokio::task::JoinHandle<()>,
+    driver: Option<tokio::task::JoinHandle<Result<(), String>>>,
     h2: bool,
     targets: [SocketAddr; 2],
     last_upstream: Option<&'static str>,
     payload_size: usize,
+    capture_raw: bool,
+    last_raw: Option<ResourceResponseFacts>,
 }
 struct PayloadValidator {
     grpc: bool,
     length: usize,
     upstream: u8,
     seen: usize,
+    digest: Option<Sha256>,
 }
 impl PayloadValidator {
     fn new(grpc: bool, length: usize, upstream: u8) -> Self {
@@ -576,6 +1287,7 @@ impl PayloadValidator {
             length,
             upstream,
             seen: 0,
+            digest: None,
         }
     }
     fn push(&mut self, data: &Bytes) -> Result<(), SoakError> {
@@ -599,6 +1311,9 @@ impl PayloadValidator {
             }
             self.seen += 1;
         }
+        if let Some(digest) = &mut self.digest {
+            digest.update(data);
+        }
         Ok(())
     }
     fn finish(&self) -> Result<(), SoakError> {
@@ -607,18 +1322,35 @@ impl PayloadValidator {
         }
         Ok(())
     }
+
+    fn capture(&mut self) {
+        self.digest = Some(Sha256::new());
+    }
+    fn digest(&self) -> Option<String> {
+        self.digest.as_ref().map(|digest| {
+            digest
+                .clone()
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+    }
 }
 struct HeldGrpc {
     body: hyper::body::Incoming,
     validator: PayloadValidator,
+    raw: Option<ResourceResponseFacts>,
 }
 impl Drop for DataClient {
     fn drop(&mut self) {
-        self.driver.abort();
+        if let Some(driver) = &self.driver {
+            driver.abort();
+        }
     }
 }
 impl DataClient {
-    async fn connect(
+    pub(super) async fn connect(
         address: SocketAddr,
         config: Arc<rustls::ClientConfig>,
         h2: bool,
@@ -638,13 +1370,17 @@ impl DataClient {
                 .map_err(io_error)?;
             Ok(Self {
                 sender: Sender::H2(sender),
-                driver: tokio::spawn(async move {
-                    let _ = connection.await;
-                }),
+                driver: Some(tokio::spawn(async move {
+                    connection
+                        .await
+                        .map_err(|_| "retained_http2_driver_error".into())
+                })),
                 h2,
                 targets,
                 last_upstream: None,
                 payload_size,
+                capture_raw: false,
+                last_raw: None,
             })
         } else {
             let (sender, connection) = http1::handshake(TokioIo::new(tls))
@@ -652,22 +1388,49 @@ impl DataClient {
                 .map_err(io_error)?;
             Ok(Self {
                 sender: Sender::H1(sender),
-                driver: tokio::spawn(async move {
-                    let _ = connection.await;
-                }),
+                driver: Some(tokio::spawn(async move {
+                    connection
+                        .await
+                        .map_err(|_| "retained_http1_driver_error".into())
+                })),
                 h2,
                 targets,
                 last_upstream: None,
                 payload_size,
+                capture_raw: false,
+                last_raw: None,
             })
         }
     }
-    async fn request(
+    /// Capture-only cleanup acknowledges actual driver exit. Legacy callers
+    /// retain their original drop-abort behavior and schema.
+    async fn close_captured(mut self) -> Result<(), SoakError> {
+        let mut driver = self
+            .driver
+            .take()
+            .ok_or_else(|| fail("retained driver missing"))?;
+        driver.abort();
+        match tokio::time::timeout(Duration::from_secs(3), &mut driver).await {
+            Ok(Err(error)) if error.is_cancelled() => Ok(()),
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(code))) => Err(fail(code)),
+            Ok(Err(_)) => Err(fail("retained driver panicked")),
+            Err(_) => Err(fail(
+                "retained driver cancellation acknowledgement deadline",
+            )),
+        }
+    }
+    pub(super) async fn request(
         &mut self,
         grpc: bool,
         cancel: bool,
         expected_upstream: Option<&str>,
     ) -> Result<(u16, u64, bool), SoakError> {
+        let started = if self.capture_raw {
+            Some(super::resource_identity::monotonic_ns()?)
+        } else {
+            None
+        };
         let path = format!(
             "/{}?b=2&a=1&a=3",
             if cancel {
@@ -704,7 +1467,16 @@ impl DataClient {
         }
         .map_err(io_error)?;
         let status = response.status().as_u16();
+        let mut raw = self.capture_raw.then(|| {
+            resource_head_facts(
+                &response,
+                "retained:request",
+                if self.h2 { "h2" } else { "http1" },
+                started,
+            )
+        });
         if status != 200 {
+            self.last_raw = raw;
             return Ok((status, 0, false));
         }
         if grpc
@@ -756,6 +1528,9 @@ impl DataClient {
         }
         let mut bytes = 0u64;
         let mut validator = PayloadValidator::new(grpc, self.payload_size, upstream.as_bytes()[0]);
+        if self.capture_raw {
+            validator.capture();
+        }
         let mut trailer = false;
         let mut body = response.into_body();
         while let Some(frame) = body.frame().await {
@@ -765,10 +1540,26 @@ impl DataClient {
                 bytes = bytes.saturating_add(data.len() as u64);
                 if cancel {
                     drop(body);
+                    if let Some(raw) = &mut raw {
+                        raw.body_bytes = bytes;
+                        raw.body_sha256 = validator.digest().expect("capture enabled");
+                        raw.data_observed = bytes > 0;
+                        raw.cancelled = true;
+                        raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+                    }
+                    self.last_raw = raw;
                     return Ok((status, bytes, true));
                 }
             }
             if let Some(trailers) = frame.trailers_ref() {
+                if let Some(raw) = &mut raw {
+                    for (name, value) in trailers {
+                        raw.trailers.insert(
+                            name.to_string(),
+                            value.to_str().map_err(io_error)?.to_owned(),
+                        );
+                    }
+                }
                 trailer = trailers.get("grpc-status").is_some_and(|v| v == "0")
                     && trailers.get("grpc-message").is_some_and(|v| v == "ok");
             }
@@ -777,10 +1568,23 @@ impl DataClient {
             return Err(fail("gRPC status trailer missing"));
         }
         validator.finish()?;
+        if let Some(raw) = &mut raw {
+            raw.body_bytes = bytes;
+            raw.body_sha256 = validator.digest().expect("capture enabled");
+            raw.data_observed = bytes > 0;
+            raw.eof = true;
+            raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+        }
+        self.last_raw = raw;
         Ok((status, bytes, false))
     }
 
     async fn hold_grpc(&mut self) -> Result<Option<HeldGrpc>, SoakError> {
+        let started = if self.capture_raw {
+            Some(super::resource_identity::monotonic_ns()?)
+        } else {
+            None
+        };
         let Sender::H2(sender) = &mut self.sender else {
             return Err(fail("held gRPC proof requires negotiated H2"));
         };
@@ -818,6 +1622,9 @@ impl DataClient {
                 "initial held gRPC stream did not use actual fixture A",
             ));
         }
+        let raw = self
+            .capture_raw
+            .then(|| resource_head_facts(&response, "retained:held-grpc", "h2", started));
         let mut body = response.into_body();
         let first = body
             .frame()
@@ -828,8 +1635,15 @@ impl DataClient {
             return Err(fail("held stream lacks its first gRPC DATA frame"));
         }
         let mut validator = PayloadValidator::new(true, self.payload_size, b'a');
+        if self.capture_raw {
+            validator.capture();
+        }
         validator.push(first.data_ref().expect("validated first DATA"))?;
-        Ok(Some(HeldGrpc { body, validator }))
+        Ok(Some(HeldGrpc {
+            body,
+            validator,
+            raw,
+        }))
     }
 }
 
@@ -837,6 +1651,27 @@ async fn open_upgrade(
     address: SocketAddr,
     config: Arc<rustls::ClientConfig>,
 ) -> Result<Option<tokio_rustls::client::TlsStream<TcpStream>>, SoakError> {
+    open_upgrade_capture(address, config, false)
+        .await
+        .map(|value| value.0)
+}
+
+async fn open_upgrade_capture(
+    address: SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+    capture: bool,
+) -> Result<
+    (
+        Option<tokio_rustls::client::TlsStream<TcpStream>>,
+        Option<ResourceResponseFacts>,
+    ),
+    SoakError,
+> {
+    let started = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
     let socket = TcpStream::connect(address).await.map_err(io_error)?;
     let name = rustls::pki_types::ServerName::try_from("gateway.example.test".to_owned())
         .map_err(io_error)?;
@@ -854,16 +1689,52 @@ async fn open_upgrade(
         }
     }
     if head.starts_with(b"HTTP/1.1 503") {
-        return Ok(None);
+        return Ok((None, None));
     }
     if !head.starts_with(b"HTTP/1.1 101") {
         return Err(fail("trusted Proxy Upgrade handshake failed"));
     }
-    Ok(Some(socket))
+    let raw = if capture {
+        let mut facts = ResourceResponseFacts::blank("retained:upgrade".into(), "upgrade");
+        facts.started_ns = started;
+        facts.head_ns = Some(super::resource_identity::monotonic_ns()?);
+        facts.status = Some(101);
+        facts.request_head_sent = true;
+        let text = std::str::from_utf8(&head).map_err(io_error)?;
+        for line in text.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| fail("captured Upgrade header invalid"))?;
+            if facts
+                .upgrade_headers
+                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                .is_some()
+            {
+                return Err(fail("captured Upgrade header duplicated"));
+            }
+        }
+        facts.upstream_peer = facts.upgrade_headers.get("x-fixture-peer").cloned();
+        facts.upstream_name = facts.upgrade_headers.get("x-fixture-upstream").cloned();
+        facts.authority = facts.upgrade_headers.get("x-fixture-authority").cloned();
+        facts.server_name = facts.upgrade_headers.get("x-fixture-sni").cloned();
+        facts.path = facts.upgrade_headers.get("x-fixture-path").cloned();
+        Some(facts)
+    } else {
+        None
+    };
+    Ok((Some(socket), raw))
 }
 
 async fn echo_upgrade(
     socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
+) -> Result<(), SoakError> {
+    echo_upgrade_capture(socket, None, None).await
+}
+
+async fn echo_upgrade_capture(
+    socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    mut raw: Option<&mut ResourceResponseFacts>,
+    mut digest: Option<&mut Sha256>,
 ) -> Result<(), SoakError> {
     for _ in 0..4 {
         let bytes = b"qualification-tunnel";
@@ -873,12 +1744,20 @@ async fn echo_upgrade(
         if echoed != bytes {
             return Err(fail("Upgrade bidirectional byte mismatch"));
         }
+        if let Some(digest) = digest.as_mut() {
+            digest.update(&echoed);
+        }
+        if let Some(raw) = raw.as_mut() {
+            raw.body_bytes += echoed.len() as u64;
+            raw.data_observed = true;
+            raw.echo_iterations += 1;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Ok(())
 }
 
-async fn websocket(
+pub(super) async fn websocket(
     address: SocketAddr,
     config: Arc<rustls::ClientConfig>,
 ) -> Result<bool, SoakError> {
@@ -934,16 +1813,16 @@ pub(super) async fn complete_bounded_request<T, E: std::fmt::Display>(
         .map_err(|error| error.to_string())
 }
 
-struct RetainedProofPlan<'a> {
-    gateway: &'a Path,
-    gateway_address: SocketAddr,
-    root: &'a Path,
-    results: &'a Path,
-    a: &'a str,
-    b: &'a str,
-    h1: Arc<rustls::ClientConfig>,
-    h2: Arc<rustls::ClientConfig>,
-    payload_size: usize,
+pub(super) struct RetainedProofPlan<'a> {
+    pub(super) gateway: &'a Path,
+    pub(super) gateway_address: SocketAddr,
+    pub(super) root: &'a Path,
+    pub(super) results: &'a Path,
+    pub(super) a: &'a str,
+    pub(super) b: &'a str,
+    pub(super) h1: Arc<rustls::ClientConfig>,
+    pub(super) h2: Arc<rustls::ClientConfig>,
+    pub(super) payload_size: usize,
 }
 
 fn validate_completed_new_b_stream(
@@ -963,11 +1842,30 @@ fn validate_completed_new_b_stream(
     Ok(())
 }
 
-async fn retained_stream_proof(
+pub(super) async fn retained_stream_proof(
     plan: RetainedProofPlan<'_>,
     dns: &mut FixtureProcess,
     upstream: &mut FixtureProcess,
     sequence: &mut u64,
+) -> Result<Value, SoakError> {
+    retained_stream_proof_inner(plan, dns, upstream, sequence, false).await
+}
+
+pub(super) async fn resource_retained_stream_proof(
+    plan: RetainedProofPlan<'_>,
+    dns: &mut FixtureProcess,
+    upstream: &mut FixtureProcess,
+    sequence: &mut u64,
+) -> Result<Value, SoakError> {
+    retained_stream_proof_inner(plan, dns, upstream, sequence, true).await
+}
+
+async fn retained_stream_proof_inner(
+    plan: RetainedProofPlan<'_>,
+    dns: &mut FixtureProcess,
+    upstream: &mut FixtureProcess,
+    sequence: &mut u64,
+    capture: bool,
 ) -> Result<Value, SoakError> {
     let RetainedProofPlan {
         gateway,
@@ -988,6 +1886,7 @@ async fn retained_stream_proof(
             .ok_or_else(|| fail("fixture B missing"))?,
     ];
     let mut client = DataClient::connect(gateway_address, h2, true, targets, payload_size).await?;
+    client.capture_raw = capture;
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut held = loop {
         if let Some(body) = client.hold_grpc().await? {
@@ -998,10 +1897,15 @@ async fn retained_stream_proof(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    let mut tunnel = open_upgrade(gateway_address, h1)
-        .await?
-        .ok_or_else(|| fail("initial Upgrade fixture unavailable"))?;
-    echo_upgrade(&mut tunnel).await?;
+    let (tunnel, mut upgrade_raw) = open_upgrade_capture(gateway_address, h1, capture).await?;
+    let mut tunnel = tunnel.ok_or_else(|| fail("initial Upgrade fixture unavailable"))?;
+    let mut upgrade_digest = Sha256::new();
+    echo_upgrade_capture(
+        &mut tunnel,
+        upgrade_raw.as_mut(),
+        capture.then_some(&mut upgrade_digest),
+    )
+    .await?;
     let before: Value =
         serde_json::from_slice(&admin_read(root, "/api/v1/runtime").await?).map_err(json_error)?;
     dns.command(FixtureCommand::Dns {
@@ -1025,12 +1929,21 @@ async fn retained_stream_proof(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let mut successful_new_b_streams = 0;
+    let mut new_b_streams_raw = Vec::new();
     for _ in 0..8 {
         // request() has already checked the actual B socket, fixed SNI,
         // authority, path, every opaque gRPC byte and the final trailers. A
         // non-200 response skips those checks, so it cannot count as proof.
         let response = client.request(true, false, Some("b")).await?;
         validate_completed_new_b_stream(response, payload_size)?;
+        if capture {
+            let mut raw = client
+                .last_raw
+                .clone()
+                .ok_or_else(|| fail("new B raw response missing"))?;
+            raw.operation_id = format!("retained:new-b-{successful_new_b_streams}");
+            new_b_streams_raw.push(raw);
+        }
         successful_new_b_streams += 1;
     }
     let normal_drops = upstream.command(FixtureCommand::Status).await?["body_drops"]
@@ -1093,9 +2006,43 @@ async fn retained_stream_proof(
                 .into(),
         ],
     );
+    let publication_before_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
     command_json(gateway, &activate, results, sequence).await?;
-    echo_upgrade(&mut tunnel).await?;
+    let publication_after_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
+    echo_upgrade_capture(
+        &mut tunnel,
+        upgrade_raw.as_mut(),
+        capture.then_some(&mut upgrade_digest),
+    )
+    .await?;
     tunnel.shutdown().await.map_err(io_error)?;
+    if let Some(raw) = &mut upgrade_raw {
+        raw.body_sha256 = upgrade_digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        raw.eof = true;
+        raw.tunnel_client_shutdown = true;
+        let mut tail = [0u8; 1];
+        if tokio::time::timeout(Duration::from_secs(3), tunnel.read(&mut tail))
+            .await
+            .map_err(|_| fail("captured retained tunnel peer EOF deadline"))?
+            .map_err(io_error)?
+            != 0
+        {
+            return Err(fail("captured retained tunnel trailing data"));
+        }
+        raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+    }
     upstream.command(FixtureCommand::Release).await?;
     let mut status_trailer = false;
     while let Some(frame) = held.body.frame().await {
@@ -1104,6 +2051,14 @@ async fn retained_stream_proof(
             held.validator.push(data)?;
         }
         if let Some(trailers) = frame.trailers_ref() {
+            if let Some(raw) = &mut held.raw {
+                for (name, value) in trailers {
+                    raw.trailers.insert(
+                        name.to_string(),
+                        value.to_str().map_err(io_error)?.to_owned(),
+                    );
+                }
+            }
             status_trailer |= trailers.get("grpc-status").is_some_and(|v| v == "0")
                 && trailers.get("grpc-message").is_some_and(|v| v == "ok");
         }
@@ -1114,12 +2069,23 @@ async fn retained_stream_proof(
         ));
     }
     held.validator.finish()?;
+    if let Some(raw) = &mut held.raw {
+        raw.body_bytes = held.validator.seen as u64;
+        raw.body_sha256 = held.validator.digest().expect("captured held validator");
+        raw.data_observed = raw.body_bytes > 0;
+        raw.eof = true;
+        raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+    }
     if upstream.command(FixtureCommand::Status).await?["body_drops"] != normal_drops + 1 {
         return Err(fail(
             "released completed gRPC stream was falsely counted as cancelled",
         ));
     }
-    drop(client);
+    if capture {
+        client.close_captured().await?;
+    } else {
+        drop(client);
+    }
     let after_activate = command_json(gateway, &ctl(root, &["status"]), results, sequence).await?;
     if after_activate["etag"] == before["etag"] || after_activate["bundle_digest"] != b {
         return Err(fail("authenticated activation did not publish B"));
@@ -1141,9 +2107,16 @@ async fn retained_stream_proof(
         ttl: 3,
     })
     .await?;
-    Ok(
-        json!({"held_h2_grpc_completed":true,"grpc_status_trailer":true,"opaque_grpc_bytes_verified":true,"gateway_cancelled_termination_delta":cancelled_delta,"fixture_unreleased_body_drop_delta":1,"upgrade_across_withdrawal_and_publication":true,"successful_new_b_streams":successful_new_b_streams,"withdrawn_endpoint_new_streams":0,"unchanged_dns_runtime":before,"after_dns":after_dns,"after_activate":after_activate}),
-    )
+    let mut result = json!({"held_h2_grpc_completed":true,"grpc_status_trailer":true,"opaque_grpc_bytes_verified":true,"gateway_cancelled_termination_delta":cancelled_delta,"fixture_unreleased_body_drop_delta":1,"upgrade_across_withdrawal_and_publication":true,"successful_new_b_streams":successful_new_b_streams,"withdrawn_endpoint_new_streams":0,"unchanged_dns_runtime":before,"after_dns":after_dns,"after_activate":after_activate});
+    if capture {
+        result["new_b_streams_raw"] =
+            serde_json::to_value(new_b_streams_raw).map_err(json_error)?;
+        result["held_grpc_raw"] = serde_json::to_value(held.raw).map_err(json_error)?;
+        result["upgrade_raw"] = serde_json::to_value(upgrade_raw).map_err(json_error)?;
+        result["publication_window"] =
+            json!({"before_ns":publication_before_ns,"after_ns":publication_after_ns});
+    }
+    Ok(result)
 }
 
 pub(super) async fn run_controller(args: ProcessArguments) -> Result<(), SoakError> {
@@ -1796,6 +2769,116 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_uploads_have_exact_wire_size_and_bounded_frames() {
+        for grpc in [false, true] {
+            for size in [0usize, 1, 1024, 1025, 16 * 1024 * 1024] {
+                let mut body = GeneratedUpload::new(grpc, size);
+                let expected = size + if grpc { 5 } else { 0 };
+                assert_eq!(body.size_hint().exact(), Some(expected as u64));
+                let mut seen = 0usize;
+                let prefix = [
+                    0,
+                    (size >> 24) as u8,
+                    (size >> 16) as u8,
+                    (size >> 8) as u8,
+                    size as u8,
+                ];
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.expect("generated upload is infallible");
+                    let data = frame.data_ref().expect("only DATA in this recipe");
+                    assert!(data.len() <= 1024);
+                    for byte in data {
+                        let wanted = if grpc && seen < 5 { prefix[seen] } else { b'u' };
+                        assert_eq!(*byte, wanted, "every wire byte is independently checked");
+                        seen += 1;
+                    }
+                    assert_eq!(body.size_hint().exact(), Some((expected - seen) as u64));
+                }
+                assert_eq!(seen, expected);
+                assert!(body.is_end_stream());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_driver_close_receipt_preserves_actual_completion_error_and_cancellation() {
+        for expected in ["completed", "error", "cancelled", "panicked"] {
+            let driver = tokio::spawn(async move {
+                match expected {
+                    "completed" => Ok(()),
+                    "error" => Err("http1_driver_error".to_owned()),
+                    "panicked" => panic!("test-only driver panic must not become completed"),
+                    _ => std::future::pending().await,
+                }
+            });
+            if expected == "cancelled" {
+                driver.abort();
+            }
+            let client = ResourceDataClient {
+                sender: None,
+                driver: Some(driver),
+                h2: false,
+                targets: Vec::new(),
+            };
+            let receipt = client.close_receipt().await;
+            assert_eq!(receipt["result"], expected);
+            assert_eq!(receipt["join_acknowledged"], true);
+            assert!(receipt["exit_ns"].as_u64().is_some());
+            assert_eq!(receipt["abort_requested"], false);
+            if expected == "error" {
+                assert_eq!(receipt["code"], "http1_driver_error");
+            }
+        }
+        let unavailable = ResourceDataClient {
+            sender: None,
+            driver: None,
+            h2: false,
+            targets: Vec::new(),
+        }
+        .close_receipt()
+        .await;
+        assert_eq!(unavailable["result"], "unavailable");
+        assert_eq!(unavailable["join_acknowledged"], false);
+        assert!(
+            unavailable["exit_ns"].is_null(),
+            "no observed exit is not fabricated"
+        );
+    }
+
+    #[test]
+    fn raw_missing_metadata_stays_null_and_captured_digest_is_independent_of_legacy_flag() {
+        let facts = ResourceResponseFacts::blank("op-1".into(), "h2");
+        let raw = serde_json::to_value(&facts).expect("valid raw JSON");
+        for key in [
+            "status",
+            "started_ns",
+            "upstream_peer",
+            "authority",
+            "server_name",
+            "path",
+        ] {
+            assert!(raw[key].is_null(), "unavailable {key} is not fabricated");
+        }
+        assert!(!facts.request_head_sent && !facts.eof && !facts.fixture_cancel_ack);
+        let mut validator = PayloadValidator::new(false, 3, b'a');
+        assert!(
+            validator.digest().is_none(),
+            "ordinary legacy requests do not hash bodies"
+        );
+        validator.capture();
+        validator
+            .push(&Bytes::from_static(b"axx"))
+            .expect("exact legacy recipe");
+        validator.finish().expect("complete recipe");
+        let expected: String = Sha256::digest(b"axx")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(validator.digest().as_deref(), Some(expected.as_str()));
+    }
+
     #[test]
     fn all_fixture_cycles_keep_health_retry_and_declared_availability_consistent() {
         // Two complete LCM(11 modes, 4 health toggles, 3 retry toggles) cycles;
