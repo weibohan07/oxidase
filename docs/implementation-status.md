@@ -18,7 +18,11 @@ but their positive resident drift remains INCONCLUSIVE. Formal C's original
 unacknowledged cancellation and H2 upload errors remain failures, not whitelisted
 expected faults. No production leak is inferred and retention policy is unchanged.
 Formal Linux resource/memory qualification and allocation attribution remain
-unclosed. See
+unclosed. Formal healthy H completed its full hour and Running recovery/Quiet
+with all 1185958 operations classified and no unexpected outcome, but its sealed
+report remains INCONCLUSIVE (TLS close, capacity and resident attribution gaps).
+Actual external heaptrack collection/parsing succeeded only for a separate
+60-second debug-enabled H1 experiment, not normal H/C attribution. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
 ## Baseline

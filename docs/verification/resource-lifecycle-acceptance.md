@@ -58,9 +58,9 @@ This is local macOS validation, not a Linux campaign or new Hosted check.
 | RL-06 | no-scrape Running retirement, 0/low/high scrape controls | PASS_IMPLEMENTATION; three complete Linux Respond controls, positive drift INCONCLUSIVE and no-scrape Running lifecycle unavailable |
 | RL-07 | healthy and fault lanes fully validate DATA/trailers with all operations classified | PASS_IMPLEMENTATION for conservation/oracle; original actual H/C failures remain FAIL, final repeat pending |
 | RL-08 | bounded fault windows and real recovery deadlines, AAAA/timeout/post-head failure | PASS_IMPLEMENTATION: adversarial oracle and real fixture corpus; complete C qualification pending |
-| RL-09 | warm / steady / recovery-running / quiet-running / post-drain measurements | first short H measured; C stopped early; formal qualification pending |
+| RL-09 | warm / steady / recovery-running / quiet-running / post-drain measurements | formal H completed all minima with actual Running reclamation; original INCONCLUSIVE, all C attempts so far stopped early |
 | RL-10 | independent verifier rejects missing data, false healthy, leak and lost results | PASS_IMPLEMENTATION: negative corpus and actual Hosted artifact rejections; never promotes controller claim to PASS |
-| RL-11 | exact implementation/tool/binary/PID identity and untruncated raw evidence | PASS_IMPLEMENTATION: verified source/binary/PID records and byte-identical original replay; final campaign pending |
+| RL-11 | exact implementation/tool/binary/PID identity and untruncated raw evidence | PASS_IMPLEMENTATION; sealed formal H and original C/provider/per-file/frozen-replay indices, earlier truncated C remains FAIL |
 | RL-12 | evidence-driven attribution, necessary regression-backed fixes and Linux repeat | INCONCLUSIVE: multiple preserved failures and regression-backed tool repairs; no proven production-retention defect |
 | RL-13 | final-head and independent main CI for all three PRs | PR #20 and #21 PASS; PR #22 Draft, final delivery pending |
 

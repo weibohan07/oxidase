@@ -183,6 +183,53 @@ pools, health or DNS; absent periodic Admin cannot prove Running lifetimes.
 They do not establish a scrape-rate effect or assign those pages to an
 allocator. All three independent reports remain INCONCLUSIVE.
 
+### Complete formal healthy load (H), still INCONCLUSIVE
+
+[The sealed H index](artifacts/resource-7a-097c6ec-formal-h.json) records source
+`097c6ec`, run `37204003262`, artifact `11305298669`, all 35 verified files
+and exact frozen-original-analyzer replay. Actual phase seconds were
+180.088 / 3600.031 / 900.071 / 300.019 / 300.005. The normal release remained
+Running through recovery and Quiet; explicit drain came only afterward.
+
+All 1185958 offered operations were received: 1176872 complete ordinary/gRPC
+responses, 4463 actual acknowledged cancellations, 4623 complete Upgrade
+exchanges. All 1178 deliberate connection retirements had actual join receipts.
+No unexpected workload outcome or FAIL finding was observed in this exact H
+capture. This conclusion applies to that source/configuration/platform/seed,
+not every protocol behavior or the later C tools.
+
+| Phase | RSS baseline / peak / final KiB | FD baseline / peak / final |
+| --- | --- | --- |
+| 60-minute steady | 29636 / 32976 / 31404 | 33 / 35 / 33 |
+| Recovery Running | 31228 / 32420 / 29528 | see original time series |
+| Quiet Running | 28632 / 29748 / 29120 | 24 / 24 / 22 |
+| Post-drain | 29120 / 29120 / 29120 | 21 to 19 |
+
+Steady PSS had 339 actual observations, 27505/29788/28324 KiB; Private_Dirty
+was 12192/14476/13012. Full-phase RSS slope was +0.58315 KiB/s, while the
+fixed final-half slope was -0.25747: both remain visible rather than choosing
+the favorable window. Five-minute RSS medians were 29774, 29622, 29754,
+29926, 30084, 30464, 29832, 30080, 31140, 31208, 31664, 31260 KiB.
+Recovery declined, but Quiet gained 488 KiB; no retained-allocation proof
+assigns either increment to an allocator or leak.
+
+Actual snapshot instances stayed current=1/retired=0 in steady Running; health
+and discovery supervisor owners stayed one each. During **Quiet Running**,
+physical TCP dropped four to two, executor futures twelve to eight, and bodies
+and tunnels reached zero. Only afterward did drain retire supervisor owners;
+TCP later reached zero, tasks eight to four. The current Proxy/Health Client
+families (four/two) still have legal current ownership and must not be forced
+to zero. These are real reclamation intervals, not registry lengths or a
+scrape-triggered sweep, but fixed H does not prove churn-generation bounds.
+
+The original report remains INCONCLUSIVE and its Hosted job non-green:
+4625 `RL_GRACEFUL_TLS_CLOSE`, 21 `RL_CAPACITY_UNPROVEN`, two
+`RL_MEMORY_ATTRIBUTION` findings, zero FAIL. Only the first 200 repeated TLS
+notices fit in its detail list. The sealed index retains all actual code counts;
+the analyzer now also emits bounded per-code counts before detail truncation.
+That additive visibility change does not alter verdicts, thresholds, or the
+original report. A complete hour is not whole-resource or memory qualification.
+
 Formal H/C must preserve original minima and complete operation conservation,
 full content/trailer validation, finite faults with fresh affected-peer recovery,
 old A held/Upgrade proof, and Running-only reclamation before drain. Missing
