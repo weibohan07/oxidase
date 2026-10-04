@@ -21,7 +21,7 @@ restarting gateway is a permitted production fix.
 | bounded cache filling | entry/byte growth saturates at declared owner capacity | bounded-scale saturation, no-scrape and background-only controls | capacity varies by owner; no peak-derived bounds permitted |
 | legitimate Admin receipts/audit/history | growth follows successful mutations, stays within existing retention rules | fixed DNS/no publication and existing count/byte eviction tests | CandidateStore history is metadata, not retained RuntimeSnapshot; volatile recovery container global bound unproven |
 | allocator retention/fragmentation | object/allocation evidence stable while resident private pages remain | external allocation stacks plus RSS/PSS/Private_Dirty, separate profiled and normal release runs | NOT ATTRIBUTED; a positive/flat RSS line alone proves neither hypothesis |
-| observation itself changes growth | growth follows scrape rate with otherwise matched full-success load | pure reads, low/high/zero periodic scrape and observation-disabled comparison | pure-read regressions pass; actual rate-matched memory experiment pending |
+| observation itself changes growth | growth follows scrape rate with otherwise matched full-success load | pure reads, low/high/zero periodic scrape and observation-disabled comparison | three actual matched Respond controls completed; all positive drift remains INCONCLUSIVE, cross-machine values do not identify causation |
 
 ## Proven local boundaries are not global bounds
 
@@ -132,7 +132,56 @@ own-process PID/start/binary validation; no allocator replacement or Yama bypass
 fixture is HTTP/1 Proxy/Asset, not TLS/H2 H/C qualification. `CAPTURED` means
 only a bounded trace was actually collected and parsed; unfreed-at-exit values
 are not proof of a leak. Late/unjoined sampler, full-response deadline and PID
-ownership negative tests must reject false capture. Actual Linux run pending.
+ownership negative tests must reject false capture. Actual attempts and their
+failures are preserved separately; completion of the native build does not
+prove collection, parsing or source attribution.
+
+### Subsequent original failures and matched controls
+
+[The original failure index](artifacts/resource-7a-876dbdb-097c6ec-hosted-failures.json)
+preserves C run `37201451796` at `876dbdb` (seed 700213) and formal C run
+`37204003262` at `097c6ec` (seed 700214), including exact binary/PID identities,
+provider archive hashes, all per-file checks, and identical frozen-analyzer
+replay. Neither completed Recovery Running or Quiet Running; those missing
+measurements remain null.
+
+The first hit the unchanged 64-MiB error-journal cap: unwindowed TTL-zero
+withdrawal had generated tens of thousands of complete 503s. The repair defines
+TTL zero as its own finite physical fault/restore window, not a new production
+lease rule. A bounded contiguous-range journal now preserves only individually
+received, identical complete safe 503s inside a single allowed C window; it
+never compresses healthy errors, transport failures, cancellation or partial
+bodies. Independent negative tests reject lost, overlapping, cross-window or
+incorrectly fingerprinted ranges. The original truncated file remains FAIL.
+
+Formal C then conserved all 88364 offered/terminal operations and its compact
+record stayed within capacity, but stopped after 54.465 seconds of steady with
+`resource.control_peer_recovery_unproven:dns_readd`. Raw probes already proved
+a complete fresh B followed by a complete fresh A inside the same original
+12-second recovery deadline. The sequential A-then-B helper discarded B while
+looking for A. Its repair retains a shared physical-peer witness set, verifies
+each full body/metadata/EOF, and applies one unchanged deadline measured from
+the actual window end. It neither changes load balancing nor retries business
+requests. A fixed finite probe cap is additional to, not a replacement for,
+that common deadline. The eight new B streams in the original held-flow proof
+remain mandatory.
+
+That original also contains an unacknowledged warmup body cancellation and
+eleven H2 large-upload response-head transport errors inside an NXDOMAIN
+window allowing **only complete 503s**. Those facts are not excused by the
+controller repair, safe root error mapping, or a gateway cancellation metric.
+Their upstream physical Drop/reset causes remain unproven; no broader fault
+allowance or production protocol change is justified by this coarse evidence.
+
+[Three actual Respond-only scrape controls](artifacts/7a3-097-respond-scrape-controls.md)
+ran at the same frozen source/seed/phase recipe on independent Linux runners:
+first/final-only, 1-Hz and 4-Hz Admin sampling, with independent 1-Hz OS capture.
+All 170467 / 170443 / 170522 operations were fully verified 16-byte responses,
+with no abandoned or unexpected workload terminals. Steady RSS increments were
+676 / 620 / 480 KiB, respectively. These controls do not exercise upstream
+pools, health or DNS; absent periodic Admin cannot prove Running lifetimes.
+They do not establish a scrape-rate effect or assign those pages to an
+allocator. All three independent reports remain INCONCLUSIVE.
 
 Formal H/C must preserve original minima and complete operation conservation,
 full content/trailer validation, finite faults with fresh affected-peer recovery,

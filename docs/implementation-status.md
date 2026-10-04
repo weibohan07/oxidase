@@ -10,9 +10,13 @@ main push passed `37197386244`. Separate-process healthy/churn/isolated workload
 raw operation conservation, Running recovery/quiet windows, independent sampling
 and an offline positive/negative oracle are implemented. Initial Linux smoke and
 the first short H/C campaign failed; their original artifacts remain unchanged.
-PR #22 addresses the observed validation defects (connection request-budget
-retirement and canonical SRV target comparison) with independent raw-journal
-regressions. It does not infer a production leak or change retention policy.
+PR #22 addresses evidence-backed validation defects: explicit connection-budget
+retirement, dispatcher readiness, canonical SRV/AAAA witnesses, finite TTL-zero
+faults, lossless bounded safe-503 storage, and common-deadline multi-peer recovery.
+Three actual Respond scrape controls fully validated about 170000 replies each,
+but their positive resident drift remains INCONCLUSIVE. Formal C's original
+unacknowledged cancellation and H2 upload errors remain failures, not whitelisted
+expected faults. No production leak is inferred and retention policy is unchanged.
 Formal Linux resource/memory qualification and allocation attribution remain
 unclosed. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
