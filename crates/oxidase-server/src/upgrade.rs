@@ -20,7 +20,7 @@ use oxidase_runtime::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::body::GatewayRequestBody;
+use crate::body::{GatewayRequestBody, UnconsumedH2Body};
 use crate::protocol::RequestTrailerGuard;
 
 /// A validated, normalized HTTP Upgrade protocol identifier.
@@ -93,9 +93,10 @@ impl UpgradeCandidate {
 /// Keeping the upgrade capability next to the one-shot incoming body prevents
 /// fallback or a non-Proxy Service from recreating it from ordinary headers.
 pub(crate) struct GatewayRequestPayload {
-    body: GatewayRequestBody,
+    body: Option<GatewayRequestBody>,
     upgrade: Option<PendingUpgrade>,
-    trailer_guard: RequestTrailerGuard,
+    trailer_guard: Option<RequestTrailerGuard>,
+    unconsumed_h2: Option<UnconsumedH2Body>,
 }
 
 impl GatewayRequestPayload {
@@ -105,20 +106,51 @@ impl GatewayRequestPayload {
         trailer_guard: RequestTrailerGuard,
     ) -> Self {
         Self {
-            body,
+            body: Some(body),
             upgrade,
-            trailer_guard,
+            trailer_guard: Some(trailer_guard),
+            unconsumed_h2: None,
         }
     }
 
+    pub(crate) fn with_unconsumed_h2(mut self, slot: UnconsumedH2Body) -> Self {
+        debug_assert!(
+            self.upgrade.is_none(),
+            "HTTP/1 Upgrade has no H2 disposition"
+        );
+        self.unconsumed_h2 = Some(slot);
+        self
+    }
+
     pub(crate) fn into_parts(
-        self,
+        mut self,
     ) -> (
         GatewayRequestBody,
         Option<PendingUpgrade>,
         RequestTrailerGuard,
     ) {
-        (self.body, self.upgrade, self.trailer_guard)
+        // Once Proxy has claimed the payload, its upload/response guards own
+        // it. Never return that body to the root, even if an attempt fails or
+        // has not polled input yet.
+        self.unconsumed_h2.take();
+        (
+            self.body.take().expect("one-shot request payload"),
+            self.upgrade.take(),
+            self.trailer_guard.take().expect("request trailer policy"),
+        )
+    }
+}
+
+impl Drop for GatewayRequestPayload {
+    fn drop(&mut self) {
+        if let Some(slot) = self.unconsumed_h2.take()
+            && let Some(body) = self.body.take()
+        {
+            slot.recover(
+                body,
+                self.trailer_guard.take().expect("request trailer policy"),
+            );
+        }
     }
 }
 

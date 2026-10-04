@@ -2,8 +2,8 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,8 +17,12 @@ use oxidase_runtime::{
 };
 use tokio::time::{Instant, Sleep};
 
+use crate::connection::{
+    H2DispositionDeadlineGuard, H2DispositionTimeoutSignal, arm_h2_disposition_deadline,
+    h2_disposition_timeout_signal,
+};
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
-use crate::protocol::TrailerGuard;
+use crate::protocol::{RequestTrailerGuard, TrailerGuard};
 use crate::upgrade::TunnelPlan;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -272,6 +276,234 @@ fn timeout_downstream_response_body(body: GatewayBody, timeout: Duration) -> Gat
     TimeoutBody::new(body, timeout, BodyIdleDirection::DownstreamResponse).boxed_unsync()
 }
 
+/// A one-shot ownership handoff, not an observer or replay buffer. Only a
+/// payload that has never entered Proxy may return its unread HTTP/2 body here.
+/// The request handler takes it immediately after Service execution; no task or
+/// global registry retains this slot.
+#[derive(Clone, Default)]
+pub(crate) struct UnconsumedH2Body(Arc<Mutex<Option<(GatewayRequestBody, RequestTrailerGuard)>>>);
+
+impl UnconsumedH2Body {
+    pub(crate) fn recover(&self, body: GatewayRequestBody, trailers: RequestTrailerGuard) {
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((body, trailers));
+        debug_assert!(previous.is_none(), "unread payload is handed off once");
+    }
+
+    fn take(&self) -> Option<(GatewayRequestBody, RequestTrailerGuard)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+const H2_DISPOSITION_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const H2_DISPOSITION_MAX_DURATION: Duration = Duration::from_secs(30);
+const H2_DISPOSITION_FRAMES_PER_POLL: usize = 32;
+
+/// Early ordinary HTTP/2 responses may send their head and DATA immediately,
+/// but retain stream ownership until unread input is disposed. Sending terminal
+/// trailers/EOS first would make h2 reset an unfinished upload; late DATA on
+/// forgotten reset streams can then exhaust its real protocol-error budget.
+/// Explicit 400/413 rejection remains fail-fast, as does invalid ingress before
+/// this ownership handoff is constructed. HTTP/1 and claimed Proxy bodies never
+/// reach this adapter.
+pub(crate) fn retain_unconsumed_h2_body(
+    response: http::Response<GatewayBody>,
+    slot: UnconsumedH2Body,
+    request_idle_timeout: Duration,
+) -> http::Response<GatewayBody> {
+    let Some((request, trailers)) = slot.take() else {
+        return response;
+    };
+    if request.is_end_stream() || matches!(response.status().as_u16(), 400 | 413) {
+        return response;
+    }
+    let (parts, response) = response.into_parts();
+    let body = H2BodyDisposition::new(
+        response,
+        request,
+        trailers,
+        H2_DISPOSITION_MAX_BYTES,
+        request_idle_timeout.min(H2_DISPOSITION_MAX_DURATION),
+    )
+    .boxed_unsync();
+    http::Response::from_parts(parts, body)
+}
+
+#[derive(Debug)]
+struct H2DispositionLimit;
+
+impl std::fmt::Display for H2DispositionLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unread HTTP/2 request body disposition limit exceeded")
+    }
+}
+
+impl Error for H2DispositionLimit {}
+
+#[derive(Debug)]
+struct H2DispositionDeadline;
+
+impl std::fmt::Display for H2DispositionDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unread HTTP/2 request body disposition deadline expired")
+    }
+}
+
+impl Error for H2DispositionDeadline {}
+
+struct H2BodyDisposition {
+    response: GatewayBody,
+    request: Option<GatewayRequestBody>,
+    request_trailers: RequestTrailerGuard,
+    deadline: Pin<Box<Sleep>>,
+    stream_deadline: Option<H2DispositionDeadlineGuard>,
+    max_bytes: u64,
+    bytes: u64,
+    response_ended: bool,
+    terminal_trailers: Option<http::HeaderMap>,
+    terminated: bool,
+}
+
+impl H2BodyDisposition {
+    fn new(
+        response: GatewayBody,
+        request: GatewayRequestBody,
+        request_trailers: RequestTrailerGuard,
+        max_bytes: u64,
+        total: Duration,
+    ) -> Self {
+        let now = Instant::now();
+        let deadline = now.checked_add(total).unwrap_or(now);
+        let response_ended = response.is_end_stream();
+        Self {
+            response,
+            request: Some(request),
+            request_trailers,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            stream_deadline: arm_h2_disposition_deadline(deadline),
+            max_bytes,
+            bytes: 0,
+            response_ended,
+            terminal_trailers: None,
+            terminated: false,
+        }
+    }
+
+    fn poll_disposition(&mut self, context: &mut Context<'_>) -> Result<(), BoxError> {
+        if self.request.is_none() {
+            return Ok(());
+        }
+        if self.deadline.as_mut().poll(context).is_ready() {
+            return Err(Box::new(H2DispositionDeadline));
+        }
+        for _ in 0..H2_DISPOSITION_FRAMES_PER_POLL {
+            let request = self.request.as_mut().expect("unread request retained");
+            match Pin::new(&mut *request).poll_frame(context) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(bytes) = frame.data_ref() {
+                        self.bytes = self
+                            .bytes
+                            .checked_add(bytes.len() as u64)
+                            .filter(|bytes| *bytes <= self.max_bytes)
+                            .ok_or_else(|| Box::new(H2DispositionLimit) as BoxError)?;
+                    }
+                    if let Some(trailers) = frame.trailers_ref() {
+                        self.request_trailers.validate(trailers)?;
+                    }
+                    if request.is_end_stream() {
+                        self.request.take();
+                        self.stream_deadline.take();
+                        return Ok(());
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => return Err(error),
+                Poll::Ready(None) => {
+                    self.request.take();
+                    self.stream_deadline.take();
+                    return Ok(());
+                }
+                Poll::Pending => return Ok(()),
+            }
+        }
+        // Bound synchronous discard work. Retain the same absolute timer and
+        // let other streams progress rather than monopolizing a worker.
+        context.waker().wake_by_ref();
+        Ok(())
+    }
+}
+
+impl Body for H2BodyDisposition {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        if let Err(error) = self.poll_disposition(context) {
+            self.terminated = true;
+            self.request.take();
+            self.stream_deadline.take();
+            return Poll::Ready(Some(Err(error)));
+        }
+        if !self.response_ended && self.terminal_trailers.is_none() {
+            match Pin::new(&mut self.response).poll_frame(context) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.is_trailers() {
+                        self.terminal_trailers =
+                            Some(frame.into_trailers().expect("trailer frame"));
+                        self.response_ended = true;
+                    } else {
+                        self.response_ended = self.response.is_end_stream();
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.terminated = true;
+                    self.request.take();
+                    self.stream_deadline.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => self.response_ended = true,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if self.response_ended && self.request.is_none() {
+            self.terminated = true;
+            return Poll::Ready(
+                self.terminal_trailers
+                    .take()
+                    .map(|trailers| Ok(Frame::trailers(trailers))),
+            );
+        }
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminated
+            || (self.response_ended && self.request.is_none() && self.terminal_trailers.is_none())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.response_ended {
+            SizeHint::with_exact(0)
+        } else {
+            // Preserve representation length, but never let it substitute for
+            // the real two-sided EOS boundary above.
+            self.response.size_hint()
+        }
+    }
+}
+
 /// Preserves streaming body frames while enforcing the downstream trailer
 /// contract selected from the response head and wire protocol.
 ///
@@ -401,6 +633,7 @@ struct InstrumentedBody {
     termination: Option<BodyTermination>,
     snapshot: Option<Arc<RuntimeSnapshot>>,
     downstream_timeout: Option<DownstreamTimeoutSignal>,
+    h2_disposition_timeout: Option<H2DispositionTimeoutSignal>,
     _resource: ResourceToken,
 }
 
@@ -426,6 +659,7 @@ impl InstrumentedBody {
             termination: None,
             snapshot,
             downstream_timeout,
+            h2_disposition_timeout: h2_disposition_timeout_signal(),
             _resource: census.token(ResourceKind::ResponseBody, ResourceState::Live),
         };
         if body.inner.is_end_stream() {
@@ -470,6 +704,7 @@ impl Body for InstrumentedBody {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
                     || error.downcast_ref::<BodyIdleTimeout>().is_some()
+                    || error.downcast_ref::<H2DispositionDeadline>().is_some()
                 {
                     BodyTermination::Timeout
                 } else {
@@ -502,6 +737,10 @@ impl Drop for InstrumentedBody {
                 .downstream_timeout
                 .as_ref()
                 .is_some_and(DownstreamTimeoutSignal::is_marked)
+                || self
+                    .h2_disposition_timeout
+                    .as_ref()
+                    .is_some_and(H2DispositionTimeoutSignal::is_marked)
             {
                 BodyTermination::Timeout
             } else {
@@ -703,6 +942,657 @@ mod tests {
     }
 
     struct PendingBody;
+
+    struct WatchedIncoming {
+        inner: hyper::body::Incoming,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Body for WatchedIncoming {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            self.polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::pin::Pin::new(&mut self.inner)
+                .poll_frame(context)
+                .map(|frame| frame.map(|frame| frame.map_err(|error| Box::new(error) as BoxError)))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.inner.is_end_stream()
+        }
+    }
+
+    impl Drop for WatchedIncoming {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[derive(Clone)]
+    enum DispositionTestExecutor {
+        Scoped(crate::connection::TrackedExecutor),
+        Cooperative(hyper_util::rt::TokioExecutor),
+    }
+
+    impl<F> hyper::rt::Executor<F> for DispositionTestExecutor
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        fn execute(&self, future: F) {
+            match self {
+                Self::Scoped(executor) => executor.execute(future),
+                Self::Cooperative(executor) => executor.execute(future),
+            }
+        }
+    }
+
+    async fn zero_response_window_disposition_case(scoped: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("zero-window wire fixture");
+        let address = listener.local_addr().expect("zero-window wire fixture");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let metrics = Arc::new(Metrics::default());
+        let watched_drop = Arc::clone(&dropped);
+        let watched_polls = Arc::clone(&polls);
+        let server_metrics = Arc::clone(&metrics);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("zero-window wire fixture");
+            let executor = if scoped {
+                DispositionTestExecutor::Scoped(crate::connection::TrackedExecutor::new(
+                    server_metrics.listener_transport("disposition"),
+                ))
+            } else {
+                DispositionTestExecutor::Cooperative(hyper_util::rt::TokioExecutor::new())
+            };
+            let service =
+                hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+                    let watched_drop = Arc::clone(&watched_drop);
+                    let watched_polls = Arc::clone(&watched_polls);
+                    let metrics = Arc::clone(&server_metrics);
+                    async move {
+                        let mut response = if request.uri().path() == "/blocked" {
+                            let body = super::GatewayRequestBody::Stream(
+                                WatchedIncoming {
+                                    inner: request.into_body(),
+                                    dropped: watched_drop,
+                                    polls: watched_polls,
+                                }
+                                .boxed_unsync(),
+                            );
+                            let response = super::H2BodyDisposition::new(
+                                full_body(Bytes::from_static(b"Service Unavailable")),
+                                body,
+                                super::RequestTrailerGuard::from_request_headers(
+                                    WireProtocol::Http2,
+                                    &HeaderMap::new(),
+                                )
+                                .expect("zero-window wire fixture"),
+                                16 * 1024 * 1024,
+                                Duration::from_secs(1),
+                            );
+                            assert_eq!(response.stream_deadline.is_some(), scoped);
+                            let mut response = Response::new(response.boxed_unsync());
+                            *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+                            response
+                                .headers_mut()
+                                .insert(header::CONTENT_LENGTH, HeaderValue::from_static("19"));
+                            response
+                        } else {
+                            assert!(request.body().is_end_stream());
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("x-proof", HeaderValue::from_static("complete"));
+                            Response::new(
+                                FrameSequenceBody::new([
+                                    Ok(Frame::data(Bytes::from_static(b"healthy"))),
+                                    Ok(Frame::trailers(trailers)),
+                                ])
+                                .boxed_unsync(),
+                            )
+                        };
+                        response
+                            .headers_mut()
+                            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                        let active = metrics.request_started();
+                        Ok::<_, std::convert::Infallible>(instrument_response_body(
+                            response, metrics, active,
+                        ))
+                    }
+                });
+            hyper::server::conn::http2::Builder::new(executor)
+                .timer(hyper_util::rt::TokioTimer::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                .await
+        });
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("zero-window wire fixture");
+        let (mut sender, mut connection) = h2::client::Builder::new()
+            .initial_window_size(0)
+            .handshake::<_, Bytes>(socket)
+            .await
+            .expect("zero-window wire fixture");
+        let mut ping = connection.ping_pong().expect("zero-window wire fixture");
+        let (change_window, mut window_changed) = tokio::sync::mpsc::channel::<()>(1);
+        let driver = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = &mut connection => return result,
+                    Some(()) = window_changed.recv() => {
+                        connection.set_initial_window_size(65535).expect("zero-window wire fixture");
+                    }
+                }
+            }
+        });
+        sender = sender.ready().await.expect("zero-window wire fixture");
+        let (head, mut upload) = sender
+            .send_request(
+                http::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{address}/blocked"))
+                    .body(())
+                    .expect("zero-window wire fixture"),
+                false,
+            )
+            .expect("zero-window wire fixture");
+        upload
+            .send_data(Bytes::from_static(b"unfinished"), false)
+            .expect("zero-window wire fixture");
+        let response = tokio::time::timeout(Duration::from_secs(1), head)
+            .await
+            .expect("zero-window wire fixture")
+            .expect("zero-window wire fixture");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "19");
+        let mut blocked = response.into_body();
+        assert_eq!(blocked.flow_control().available_capacity(), 0);
+        sender = sender.ready().await.expect("zero-window wire fixture");
+        let (sibling_head, _) = sender
+            .send_request(
+                http::Request::builder()
+                    .uri(format!("http://{address}/healthy"))
+                    .body(())
+                    .expect("zero-window wire fixture"),
+                true,
+            )
+            .expect("zero-window wire fixture");
+        let sibling = tokio::time::timeout(Duration::from_secs(1), sibling_head)
+            .await
+            .expect("zero-window wire fixture")
+            .expect("zero-window wire fixture");
+        assert_eq!(sibling.status(), http::StatusCode::OK);
+        assert_eq!(sibling.headers()[header::CONTENT_TYPE], "text/plain");
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("oxidase_active_requests 2")
+        );
+        for _ in 0..5 {
+            tokio::time::timeout(Duration::from_millis(200), ping.ping(h2::Ping::opaque()))
+                .await
+                .expect("zero-window wire fixture")
+                .expect("zero-window wire fixture");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let first_poll_count = polls.load(Ordering::Relaxed);
+        assert!(first_poll_count > 0, "request cleanup was actually polled");
+        if scoped {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !dropped.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("hard expiry drops Incoming even without send capacity");
+            assert_eq!(
+                polls.load(Ordering::Relaxed),
+                first_poll_count,
+                "expiry did not need another Body poll"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), blocked.data())
+                    .await
+                    .expect("zero-window wire fixture")
+                    .expect("zero-window wire fixture")
+                    .is_err(),
+                "expired stream is reset, not fake EOF"
+            );
+            let rendered = metrics.render_prometheus();
+            assert!(rendered.contains("oxidase_active_requests 1"));
+            assert!(
+                rendered.contains("oxidase_response_body_terminations_total{reason=\"timeout\"} 1")
+            );
+            // A sibling that was already active before expiry is not canceled.
+            // The same connection remains live; restore its response window.
+            ping.ping(h2::Ping::opaque())
+                .await
+                .expect("zero-window wire fixture");
+            change_window
+                .send(())
+                .await
+                .expect("zero-window wire fixture");
+            let mut body = sibling.into_body();
+            let mut bytes = Vec::new();
+            while let Some(data) = tokio::time::timeout(Duration::from_secs(1), body.data())
+                .await
+                .expect("zero-window wire fixture")
+            {
+                let data = data.expect("zero-window wire fixture");
+                body.flow_control()
+                    .release_capacity(data.len())
+                    .expect("zero-window wire fixture");
+                bytes.extend_from_slice(&data);
+            }
+            assert_eq!(bytes, b"healthy");
+            let trailers = body
+                .trailers()
+                .await
+                .expect("zero-window wire fixture")
+                .expect("zero-window wire fixture");
+            assert_eq!(trailers["x-proof"], "complete");
+            assert!(body.is_end_stream());
+            assert!(
+                metrics
+                    .render_prometheus()
+                    .contains("oxidase_active_requests 0")
+            );
+        } else {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert!(
+                !dropped.load(Ordering::Acquire),
+                "cooperative Body sleep alone cannot enforce a hard deadline"
+            );
+            assert_eq!(polls.load(Ordering::Relaxed), first_poll_count);
+            assert!(
+                metrics
+                    .render_prometheus()
+                    .contains("oxidase_active_requests 2")
+            );
+            assert!(
+                !metrics
+                    .render_prometheus()
+                    .contains("oxidase_response_body_terminations_total{reason=\"timeout\"} 1")
+            );
+            drop(sibling);
+        }
+        drop(blocked);
+        drop(upload);
+        drop(sender);
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("test server cancellation is acknowledged")
+                .is_cancelled()
+        );
+        driver.abort();
+        let _ = driver.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test cleanup joins drivers and drops the actual Incoming");
+    }
+
+    #[tokio::test]
+    async fn h2_zero_response_window_ping_cannot_bypass_stream_disposition_deadline() {
+        zero_response_window_disposition_case(false).await;
+        zero_response_window_disposition_case(true).await;
+    }
+
+    struct DispositionInput {
+        receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Body for DispositionInput {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            self.polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.receiver.poll_recv(context)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.receiver.is_closed() && self.receiver.is_empty()
+        }
+    }
+
+    impl Drop for DispositionInput {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    type DispositionTestInput = (
+        tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+        super::GatewayRequestBody,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    fn disposition_input() -> DispositionTestInput {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            sender,
+            super::GatewayRequestBody::Stream(
+                DispositionInput {
+                    receiver,
+                    dropped: Arc::clone(&dropped),
+                    polls: Arc::clone(&polls),
+                }
+                .boxed_unsync(),
+            ),
+            dropped,
+            polls,
+        )
+    }
+
+    fn request_trailer_policy() -> crate::protocol::RequestTrailerGuard {
+        crate::protocol::RequestTrailerGuard::from_request_headers(
+            WireProtocol::Http2,
+            &HeaderMap::new(),
+        )
+        .expect("normal H2 trailer policy")
+    }
+
+    #[tokio::test]
+    async fn h2_disposition_sends_data_without_waiting_but_keeps_real_eos() {
+        let (sender, input, dropped, _) = disposition_input();
+        let mut body = super::H2BodyDisposition::new(
+            full_body(Bytes::from_static(b"Service Unavailable")),
+            input,
+            request_trailer_policy(),
+            16,
+            Duration::from_secs(1),
+        );
+        assert_eq!(body.size_hint().exact(), Some(19));
+        assert!(!body.is_end_stream());
+        assert_eq!(
+            body.frame()
+                .await
+                .expect("immediate DATA")
+                .expect("DATA")
+                .into_data()
+                .expect("data"),
+            Bytes::from_static(b"Service Unavailable")
+        );
+        assert!(
+            !body.is_end_stream(),
+            "Content-Length is not input disposition"
+        );
+        let mut next = Box::pin(body.frame());
+        assert!(futures_util::poll!(&mut next).is_pending());
+        sender
+            .send(Ok(Frame::data(Bytes::from_static(b"request"))))
+            .await
+            .expect("input DATA");
+        drop(sender);
+        assert!(next.await.is_none());
+        assert!(body.is_end_stream());
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn h2_disposition_defers_terminal_response_trailers_and_validates_input_trailers() {
+        for forbidden in [false, true] {
+            let (sender, input, dropped, _) = disposition_input();
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            let response = FrameSequenceBody::new([
+                Ok(Frame::data(Bytes::from_static(b"prefix"))),
+                Ok(Frame::trailers(trailers.clone())),
+            ])
+            .boxed_unsync();
+            let mut body = super::H2BodyDisposition::new(
+                response,
+                input,
+                request_trailer_policy(),
+                16,
+                Duration::from_secs(1),
+            );
+            assert_eq!(
+                body.frame()
+                    .await
+                    .expect("response DATA")
+                    .expect("frame")
+                    .into_data()
+                    .expect("data"),
+                Bytes::from_static(b"prefix")
+            );
+            let mut terminal = Box::pin(body.frame());
+            assert!(
+                futures_util::poll!(&mut terminal).is_pending(),
+                "response trailers cannot terminate before input"
+            );
+            let mut input_trailers = HeaderMap::new();
+            input_trailers.insert(
+                if forbidden {
+                    header::CONTENT_LENGTH
+                } else {
+                    http::HeaderName::from_static("x-input")
+                },
+                HeaderValue::from_static("1"),
+            );
+            sender
+                .send(Ok(Frame::trailers(input_trailers)))
+                .await
+                .expect("actual input trailer frame");
+            drop(sender);
+            let result = terminal.await.expect("terminal frame or real error");
+            if forbidden {
+                assert!(
+                    result
+                        .expect_err("forbidden request trailer is not swallowed")
+                        .downcast_ref::<TrailerValidationError>()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect("response trailer")
+                        .into_trailers()
+                        .expect("trailers"),
+                    trailers
+                );
+                assert!(body.frame().await.is_none());
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_disposition_exact_byte_cap_is_allowed_and_one_above_errors() {
+        for bytes in [4, 5] {
+            let (sender, input, dropped, _) = disposition_input();
+            let mut body = super::H2BodyDisposition::new(
+                full_body(Bytes::from_static(b"head-body")),
+                input,
+                request_trailer_policy(),
+                4,
+                Duration::from_secs(1),
+            );
+            body.frame().await.expect("early DATA").expect("response");
+            sender
+                .send(Ok(Frame::data(Bytes::from(vec![b'x'; bytes]))))
+                .await
+                .expect("input bytes");
+            drop(sender);
+            let terminal = body.frame().await;
+            if bytes == 4 {
+                assert!(terminal.is_none());
+            } else {
+                assert!(
+                    terminal
+                        .expect("post-head error")
+                        .expect_err("cap+1 cannot become EOF")
+                        .downcast_ref::<super::H2DispositionLimit>()
+                        .is_some()
+                );
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_disposition_absolute_deadline_is_not_refreshed_by_progress() {
+        let (sender, input, dropped, _) = disposition_input();
+        let mut body = super::H2BodyDisposition::new(
+            full_body(Bytes::from_static(b"early")),
+            input,
+            request_trailer_policy(),
+            16,
+            Duration::from_secs(1),
+        );
+        body.frame().await.expect("early DATA").expect("frame");
+        tokio::time::advance(Duration::from_millis(750)).await;
+        sender
+            .send(Ok(Frame::data(Bytes::from_static(b"x"))))
+            .await
+            .expect("progress inside deadline");
+        let mut pending = Box::pin(body.frame());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(
+            pending
+                .await
+                .expect("real timeout frame")
+                .expect_err("no renewed deadline")
+                .downcast_ref::<super::H2DispositionDeadline>()
+                .is_some()
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_disposition_preserves_request_idle_and_empty_response_cleanup() {
+        let (_sender, input, dropped, _) = disposition_input();
+        let input = super::GatewayRequestBody::Stream(super::timeout_proxy_request_body(
+            input.boxed_unsync(),
+            Duration::from_secs(1),
+        ));
+        let mut body = super::H2BodyDisposition::new(
+            super::empty_body(),
+            input,
+            request_trailer_policy(),
+            16,
+            Duration::from_secs(2),
+        );
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(
+            !body.is_end_stream(),
+            "HEAD/204 representation cannot skip request cleanup"
+        );
+        let mut pending = Box::pin(body.frame());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            pending
+                .await
+                .expect("idle error")
+                .expect_err("idle timeout is preserved")
+                .downcast_ref::<BodyIdleTimeout>()
+                .is_some()
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn h2_disposition_cancellation_drops_input_without_background_work() {
+        let (_sender, input, dropped, _) = disposition_input();
+        let mut body = super::H2BodyDisposition::new(
+            full_body(Bytes::from_static(b"early")),
+            input,
+            request_trailer_policy(),
+            16,
+            Duration::from_secs(1),
+        );
+        body.frame().await.expect("early DATA").expect("frame");
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        drop(body);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn h2_unconsumed_payload_handoff_never_recovers_claimed_proxy_input() {
+        use crate::upgrade::GatewayRequestPayload;
+        for claimed in [false, true] {
+            let (_sender, input, dropped, _) = disposition_input();
+            let slot = super::UnconsumedH2Body::default();
+            let payload = GatewayRequestPayload::new(input, None, request_trailer_policy())
+                .with_unconsumed_h2(slot.clone());
+            if claimed {
+                let (input, _, _) = payload.into_parts();
+                assert!(
+                    slot.take().is_none(),
+                    "Proxy claim permanently disarms root recovery"
+                );
+                assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+                drop(input);
+            } else {
+                drop(payload);
+                assert!(
+                    !dropped.load(std::sync::atomic::Ordering::Acquire),
+                    "root slot owns genuinely unclaimed input"
+                );
+                drop(slot.take().expect("actual one-shot handoff"));
+                assert!(slot.take().is_none());
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_unconsumed_malformed_and_oversize_rejections_remain_fail_fast() {
+        for status in [400, 413] {
+            let (_sender, input, dropped, polls) = disposition_input();
+            let slot = super::UnconsumedH2Body::default();
+            slot.recover(input, request_trailer_policy());
+            let response = Response::builder()
+                .status(status)
+                .body(full_body(Bytes::from_static(b"rejected")))
+                .expect("response");
+            let response = super::retain_unconsumed_h2_body(response, slot, Duration::from_secs(1));
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("fail-fast response bytes")
+                    .to_bytes(),
+                Bytes::from_static(b"rejected")
+            );
+            assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "rejected oversized/malformed body is not discarded"
+            );
+        }
+    }
 
     impl Body for PendingBody {
         type Data = Bytes;
