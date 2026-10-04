@@ -230,6 +230,9 @@ pub(super) struct ResourceResponseFacts {
     pub(super) path: Option<String>,
     pub(super) error_stage: Option<String>,
     pub(super) error_code: Option<String>,
+    pub(super) sender_ready: Option<bool>,
+    pub(super) sender_closed_on_error: Option<bool>,
+    pub(super) sender_error_category: Option<String>,
     pub(super) cancelled: bool,
     pub(super) data_observed: bool,
     pub(super) fixture_cancel_ack: bool,
@@ -265,6 +268,9 @@ impl ResourceResponseFacts {
             path: None,
             error_stage: None,
             error_code: None,
+            sender_ready: None,
+            sender_closed_on_error: None,
+            sender_error_category: None,
             cancelled: false,
             data_observed: false,
             fixture_cancel_ack: false,
@@ -538,6 +544,12 @@ impl ResourceDataClient {
         if self.sender.is_none() {
             return Err(fail("fixture acknowledgement client closed"));
         }
+        match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.ready().await,
+            Some(ResourceSender::H2(sender)) => sender.ready().await,
+            None => return Err(fail("fixture acknowledgement client closed")),
+        }
+        .map_err(io_error)?;
         self.count_request_submission()?;
         let response = match self.sender.as_mut() {
             Some(ResourceSender::H1(sender)) => sender.send_request(request).await,
@@ -662,6 +674,20 @@ impl ResourceDataClient {
             resource_error(facts, "response_head", "client_closed");
             return;
         }
+        // Body EOF and owning a SendRequest are not dispatcher admission. This
+        // wait stays inside measure's existing total deadline; it neither sends
+        // nor consumes body bytes, and never retries an already-started request.
+        let ready = match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.ready().await,
+            Some(ResourceSender::H2(sender)) => sender.ready().await,
+            None => unreachable!("sender existence checked without cancellation gap"),
+        };
+        facts.sender_ready = Some(ready.is_ok());
+        if let Err(error) = ready {
+            self.record_sender_error(facts, &error);
+            resource_error(facts, "response_head", "transport_error");
+            return;
+        }
         if self.count_request_submission().is_err() {
             resource_error(facts, "request", "client_request_counter_exhausted");
             return;
@@ -674,9 +700,13 @@ impl ResourceDataClient {
                 return;
             }
         };
-        let Ok(response) = response else {
-            resource_error(facts, "response_head", "transport_error");
-            return;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_sender_error(facts, &error);
+                resource_error(facts, "response_head", "transport_error");
+                return;
+            }
         };
         facts.status = Some(response.status().as_u16());
         match super::resource_identity::monotonic_ns() {
@@ -770,6 +800,27 @@ impl ResourceDataClient {
             }
         }
         facts.eof = true;
+    }
+
+    fn record_sender_error(&self, facts: &mut ResourceResponseFacts, error: &hyper::Error) {
+        facts.sender_closed_on_error = self.sender.as_ref().map(|sender| match sender {
+            ResourceSender::H1(sender) => sender.is_closed(),
+            ResourceSender::H2(sender) => sender.is_closed(),
+        });
+        facts.sender_error_category = Some(
+            if error.is_canceled() {
+                "cancelled"
+            } else if error.is_closed() {
+                "closed"
+            } else if error.is_parse() {
+                "parse"
+            } else if error.is_timeout() {
+                "timeout"
+            } else {
+                "transport"
+            }
+            .to_owned(),
+        );
     }
 
     fn check_peer_metadata(&self, facts: &mut ResourceResponseFacts, path: &str) {
@@ -3672,6 +3723,98 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_http1_waits_for_occupied_dispatcher_without_retry() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            let service =
+                hyper::service::service_fn(move |_request: Request<hyper::body::Incoming>| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                                .body(Full::new(Bytes::from_static(b"resource-respond")))
+                                .expect("bounded local response"),
+                        )
+                    }
+                });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+        });
+        let (mut sender, connection) = http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("handshake returns a sender before driver polling");
+        // Hyper allows one initial queued request before the driver asks for
+        // work. Keep that real HEAD operation and collect it below, so the
+        // next operation must observe actual dispatcher backpressure.
+        let queued = sender.send_request(
+            Request::builder()
+                .method(http::Method::HEAD)
+                .uri("/resource/respond")
+                .header(header::HOST, "gateway.example.test")
+                .body(GeneratedUpload::new(false, 0))
+                .expect("first real operation"),
+        );
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        // No yield: the current-thread runtime has not polled the spawned
+        // driver. Merely having a sender does not mean its dispatcher is ready.
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 1,
+        };
+        let facts = client
+            .measure(ResourceRequest {
+                operation_id: "fresh-dispatcher".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        let prior = tokio::time::timeout(Duration::from_secs(2), queued).await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("all server work collected")
+            .expect("server task did not panic")
+            .expect("server transport ended normally");
+        assert_eq!(close["result"], "completed");
+        assert_eq!(close["join_acknowledged"], true);
+        let mut prior = prior
+            .expect("queued operation bounded")
+            .expect("queued operation completed");
+        assert_eq!(prior.status(), http::StatusCode::OK);
+        assert_eq!(prior.headers()[header::CONTENT_LENGTH], "16");
+        assert!(
+            prior.body_mut().frame().await.is_none(),
+            "HEAD observed EOS"
+        );
+        assert_eq!(
+            facts.status,
+            Some(200),
+            "dispatcher admission must not become a fake transport failure: {facts:?}; actual server received {} requests",
+            received.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(facts.eof && facts.error_code.is_none());
+        assert_eq!(facts.body_bytes, 16);
+        assert_eq!(submitted, 2, "two actual operations, not hidden retries");
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn resource_client_retires_at_the_exact_declared_submission_budget() {
         let mut client = ResourceDataClient {
@@ -3705,7 +3848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_client_counts_failed_submitted_attempt_without_retrying_or_hiding_it() {
+    async fn resource_client_closed_before_ready_is_failed_without_submission_or_retry() {
         let (socket, peer) = tokio::io::duplex(1024);
         let (sender, connection) = http1::handshake(TokioIo::new(socket))
             .await
@@ -3737,11 +3880,66 @@ mod tests {
         assert_eq!(failed.error_code.as_deref(), Some("transport_error"));
         assert_eq!(failed.error_stage.as_deref(), Some("response_head"));
         assert!(failed.status.is_none() && !failed.eof);
-        assert_eq!(client.submitted_requests(), 1);
+        assert_eq!(failed.sender_ready, Some(false));
+        assert_eq!(failed.sender_closed_on_error, Some(true));
+        assert_eq!(failed.sender_error_category.as_deref(), Some("closed"));
+        assert_eq!(client.submitted_requests(), 0, "closed before actual send");
         assert!(!client.needs_retirement());
         let closed = client.close_receipt().await;
         assert_eq!(closed["join_acknowledged"], true);
         assert!(closed["exit_ns"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn resource_client_counts_actual_submitted_head_failure_without_retry() {
+        let (socket, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(peer.read_u8().await.expect("actual submitted request"));
+                assert!(head.len() <= 16384);
+            }
+            assert!(head.starts_with(b"GET /resource/respond HTTP/1.1\r\n"));
+            // A real post-submission transport failure, not dispatcher capacity.
+            drop(peer);
+        });
+        let (sender, connection) = http1::handshake(TokioIo::new(socket))
+            .await
+            .expect("real Hyper sender");
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        let failed = client
+            .measure(ResourceRequest {
+                operation_id: "actual-failed-submission".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        assert_eq!(failed.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(failed.error_stage.as_deref(), Some("response_head"));
+        assert!(failed.status.is_none() && !failed.eof);
+        assert_eq!(failed.sender_ready, Some(true));
+        assert_eq!(client.submitted_requests(), 1);
+        let closed = client.close_receipt().await;
+        assert_eq!(closed["join_acknowledged"], true);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture failure collected")
+            .expect("fixture did not panic");
     }
 
     #[test]
@@ -4334,6 +4532,9 @@ mod tests {
             "authority",
             "server_name",
             "path",
+            "sender_ready",
+            "sender_closed_on_error",
+            "sender_error_category",
         ] {
             assert!(raw[key].is_null(), "unavailable {key} is not fabricated");
         }
