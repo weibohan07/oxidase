@@ -451,10 +451,12 @@ struct ProbeSpec<'a> {
     grpc: bool,
     h2: bool,
     window: Option<&'a str>,
+    deadline_ns: Option<u64>,
 }
 struct Probe {
     id: String,
     raw: Value,
+    end_ns: u64,
 }
 struct Scene<'a> {
     round: usize,
@@ -500,7 +502,10 @@ async fn probe(
     if let Some(address) = upstream.ready.ipv6 {
         targets.push(("ipv6".into(), address));
     }
-    let result = tokio::time::timeout(CONTROL_WIRE_DEADLINE, async {
+    let wire_deadline = spec.deadline_ns.map_or(CONTROL_WIRE_DEADLINE, |deadline| {
+        CONTROL_WIRE_DEADLINE.min(Duration::from_nanos(deadline.saturating_sub(start)))
+    });
+    let result = tokio::time::timeout(wire_deadline, async {
         let connected =
             ResourceDataClient::connect(plan.gateway_address, config, spec.h2, targets).await?;
         client = Some(connected);
@@ -551,7 +556,11 @@ async fn probe(
     {
         return Err(fail("resource.control_probe_driver_exit"));
     }
-    Ok(Probe { id, raw })
+    Ok(Probe {
+        id,
+        raw,
+        end_ns: end,
+    })
 }
 
 fn full_response(raw: &Value, payload: usize, grpc: bool, peer: Option<SocketAddr>) -> bool {
@@ -616,7 +625,76 @@ async fn full_peer(
     let deadline = monotonic_ns()?
         .checked_add(RECOVERY_NS)
         .ok_or_else(|| fail("resource.control_clock_overflow"))?;
-    for _ in 0..8 {
+    let mut witnesses = full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &[peer],
+            scenario,
+            deadline_ns: deadline,
+        },
+    )
+    .await?;
+    Ok(witnesses.remove(0).1)
+}
+
+struct PeerRecovery<'a> {
+    peers: &'a [SocketAddr],
+    scenario: &'a str,
+    deadline_ns: u64,
+}
+
+// A successful B response must not disappear while a later probe looks for A.
+// This collector keeps physical, fully verified witnesses under one original
+// recovery deadline; it never changes runtime endpoint selection or retries.
+struct FreshPeerWitnesses {
+    pending: Vec<SocketAddr>,
+    completed: Vec<(SocketAddr, Probe)>,
+    deadline_ns: u64,
+}
+impl FreshPeerWitnesses {
+    fn new(peers: &[SocketAddr], deadline_ns: u64) -> Self {
+        Self {
+            pending: peers.to_vec(),
+            completed: Vec::new(),
+            deadline_ns,
+        }
+    }
+    fn record(&mut self, seen: Probe, payload: usize) -> Result<(), SoakError> {
+        if seen.end_ns > self.deadline_ns {
+            return Err(fail("resource.control_peer_recovery_deadline"));
+        }
+        if !full_response(&seen.raw, payload, false, None) {
+            return Err(fail("resource.control_bad_full_response"));
+        }
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|peer| full_response(&seen.raw, payload, false, Some(*peer)))
+        {
+            let peer = self.pending.remove(index);
+            self.completed.push((peer, seen));
+        }
+        Ok(())
+    }
+}
+
+async fn full_peers(
+    plan: &ControlPlan<'_>,
+    upstream: &FixtureProcess,
+    round: usize,
+    sequence: &mut u64,
+    journal: &mut ProbeJournal,
+    recovery: PeerRecovery<'_>,
+) -> Result<Vec<(SocketAddr, Probe)>, SoakError> {
+    let mut witnesses = FreshPeerWitnesses::new(recovery.peers, recovery.deadline_ns);
+    for _ in 0..64 {
+        if monotonic_ns()? >= recovery.deadline_ns {
+            break;
+        }
         let seen = probe(
             plan,
             upstream,
@@ -624,23 +702,23 @@ async fn full_peer(
             sequence,
             journal,
             ProbeSpec {
-                scenario,
+                scenario: recovery.scenario,
                 grpc: false,
                 h2: true,
                 window: None,
+                deadline_ns: Some(recovery.deadline_ns),
             },
         )
         .await?;
-        if full_response(&seen.raw, plan.args.payload_size, false, Some(peer)) {
-            return Ok(seen);
-        }
-        if monotonic_ns()? > deadline {
-            break;
+        witnesses.record(seen, plan.args.payload_size)?;
+        if witnesses.pending.is_empty() {
+            return Ok(witnesses.completed);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(fail(format!(
-        "resource.control_peer_recovery_unproven:{scenario}"
+        "resource.control_peer_recovery_unproven:{}",
+        recovery.scenario
     )))
 }
 
@@ -1037,6 +1115,7 @@ async fn data_fault(
                     grpc: scenario != "deadline_timeout",
                     h2: true,
                     window: Some(&window.id),
+                    deadline_ns: None,
                 },
             )
             .await?;
@@ -1105,18 +1184,24 @@ async fn data_fault(
             &after_metrics,
         )?;
     }
-    for peer in peers {
-        let peer = peer.parse().map_err(io_error)?;
-        let recovered = full_peer(
-            plan,
-            upstream,
-            round,
-            sequence,
-            journal,
-            peer,
-            "fault_recovery",
-        )
-        .await?;
+    let peers = peers
+        .iter()
+        .map(|peer| peer.parse().map_err(io_error))
+        .collect::<Result<Vec<SocketAddr>, _>>()?;
+    for (peer, recovered) in full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &peers,
+            scenario: "fault_recovery",
+            deadline_ns: end + RECOVERY_NS,
+        },
+    )
+    .await?
+    {
         coverage(
             events,
             "fault_recovery",
@@ -1163,6 +1248,7 @@ async fn dns_window(
                 grpc: false,
                 h2: true,
                 window: Some(&window.id),
+                deadline_ns: None,
             },
         )
         .await?;
@@ -1183,14 +1269,27 @@ async fn dns_window(
     events.write(json!({"kind":"fault_window","t_ns":monotonic_ns()?,"id":window.id,"start_ns":window.start,"end_ns":end,"recovery_deadline_ns":end+RECOVERY_NS,"recovery_peers":[upstream.ready.address.to_string(),upstream.ready.alternate.ok_or_else(||fail("resource.control_fixture_b_missing"))?.to_string()],"target":"upstream","lanes":["churn","cancel"],"allowed":[{"status":503}],"trigger":{"source":"fixture_counter","name":field,"before":counter(&before,field)?,"after":counter(&after,field)?},"fixture_before":before,"fixture_after":after}))?;
     fixture_coverage(events, behavior, field, &before, &after)?;
     result?;
-    for peer in [
+    let peers = [
         upstream.ready.address,
         upstream
             .ready
             .alternate
             .ok_or_else(|| fail("resource.control_fixture_b_missing"))?,
-    ] {
-        let seen = full_peer(plan, upstream, round, sequence, journal, peer, "dns_readd").await?;
+    ];
+    for (peer, seen) in full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &peers,
+            scenario: "dns_readd",
+            deadline_ns: end + RECOVERY_NS,
+        },
+    )
+    .await?
+    {
         coverage(
             events,
             "dns_readd",
@@ -1468,6 +1567,7 @@ async fn control_round_inner(
                             grpc: false,
                             h2: false,
                             window: None,
+                            deadline_ns: None,
                         },
                     )
                     .await?;
@@ -1508,6 +1608,66 @@ async fn control_round_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn peer_probe(peer: SocketAddr, end_ns: u64, id: &str) -> Probe {
+        let digest = Sha256::digest(b"xx")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Probe {
+            id: id.into(),
+            end_ns,
+            raw: json!({"status":200,"eof":true,"error_code":null,"diagnostics":[],
+                "content_type":"application/octet-stream","authority":"gateway.example.test",
+                "server_name":"gateway.example.test","path":"/base/resource/payload?b=2&a=1&a=3",
+                "upstream_peer":peer.to_string(),"body_bytes":2,"body_sha256":digest,"trailers":{}}),
+        }
+    }
+    #[test]
+    fn recovery_keeps_b_before_a_and_does_not_restart_deadline_per_peer() {
+        let a = "127.0.0.1:1200".parse().expect("A");
+        let b = "127.0.0.1:1201".parse().expect("B");
+        let mut witnesses = FreshPeerWitnesses::new(&[a, b], 100);
+        witnesses
+            .record(peer_probe(b, 70, "B-first"), 2)
+            .expect("full B");
+        witnesses
+            .record(peer_probe(b, 80, "B-duplicate"), 2)
+            .expect("duplicate cannot replace first");
+        witnesses
+            .record(peer_probe(a, 100, "A-last"), 2)
+            .expect("exact common deadline");
+        assert!(witnesses.pending.is_empty());
+        assert_eq!(witnesses.completed.len(), 2);
+        assert_eq!(witnesses.completed[0].1.id, "B-first");
+        assert_eq!(witnesses.completed[1].1.id, "A-last");
+        let mut late = FreshPeerWitnesses::new(&[a, b], 100);
+        late.record(peer_probe(b, 90, "B"), 2).expect("B");
+        assert!(late.record(peer_probe(a, 101, "late-A"), 2).is_err());
+        assert_eq!(late.pending, vec![a]);
+    }
+    #[test]
+    fn recovery_needs_actual_peer_and_full_wire_not_an_admin_health_label() {
+        let a = "127.0.0.1:1200".parse().expect("A");
+        let other = "127.0.0.1:1202".parse().expect("other");
+        let mut witnesses = FreshPeerWitnesses::new(&[a], 100);
+        witnesses
+            .record(peer_probe(other, 10, "wrong-peer"), 2)
+            .expect("valid but not a witness");
+        assert_eq!(witnesses.pending, vec![a]);
+        for (field, wrong) in [
+            ("status", json!(503)),
+            ("body_bytes", json!(1)),
+            ("body_sha256", json!("00")),
+            ("eof", json!(false)),
+            ("error_code", json!("transport_error")),
+            ("diagnostics", json!(["bad_wire"])),
+        ] {
+            let mut probe = peer_probe(a, 20, "bad");
+            probe.raw[field] = wrong;
+            assert!(witnesses.record(probe, 2).is_err(), "{field}");
+            assert_eq!(witnesses.pending, vec![a]);
+        }
+    }
     #[test]
     fn ttl_zero_uses_the_same_finite_recovery_contract_as_withdrawal() {
         assert_eq!(
