@@ -253,6 +253,80 @@ struct Fixture {
 
 const ALL_PERMISSIONS: &str = "    read: true\n    stage: true\n    activate: true\n    rollback: true\n    drain: true\n    reload_source: true\n";
 
+#[tokio::test]
+async fn resource_census_is_authenticated_read_only_and_never_changes_runtime_identity() {
+    let fixture = Fixture::start("    read: true\n", false, TOKEN).await;
+    let original = fixture.running.reload_handle().published_runtime();
+    let runtime_before = fixture.read("/api/v1/runtime").await;
+    let unauthenticated = unix_request(
+        &fixture.socket,
+        Method::GET,
+        "/api/v1/resources",
+        None,
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+    for _ in 0..10 {
+        let reply = fixture.read("/api/v1/resources").await;
+        reply.successful();
+        assert_eq!(reply.headers[header::CONTENT_TYPE], "application/json");
+        let body = reply.json();
+        assert_eq!(body["schema_version"], "oxidase.resources/v1");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["globally_atomic"], false);
+        assert_eq!(body["invariant_failures"], 0);
+        let rows = body["resources"].as_array().expect("real closed-kind rows");
+        for kind in [
+            "snapshot",
+            "health_supervisor",
+            "health_pool_family",
+            "proxy_pool_family",
+        ] {
+            assert!(rows.iter().any(|row| row["kind"] == kind));
+        }
+        let text = String::from_utf8(reply.body.to_vec()).expect("UTF8 JSON");
+        assert!(!text.contains("test-only-control-plane-token"));
+        assert!(!text.contains(&fixture.root.to_string_lossy().to_string()));
+    }
+    let head = unix_request(
+        &fixture.socket,
+        Method::HEAD,
+        "/api/v1/resources",
+        Some(TOKEN),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.body.is_empty());
+    let post = unix_request(
+        &fixture.socket,
+        Method::POST,
+        "/api/v1/resources",
+        Some(TOKEN),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(post.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(post.headers[header::ALLOW], "GET, HEAD");
+    let runtime_after = fixture.read("/api/v1/runtime").await;
+    assert_eq!(runtime_before.json(), runtime_after.json());
+    assert_eq!(runtime_before.etag(), runtime_after.etag());
+    assert!(Arc::ptr_eq(
+        &original,
+        &fixture.running.reload_handle().published_runtime()
+    ));
+    fixture.running.shutdown().await.expect("normal shutdown");
+
+    let readless = Fixture::start("    read: false\n    drain: true\n", false, TOKEN).await;
+    let reply = readless.read("/api/v1/resources").await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    readless.running.shutdown().await.expect("normal shutdown");
+}
+
 impl Fixture {
     async fn start(permissions: &str, bundle_permissions: bool, token_file: &[u8]) -> Self {
         let directory = tempdir().expect("temporary deployment root");

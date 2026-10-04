@@ -17,10 +17,14 @@ use http::Uri;
 use http_body::Body;
 use hyper_rustls::MaybeHttpsStream;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use oxidase_config::ClusterProtocol;
 use oxidase_core::{ContentDigest, ContentDigestBuilder, ResourceId};
-use oxidase_runtime::{PreparedCluster, PreparedUpstreamTls};
+use oxidase_runtime::{
+    PreparedCluster, PreparedUpstreamTls, ResourceCancellationHandle, ResourceCensus, ResourceKind,
+    ResourceState, ResourceToken,
+};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{ClientConfig, pki_types::ServerName};
@@ -278,6 +282,10 @@ pub(crate) struct DirectConnector {
     endpoint_incarnation: u64,
     warm: Arc<WarmTransport>,
     connect_admission: Option<Arc<tokio::sync::Semaphore>>,
+    census: Arc<ResourceCensus>,
+    // Hyper Client::request clones its connector internally. Those clones are
+    // the same build's handle family, not independently created pools.
+    _pool_family: Option<Arc<ResourceToken>>,
 }
 
 impl DirectConnector {
@@ -332,6 +340,8 @@ impl DirectConnector {
             endpoint_incarnation: 0,
             warm: Arc::new(WarmTransport::default()),
             connect_admission: None,
+            census: ResourceCensus::process(),
+            _pool_family: None,
         })
     }
 
@@ -377,6 +387,11 @@ impl DirectConnector {
         self
     }
 
+    pub(crate) fn with_census(mut self, census: Arc<ResourceCensus>) -> Self {
+        self.census = census;
+        self
+    }
+
     /// Uses the cold address-selection budget for this one TCP attempt only.
     /// Restore the immutable transport policy before the resulting connector
     /// can be stored in a pool or used by a later shared reconnect.
@@ -411,13 +426,25 @@ impl DirectConnector {
     pub(crate) async fn preconnect(mut self) -> Result<Self, TransportError> {
         let uri = self.origin.request_uri("/")?;
         let stream = self.call(uri).await?;
+        let slot = WarmSocket {
+            stream,
+            _lifecycle: self
+                .census
+                .token(ResourceKind::WarmSocketSlot, ResourceState::Live),
+        };
         *self
             .warm
             .stream
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stream);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
         let weak = Arc::downgrade(&self.warm);
+        let task_lifecycle = self
+            .census
+            .token(ResourceKind::WarmExpiryTask, ResourceState::Scheduled);
+        let cancellation = task_lifecycle.cancellation_handle();
         let task = tokio::spawn(async move {
+            let _lifecycle = task_lifecycle;
+            _lifecycle.transition(ResourceState::Running);
             tokio::time::sleep(Duration::from_secs(90)).await;
             if let Some(warm) = weak.upgrade() {
                 warm.stream
@@ -434,7 +461,10 @@ impl DirectConnector {
             .warm
             .expiry
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task.abort_handle());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WarmExpiry {
+            task: task.abort_handle(),
+            cancellation,
+        });
         Ok(self)
     }
 
@@ -470,12 +500,106 @@ impl DirectConnector {
     }
 }
 
-type DirectStream = MaybeHttpsStream<TokioIo<TcpStream>>;
+type DirectStream = MaybeHttpsStream<TokioIo<ObservedTcpStream>>;
+
+/// The token lives underneath TLS and Hyper Upgrade, alongside the actual TCP
+/// owner. EOF, response-head completion or a driver exit is not a socket Drop.
+#[derive(Debug)]
+pub(crate) struct ObservedTcpStream {
+    inner: TcpStream,
+    _connection: ResourceToken,
+    tls_connection: Option<ResourceToken>,
+}
+
+impl ObservedTcpStream {
+    fn new(inner: TcpStream, census: &Arc<ResourceCensus>) -> Self {
+        Self {
+            inner,
+            _connection: census.token(ResourceKind::UpstreamTcpConnection, ResourceState::Live),
+            tls_connection: None,
+        }
+    }
+
+    fn tls_established(&mut self, census: &Arc<ResourceCensus>) {
+        debug_assert!(self.tls_connection.is_none());
+        self.tls_connection =
+            Some(census.token(ResourceKind::UpstreamTlsConnection, ResourceState::Live));
+    }
+}
+
+impl tokio::io::AsyncRead for ObservedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, bytes)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(context, bytes)
+    }
+}
+
+impl Connection for ObservedTcpStream {
+    fn connected(&self) -> Connected {
+        self.inner.connected()
+    }
+}
+
+struct WarmSocket {
+    stream: DirectStream,
+    _lifecycle: ResourceToken,
+}
+
+struct WarmExpiry {
+    task: tokio::task::AbortHandle,
+    cancellation: ResourceCancellationHandle,
+}
+
+impl WarmExpiry {
+    fn abort(self) {
+        self.cancellation.cancel_requested();
+        self.task.abort();
+    }
+}
 
 #[derive(Default)]
 struct WarmTransport {
-    stream: Mutex<Option<DirectStream>>,
-    expiry: Mutex<Option<tokio::task::AbortHandle>>,
+    stream: Mutex<Option<WarmSocket>>,
+    expiry: Mutex<Option<WarmExpiry>>,
 }
 
 impl WarmTransport {
@@ -494,7 +618,7 @@ impl WarmTransport {
         {
             task.abort();
         }
-        stream
+        stream.map(|slot| slot.stream)
     }
 }
 
@@ -545,6 +669,9 @@ impl Service<Uri> for DirectConnector {
             // same immutable target carried by the endpoint lease and pool key.
             let connect_deadline =
                 checked_transport_deadline(connector.timeouts.connect, TransportPhase::Connect)?;
+            let _connecting = connector
+                .census
+                .token(ResourceKind::UpstreamConnectAttempt, ResourceState::Running);
             let socket = tokio::time::timeout_at(
                 connect_deadline,
                 TcpStream::connect(connector.target.address()),
@@ -558,7 +685,9 @@ impl Service<Uri> for DirectConnector {
                     Some(Box::new(error)),
                 )
             })?;
-            socket.set_nodelay(true).map_err(|error| {
+            drop(_connecting);
+            let socket = ObservedTcpStream::new(socket, &connector.census);
+            socket.inner.set_nodelay(true).map_err(|error| {
                 TransportError::new(
                     TransportPhase::Connect,
                     TransportErrorKind::Io,
@@ -571,7 +700,10 @@ impl Service<Uri> for DirectConnector {
             };
             let tls_deadline =
                 checked_transport_deadline(connector.timeouts.tls_handshake, TransportPhase::Tls)?;
-            let stream = tokio::time::timeout_at(
+            let _handshake = connector
+                .census
+                .token(ResourceKind::UpstreamTlsHandshake, ResourceState::Running);
+            let mut stream = tokio::time::timeout_at(
                 tls_deadline,
                 TlsConnector::from(config).connect(identity.server_name, TokioIo::new(socket)),
             )
@@ -584,6 +716,13 @@ impl Service<Uri> for DirectConnector {
                     Some(Box::new(error)),
                 )
             })?;
+            stream
+                .get_mut()
+                .0
+                .inner_mut()
+                .inner_mut()
+                .tls_established(&connector.census);
+            drop(_handshake);
             if connector.protocol == ClusterProtocol::H2
                 && stream.get_ref().1.alpn_protocol() != Some(b"h2")
             {
@@ -598,6 +737,7 @@ impl Service<Uri> for DirectConnector {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_upstream_pool<B>(
     connector: DirectConnector,
     protocol: ClusterProtocol,
@@ -608,7 +748,25 @@ where
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
-    let mut builder = Client::builder(crate::upstream_timing::UpstreamExecutor);
+    build_observed_upstream_pool(connector, protocol, max_idle, ResourceKind::ProxyPoolFamily).0
+}
+
+pub(crate) fn build_observed_upstream_pool<B>(
+    mut connector: DirectConnector,
+    protocol: ClusterProtocol,
+    max_idle: usize,
+    kind: ResourceKind,
+) -> (Client<DirectConnector, B>, Arc<ResourceToken>)
+where
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<BoxError>,
+{
+    let family = Arc::new(connector.census.token(kind, ResourceState::Candidate));
+    connector._pool_family = Some(Arc::clone(&family));
+    let mut builder = Client::builder(crate::upstream_timing::ObservedUpstreamExecutor::new(
+        Arc::clone(&connector.census),
+    ));
     builder
         .pool_timer(TokioTimer::new())
         .pool_idle_timeout(Duration::from_secs(90))
@@ -617,7 +775,7 @@ where
         // Business retry is explicit, bounded and charged by the Proxy. An
         // unstarted reused request must not be transparently replayed here.
         .retry_canceled_requests(false);
-    builder.build(connector)
+    (builder.build(connector), family)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -745,6 +903,219 @@ mod tests {
 
     fn target(address: &str) -> DialTarget {
         DialTarget::new(address.parse().expect("valid test address")).expect("valid target")
+    }
+
+    fn count(census: &ResourceCensus, kind: ResourceKind) -> oxidase_runtime::ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("resource row")
+    }
+
+    async fn tasks_finished(census: &ResourceCensus, kind: ResourceKind) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count(census, kind).live != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned task actually exits");
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unconsumed_warm_owner_closes_the_real_socket_without_a_scrape() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let census = Arc::new(ResourceCensus::new(true));
+        let connector = DirectConnector::new(
+            origin("http://logical.oxidase.invalid/"),
+            DialTarget::new(listener.local_addr().expect("address")).expect("target"),
+            ClusterProtocol::Http1,
+            None,
+            timeouts(),
+        )
+        .expect("connector")
+        .with_census(Arc::clone(&census))
+        .preconnect()
+        .await
+        .expect("preconnected socket");
+        let (mut peer, _) = listener.accept().await.expect("actual accepted socket");
+        let shared_owner = connector.clone();
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 1);
+        assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 1);
+        drop(connector);
+        assert_eq!(
+            count(&census, ResourceKind::WarmSocketSlot).live,
+            1,
+            "same warm family still owns IO"
+        );
+        drop(shared_owner);
+        // No observation or registry maintenance participates in the close.
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .expect("peer sees close")
+                .expect("read"),
+            0
+        );
+        assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 0);
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 0);
+        tasks_finished(&census, ResourceKind::WarmExpiryTask).await;
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn consuming_a_warm_socket_retires_the_slot_but_keeps_real_io_until_drop() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let census = Arc::new(ResourceCensus::new(true));
+        let logical = origin("http://logical.oxidase.invalid/");
+        let mut connector = DirectConnector::new(
+            logical.clone(),
+            DialTarget::new(listener.local_addr().expect("address")).expect("target"),
+            ClusterProtocol::Http1,
+            None,
+            timeouts(),
+        )
+        .expect("connector")
+        .with_census(Arc::clone(&census))
+        .preconnect()
+        .await
+        .expect("warm socket");
+        let (mut peer, _) = listener.accept().await.expect("peer");
+        let stream = connector
+            .call(logical.request_uri("/").expect("URI"))
+            .await
+            .expect("one-shot consumption");
+        assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 0);
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 1);
+        tasks_finished(&census, ResourceKind::WarmExpiryTask).await;
+        drop(stream);
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .expect("real EOF")
+                .expect("read"),
+            0
+        );
+        let tcp = count(&census, ResourceKind::UpstreamTcpConnection);
+        assert_eq!((tcp.created, tcp.destroyed, tcp.live), (1, 1, 0));
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_socket_expiry_closes_io_on_its_existing_ninety_second_policy_without_reads() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let census = Arc::new(ResourceCensus::new(true));
+        let connector = DirectConnector::new(
+            origin("http://logical.oxidase.invalid/"),
+            DialTarget::new(listener.local_addr().expect("address")).expect("target"),
+            ClusterProtocol::Http1,
+            None,
+            timeouts(),
+        )
+        .expect("connector")
+        .with_census(Arc::clone(&census))
+        .preconnect()
+        .await
+        .expect("warm socket");
+        let (mut peer, _) = listener.accept().await.expect("peer");
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(90)).await;
+        let mut byte = [0; 1];
+        assert_eq!(
+            peer.read(&mut byte)
+                .await
+                .expect("expiry produces real EOF"),
+            0
+        );
+        assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 0);
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 0);
+        tasks_finished(&census, ResourceKind::WarmExpiryTask).await;
+        assert_eq!(count(&census, ResourceKind::WarmExpiryTask).created, 1);
+        drop(connector);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tls_handshake_counts_open_tcp_until_real_future_and_socket_drop() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let census = Arc::new(ResourceCensus::new(true));
+        let logical = origin("https://logical.oxidase.invalid/");
+        let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocols")
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let identity = TlsPeerIdentity {
+            server_name: ServerName::try_from("logical.oxidase.invalid".to_owned())
+                .expect("TLS name"),
+            policy_digest: ContentDigest::of_bytes("fixture roots"),
+        };
+        let mut connector = DirectConnector::from_parts(
+            logical.clone(),
+            DialTarget::new(listener.local_addr().expect("address")).expect("target"),
+            ClusterProtocol::Http1,
+            Some((identity, Arc::new(config))),
+            TransportTimeouts {
+                connect: Duration::from_secs(2),
+                tls_handshake: Duration::from_secs(10),
+            },
+        )
+        .expect("connector")
+        .with_census(Arc::clone(&census));
+        let pending = tokio::spawn(connector.call(logical.request_uri("/").expect("URI")));
+        let (mut peer, _) = listener.accept().await.expect("actual TCP connection");
+        let mut bytes = [0; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut bytes))
+                .await
+                .expect("ClientHello")
+                .expect("read")
+                > 0
+        );
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 1);
+        assert_eq!(count(&census, ResourceKind::UpstreamTlsHandshake).live, 1);
+        assert_eq!(
+            count(&census, ResourceKind::UpstreamTlsConnection).created,
+            0
+        );
+        pending.abort();
+        assert!(
+            pending
+                .await
+                .expect_err("future was actually cancelled")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while peer
+                .read(&mut bytes)
+                .await
+                .expect("read remaining ClientHello")
+                != 0
+            {}
+        })
+        .await
+        .expect("cancelled TCP owner closes real IO");
+        for kind in [
+            ResourceKind::UpstreamTcpConnection,
+            ResourceKind::UpstreamTlsHandshake,
+            ResourceKind::UpstreamConnectAttempt,
+        ] {
+            let resource = count(&census, kind);
+            assert_eq!(
+                (resource.created, resource.destroyed, resource.live),
+                (1, 1, 0)
+            );
+        }
+        assert_eq!(census.sample().invariant_failures, 0);
     }
 
     #[test]
@@ -1062,12 +1433,14 @@ mod tests {
 
     #[tokio::test]
     async fn tls_uses_fixed_logical_sni_and_proves_h2_alpn_and_actual_peer() {
+        use tokio::io::AsyncReadExt as _;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback");
         let address = listener.local_addr().expect("fixture address");
+        let census = Arc::new(ResourceCensus::new(true));
         let (server, client) = tls_fixture("logical.oxidase.invalid", &[b"h2"]);
         let fixture = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("direct socket");
-            let stream = TlsAcceptor::from(server)
+            let mut stream = TlsAcceptor::from(server)
                 .accept(socket)
                 .await
                 .expect("verified TLS handshake");
@@ -1076,6 +1449,16 @@ mod tests {
                 Some("logical.oxidase.invalid")
             );
             assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+            let mut bytes = Vec::new();
+            // A dropped socket can close with EOF or RST when TLS 1.3 tickets
+            // remain unread; both prove real IO closure, not a metadata drop.
+            if let Err(error) = stream.get_mut().0.read_to_end(&mut bytes).await {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset,
+                    "unexpected peer close error: {error}"
+                );
+            }
         });
         let logical = origin("https://logical.oxidase.invalid/");
         let mut connector = tls_connector(
@@ -1084,7 +1467,8 @@ mod tests {
             ClusterProtocol::H2,
             client,
             Duration::from_secs(1),
-        );
+        )
+        .with_census(Arc::clone(&census));
         let stream = connector
             .call(logical.request_uri("/").expect("URI"))
             .await
@@ -1100,7 +1484,34 @@ mod tests {
                 .remote_addr(),
             address
         );
-        fixture.await.expect("fixture finished");
+        for kind in [
+            ResourceKind::UpstreamTcpConnection,
+            ResourceKind::UpstreamTlsConnection,
+        ] {
+            assert_eq!(
+                count(&census, kind).live,
+                1,
+                "a completed handshake still owns actual IO"
+            );
+        }
+        assert_eq!(count(&census, ResourceKind::UpstreamTlsHandshake).live, 0);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), fixture)
+            .await
+            .expect("peer closed within bound")
+            .expect("fixture finished");
+        for kind in [
+            ResourceKind::UpstreamTcpConnection,
+            ResourceKind::UpstreamTlsConnection,
+            ResourceKind::UpstreamTlsHandshake,
+        ] {
+            let resource = count(&census, kind);
+            assert_eq!(
+                (resource.created, resource.destroyed, resource.live),
+                (1, 1, 0)
+            );
+        }
+        assert_eq!(census.sample().invariant_failures, 0);
     }
 
     #[tokio::test]
@@ -1109,6 +1520,7 @@ mod tests {
             ("logical.oxidase.invalid", TransportErrorKind::Alpn),
             ("wrong.oxidase.invalid", TransportErrorKind::Tls),
         ] {
+            let census = Arc::new(ResourceCensus::new(true));
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback");
             let address = listener.local_addr().expect("fixture address");
             let (server, client) = tls_fixture(certificate_name, &[]);
@@ -1123,7 +1535,8 @@ mod tests {
                 ClusterProtocol::H2,
                 client,
                 Duration::from_secs(1),
-            );
+            )
+            .with_census(Arc::clone(&census));
             let error = connector
                 .call(logical.request_uri("/").expect("URI"))
                 .await
@@ -1131,6 +1544,23 @@ mod tests {
             assert_eq!(error.phase(), TransportPhase::Tls);
             assert_eq!(error.kind(), expected);
             fixture.await.expect("fixture finished");
+            for kind in [
+                ResourceKind::UpstreamTcpConnection,
+                ResourceKind::UpstreamTlsHandshake,
+            ] {
+                let resource = count(&census, kind);
+                assert_eq!(
+                    (resource.created, resource.destroyed, resource.live),
+                    (1, 1, 0)
+                );
+            }
+            let established = count(&census, ResourceKind::UpstreamTlsConnection);
+            let expected_sessions = u64::from(expected == TransportErrorKind::Alpn);
+            assert_eq!(
+                (established.created, established.destroyed, established.live),
+                (expected_sessions, expected_sessions, 0)
+            );
+            assert_eq!(census.sample().invariant_failures, 0);
         }
     }
 

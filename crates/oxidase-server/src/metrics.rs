@@ -495,6 +495,32 @@ impl Metrics {
     #[must_use]
     pub fn render_prometheus_for(&self, snapshot: &RuntimeSnapshot) -> String {
         let mut output = self.render_prometheus();
+        let census = snapshot.resource_census().sample();
+        output.push_str(&format!("oxidase_resource_capture_start_milliseconds {}\noxidase_resource_capture_end_milliseconds {}\noxidase_resource_sequence_start {}\noxidase_resource_sequence_end {}\noxidase_resource_mutations_in_flight_start {}\noxidase_resource_mutations_in_flight_end {}\n", census.capture_start_ms, census.capture_end_ms, census.sequence_start, census.sequence_end, census.mutations_in_flight_start, census.mutations_in_flight_end));
+        output.push_str(&format!("oxidase_resource_observation_enabled {}\noxidase_resource_invariant_failures_total {}\noxidase_resource_detail_records {}\n", u8::from(census.enabled), census.invariant_failures, census.detailed_records));
+        for row in census.resources {
+            let kind = serde_json::to_value(row.kind).expect("fixed enum serializes");
+            let kind = kind.as_str().expect("fixed enum is a string");
+            output.push_str(&format!("oxidase_resource_created_total{{kind=\"{kind}\"}} {}\noxidase_resource_destroyed_total{{kind=\"{kind}\"}} {}\noxidase_resource_live{{kind=\"{kind}\"}} {}\noxidase_resource_published_total{{kind=\"{kind}\"}} {}\noxidase_resource_detail_untracked_live{{kind=\"{kind}\"}} {}\n", row.created, row.destroyed, row.live, row.published, row.detail_untracked_live));
+            for state in row.states {
+                let name = serde_json::to_value(state.state).expect("fixed enum serializes");
+                let name = name.as_str().expect("fixed enum is a string");
+                output.push_str(&format!(
+                    "oxidase_resource_state{{kind=\"{kind}\",state=\"{name}\"}} {}\n",
+                    state.live
+                ));
+            }
+            if let Some(age) = row.oldest_retired_age_ms {
+                output.push_str(&format!(
+                    "oxidase_resource_oldest_retired_age_milliseconds{{kind=\"{kind}\"}} {age}\n"
+                ));
+            }
+            if let Some(age) = row.oldest_exiting_age_ms {
+                output.push_str(&format!(
+                    "oxidase_resource_oldest_exiting_age_milliseconds{{kind=\"{kind}\"}} {age}\n"
+                ));
+            }
+        }
         output.push_str(&format!(
             "oxidase_discovery_active_supervisors {}\n",
             self.discovery_tasks.load(Ordering::Relaxed)
@@ -526,7 +552,7 @@ impl Metrics {
         }
         let now = Instant::now();
         for cluster in snapshot.resources.clusters.values() {
-            let status = cluster.status(now);
+            let status = cluster.observed_status(now);
             let cluster_name = escape_label(&status.cluster);
             output.push_str(&format!(
                 "oxidase_cluster_info{{cluster=\"{cluster_name}\",policy=\"{}\",protocol=\"{}\"}} 1\n",

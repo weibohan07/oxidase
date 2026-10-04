@@ -462,7 +462,8 @@ impl GatewayServer {
         snapshot: RuntimeSnapshot,
         origin: RuntimeOrigin,
     ) -> Result<Self, ServerError> {
-        let discovery = DiscoveryManager::new();
+        let census = snapshot.resource_census();
+        let discovery = DiscoveryManager::new_with_census(Arc::clone(&census));
         let preparation = discovery.preparation_for(&snapshot);
         let prepared_discovery = tokio::task::spawn_blocking(move || preparation.prepare())
             .await
@@ -496,9 +497,11 @@ impl GatewayServer {
             });
         }
         let admin = bind_configured_admin(&snapshot).await?;
-        let proxy = Arc::new(ProxyClient::new().map_err(ServerError::DataPlane)?);
+        let proxy = Arc::new(
+            ProxyClient::with_census(Arc::clone(&census)).map_err(ServerError::DataPlane)?,
+        );
         proxy.reconcile_snapshot(&snapshot);
-        let health = ClusterHealthManager::new().map_err(ServerError::DataPlane)?;
+        let health = ClusterHealthManager::with_census(census).map_err(ServerError::DataPlane)?;
         Ok(Self {
             store: Arc::new(SnapshotStore::new_with_origin(snapshot, origin)),
             proxy,
@@ -2287,6 +2290,7 @@ async fn handle_admin_request(
                 | "/health/ready"
                 | "/metrics"
                 | "/api/v1/clusters"
+                | "/api/v1/resources"
                 | "/api/v1/runtime"
                 | "/api/v1/snapshots/current"
                 | "/api/v1/snapshots"
@@ -2410,6 +2414,15 @@ async fn handle_admin_request(
             )
         }
         "/api/v1/clusters" => cluster_admin_response(&snapshot, &method),
+        "/api/v1/resources" => admin_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(
+                serde_json::to_vec(&snapshot.resource_census().sample())
+                    .expect("fixed scalar resource sample serializes"),
+            ),
+            &method,
+        ),
         "/api/v1/runtime" | "/api/v1/snapshots/current" => {
             current_runtime_admin_response(&published, &method)
         }
@@ -3612,7 +3625,7 @@ fn cluster_admin_response(snapshot: &RuntimeSnapshot, method: &Method) -> Respon
         .resources
         .clusters
         .values()
-        .map(|cluster| cluster.status(now))
+        .map(|cluster| cluster.observed_status(now))
         .collect::<Vec<_>>();
     clusters.sort_by(|left, right| left.cluster.cmp(&right.cluster));
     for cluster in &mut clusters {

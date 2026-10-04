@@ -462,6 +462,7 @@ pub(crate) fn classify_admin_route(method: &Method, path: &str) -> Option<AdminR
                 | "/health/ready"
                 | "/metrics"
                 | "/api/v1/clusters"
+                | "/api/v1/resources"
                 | "/api/v1/runtime"
                 | "/api/v1/snapshots/current"
                 | "/api/v1/snapshots"

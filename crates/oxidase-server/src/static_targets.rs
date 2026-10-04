@@ -479,6 +479,7 @@ where
                 cluster.upstream_tls().map(Arc::as_ref),
                 TransportTimeouts::for_cluster(cluster),
             )?
+            .with_census(registry.census())
             .with_connection_admission(Arc::clone(&targets_cache.connect_admission))
             .with_endpoint_incarnation(endpoint.incarnation());
             Ok(

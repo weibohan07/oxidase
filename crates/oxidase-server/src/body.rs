@@ -12,7 +12,9 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
-use oxidase_runtime::{ConcurrencyPermit, RuntimeSnapshot};
+use oxidase_runtime::{
+    ConcurrencyPermit, ResourceCensus, ResourceKind, ResourceState, ResourceToken, RuntimeSnapshot,
+};
 use tokio::time::{Instant, Sleep};
 
 use crate::metrics::{ActiveRequest, BodyTermination, Metrics};
@@ -399,6 +401,7 @@ struct InstrumentedBody {
     termination: Option<BodyTermination>,
     snapshot: Option<Arc<RuntimeSnapshot>>,
     downstream_timeout: Option<DownstreamTimeoutSignal>,
+    _resource: ResourceToken,
 }
 
 impl InstrumentedBody {
@@ -409,6 +412,11 @@ impl InstrumentedBody {
         snapshot: Option<Arc<RuntimeSnapshot>>,
         downstream_timeout: Option<DownstreamTimeoutSignal>,
     ) -> Self {
+        let census = snapshot
+            .as_ref()
+            .map_or_else(ResourceCensus::process, |snapshot| {
+                snapshot.resource_census()
+            });
         let mut body = Self {
             inner,
             metrics,
@@ -418,6 +426,7 @@ impl InstrumentedBody {
             termination: None,
             snapshot,
             downstream_timeout,
+            _resource: census.token(ResourceKind::ResponseBody, ResourceState::Live),
         };
         if body.inner.is_end_stream() {
             body.finish(BodyTermination::Completed);
@@ -1241,5 +1250,136 @@ listeners:
             weak.upgrade().is_none(),
             "body error releases the snapshot pin"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_respond_snapshot_is_held_by_actual_body_until_trailers_error_or_cancel() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState, SnapshotStore};
+
+        for terminal in ["completed", "error", "cancelled"] {
+            let census = Arc::new(ResourceCensus::default());
+            let directory = tempfile::tempdir().expect("isolated fixture");
+            let config = directory.path().join("gateway.yaml");
+            std::fs::write(&config, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nlisteners:\n  - name: test\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n      body:\n        text: original\n").expect("Respond source");
+            let compiled = Compiler::compile_path(&config).expect("compiled Respond");
+            let snapshot =
+                RuntimeSnapshot::prepare_reusing_in(compiled.clone(), None, census.clone())
+                    .expect("prepared Respond")
+                    .0;
+            let store = SnapshotStore::new(snapshot);
+            let pinned = store.pin();
+            let weak = Arc::downgrade(&pinned);
+            let metrics = Arc::new(Metrics::default());
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            let source = if terminal == "error" {
+                failing_body(std::io::ErrorKind::BrokenPipe)
+            } else {
+                FrameSequenceBody::new([
+                    Ok(Frame::data(Bytes::from_static(b"original bytes"))),
+                    Ok(Frame::trailers(trailers.clone())),
+                ])
+                .boxed_unsync()
+            };
+            let response = instrument_response_body_with_snapshot(
+                Response::new(source),
+                metrics.clone(),
+                metrics.request_started(),
+                Some(pinned),
+            );
+            let next = RuntimeSnapshot::prepare_reusing_in(compiled, None, census.clone())
+                .expect("next candidate")
+                .0;
+            drop(store.publish(next));
+            let retired = || {
+                census
+                    .sample()
+                    .resources
+                    .into_iter()
+                    .find(|row| row.kind == ResourceKind::Snapshot)
+                    .expect("snapshot unit")
+                    .states
+                    .into_iter()
+                    .find(|state| state.state == ResourceState::Retired)
+                    .expect("retired role")
+                    .live
+            };
+            assert_eq!(retired(), 1);
+            assert!(
+                weak.upgrade().is_some(),
+                "held response retains old snapshot, no Proxy dependency"
+            );
+            for _ in 0..100 {
+                assert_eq!(
+                    retired(),
+                    1,
+                    "pure observations cannot reap the held instance"
+                );
+            }
+            let mut body = response.into_body();
+            let data = body
+                .frame()
+                .await
+                .expect("DATA exists")
+                .expect("DATA succeeds")
+                .into_data()
+                .expect("DATA frame");
+            assert_eq!(
+                data,
+                if terminal == "error" {
+                    Bytes::from_static(b"abc")
+                } else {
+                    Bytes::from_static(b"original bytes")
+                }
+            );
+            assert_eq!(retired(), 1);
+            match terminal {
+                "completed" => {
+                    assert_eq!(
+                        body.frame()
+                            .await
+                            .expect("terminal trailers exist")
+                            .expect("terminal trailers succeed")
+                            .into_trailers()
+                            .expect("trailer frame"),
+                        trailers
+                    );
+                    assert!(body.frame().await.is_none());
+                }
+                "error" => {
+                    assert!(body.frame().await.expect("body fault arrives").is_err());
+                }
+                "cancelled" => {}
+                _ => unreachable!("closed fixture outcomes"),
+            }
+            drop(body);
+            assert!(
+                weak.upgrade().is_none(),
+                "actual terminal ownership release, not scrape GC"
+            );
+            assert_eq!(retired(), 0);
+            let row = census
+                .sample()
+                .resources
+                .into_iter()
+                .find(|row| row.kind == ResourceKind::ResponseBody)
+                .expect("actual adapter unit");
+            assert_eq!((row.created, row.destroyed, row.live), (1, 1, 0));
+            assert_eq!(census.sample().invariant_failures, 0);
+            assert!(metrics.render_prometheus().contains(&format!(
+                "oxidase_response_body_terminations_total{{reason=\"{terminal}\"}} 1"
+            )));
+            drop(store);
+            assert_eq!(
+                census
+                    .sample()
+                    .resources
+                    .into_iter()
+                    .find(|row| row.kind == ResourceKind::Snapshot)
+                    .expect("snapshot unit")
+                    .live,
+                0
+            );
+        }
     }
 }
