@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::{SoakError, fail, io_error, json_error};
+use super::{RESOURCE_REQUESTS_PER_CONNECTION, SoakError, fail, io_error, json_error};
 
 pub(super) struct JsonLines {
     file: std::fs::File,
@@ -60,6 +60,24 @@ impl JsonLines {
 /// IDs are issued before connection preparation. One terminal per ID, including
 /// connection failure. A stop signal cannot discard already-issued work.
 pub(super) enum OperationEvent {
+    RetirementStarted {
+        worker: usize,
+        connection_epoch: u64,
+        after_sequence: u64,
+        start_ns: u64,
+        protocol: &'static str,
+        submitted: u64,
+    },
+    RetirementTerminal {
+        worker: usize,
+        connection_epoch: u64,
+        after_sequence: u64,
+        start_ns: u64,
+        end_ns: u64,
+        protocol: &'static str,
+        submitted: u64,
+        driver_exit: Value,
+    },
     Started {
         worker: usize,
         sequence: u64,
@@ -104,6 +122,8 @@ pub(super) struct Collected {
     pub(super) fatal_errors: Vec<String>,
     pub(super) abandoned_operations: Vec<Value>,
     pub(super) artifact_truncated: bool,
+    retirement_started: u64,
+    retirement_received: u64,
     pub(super) workers: BTreeMap<usize, WorkerCounts>,
 }
 
@@ -122,6 +142,7 @@ impl Collected {
         json!({"offered":self.offered,"connection_attempts":self.connection_attempts,
             "admitted_http_operations":self.admitted_http_operations,"received_operations":self.received_operations,
             "admitted_upgrade_operations":self.admitted_upgrade_operations,
+            "client_retirements_started":self.retirement_started,"client_retirements_received":self.retirement_received,
             "abandoned_operations":self.abandoned_operations,
             "workers":self.workers.iter().map(|(worker,c)|json!({"worker_id":worker,"last_operation_seq":c.last,"offered":c.offered,"received_operations":c.received,"connection_attempts":c.connections,"admitted_http_operations":c.admitted,"admitted_upgrade_operations":c.upgrades})).collect::<Vec<_>>()})
     }
@@ -156,6 +177,9 @@ pub(super) async fn collect(
 ) -> Result<Collected, SoakError> {
     let mut buckets = JsonLines::create(&output.join("buckets.jsonl"), 256 * 1024 * 1024)?;
     let mut errors = JsonLines::create(&output.join("errors.jsonl"), 64 * 1024 * 1024)?;
+    let mut retirements =
+        JsonLines::create(&output.join("client-retirements.jsonl"), 64 * 1024 * 1024)?;
+    let mut retiring = HashMap::new();
     let mut pending = HashMap::new();
     let mut rows = BTreeMap::<usize, WorkerBucket>::new();
     let mut result = Collected::default();
@@ -175,6 +199,92 @@ pub(super) async fn collect(
         };
         let Some(event) = received else { break };
         match event {
+            OperationEvent::RetirementStarted {
+                worker,
+                connection_epoch,
+                after_sequence,
+                start_ns,
+                protocol,
+                submitted,
+            } => {
+                result.retirement_started += 1;
+                if retiring
+                    .insert(
+                        worker,
+                        (
+                            connection_epoch,
+                            after_sequence,
+                            start_ns,
+                            protocol,
+                            submitted,
+                        ),
+                    )
+                    .is_some()
+                    || pending.contains_key(&worker)
+                    || result
+                        .workers
+                        .get(&worker)
+                        .is_none_or(|count| count.last != after_sequence)
+                    || submitted != RESOURCE_REQUESTS_PER_CONNECTION
+                {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                    first_failure.get_or_insert_with(|| {
+                        fail("invalid or overlapping client retirement boundary")
+                    });
+                }
+                // FIFO places this after terminal N and before started N+1.
+                // End only this worker's bucket so the offline oracle can prove
+                // actual retirement-before-next-admission without per-op success logs.
+                if first_failure.is_none() {
+                    let mut boundary = BTreeMap::new();
+                    if let Some(bucket) = rows.remove(&worker) {
+                        boundary.insert(worker, bucket);
+                    }
+                    let record = json!({"schema_version":"oxidase.resource-client-retirement/v1","kind":"started","retirement_id":format!("{worker}:{connection_epoch}"),"worker_id":worker,"protocol":protocol,"connection_epoch":connection_epoch,"start_ns":start_ns,"after_operation_seq":after_sequence,"next_operation_seq":after_sequence+1,"request_budget":RESOURCE_REQUESTS_PER_CONNECTION,"submitted_requests":submitted});
+                    if let Err(error) = flush_buckets(&mut buckets, &mut boundary)
+                        .and_then(|()| retirements.write(record))
+                    {
+                        failed.store(true, std::sync::atomic::Ordering::Release);
+                        first_failure = Some(error);
+                    }
+                }
+            }
+            OperationEvent::RetirementTerminal {
+                worker,
+                connection_epoch,
+                after_sequence,
+                start_ns,
+                end_ns,
+                protocol,
+                submitted,
+                driver_exit,
+            } => {
+                result.retirement_received += 1;
+                if retiring.remove(&worker)
+                    != Some((
+                        connection_epoch,
+                        after_sequence,
+                        start_ns,
+                        protocol,
+                        submitted,
+                    ))
+                    || end_ns < start_ns
+                    || driver_exit["result"] != "completed"
+                    || driver_exit["join_acknowledged"] != true
+                {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                    first_failure.get_or_insert_with(|| {
+                        fail("client retirement driver was not actually completed/joined")
+                    });
+                }
+                let record = json!({"schema_version":"oxidase.resource-client-retirement/v1","kind":"terminal","retirement_id":format!("{worker}:{connection_epoch}"),"worker_id":worker,"protocol":protocol,"connection_epoch":connection_epoch,"start_ns":start_ns,"end_ns":end_ns,"after_operation_seq":after_sequence,"next_operation_seq":after_sequence+1,"request_budget":RESOURCE_REQUESTS_PER_CONNECTION,"submitted_requests":submitted,"driver_exit":driver_exit});
+                // Even failed acknowledgement is kept when writer capacity is
+                // still available; fatal receipt cannot masquerade as success.
+                if let Err(error) = retirements.write(record) {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                    first_failure.get_or_insert(error);
+                }
+            }
             OperationEvent::Started {
                 worker,
                 sequence,
@@ -276,7 +386,9 @@ pub(super) async fn collect(
         result.artifact_truncated =
             error.to_string().contains("capacity") || error.to_string().contains("size");
         result.fatal_errors.push(error.to_string());
-    } else if let Err(error) = flush_buckets(&mut buckets, &mut rows).and_then(|()| errors.flush())
+    } else if let Err(error) = flush_buckets(&mut buckets, &mut rows)
+        .and_then(|()| errors.flush())
+        .and_then(|()| retirements.flush())
     {
         result.artifact_truncated = true;
         result.fatal_errors.push(error.to_string());
@@ -285,12 +397,158 @@ pub(super) async fn collect(
         result.abandoned_operations = pending.into_iter().map(|(worker,(sequence,start_ns))|json!({"worker_id":worker,"operation_seq":sequence,"start_ns":start_ns,"classification":"abandoned","connection_attempted":null,"admitted":null})).collect();
         result.fatal_errors.push("started operations were abandoned by load workers; unknown connection/admission state is not fabricated".into());
     }
+    if !retiring.is_empty() || result.retirement_started != result.retirement_received {
+        result.fatal_errors.push(
+            "started client retirement was abandoned or lacked terminal acknowledgement".into(),
+        );
+    }
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn normal_retirement_flushes_a_provable_before_next_admission_boundary() {
+        let directory = tempfile::tempdir().expect("synthetic collector evidence");
+        let (send, receive) = mpsc::channel(8);
+        let path = directory.path().to_owned();
+        let collector = tokio::spawn(async move {
+            collect(
+                &path,
+                receive,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+        });
+        for sequence in 1..=1000 {
+            send.send(OperationEvent::Started {
+                worker: 0,
+                sequence,
+                start_ns: sequence * 2,
+            })
+            .await
+            .expect("started");
+            send.send(OperationEvent::Terminal {
+                worker: 0,
+                sequence,
+                start_ns: sequence * 2,
+                end_ns: sequence * 2 + 1,
+                phase: "steady",
+                lane: "healthy",
+                protocol: "h2",
+                recipe: "download",
+                connection_attempts: u64::from(sequence == 1),
+                admitted: true,
+                window_id: None,
+                raw: json!({"status":200,"eof":true,"connection_epoch":1}),
+            })
+            .await
+            .expect("terminal");
+        }
+        send.send(OperationEvent::RetirementStarted {
+            worker: 0,
+            connection_epoch: 1,
+            after_sequence: 1000,
+            start_ns: 3000,
+            protocol: "h2",
+            submitted: 1000,
+        })
+        .await
+        .expect("retirement start");
+        send.send(OperationEvent::RetirementTerminal {
+            worker: 0,
+            connection_epoch: 1,
+            after_sequence: 1000,
+            start_ns: 3000,
+            end_ns: 4000,
+            protocol: "h2",
+            submitted: 1000,
+            driver_exit: json!({"result":"completed","join_acknowledged":true}),
+        })
+        .await
+        .expect("actual join");
+        send.send(OperationEvent::Started {
+            worker: 0,
+            sequence: 1001,
+            start_ns: 5000,
+        })
+        .await
+        .expect("next started");
+        send.send(OperationEvent::Terminal {
+            worker: 0,
+            sequence: 1001,
+            start_ns: 5000,
+            end_ns: 6000,
+            phase: "steady",
+            lane: "healthy",
+            protocol: "h2",
+            recipe: "download",
+            connection_attempts: 1,
+            admitted: true,
+            window_id: None,
+            raw: json!({"status":200,"eof":true,"connection_epoch":2}),
+        })
+        .await
+        .expect("next terminal");
+        drop(send);
+        let counted = collector.await.expect("joined").expect("counted");
+        assert_eq!(counted.offered, 1001);
+        assert_eq!(counted.received_operations, 1001);
+        assert_eq!(counted.retirement_started, 1);
+        assert_eq!(counted.retirement_received, 1);
+        assert!(counted.fatal_errors.is_empty());
+        let rows = std::fs::read_to_string(directory.path().join("buckets.jsonl"))
+            .expect("buckets")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSON"))
+            .collect::<Vec<_>>();
+        let previous = rows
+            .iter()
+            .find(|row| row["last_operation_seq"] == 1000)
+            .expect("flushed old connection");
+        let next = rows
+            .iter()
+            .find(|row| row["first_operation_seq"] == 1001)
+            .expect("new connection");
+        assert!(previous["bucket_end_ns"].as_u64().expect("time") <= 3000);
+        assert!(next["bucket_start_ns"].as_u64().expect("time") >= 4000);
+        let raw = std::fs::read_to_string(directory.path().join("client-retirements.jsonl"))
+            .expect("independent journal");
+        assert_eq!(raw.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn abandoned_retirement_is_not_a_completed_worker_operation() {
+        let directory = tempfile::tempdir().expect("synthetic failure evidence");
+        let (send, receive) = mpsc::channel(1);
+        let path = directory.path().to_owned();
+        let collector = tokio::spawn(async move {
+            collect(
+                &path,
+                receive,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+        });
+        send.send(OperationEvent::RetirementStarted {
+            worker: 0,
+            connection_epoch: 1,
+            after_sequence: 0,
+            start_ns: 3000,
+            protocol: "h2",
+            submitted: 1000,
+        })
+        .await
+        .expect("started invalid/abandoned cleanup");
+        drop(send);
+        let counted = collector.await.expect("join").expect("receipt");
+        assert_eq!(counted.offered, 0, "cleanup never enters HTTP denominator");
+        assert_eq!(counted.retirement_started, 1);
+        assert_eq!(counted.retirement_received, 0);
+        assert!(!counted.fatal_errors.is_empty());
+    }
 
     #[tokio::test]
     async fn stop_drains_an_already_full_result_channel() {

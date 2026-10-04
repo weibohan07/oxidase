@@ -58,8 +58,51 @@ with zero because the census cannot expose it.
 Short baseline `37197630141` uses exact main `54b0fc6`, normal locked release,
 independent H/C runners, seed 700211, 30/300/120/60/60-second phases, concurrency
 8 plus separate cancellation/Upgrade lanes, 32768-byte responses, 1 MiB uploads,
-and actual 1-second OS/Admin sampling. It is running; no result is presumed.
+and actual 1-second OS/Admin sampling. Both original jobs finished FAIL, with
+archive checksums and byte-identical independent replay preserved.
 Its durations do not satisfy H-final/C-final minima. Raw failures must remain.
+
+| Original load | Offered / received | Complete success / intentional cancel / Upgrade / transport error | Actual stopping/result boundary |
+| --- | ---: | ---: | --- |
+| H | 112763 / 112763 | 111796 / 427 / 432 / 108 | all five short phases complete; every transport error follows the configured 1000-request connection retirement |
+| C | 12346 / 12346 | 12264 / 37 / 37 / 8 | canonical SRV target comparison failed about 11.155 s into steady; Recovery/Quiet/drain never began |
+
+H's actual phase durations were 30.1051/300.1080/120.0841/60.0018/60.0065 s.
+Steady RSS baseline/peak/final was 27660/30872/30448 KiB, with full-phase slope
++8.773 KiB/s; PSS was 25310/28446/27238 KiB from 29 actual smaps captures.
+Recovery RSS was 30448/30972/30080; Quiet Running 29708/29708/28324. FD was
+33/35/33 steady, 33/35/33 recovery, 24/24/22 quiet and 21/21/21 post-drain.
+This is positive resident drift, not proven retained allocation or a leak. Its
+memory attribution remains INCONCLUSIVE and its traffic validation remains FAIL.
+
+Snapshots peaked at one with no retired instance in this fixed H load; final
+created/destroyed/current was 10/9/1. Health/discovery supervisors were each one
+while Running and zero post-drain. Proxy families peaked at four (retired peak
+one, max observed retirement age 1196 ms) and ended at zero; current health
+families and physical TCP/TLS each ended at two, with six upstream executor
+futures. Upload/response/tunnel/warm/expiry ended at actual zero. Current health
+pool/idle executor retention is a distinct legal owner, not a failure to make
+every gauge zero. C's incomplete 41-second record proves no memory recovery.
+
+Confirmed **validation**, not production-retention, repairs:
+
+- Admin SRV targets are canonical `a.discovery.test.` / `b.discovery.test.`.
+  Exact weight/priority/identity validation now uses those actual bytes; no
+  deadline extension, name-policy change or relaxed weight check is involved.
+- Normal downstream connections retire after the fixture's explicit unchanged
+  1000-request budget. A client must actually close/join at that boundary before
+  submitting a new logical operation; it must not reuse the already-retired
+  sender, silently replay a POST/gRPC operation or whitelist healthy errors.
+  Separate retirement Started/Terminal records and per-worker histogram flush
+  prove the old completion → actual driver join → next admission ordering.
+  Existing errors remain recorded, and missing acknowledgement is fatal.
+
+Original archives: H artifact `11302070528`, SHA-256
+`ce1103790ee750d713d32686d563b4aa19893c750758f9c5f551fa409a46c95b`;
+C artifact `11301424456`, SHA-256
+`11540e78491b8e8016d8cde6cc67dccad0dd8d06a8b060d39f5a3dbbbe859c70`.
+Original per-file manifests verified 33 H / 35 C files; repeated independent
+analysis equals the uploaded original reports. New repairs require new runs.
 
 Formal H/C must preserve original minima and complete operation conservation,
 full content/trailer validation, finite faults with fresh affected-peer recovery,

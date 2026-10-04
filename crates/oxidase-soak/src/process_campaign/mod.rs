@@ -86,6 +86,11 @@ enum ResourceCampaign {
     ScrapeOnly,
 }
 
+/// Explicit validation-fixture listener budget. Respect normal connection
+/// retirement before submitting the next operation; never replay an operation
+/// that has already been admitted or weaken the server's production limit.
+const RESOURCE_REQUESTS_PER_CONNECTION: u64 = 1000;
+
 #[derive(Debug, Parser)]
 struct ResourceArguments {
     #[arg(long)]

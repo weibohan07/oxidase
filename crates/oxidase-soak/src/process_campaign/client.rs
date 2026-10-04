@@ -356,6 +356,7 @@ pub(super) struct ResourceDataClient {
     h2: bool,
     targets: Vec<(String, SocketAddr)>,
     local_response: bool,
+    submitted_requests: u64,
 }
 
 impl Drop for ResourceDataClient {
@@ -441,7 +442,26 @@ impl ResourceDataClient {
             h2,
             targets,
             local_response,
+            submitted_requests: 0,
         })
+    }
+
+    /// Submitted attempts, not successful responses: an error or cancellation
+    /// after handing the request to Hyper still consumes the fixture budget.
+    pub(super) fn submitted_requests(&self) -> u64 {
+        self.submitted_requests
+    }
+
+    pub(super) fn needs_retirement(&self) -> bool {
+        self.submitted_requests >= super::RESOURCE_REQUESTS_PER_CONNECTION
+    }
+
+    fn count_request_submission(&mut self) -> Result<(), SoakError> {
+        self.submitted_requests = self
+            .submitted_requests
+            .checked_add(1)
+            .ok_or_else(|| fail("resource client request counter exhausted"))?;
+        Ok(())
     }
 
     pub(super) async fn close(self) -> Result<(), SoakError> {
@@ -515,6 +535,10 @@ impl ResourceDataClient {
             .header("x-resource-operation-id", operation_id)
             .body(GeneratedUpload::new(false, 0))
             .map_err(io_error)?;
+        if self.sender.is_none() {
+            return Err(fail("fixture acknowledgement client closed"));
+        }
+        self.count_request_submission()?;
         let response = match self.sender.as_mut() {
             Some(ResourceSender::H1(sender)) => sender.send_request(request).await,
             Some(ResourceSender::H2(sender)) => sender.send_request(request).await,
@@ -634,6 +658,14 @@ impl ResourceDataClient {
             resource_error(facts, "request", "request_headers_invalid");
             return;
         };
+        if self.sender.is_none() {
+            resource_error(facts, "response_head", "client_closed");
+            return;
+        }
+        if self.count_request_submission().is_err() {
+            resource_error(facts, "request", "client_request_counter_exhausted");
+            return;
+        }
         let response = match self.sender.as_mut() {
             Some(ResourceSender::H1(sender)) => sender.send_request(built).await,
             Some(ResourceSender::H2(sender)) => sender.send_request(built).await,
@@ -3641,6 +3673,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resource_client_retires_at_the_exact_declared_submission_budget() {
+        let mut client = ResourceDataClient {
+            sender: None,
+            driver: None,
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        assert_eq!(super::super::RESOURCE_REQUESTS_PER_CONNECTION, 1000);
+        for _ in 0..999 {
+            client.count_request_submission().expect("bounded attempt");
+        }
+        assert_eq!(client.submitted_requests(), 999);
+        assert!(!client.needs_retirement(), "not an artificial early close");
+        client.count_request_submission().expect("1000th attempt");
+        assert_eq!(client.submitted_requests(), 1000);
+        assert!(
+            client.needs_retirement(),
+            "retire before submitting request 1001"
+        );
+        client
+            .count_request_submission()
+            .expect("no hidden counter reset");
+        assert_eq!(client.submitted_requests(), 1001);
+        assert!(client.needs_retirement());
+        client.submitted_requests = u64::MAX;
+        assert!(client.count_request_submission().is_err());
+        assert_eq!(client.submitted_requests(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn resource_client_counts_failed_submitted_attempt_without_retrying_or_hiding_it() {
+        let (socket, peer) = tokio::io::duplex(1024);
+        let (sender, connection) = http1::handshake(TokioIo::new(socket))
+            .await
+            .expect("real Hyper sender");
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        drop(peer);
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        let failed = client
+            .measure(ResourceRequest {
+                operation_id: "actual-failed-attempt".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        assert_eq!(failed.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(failed.error_stage.as_deref(), Some("response_head"));
+        assert!(failed.status.is_none() && !failed.eof);
+        assert_eq!(client.submitted_requests(), 1);
+        assert!(!client.needs_retirement());
+        let closed = client.close_receipt().await;
+        assert_eq!(closed["join_acknowledged"], true);
+        assert!(closed["exit_ns"].as_u64().is_some());
+    }
+
+    #[test]
     fn retained_upgrade_requires_actual_a_socket_and_all_logical_metadata() {
         let fixture_a: SocketAddr = "127.0.0.1:43210".parse().expect("numeric fixture address");
         let mut raw = ResourceResponseFacts::blank("retained:a".into(), "upgrade");
@@ -3776,6 +3880,7 @@ mod tests {
             h2: true,
             targets: Vec::new(),
             local_response: true,
+            submitted_requests: 0,
         };
         let mut facts = ResourceResponseFacts::blank("local".into(), "h2");
         facts.status = Some(200);
@@ -3800,6 +3905,7 @@ mod tests {
             h2: true,
             targets: vec![("a".into(), "127.0.0.1:8080".parse().expect("numeric peer"))],
             local_response: false,
+            submitted_requests: 0,
         };
         let mut missing = ResourceResponseFacts::blank("proxy".into(), "h2");
         missing.status = Some(200);
@@ -3888,6 +3994,21 @@ mod tests {
             let mut client = ResourceDataClient::connect_local(address, config, h2)
                 .await
                 .expect("explicit local transport");
+            let invalid = client
+                .measure(ResourceRequest {
+                    operation_id: "not-submitted".into(),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 0,
+                    upload_bytes: 0,
+                })
+                .await;
+            assert_eq!(
+                invalid.error_code.as_deref(),
+                Some("request_parameters_invalid")
+            );
+            assert_eq!(client.submitted_requests(), 0);
             let raw = client
                 .measure(ResourceRequest {
                     operation_id: "local-wire".into(),
@@ -3899,6 +4020,8 @@ mod tests {
                 })
                 .await;
             assert_eq!(raw.status, Some(200));
+            assert_eq!(client.submitted_requests(), 1);
+            assert!(!client.needs_retirement());
             assert!(raw.eof && raw.error_code.is_none() && raw.diagnostics.is_empty());
             assert_eq!(raw.body_bytes, 16);
             let expected: String = Sha256::digest(b"resource-respond")
@@ -3918,6 +4041,19 @@ mod tests {
                     && raw.path.is_none(),
                 "local response does not fabricate fixture metadata from transport"
             );
+            client.sender.take();
+            let closed = client
+                .measure(ResourceRequest {
+                    operation_id: "not-submitted-closed".into(),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 1,
+                    upload_bytes: 0,
+                })
+                .await;
+            assert_eq!(closed.error_code.as_deref(), Some("client_closed"));
+            assert_eq!(client.submitted_requests(), 1);
             client.close().await.expect("actual client driver exit");
             tokio::time::timeout(Duration::from_secs(2), task)
                 .await
@@ -4158,6 +4294,7 @@ mod tests {
                 h2: false,
                 targets: Vec::new(),
                 local_response: false,
+                submitted_requests: 0,
             };
             let receipt = client.close_receipt().await;
             assert_eq!(receipt["result"], expected);
@@ -4174,6 +4311,7 @@ mod tests {
             h2: false,
             targets: Vec::new(),
             local_response: false,
+            submitted_requests: 0,
         }
         .close_receipt()
         .await;

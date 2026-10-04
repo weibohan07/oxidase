@@ -50,6 +50,7 @@ FIXTURE_GAUGES = (
     'oxidase_http2_active_streams{listener="qualification"}',
     'oxidase_active_tunnels{listener="qualification"}',
 )
+FIXTURE_REQUEST_BUDGET = 1000
 
 
 class EvidenceError(Exception):
@@ -196,6 +197,11 @@ class Analyzer:
         self.retained_proofs = []
         self.unbounded_kinds = set()
         self.required_gauges = []
+        self.retirements = []
+        self.retirement_journal = False
+        self.epoch_submissions = Counter()
+        self.epoch_protocols = {}
+        self.bucket_boundaries = defaultdict(list)
         self.first_metric = {}
         self.last_metric = {}
         self.actual_ipv6_responses = 0
@@ -624,6 +630,87 @@ class Analyzer:
                 self.finding("RL_CONTROL_CLASSIFICATION", "control classification contradicts independently derived facts", operation_id=operation_id)
         if pending:
             self.finding("RL_CONTROL_RESULT", "begun control operations lack terminal receipts", ids=list(pending))
+
+    def load_retirements(self):
+        """Client retirement is control work, never a silently retried request."""
+        self.retirement_journal = self.optional_file("client-retirements.jsonl")
+        if not self.retirement_journal:
+            if self.receipt["parameters"].get("formal"):
+                self.finding("RL_RETIREMENT_RESULT", "formal load lacks independently paired client retirements", "INCONCLUSIVE")
+            return
+        pending, identities, epochs, sequence = {}, set(), defaultdict(int), 0
+        for _, row in self.inputs.rows("client-retirements.jsonl"):
+            if row.get("schema_version") != "oxidase.resource-client-retirement/v1":
+                raise EvidenceError("unknown client retirement schema")
+            current = integer(required(row, "writer_seq"), "retirement writer_seq", 1)
+            if current != sequence + 1:
+                raise EvidenceError("retirement writer sequence missing or duplicated")
+            sequence = current
+            retirement_id = required(row, "retirement_id")
+            worker = integer(required(row, "worker_id"), "retirement worker")
+            epoch = integer(required(row, "connection_epoch"), "retirement epoch", 1)
+            start = integer(required(row, "start_ns"), "retirement start")
+            after = integer(required(row, "after_operation_seq"), "retirement after sequence", 1)
+            next_seq = integer(required(row, "next_operation_seq"), "retirement next sequence", 1)
+            if retirement_id != f"{worker}:{epoch}" or next_seq != after + 1:
+                raise EvidenceError("retirement identity/next operation sequence changed")
+            if row.get("protocol") not in ("http1", "h2"):
+                raise EvidenceError("unknown budget-retired client protocol")
+            if (integer(required(row, "request_budget"), "retirement request budget", 1) != FIXTURE_REQUEST_BUDGET or
+                    integer(required(row, "submitted_requests"), "retirement submitted requests") != FIXTURE_REQUEST_BUDGET):
+                self.finding("RL_RETIREMENT_BUDGET", "client retirement does not match exact predeclared listener request budget")
+            kind = required(row, "kind")
+            if kind == "started":
+                if retirement_id in identities or worker in pending or len(identities) >= MAX_PROBES or epoch <= epochs[worker]:
+                    raise EvidenceError("duplicate/concurrent/backwards client retirement identity")
+                identities.add(retirement_id)
+                epochs[worker] = epoch
+                pending[worker] = row
+                self.counts["client_retirements.offered"] += 1
+                continue
+            if kind != "terminal" or worker not in pending:
+                raise EvidenceError("retirement terminal lacks its Started or is duplicated")
+            started = pending.pop(worker)
+            fields = ("retirement_id", "worker_id", "connection_epoch", "start_ns", "after_operation_seq",
+                      "next_operation_seq", "protocol", "request_budget", "submitted_requests")
+            if any(row.get(field) != started.get(field) for field in fields):
+                raise EvidenceError("retirement terminal changed actual connection/counter identity")
+            end = integer(required(row, "end_ns"), "retirement end")
+            if end < start or self.phase_at(start) not in ("warmup", "steady", "recovery"):
+                self.finding("RL_RETIREMENT_BOUNDARY", "budget retirement did not occur during active load before next admission")
+            driver = required(row, "driver_exit")
+            if not isinstance(driver, dict) or driver.get("result") != "completed" or driver.get("join_acknowledged") is not True:
+                self.finding("RL_RETIREMENT_DRIVER", "budget-retired connection has no actual completed driver join")
+            elif not start <= integer(required(driver, "exit_ns"), "retired driver exit") <= end:
+                self.finding("RL_RETIREMENT_DRIVER", "actual driver exit lies outside retirement interval")
+            self.retirements.append(row)
+            self.counts["client_retirements.received"] += 1
+        if pending:
+            self.finding("RL_RETIREMENT_RESULT", "begun client retirement did not receive a terminal join", workers=list(pending))
+
+    def retirement_boundaries(self):
+        for row in self.retirements:
+            worker, epoch, after, next_seq = (row[key] for key in
+                                            ("worker_id", "connection_epoch", "after_operation_seq", "next_operation_seq"))
+            known = self.bucket_boundaries.get(worker, [])
+            prior = [bucket for bucket in known if bucket[1] == after]
+            following = [bucket for bucket in known if bucket[0] == next_seq]
+            if len(prior) != 1 or prior[0][3] > row["start_ns"]:
+                self.finding("RL_RETIREMENT_BOUNDARY", "old operation terminal bucket was not flushed before retirement", worker_id=worker, epoch=epoch)
+            if self.last_operation[worker] > after:
+                if len(following) != 1 or row["end_ns"] > following[0][2]:
+                    self.finding("RL_RETIREMENT_BOUNDARY", "new operation was admitted before actual retirement/join", worker_id=worker, epoch=epoch)
+            elif self.last_operation[worker] != after:
+                self.finding("RL_RETIREMENT_BOUNDARY", "retirement references an operation absent from the conserved worker ledger")
+            # An admission stop may follow the join; that does not invent a new
+            # request. The last conserved sequence must then be exactly `after`.
+            if self.epoch_submissions[(worker, epoch)] != row["submitted_requests"]:
+                self.finding("RL_RETIREMENT_BUDGET", "actual submitted operations in retired epoch do not match counter receipt", worker_id=worker, epoch=epoch)
+            if self.epoch_protocols.get((worker, epoch)) != row["protocol"]:
+                self.finding("RL_RETIREMENT_IDENTITY", "retirement protocol differs from the real retired client epoch")
+            if self.last_operation[worker] > after and not any(
+                    item[0] == next_seq and item[4] is not None and item[4] > epoch for item in known):
+                self.finding("RL_RETIREMENT_IDENTITY", "next operation reused the retired epoch instead of a new successful connection")
 
     def load_prelude(self):
         """Preserve every connection preparation and old/new flow operation."""
@@ -1189,6 +1276,7 @@ class Analyzer:
                 raise EvidenceError("worker bucket time moves backwards")
             self.last_operation[worker] = last
             self.last_bucket_time[worker] = end
+            epoch_at_first = None
             offered = last - first + 1
             for key in COUNT_KEYS + OPTIONAL_COUNT_KEYS:
                 value = integer(row.get(key, 0) if key in OPTIONAL_COUNT_KEYS else required(row, key), f"bucket {key}")
@@ -1218,6 +1306,17 @@ class Analyzer:
                         upgrades += count
                     else:
                         admitted += count
+                        if self.retirement_journal:
+                            epoch = integer(required(raw, "connection_epoch"), "actual submitted client epoch", 1)
+                            self.epoch_submissions[(worker, epoch)] += count
+                            protocol = required(outcome, "protocol")
+                            known = self.epoch_protocols.setdefault((worker, epoch), protocol)
+                            if known != protocol:
+                                self.finding("RL_RETIREMENT_IDENTITY", "one successful connection epoch changed protocol")
+                            if self.epoch_submissions[(worker, epoch)] > FIXTURE_REQUEST_BUDGET:
+                                self.finding("RL_RETIREMENT_BUDGET", "new request reused an epoch beyond its listener budget")
+                            if outcome.get("first_start_ns", start) == start:
+                                epoch_at_first = epoch
                 outcome_start = outcome.get("first_start_ns", start)
                 self.check_phase(required(outcome, "phase"), outcome_start, end, "bucket")
                 if "first_start_ns" in outcome:
@@ -1252,6 +1351,8 @@ class Analyzer:
                     self.finding("RL_QUIET_ADMISSION", "business admission continued after quiet Running began")
             if total != offered or attempts != row["connection_attempts"] or admitted != row["admitted_http_operations"] or upgrades != row.get("admitted_upgrade_operations", 0):
                 self.finding("RL_RESULT_CONSERVATION", "raw histogram does not conserve offered/connect/admitted/terminal counts")
+            self.bucket_boundaries[worker].append((first, last, start, end, epoch_at_first))
+        self.retirement_boundaries()
         if set(self.errors) != self.consumed_errors:
             self.finding("RL_ABANDONED_RESULT", "operation-level errors are not covered by a worker bucket")
         final = required(self.receipt, "final_counts")
@@ -1614,6 +1715,7 @@ class Analyzer:
             self.timeline()
             self.load_prelude()
             self.load_controls()
+            self.load_retirements()
             self.load_errors()
             self.load_probes()
             self.operations()

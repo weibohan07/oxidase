@@ -834,12 +834,12 @@ fn srv_weights(document: &Value, a: u16, b: u16) -> Result<bool, SoakError> {
         .is_some_and(|targets| {
             targets.len() == 2
                 && targets.iter().any(|row| {
-                    row["target"] == "a.discovery.test"
+                    row["target"] == "a.discovery.test."
                         && row["weight"] == a
                         && row["priority"] == 0
                 })
                 && targets.iter().any(|row| {
-                    row["target"] == "b.discovery.test"
+                    row["target"] == "b.discovery.test."
                         && row["weight"] == b
                         && row["priority"] == 0
                 })
@@ -1550,11 +1550,17 @@ mod tests {
     }
     #[test]
     fn srv_weight_oracle_rejects_priority_or_identity_changes() {
-        let mut raw = json!({"clusters":[{"cluster":"upstream","discovery":{"srv_targets":[{"target":"a.discovery.test","priority":0,"weight":1},{"target":"b.discovery.test","priority":0,"weight":1}]}}]});
+        // Literal canonical target representation observed in the actual Linux
+        // Admin artifact, not an unqualified-name fixture invented by this
+        // oracle. DNS target identity/priority must remain exact.
+        let mut raw = json!({"clusters":[{"cluster":"upstream","discovery":{"srv_targets":[{"target":"a.discovery.test.","priority":0,"weight":1},{"target":"b.discovery.test.","priority":0,"weight":1}]}}]});
         assert!(srv_weights(&raw, 1, 1).expect("equal weights"));
         assert!(!srv_weights(&raw, 3, 1).expect("not weighted"));
         raw["clusters"][0]["discovery"]["srv_targets"][0]["weight"] = 3.into();
         assert!(srv_weights(&raw, 3, 1).expect("weighted"));
+        raw["clusters"][0]["discovery"]["srv_targets"][0]["target"] = "a.discovery.test".into();
+        assert!(!srv_weights(&raw, 3, 1).expect("unqualified metadata is not canonical"));
+        raw["clusters"][0]["discovery"]["srv_targets"][0]["target"] = "a.discovery.test.".into();
         raw["clusters"][0]["discovery"]["srv_targets"][1]["priority"] = 1.into();
         assert!(!srv_weights(&raw, 3, 1).expect("changed priority"));
         raw["clusters"][0]["discovery"]["srv_targets"][1]["priority"] = 0.into();

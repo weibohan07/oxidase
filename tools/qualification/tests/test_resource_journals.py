@@ -73,6 +73,36 @@ def labelled_metrics_corpus():
     return data
 
 
+def retirement_corpus():
+    data = corpus()
+    for bucket in data["buckets.jsonl"]:
+        bucket["outcomes"][0]["raw"]["connection_epoch"] = 1 if bucket["worker_id"] != 0 or bucket["first_operation_seq"] == 1 else 2
+    first = data["buckets.jsonl"][0]
+    second = copy.deepcopy(first["outcomes"][0])
+    second["count"] = 999
+    second["raw"]["connection_attempted"] = False
+    first["outcomes"].append(second)
+    first.update(last_operation_seq=1000, offered=1000, received_operations=1000, admitted_http_operations=1000)
+    for bucket in data["buckets.jsonl"]:
+        if bucket["worker_id"] == 0 and bucket is not first:
+            bucket["first_operation_seq"] += 999
+            bucket["last_operation_seq"] += 999
+    final = data["receipt.json"]["final_counts"]
+    for key in ("offered", "received_operations", "admitted_http_operations"):
+        final[key] += 999
+        final["workers"][0][key] += 999
+    final["workers"][0]["last_operation_seq"] += 999
+    start = first["bucket_end_ns"] + 10
+    started = {"schema_version": "oxidase.resource-client-retirement/v1", "kind": "started", "writer_seq": 1,
+               "retirement_id": "0:1", "worker_id": 0, "protocol": "http1", "connection_epoch": 1,
+               "start_ns": start, "after_operation_seq": 1000, "next_operation_seq": 1001,
+               "request_budget": 1000, "submitted_requests": 1000}
+    terminal = {**started, "kind": "terminal", "writer_seq": 2, "end_ns": start + 10,
+                "driver_exit": {"result": "completed", "join_acknowledged": True, "abort_requested": False, "exit_ns": start + 5}}
+    data["client-retirements.jsonl"] = [started, terminal]
+    return data
+
+
 def prelude_corpus():
     data = retained_corpus()
     proof = data["events.jsonl"][1]["evidence"]["raw"]
@@ -366,6 +396,84 @@ class IndependentJournalTests(unittest.TestCase):
         measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin" and row["phase"] == "warmup")
         measured["metrics"] = ""
         self.fail(data, "RL_MISSING_GAUGE")
+
+    def test_budget_retirement_has_independent_counter_and_actual_before_admission_boundary(self):
+        report = self.verify(retirement_corpus())
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["client_retirements.offered"], 1)
+        self.assertEqual(report["counts"]["client_retirements.received"], 1)
+        self.assertEqual(report["counts"]["offered"], 1005)
+
+    def test_missing_duplicate_and_changed_retirement_terminal_are_not_received(self):
+        for change in ("missing", "duplicate", "epoch", "next_sequence"):
+            data = retirement_corpus()
+            if change == "missing":
+                data["client-retirements.jsonl"].pop()
+                code = "RL_RETIREMENT_RESULT"
+            elif change == "duplicate":
+                row = copy.deepcopy(data["client-retirements.jsonl"][1])
+                row["writer_seq"] = 3
+                data["client-retirements.jsonl"].append(row)
+                code = "RL_INVALID_EVIDENCE"
+            else:
+                row = data["client-retirements.jsonl"][1]
+                row["connection_epoch" if change == "epoch" else "next_operation_seq"] += 1
+                code = "RL_INVALID_EVIDENCE"
+            self.fail(data, code)
+
+    def test_driver_exit_error_timeout_unknown_or_unjoined_cannot_qualify_retirement(self):
+        for result in ("error", "cancelled", "panicked", "timeout", "unavailable"):
+            data = retirement_corpus()
+            data["client-retirements.jsonl"][1]["driver_exit"]["result"] = result
+            self.fail(data, "RL_RETIREMENT_DRIVER")
+        data = retirement_corpus()
+        data["client-retirements.jsonl"][1]["driver_exit"]["join_acknowledged"] = False
+        self.fail(data, "RL_RETIREMENT_DRIVER")
+
+    def test_early_or_over_budget_retirement_counter_cannot_replace_actual_count(self):
+        for submitted in (999, 1001):
+            data = retirement_corpus()
+            for row in data["client-retirements.jsonl"]:
+                row["submitted_requests"] = submitted
+            self.fail(data, "RL_RETIREMENT_BUDGET")
+        data = retirement_corpus()
+        data["buckets.jsonl"][0]["outcomes"][0]["raw"]["connection_epoch"] = 2
+        self.fail(data, "RL_RETIREMENT_BUDGET")
+
+    def test_old_terminal_must_precede_close_and_new_admission_must_follow_join(self):
+        for change in ("old_end", "new_start", "reused_epoch", "protocol"):
+            data = retirement_corpus()
+            if change == "old_end":
+                data["buckets.jsonl"][0]["bucket_end_ns"] = data["client-retirements.jsonl"][0]["start_ns"] + 1
+                code = "RL_RETIREMENT_BOUNDARY"
+            elif change == "new_start":
+                terminal = data["client-retirements.jsonl"][1]
+                terminal["end_ns"] = data["buckets.jsonl"][2]["bucket_start_ns"] + 1
+                code = "RL_RETIREMENT_BOUNDARY"
+            elif change == "reused_epoch":
+                data["buckets.jsonl"][2]["outcomes"][0]["raw"]["connection_epoch"] = 1
+                code = "RL_RETIREMENT_IDENTITY"
+            else:
+                for row in data["client-retirements.jsonl"]:
+                    row["protocol"] = "h2"
+                code = "RL_RETIREMENT_IDENTITY"
+            self.fail(data, code)
+
+    def test_connection_failure_epochs_can_skip_but_cannot_go_backwards(self):
+        data = retirement_corpus()
+        for bucket in data["buckets.jsonl"]:
+            if bucket["worker_id"] == 0:
+                epoch = bucket["outcomes"][0]["raw"]["connection_epoch"]
+                for outcome in bucket["outcomes"]:
+                    outcome["raw"]["connection_epoch"] = epoch + 2
+        for row in data["client-retirements.jsonl"]:
+            row["connection_epoch"] = 3
+            row["retirement_id"] = "0:3"
+        self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
+        backwards = copy.deepcopy(data["client-retirements.jsonl"][0])
+        backwards.update(writer_seq=3, connection_epoch=2, retirement_id="0:2")
+        data["client-retirements.jsonl"].append(backwards)
+        self.fail(data, "RL_INVALID_EVIDENCE")
 
 
 if __name__ == "__main__":

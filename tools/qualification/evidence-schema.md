@@ -158,6 +158,29 @@ Mutation acknowledgement alone cannot prove publication: actual revision,
 ETag and origin transitions are independently checked. This scope does not
 claim that bootstrap, sampler startup or every legacy internal action is journaled.
 
+`client-retirements.jsonl` uses `oxidase.resource-client-retirement/v1` and a
+separate Started/Terminal denominator. It records `retirement_id:worker:epoch`,
+`worker_id,protocol,connection_epoch,start_ns,after_operation_seq,
+next_operation_seq,request_budget,submitted_requests`; Terminal adds `end_ns`
+and the actual `driver_exit` receipt. The validation fixture explicitly uses
+the existing listener budget of 1000 requests: the retired client's actual
+submitted count must equal that budget, and its driver must complete and join.
+This never silently retries an offered request or relaxes healthy-wire failures.
+Successful normal/cancel operations retain `raw.connection_epoch`; failed
+connection preparation preserves null, and reconnections may skip retirement
+epochs but cannot move them backwards. Upgrade uses its separate short-lived
+connection and is not this quota counter.
+
+At RetirementStarted the FIFO collector flushes that worker's normal bucket.
+The analyzer requires its last sequence N and terminal time to precede retirement,
+the next bucket to start with N+1 only after actual driver join, and a new epoch
+for that admission. A stop after joining can legitimately leave the last offered
+sequence at N; it cannot fabricate an N+1 response. Epoch counts are independently
+summed from the raw histogram, not accepted from the retirement counter alone.
+Missing/duplicate join results, 999/1001 counters, unjoined/error/timeout drivers,
+unflushed boundary buckets or reused retired epochs fail. Retirement control
+counts are not added to the normal offered/admitted/terminal denominator.
+
 `prelude-operations.json` has `schema_version: oxidase.resource-prelude/v1`,
 advisory `result`, and `evidence:{prelude_counts,prelude_operations}`. Every
 allocated `prelude:N` has `role,terminal,cause,raw,acknowledgement`; counts include
