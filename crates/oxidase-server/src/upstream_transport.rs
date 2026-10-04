@@ -881,7 +881,7 @@ mod tests {
     use http_body_util::{BodyExt as _, Empty, Full};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::client::legacy::connect::{Connection as _, HttpInfo};
+    use hyper_util::client::legacy::connect::HttpInfo;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio_rustls::TlsAcceptor;

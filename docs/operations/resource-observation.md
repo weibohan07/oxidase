@@ -51,6 +51,13 @@ cannot interpret a single Cluster role as a multi-store authority/refcount; actu
 created/destroyed/live ownership counts remain independent. Observation state is
 never used to authorize publication or choose a lease.
 
+The Cluster read view preserves `retired_admission_counters` as physical families
+with outstanding admission and no current member. The separate
+`stored_admission_tombstones` counts stored noncurrent weak slots, including dead
+or inactive metadata. These are different units: observing a dead slot cannot
+delete it or pretend it still owns a resource. Original owner/lease maintenance
+still performs its bounded cleanup.
+
 ## Consistency and bounded detail
 
 Samples report `capture_start_ms`, `capture_end_ms`, update sequence at each end,

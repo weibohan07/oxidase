@@ -177,8 +177,18 @@ async fn real_process_campaign(campaign: &str, seed: &str) {
     assert_eq!(summary["final_sample"]["discovery_tasks"], 0);
     assert_eq!(summary["final_sample"]["cluster_permits"], 0);
     assert_eq!(summary["final_sample"]["retry_permits"], 0);
-    assert_eq!(summary["final_sample"]["health_tasks"], Value::Null);
-    assert_eq!(summary["final_sample"]["pools"], Value::Null);
+    assert_eq!(summary["final_sample"]["health_tasks"], 0);
+    assert_eq!(summary["final_sample"]["old_snapshots"], 0);
+    assert_eq!(summary["final_sample"]["retired_pools"], 0);
+    let live_families = summary["final_sample"]["pools"]
+        .as_u64()
+        .expect("actual Client families are measured, not fabricated null/zero");
+    // The current PublishedRuntime and its bounded current registry ownership
+    // remain legal after drain. They are not retired body-held Client families.
+    assert!(
+        live_families <= 2 * 1024,
+        "both current registry bounds hold"
+    );
     assert!(
         std::fs::metadata(output.path().join("metrics-samples.jsonl"))
             .expect("raw PID-scoped scrapes")

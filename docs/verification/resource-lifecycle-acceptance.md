@@ -92,6 +92,20 @@ receipts and merged-main CI are recorded on PR #20 after actual execution; the
 design-only Draft head `f75b670` run `37183775955` passed four required jobs, but
 cannot substitute for its final implementation head.
 
+### Intermediate final-gate failures retained
+
+Head `c800823` ran Hosted `37185387986`: stable Clippy failed at a duplicated
+test-only `Connection as _` import under Rust 1.99; MSRV failed in process
+qualification. Its local complete gate also stopped at the two real process
+smokes: the new passive view had accidentally reported stored weak slots in the
+older `retired_admission_counters` field, while that field means still-outstanding
+noncurrent physical admission. It must retain that active-family projection and
+report raw weak storage separately, without pruning on read or changing leases.
+The old smoke's actual zero-active assertion is not removed or relaxed. New
+health/pool/snapshot observations likewise replace obsolete null assertions with
+real unit-specific checks; bounded current registry ownership is not forced to
+zero after drain. Required checks must rerun on the repaired head.
+
 Implementation, bounded runtime qualification and memory attribution are separate
 conclusions. Missing required data or unclosed attribution cannot become PASS
 because code, an interface, a workflow, or a green build exists.

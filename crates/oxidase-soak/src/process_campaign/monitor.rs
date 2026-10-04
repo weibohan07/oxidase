@@ -17,6 +17,7 @@ pub(super) struct Sample {
     pub discovery_tasks: Option<u64>,
     pub health_tasks: Option<u64>,
     pub pools: Option<u64>,
+    pub retired_pools: Option<u64>,
     pub old_snapshots: Option<u64>,
     pub cluster_permits: Option<u64>,
     pub retry_permits: Option<u64>,
@@ -100,6 +101,18 @@ pub(super) fn sample(
                     "oxidase_resource_live",
                     &["kind=\"health_pool_family\""],
                 )?)
+        }),
+        retired_pools: metrics.and_then(|m| {
+            selected_metric(
+                m,
+                "oxidase_resource_state",
+                &["kind=\"proxy_pool_family\"", "state=\"retired\""],
+            )?
+            .checked_add(selected_metric(
+                m,
+                "oxidase_resource_state",
+                &["kind=\"health_pool_family\"", "state=\"retired\""],
+            )?)
         }),
         old_snapshots: metrics.and_then(|m| {
             selected_metric(

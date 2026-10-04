@@ -132,7 +132,13 @@ pub struct DiscoveryRuntimeStatus {
     pub next_expiry_ms: Option<u64>,
     pub next_refresh_ms: Option<u64>,
     pub error_code: Option<DiscoveryErrorCode>,
+    /// Noncurrent physical admission families with an actual outstanding
+    /// permit. Reading this value never prunes their weak bookkeeping slots.
     pub retired_admission_counters: usize,
+    /// Stored weak slots not associated with a currently unexpired member.
+    /// May remain nonzero after the last permit/object has really released;
+    /// ordinary owner/lease maintenance, not observation, removes those slots.
+    pub stored_admission_tombstones: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eligible_priority: Option<u16>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

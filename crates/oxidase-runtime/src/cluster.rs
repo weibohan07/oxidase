@@ -516,7 +516,7 @@ struct EndpointMembership {
     families: [FamilyState; 2],
     valid_until: BTreeMap<DynamicEndpointKey, tokio::time::Instant>,
     stale_targets: BTreeSet<DynamicEndpointKey>,
-    admission_counters: BTreeMap<SocketAddr, Weak<AdmissionCounter>>,
+    admission_counters: BTreeMap<SocketAddr, AdmissionTombstone>,
     last_success_unix_ms: Option<u64>,
     next_refresh: Option<tokio::time::Instant>,
     srv: SrvState,
@@ -524,6 +524,34 @@ struct EndpointMembership {
     srv_cursors: BTreeMap<SrvGroupKey, u64>,
     srv_random: SrvSelectionRng,
     inherited_counter_count: usize,
+}
+
+/// Business reuse may upgrade the actual counter; observation may only borrow
+/// its existing admission atomic. Holding that scalar cannot keep the counter,
+/// its lifecycle token, notifier, endpoint, or Cluster alive.
+#[derive(Clone)]
+struct AdmissionTombstone {
+    counter: Weak<AdmissionCounter>,
+    active: Weak<AtomicU64>,
+}
+
+impl AdmissionTombstone {
+    fn new(counter: &Arc<AdmissionCounter>) -> Self {
+        Self {
+            counter: Arc::downgrade(counter),
+            active: Arc::downgrade(&counter.active),
+        }
+    }
+
+    fn upgrade(&self) -> Option<Arc<AdmissionCounter>> {
+        self.counter.upgrade()
+    }
+
+    fn observed_active(&self) -> u64 {
+        self.active
+            .upgrade()
+            .map_or(0, |active| active.load(Ordering::Acquire))
+    }
 }
 
 #[derive(Default)]
@@ -691,7 +719,7 @@ impl PreparedCluster {
                             .upgrade()
                             .is_some_and(|counter| counter.active() > 0)
                     })
-                    .map(|(target, counter)| (*target, Weak::clone(counter))),
+                    .map(|(target, counter)| (*target, counter.clone())),
             );
             for endpoint in previous
                 .endpoints
@@ -699,7 +727,7 @@ impl PreparedCluster {
                 .filter(|endpoint| endpoint.state.admission.active() > 0)
             {
                 if let Some(target) = endpoint.dial_target() {
-                    inherited.insert(target, Arc::downgrade(&endpoint.state.admission));
+                    inherited.insert(target, AdmissionTombstone::new(&endpoint.state.admission));
                 }
             }
         }
@@ -911,7 +939,7 @@ impl PreparedCluster {
                 .map(|endpoint| {
                     (
                         endpoint.dial_target(),
-                        Arc::downgrade(&endpoint.state.admission),
+                        AdmissionTombstone::new(&endpoint.state.admission),
                     )
                 })
                 .filter_map(|(target, counter)| target.map(|target| (target, counter)))
@@ -2153,6 +2181,8 @@ impl PreparedCluster {
                 .dynamic_key()
                 .is_some_and(|key| membership.stale_targets.contains(&key))
         });
+        let (retired_admission_counters, stored_admission_tombstones) =
+            Self::observed_retired_admissions(membership, now);
         Some(DiscoveryRuntimeStatus {
             name: plan.name.clone(),
             resolution: membership.resolution_for(
@@ -2172,17 +2202,8 @@ impl PreparedCluster {
                 u64::try_from(next.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
             }),
             error_code: membership.error_code(),
-            // Actual stored tombstones, not a sweep performed by observation.
-            retired_admission_counters: membership
-                .admission_counters
-                .keys()
-                .filter(|target| {
-                    !membership
-                        .valid_until
-                        .iter()
-                        .any(|(member, expiry)| &member.target == *target && now < *expiry)
-                })
-                .count(),
+            retired_admission_counters,
+            stored_admission_tombstones,
             eligible_priority: groups
                 .iter()
                 .filter(|group| group.eligible_addresses > 0)
@@ -2190,6 +2211,30 @@ impl PreparedCluster {
                 .min(),
             srv_targets: groups,
         })
+    }
+
+    fn observed_retired_admissions(
+        membership: &EndpointMembership,
+        now: tokio::time::Instant,
+    ) -> (usize, usize) {
+        let mut active = 0;
+        let mut stored = 0;
+        for (target, counter) in &membership.admission_counters {
+            if membership
+                .valid_until
+                .iter()
+                .any(|(member, expiry)| member.target == *target && now < *expiry)
+            {
+                continue;
+            }
+            stored += 1;
+            // Borrow only the very same atomic used by business admission.
+            // Parallel readers cannot chain strong references to the Counter.
+            if counter.observed_active() > 0 {
+                active += 1;
+            }
+        }
+        (active, stored)
     }
 
     fn endpoint(&self, name: &str) -> Option<Arc<PreparedEndpoint>> {
@@ -2217,6 +2262,8 @@ impl PreparedCluster {
         now: tokio::time::Instant,
     ) -> Option<DiscoveryRuntimeStatus> {
         let plan = self.spec.discovery.as_ref()?;
+        let (retired_admission_counters, stored_admission_tombstones) =
+            Self::observed_retired_admissions(membership, now);
         Some(DiscoveryRuntimeStatus {
             name: plan.name.clone(),
             resolution: membership.resolution(plan.record == DnsRecordType::Srv),
@@ -2236,16 +2283,8 @@ impl PreparedCluster {
                 u64::try_from(next.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
             }),
             error_code: membership.error_code(),
-            retired_admission_counters: membership
-                .admission_counters
-                .iter()
-                .filter(|(target, _)| {
-                    !membership
-                        .valid_until
-                        .keys()
-                        .any(|member| &member.target == *target)
-                })
-                .count(),
+            retired_admission_counters,
+            stored_admission_tombstones,
             eligible_priority: Self::srv_eligible_priority(membership, Instant::now()),
             srv_targets: membership
                 .srv_groups
@@ -2378,9 +2417,10 @@ impl PreparedCluster {
             .collect::<BTreeMap<_, _>>();
         for (target, endpoint) in &previous {
             if endpoint.state.admission.active() > 0 {
-                membership
-                    .admission_counters
-                    .insert(target.target, Arc::downgrade(&endpoint.state.admission));
+                membership.admission_counters.insert(
+                    target.target,
+                    AdmissionTombstone::new(&endpoint.state.admission),
+                );
             }
         }
         let cap = usize::from(plan.limits.max_endpoints).saturating_add(
@@ -2459,7 +2499,7 @@ impl PreparedCluster {
             let admission = membership
                 .admission_counters
                 .get(&target.target)
-                .and_then(Weak::upgrade)
+                .and_then(AdmissionTombstone::upgrade)
                 .or_else(|| {
                     previous
                         .values()
@@ -2469,7 +2509,7 @@ impl PreparedCluster {
                 .unwrap_or_else(|| Arc::new(AdmissionCounter::endpoint(self.resource_census())));
             membership
                 .admission_counters
-                .insert(target.target, Arc::downgrade(&admission));
+                .insert(target.target, AdmissionTombstone::new(&admission));
             let state = Arc::new(EndpointRuntimeState::new_at_with_admission(
                 Instant::now(),
                 admission,
@@ -3405,7 +3445,7 @@ impl ClusterRuntimeState {
 
 #[derive(Debug)]
 struct AdmissionCounter {
-    active: AtomicU64,
+    active: Arc<AtomicU64>,
     released: Notify,
     census: Arc<ResourceCensus>,
     permit_kind: ResourceKind,
@@ -3425,7 +3465,7 @@ impl AdmissionCounter {
 
     fn new(census: Arc<ResourceCensus>, permit_kind: ResourceKind, endpoint: bool) -> Self {
         Self {
-            active: AtomicU64::new(0),
+            active: Arc::new(AtomicU64::new(0)),
             released: Notify::new(),
             _lifecycle: endpoint
                 .then(|| census.token(ResourceKind::EndpointAdmission, ResourceState::Live)),
@@ -4755,16 +4795,24 @@ mod discovery_membership_tests {
         );
         let lease = cluster.acquire().await.expect("issued endpoint lease");
         let old = Arc::downgrade(lease.endpoint());
+        let physical = Arc::downgrade(&lease.endpoint().state.admission);
         observe(&cluster, DnsFamily::A, DnsObservation::NoData);
         assert_eq!(
             census_state(&census, ResourceKind::Endpoint, ResourceState::Retired),
             1
         );
         assert!(old.upgrade().is_some());
+        let held_status = cluster.observed_discovery_status().expect("DNS status");
+        assert_eq!(held_status.retired_admission_counters, 1);
+        assert_eq!(held_status.stored_admission_tombstones, 1);
         drop(lease);
         assert!(
             old.upgrade().is_none(),
             "census does not own the removed endpoint"
+        );
+        assert!(
+            physical.upgrade().is_none(),
+            "the real physical counter also releases without a scrape"
         );
         let membership_size = || {
             cluster
@@ -4794,6 +4842,13 @@ mod discovery_membership_tests {
                     .observed_discovery_status()
                     .expect("DNS status")
                     .retired_admission_counters,
+                0
+            );
+            assert_eq!(
+                cluster
+                    .observed_discovery_status()
+                    .expect("DNS status")
+                    .stored_admission_tombstones,
                 1
             );
             assert_eq!(membership_size(), 1);
@@ -4836,6 +4891,172 @@ mod discovery_membership_tests {
         let row = census_count(&census, ResourceKind::DiscoveryLease);
         assert_eq!(row.created, row.destroyed);
         assert_eq!(row.live, 0);
+        drop(cluster);
+        assert_eq!(census.sample().detailed_records, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn passive_retired_admission_projects_actual_permits_not_weak_slot_or_object_existence() {
+        let census = Arc::new(ResourceCensus::default());
+        let cluster = PreparedCluster::prepare_in(dynamic_spec(), None, Arc::clone(&census)).0;
+        cluster.observe_publication();
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        let lease = cluster.acquire().await.expect("actual physical permit");
+        let held_view = Arc::clone(lease.endpoint());
+        let physical = Arc::downgrade(&held_view.state.admission);
+        observe(&cluster, DnsFamily::A, DnsObservation::NoData);
+        let status = cluster
+            .observed_discovery_status()
+            .expect("held retired status");
+        assert_eq!(
+            (
+                status.retired_admission_counters,
+                status.stored_admission_tombstones
+            ),
+            (1, 1)
+        );
+        drop(lease);
+        assert!(
+            physical.upgrade().is_some(),
+            "the deliberately held endpoint still owns its now-idle family"
+        );
+        let generation = cluster.membership.lock().expect("membership").generation;
+        let before = census.sample();
+        for _ in 0..100 {
+            let status = cluster
+                .observed_status(Instant::now())
+                .discovery
+                .expect("pure retired status");
+            assert_eq!(
+                (
+                    status.retired_admission_counters,
+                    status.stored_admission_tombstones
+                ),
+                (0, 1)
+            );
+            assert_eq!(status.generation, generation);
+            assert_eq!(
+                cluster
+                    .membership
+                    .lock()
+                    .expect("membership")
+                    .admission_counters
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(census.sample().sequence_end, before.sequence_end);
+        drop(held_view);
+        assert!(
+            physical.upgrade().is_none(),
+            "the observer did not retain its temporary read borrow"
+        );
+        assert_eq!(
+            census_count(&census, ResourceKind::EndpointAdmission).live,
+            0
+        );
+        let status = cluster
+            .observed_discovery_status()
+            .expect("fully released status");
+        assert_eq!(
+            (
+                status.retired_admission_counters,
+                status.stored_admission_tombstones
+            ),
+            (0, 1)
+        );
+        // The existing owner/lease path may perform maintenance later; pure
+        // status was not required for release and did not remove bookkeeping.
+        drop(cluster.endpoints());
+        let status = cluster
+            .observed_discovery_status()
+            .expect("maintained status");
+        assert_eq!(
+            (
+                status.retired_admission_counters,
+                status.stored_admission_tombstones
+            ),
+            (0, 0)
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn retained_observation_scalar_cannot_keep_the_real_admission_family_alive() {
+        let census = Arc::new(ResourceCensus::default());
+        let cluster = PreparedCluster::prepare_in(dynamic_spec(), None, Arc::clone(&census)).0;
+        cluster.observe_publication();
+        assert!(cluster.activate_discovery_policy());
+        observe(
+            &cluster,
+            DnsFamily::A,
+            positive(&["198.51.100.1"], Duration::from_secs(60)),
+        );
+        let lease = cluster.acquire().await.expect("real business permit");
+        let target = lease.dial_target().expect("validated physical address");
+        let counter = Arc::downgrade(&lease.endpoint().state.admission);
+        observe(&cluster, DnsFamily::A, DnsObservation::NoData);
+        let scalar = cluster
+            .membership
+            .lock()
+            .expect("membership")
+            .admission_counters[&target]
+            .active
+            .upgrade()
+            .expect("observer can read scalar metadata");
+        assert!(
+            Arc::ptr_eq(&scalar, &lease.endpoint().state.admission.active),
+            "this is the business CAS atomic, not a mirrored admission state"
+        );
+        let scalar_weak = Arc::downgrade(&scalar);
+        assert_eq!(scalar.load(Ordering::Acquire), 1);
+        drop(lease);
+        assert_eq!(
+            scalar.load(Ordering::Acquire),
+            0,
+            "the actual permit Drop updates the same scalar"
+        );
+        assert!(
+            counter.upgrade().is_none(),
+            "an indefinitely retained scalar does not retain Counter/Endpoint/permit"
+        );
+        let family = census_count(&census, ResourceKind::EndpointAdmission);
+        assert_eq!((family.created, family.destroyed, family.live), (1, 1, 0));
+        let generation = cluster.membership.lock().expect("membership").generation;
+        let before = census.sample();
+        for _ in 0..1000 {
+            let status = cluster.observed_discovery_status().expect("pure status");
+            assert_eq!(
+                (
+                    status.retired_admission_counters,
+                    status.stored_admission_tombstones
+                ),
+                (0, 1)
+            );
+            assert_eq!(status.generation, generation);
+            assert_eq!(
+                cluster
+                    .membership
+                    .lock()
+                    .expect("membership")
+                    .admission_counters
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(census.sample().sequence_end, before.sequence_end);
+        assert!(counter.upgrade().is_none());
+        drop(scalar);
+        assert!(
+            scalar_weak.upgrade().is_none(),
+            "the weak bookkeeping also cannot retain scalar metadata"
+        );
         drop(cluster);
         assert_eq!(census.sample().detailed_records, 0);
         assert_eq!(census.sample().invariant_failures, 0);
