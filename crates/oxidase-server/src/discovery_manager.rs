@@ -947,6 +947,167 @@ mod tests {
         );
     }
 
+    fn healthy_resource_campaign_cluster() -> (TempDir, PreparedCluster, Arc<ResourceCensus>) {
+        let (dir, snapshot) = fixture();
+        let mut spec = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster")
+            .spec()
+            .clone();
+        let plan = spec.discovery.as_mut().expect("DNS policy");
+        plan.refresh.min_interval = Duration::from_millis(200);
+        plan.refresh.max_interval = Duration::from_secs(1);
+        plan.refresh.jitter_percent = 10;
+        plan.refresh.stale_if_error = Duration::from_millis(500);
+        plan.resolver.query_timeout = Duration::from_millis(500);
+        spec.health.active = Some(oxidase_config::ActiveHealthSpec {
+            path: "/healthz".into(),
+            interval: Duration::from_millis(200),
+            timeout: Duration::from_millis(500),
+            healthy_statuses: vec![oxidase_config::StatusRange {
+                start: 200,
+                end: 299,
+            }],
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            source: spec.source.clone(),
+        });
+        let census = Arc::new(ResourceCensus::default());
+        let (cluster, _) = PreparedCluster::prepare_in(spec, None, Arc::clone(&census));
+        assert!(cluster.activate_discovery_policy());
+        (dir, cluster, census)
+    }
+
+    async fn prove_positive_refresh_timing(ttl: Duration, expires_during_query: bool) {
+        let (_dir, cluster, census) = healthy_resource_campaign_cluster();
+        let initial = Instant::now();
+        let expiry = initial + ttl;
+        let positive = |fresh_until| DnsObservation::Positive {
+            addresses: vec![DnsAddressRecord {
+                address: "192.0.2.1".parse().expect("IP"),
+                fresh_until,
+            }],
+        };
+        let query = cluster.begin_discovery_query().expect("initial query");
+        let initial_receipt =
+            cluster.reconcile_dns(&query, DnsFamily::A, positive(expiry), initial);
+        assert!(initial_receipt.applied);
+        assert_eq!(initial_receipt.observation_error_code, None);
+        drop(query);
+        let held = cluster.acquire().await.expect("fresh business lease");
+        let old_endpoint = Arc::clone(held.endpoint());
+        cluster.record_active_health_for(&old_endpoint, true, std::time::Instant::now());
+        let health = &cluster.observed_status(std::time::Instant::now()).endpoints[0].runtime;
+        assert_eq!(health.health, oxidase_runtime::EndpointHealthState::Healthy);
+        assert_eq!(health.active_health_successes, 1);
+        assert_eq!(health.active_health_failures, 0);
+
+        // Seed 33 is the first seed in 0..1024 whose actual schedule for
+        // cluster:api reduces a one-second interval by less than two ms.
+        // The resolver performs no second positive cache lookup; this models
+        // one successful, still-in-flight query, not any DNS/health failure.
+        let mut schedule = RefreshSchedule::new(cluster.id(), 33);
+        let plan = cluster.spec().discovery.as_ref().expect("DNS policy");
+        schedule.complete(
+            DnsFamily::A,
+            &ResolvedFamily {
+                observation: positive(expiry),
+                retry_after: None,
+            },
+            plan,
+            initial,
+        );
+        let query_started = schedule.next[0];
+        assert_eq!(query_started - initial, Duration::from_micros(998_250));
+        let reply_delay = Duration::from_millis(2);
+        let reply_at = query_started + reply_delay;
+        tokio::time::advance(query_started - Instant::now()).await;
+        let query = cluster
+            .begin_discovery_query()
+            .expect("positive refresh query");
+        assert!(
+            cluster
+                .observed_discovery_status()
+                .expect("status")
+                .in_flight_query
+        );
+
+        if expires_during_query {
+            assert!(query_started < expiry && expiry < reply_at);
+            tokio::time::advance(expiry - Instant::now()).await;
+            assert!(matches!(
+                cluster.acquire().await,
+                Err(oxidase_runtime::ClusterAdmissionError::Unavailable)
+            ));
+            let status = cluster.observed_discovery_status().expect("expired status");
+            assert!(status.in_flight_query);
+            assert_eq!(status.eligible_endpoints, 0);
+            assert_eq!(status.error_code, None);
+            assert_eq!(old_endpoint.active_requests(), 1);
+            assert_eq!(
+                old_endpoint.health_state(std::time::Instant::now()),
+                oxidase_runtime::EndpointHealthState::Healthy
+            );
+            assert_eq!(
+                held.endpoint().dial_target(),
+                Some("192.0.2.1:8080".parse().expect("dial target"))
+            );
+        } else {
+            // The exact same one-second maximum refresh and bounded query
+            // timeout finish strictly inside the original five-second TTL.
+            assert!(query_started + plan.resolver.query_timeout < expiry);
+        }
+        tokio::time::advance(reply_at - Instant::now()).await;
+        if !expires_during_query {
+            let during_query = cluster.acquire().await.expect("unexpired admission");
+            assert!(Arc::ptr_eq(during_query.endpoint(), &old_endpoint));
+            assert_eq!(
+                cluster
+                    .observed_discovery_status()
+                    .expect("status")
+                    .error_code,
+                None
+            );
+            drop(during_query);
+        }
+        let receipt =
+            cluster.reconcile_dns(&query, DnsFamily::A, positive(reply_at + ttl), reply_at);
+        assert!(receipt.applied);
+        assert_eq!(receipt.observation_error_code, None);
+        drop(query);
+        let next = cluster.acquire().await.expect("fresh positive admitted");
+        assert_eq!(next.endpoint().dial_target(), old_endpoint.dial_target());
+        if expires_during_query {
+            assert_ne!(next.endpoint().incarnation(), old_endpoint.incarnation());
+        } else {
+            assert!(Arc::ptr_eq(next.endpoint(), &old_endpoint));
+        }
+        drop(next);
+        drop(held);
+        assert_eq!(old_endpoint.active_requests(), 0);
+        assert_eq!(
+            resource_count(&census, ResourceKind::HealthSupervisor).created,
+            0
+        );
+        assert_eq!(
+            resource_count(&census, ResourceKind::DiscoverySupervisor).created,
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_one_second_ttl_can_expire_during_two_ms_positive_refresh() {
+        prove_positive_refresh_timing(Duration::from_secs(1), true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn five_second_ttl_keeps_same_healthy_member_during_two_ms_positive_refresh() {
+        prove_positive_refresh_timing(Duration::from_secs(5), false).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn merged_quota_rejection_uses_failure_backoff_not_rejected_positive_ttl() {
         let (_dir, snapshot) = fixture();

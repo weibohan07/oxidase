@@ -19,8 +19,9 @@ use super::resource_controls::{ControlPlan, control_round};
 use super::resource_evidence::{self, JsonLines, OperationEvent};
 use super::resource_identity::{self, ProcessRole, monotonic_ns};
 use super::{
-    Campaign, FixtureCommand, FixtureProcess, RESOURCE_REQUESTS_PER_CONNECTION, ResourceArguments,
-    ResourceCampaign, SoakError, fail, io_error, json_error,
+    Campaign, FixtureCommand, FixtureProcess, HEALTHY_DNS_TTL_SECONDS,
+    RESOURCE_REQUESTS_PER_CONNECTION, ResourceArguments, ResourceCampaign, SoakError, fail,
+    io_error, json_error,
 };
 use crate::common::{client_config, identity, write_identity};
 
@@ -443,6 +444,7 @@ pub(super) async fn run(args: ResourceArguments) -> Result<(), SoakError> {
         receipt["required_gauges"] = json!(["oxidase_active_requests"]);
     }
     receipt["parameters"]["connection_request_budget"] = RESOURCE_REQUESTS_PER_CONNECTION.into();
+    receipt["parameters"]["normal_dns_ttl_seconds"] = HEALTHY_DNS_TTL_SECONDS.into();
     persist_receipt(&args.output, &receipt)?;
     let result = run_inner(&args, &mut receipt).await;
     receipt["complete"] = result.is_ok().into();
@@ -702,7 +704,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     };
     dns.command(FixtureCommand::Dns {
         mode: "both".into(),
-        ttl: 1,
+        ttl: HEALTHY_DNS_TTL_SECONDS,
     })
     .await?;
     upstream
@@ -902,7 +904,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
                     .await?;
                 dns.command(FixtureCommand::Dns {
                     mode: "both".into(),
-                    ttl: 1,
+                    ttl: HEALTHY_DNS_TTL_SECONDS,
                 })
                 .await?;
             }

@@ -22,8 +22,8 @@ use super::resource_campaign::{FaultInterval, Faults, resource_source};
 use super::resource_evidence::JsonLines;
 use super::resource_identity::monotonic_ns;
 use super::{
-    FixtureCommand, FixtureProcess, ResourceArguments, ResourceCampaign, SoakError, fail, io_error,
-    json_error,
+    FixtureCommand, FixtureProcess, HEALTHY_DNS_TTL_SECONDS, ResourceArguments, ResourceCampaign,
+    SoakError, fail, io_error, json_error,
 };
 
 pub(super) struct ControlPlan<'a> {
@@ -789,7 +789,15 @@ async fn weights(
     events: &mut JsonLines,
 ) -> Result<(), SoakError> {
     let equal_before = dns.recorded_command(FixtureCommand::Status).await?;
-    dns_change(plan, dns, "weights_equal", 1, round, events).await?;
+    dns_change(
+        plan,
+        dns,
+        "weights_equal",
+        HEALTHY_DNS_TTL_SECONDS,
+        round,
+        events,
+    )
+    .await?;
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     let (before, equal_after) = loop {
         let before = clusters(plan.root).await?;
@@ -805,7 +813,7 @@ async fn weights(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    dns_change(plan, dns, "weights", 1, round, events).await?;
+    dns_change(plan, dns, "weights", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let after = clusters(plan.root).await?;
@@ -1118,6 +1126,15 @@ async fn data_fault(
     Ok(())
 }
 
+fn dns_fault_recipe(mode: &str) -> Result<(&'static str, u32, &'static str), SoakError> {
+    match mode {
+        "nxdomain" => Ok(("nxdomain_answers", 1, "dns_nxdomain")),
+        "withdraw" => Ok(("withdraw_answers", 1, "dns_all_withdraw")),
+        "ttl0" => Ok(("ttl_zero_answers", 0, "dns_ttl_zero")),
+        _ => Err(fail("resource.control_unknown_dns_fault")),
+    }
+}
+
 async fn dns_window(
     plan: &ControlPlan<'_>,
     dns: &mut FixtureProcess,
@@ -1130,14 +1147,10 @@ async fn dns_window(
     let Scene { round, name: mode } = scene;
     healthy(upstream, false).await?;
     let before = dns.recorded_command(FixtureCommand::Status).await?;
-    let field = if mode == "nxdomain" {
-        "nxdomain_answers"
-    } else {
-        "withdraw_answers"
-    };
+    let (field, ttl, behavior) = dns_fault_recipe(mode)?;
     let mut window = Window::begin(plan.faults, format!("dns-{mode}-{round}"))?;
     let result = async {
-        dns_change(plan, dns, mode, 1, round, events).await?;
+        dns_change(plan, dns, mode, ttl, round, events).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let seen = probe(
             plan,
@@ -1164,21 +1177,11 @@ async fn dns_window(
     }
     .await;
     let after = dns.recorded_command(FixtureCommand::Status).await?;
-    dns_change(plan, dns, "weights", 1, round, events).await?;
+    dns_change(plan, dns, "weights", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
     tokio::time::sleep(SETTLING).await;
     let end = window.close()?;
     events.write(json!({"kind":"fault_window","t_ns":monotonic_ns()?,"id":window.id,"start_ns":window.start,"end_ns":end,"recovery_deadline_ns":end+RECOVERY_NS,"recovery_peers":[upstream.ready.address.to_string(),upstream.ready.alternate.ok_or_else(||fail("resource.control_fixture_b_missing"))?.to_string()],"target":"upstream","lanes":["churn","cancel"],"allowed":[{"status":503}],"trigger":{"source":"fixture_counter","name":field,"before":counter(&before,field)?,"after":counter(&after,field)?},"fixture_before":before,"fixture_after":after}))?;
-    fixture_coverage(
-        events,
-        if mode == "nxdomain" {
-            "dns_nxdomain"
-        } else {
-            "dns_all_withdraw"
-        },
-        field,
-        &before,
-        &after,
-    )?;
+    fixture_coverage(events, behavior, field, &before, &after)?;
     result?;
     for peer in [
         upstream.ready.address,
@@ -1232,7 +1235,7 @@ async fn control_round_inner(
             &plan,
             dns,
             modes[(round.wrapping_add(plan.args.seed as usize)) % modes.len()],
-            1,
+            HEALTHY_DNS_TTL_SECONDS,
             round,
             events,
         )
@@ -1347,7 +1350,7 @@ async fn control_round_inner(
             let before = metrics(plan.root).await?;
             let fixture_before = dns.recorded_command(FixtureCommand::Status).await?;
             let before_clusters = clusters(plan.root).await?;
-            dns_change(&plan, dns, "v6", 1, round, events).await?;
+            dns_change(&plan, dns, "v6", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let peer = upstream
                 .ready
@@ -1404,16 +1407,32 @@ async fn control_round_inner(
         }
         8 => weights(&plan, dns, round, events).await?,
         9 => {
-            let before = dns.recorded_command(FixtureCommand::Status).await?;
-            dns_change(&plan, dns, "ttl0", 0, round, events).await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let after = dns.recorded_command(FixtureCommand::Status).await?;
-            fixture_coverage(events, "dns_ttl_zero", "ttl_zero_answers", &before, &after)?;
+            dns_window(
+                &plan,
+                dns,
+                upstream,
+                Scene {
+                    round,
+                    name: "ttl0",
+                },
+                sequence,
+                &mut journal,
+                events,
+            )
+            .await?;
         }
         10 => {
-            dns_change(&plan, dns, "b", 1, round, events).await?;
+            dns_change(&plan, dns, "b", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            dns_change(&plan, dns, "weights", 1, round, events).await?;
+            dns_change(
+                &plan,
+                dns,
+                "weights",
+                HEALTHY_DNS_TTL_SECONDS,
+                round,
+                events,
+            )
+            .await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let seen = full_peer(
                 &plan,
@@ -1489,6 +1508,24 @@ async fn control_round_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ttl_zero_uses_the_same_finite_recovery_contract_as_withdrawal() {
+        assert_eq!(
+            dns_fault_recipe("ttl0").expect("explicit zero lease"),
+            ("ttl_zero_answers", 0, "dns_ttl_zero")
+        );
+        assert_eq!(
+            dns_fault_recipe("withdraw").expect("withdrawal"),
+            ("withdraw_answers", 1, "dns_all_withdraw")
+        );
+        assert!(
+            dns_fault_recipe("positive").is_err(),
+            "healthy traffic cannot invent a fault window"
+        );
+        assert_eq!(HEALTHY_DNS_TTL_SECONDS, 5);
+        assert!(SETTLING >= Duration::from_secs(10));
+        assert!(RECOVERY_NS > 0 && RECOVERY_NS <= 12_000_000_000);
+    }
     #[test]
     fn srv_target_aaaa_witness_requires_real_refresh_and_exact_metric_scope() {
         let before = json!({"clusters":[{"cluster":"upstream","discovery":{"name":"_https._tcp.api.discovery.test.","generation":4,"resolution":"fresh","eligible_endpoints":2}}]});
