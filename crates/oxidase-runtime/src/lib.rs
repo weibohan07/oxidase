@@ -10,6 +10,7 @@ mod governance;
 mod portable;
 mod publication;
 mod regular_file;
+mod resource_census;
 mod secret;
 mod snapshot;
 mod tls;
@@ -37,6 +38,10 @@ pub use portable::{
 };
 pub use publication::{PublishedRuntime, RuntimeOrigin, ServingState};
 pub use regular_file::SensitiveFileIdentity;
+pub use resource_census::{
+    ResourceCancellationHandle, ResourceCensus, ResourceCount, ResourceKind, ResourceSample,
+    ResourceState, ResourceToken, StateCount,
+};
 pub use secret::{PreparedSecret, SecretBytes, SecretPreparationErrorKind};
 pub use snapshot::{
     PreparationError, PreparationErrorKind, ResourceRegistry, ResourceReuse, RuntimeSnapshot,

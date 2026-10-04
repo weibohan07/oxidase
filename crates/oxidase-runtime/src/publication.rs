@@ -52,6 +52,7 @@ pub struct PublishedRuntime {
 
 impl PublishedRuntime {
     pub(crate) fn initial(snapshot: RuntimeSnapshot, origin: RuntimeOrigin) -> Self {
+        snapshot.observe_publication();
         let source_origin = if origin == RuntimeOrigin::Source {
             let path = PathBuf::from(&snapshot.summary().source);
             path.is_absolute().then_some(path)

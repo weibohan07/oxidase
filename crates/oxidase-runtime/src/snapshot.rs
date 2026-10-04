@@ -17,6 +17,7 @@ use crate::candidate::CandidateWorkControl;
 use crate::cluster::PreparedCluster;
 use crate::governance::GovernanceRegistry;
 use crate::regular_file::open_regular_file;
+use crate::resource_census::{ResourceCensus, ResourceKind, ResourceState, ResourceToken};
 use crate::secret::{PreparedSecret, SecretPreparationErrorKind, SecretPreparationFailure};
 use crate::tls::{
     CertificatePreparationErrorKind, CertificatePreparationFailure, PreparedCertificate,
@@ -55,7 +56,6 @@ pub(crate) struct PortablePreparedResources {
     pub trust_store_roots: BTreeMap<ResourceId, Vec<Vec<u8>>>,
 }
 
-#[derive(Clone)]
 pub struct RuntimeSnapshot {
     pub config_version: ConfigVersion,
     pub dependencies: Vec<std::path::PathBuf>,
@@ -75,6 +75,36 @@ pub struct RuntimeSnapshot {
     certificate_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     site_fingerprints: BTreeMap<ResourceId, ContentDigest>,
     cluster_fingerprints: BTreeMap<ResourceId, ContentDigest>,
+    // Last field: actual owned resources are released before destruction is
+    // recorded. Arc clones share this identity; value clones do not.
+    lifecycle: ResourceToken,
+}
+
+impl Clone for RuntimeSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            config_version: self.config_version.clone(),
+            dependencies: self.dependencies.clone(),
+            graph: Arc::clone(&self.graph),
+            governance: self.governance.clone(),
+            resources: self.resources.clone(),
+            listeners: self.listeners.clone(),
+            admin: self.admin.clone(),
+            prepared_listeners: self.prepared_listeners.clone(),
+            tests: self.tests.clone(),
+            preparation_warnings: self.preparation_warnings.clone(),
+            summary: self.summary.clone(),
+            secret_fingerprints: self.secret_fingerprints.clone(),
+            trust_store_fingerprints: self.trust_store_fingerprints.clone(),
+            certificate_fingerprints: self.certificate_fingerprints.clone(),
+            site_fingerprints: self.site_fingerprints.clone(),
+            cluster_fingerprints: self.cluster_fingerprints.clone(),
+            lifecycle: self
+                .lifecycle
+                .census()
+                .token(ResourceKind::Snapshot, ResourceState::Candidate),
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeSnapshot {
@@ -108,6 +138,22 @@ impl RuntimeSnapshot {
         Self::prepare_reusing_with_resources(gateway, previous, None)
     }
 
+    /// Isolated observation scope for deterministic lifecycle verification.
+    /// Runtime policy and publication do not depend on this census.
+    pub fn prepare_reusing_in(
+        gateway: CompiledGateway,
+        previous: Option<&Self>,
+        census: Arc<ResourceCensus>,
+    ) -> Result<(Self, ResourceReuse), PreparationError> {
+        Self::prepare_reusing_with_resources_controlled_in(
+            gateway,
+            previous,
+            None,
+            &CandidateWorkControl::default(),
+            census,
+        )
+    }
+
     /// File scanning and resource boundaries cooperatively observe cancellation
     /// and the candidate deadline before returning a prepared snapshot.
     pub fn prepare_reusing_controlled(
@@ -137,6 +183,20 @@ impl RuntimeSnapshot {
         portable: Option<&PortablePreparedResources>,
         control: &CandidateWorkControl,
     ) -> Result<(Self, ResourceReuse), PreparationError> {
+        let census = previous.map_or_else(ResourceCensus::process, Self::resource_census);
+        Self::prepare_reusing_with_resources_controlled_in(
+            gateway, previous, portable, control, census,
+        )
+    }
+
+    fn prepare_reusing_with_resources_controlled_in(
+        gateway: CompiledGateway,
+        previous: Option<&Self>,
+        portable: Option<&PortablePreparedResources>,
+        control: &CandidateWorkControl,
+        census: Arc<ResourceCensus>,
+    ) -> Result<(Self, ResourceReuse), PreparationError> {
+        let _preparation = census.token(ResourceKind::SnapshotPreparation, ResourceState::Running);
         preparation_checkpoint(control, &gateway.dependencies)?;
         let mut summary = gateway.summary();
         let mut sites = BTreeMap::new();
@@ -375,10 +435,11 @@ impl RuntimeSnapshot {
                 reuse.cluster_endpoints += cluster.endpoints().len();
                 cluster
             } else {
-                let (cluster, reused_endpoints) = PreparedCluster::prepare_with_tls(
+                let (cluster, reused_endpoints) = PreparedCluster::prepare_with_tls_in(
                     source,
                     upstream_tls,
                     previous_cluster.map(Arc::as_ref),
+                    Arc::clone(&census),
                 );
                 reuse.cluster_endpoints += reused_endpoints;
                 Arc::new(cluster)
@@ -473,6 +534,7 @@ impl RuntimeSnapshot {
                 certificate_fingerprints,
                 site_fingerprints,
                 cluster_fingerprints,
+                lifecycle: census.token(ResourceKind::Snapshot, ResourceState::Candidate),
             },
             reuse,
         ))
@@ -481,6 +543,34 @@ impl RuntimeSnapshot {
     #[must_use]
     pub fn summary(&self) -> &GatewaySummary {
         &self.summary
+    }
+
+    /// Passive counters only; this does not pin another Snapshot or Resource.
+    #[must_use]
+    pub fn resource_census(&self) -> Arc<ResourceCensus> {
+        self.lifecycle.census()
+    }
+
+    pub(crate) fn observe_publication(&self) {
+        self.lifecycle.record_published_once();
+        self.lifecycle.mark_current();
+        for cluster in self.resources.clusters.values() {
+            cluster.observe_publication();
+        }
+    }
+
+    pub(crate) fn observe_replacement(&self, next: &Self) {
+        self.lifecycle.mark_retired();
+        for (id, cluster) in &self.resources.clusters {
+            if !next
+                .resources
+                .clusters
+                .get(id)
+                .is_some_and(|next| Arc::ptr_eq(cluster, next))
+            {
+                cluster.observe_retirement();
+            }
+        }
     }
 
     /// Non-fatal warnings discovered while preparing file-backed resources.
@@ -1190,6 +1280,11 @@ impl SnapshotStore {
                 source_origin: previous.source_origin.clone(),
             })
         });
+        // Observations occur only after the successful atomic publication,
+        // never inside an rcu closure that can be retried. A later publish may
+        // already have retired this snapshot: monotonic tokens cannot revive it.
+        snapshot.observe_publication();
+        previous.snapshot.observe_replacement(&snapshot);
         Arc::clone(&previous.snapshot)
     }
 
@@ -1217,13 +1312,232 @@ mod tests {
         ClusterEndpointSpec, ClusterHealthSpec, ClusterLimits, ClusterProtocol, ClusterSpec,
         Compiler, LoadBalancePolicy, RetryBodyMode, RetryRequestBodySpec, RetrySpec,
     };
-    use oxidase_core::{ResourceId, SourceSpan};
+    use oxidase_core::{ContentDigest, ResourceId, SourceSpan};
     use rcgen::{CertifiedKey as GeneratedCertificate, generate_simple_self_signed};
     use tempfile::tempdir;
     use url::Url;
 
     use super::{PreparationErrorKind, RuntimeSnapshot, cluster_fingerprint};
     use crate::CandidateWorkControl;
+    use crate::{
+        ResourceCensus, ResourceCount, ResourceKind, ResourceState, ServingState, SnapshotStore,
+    };
+
+    fn census_count(census: &ResourceCensus, kind: ResourceKind) -> ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("fixed resource kind")
+    }
+
+    fn census_state(census: &ResourceCensus, kind: ResourceKind, state: ResourceState) -> u64 {
+        census_count(census, kind)
+            .states
+            .into_iter()
+            .find(|row| row.state == state)
+            .expect("fixed resource state")
+            .live
+    }
+
+    fn census_snapshot(census: &Arc<ResourceCensus>, text: &str) -> RuntimeSnapshot {
+        let directory = tempdir().expect("isolated source");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(&config, format!("api_version: oxidase.dev/v1alpha1\nkind: gateway\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n      body:\n        text: {text}\n")).expect("source fixture");
+        RuntimeSnapshot::prepare_reusing_in(
+            Compiler::compile_path(&config).expect("compiled source"),
+            None,
+            Arc::clone(census),
+        )
+        .expect("prepared source")
+        .0
+    }
+
+    #[test]
+    fn resource_census_distinguishes_arc_clones_value_clones_and_real_snapshot_drop() {
+        let census = Arc::new(ResourceCensus::default());
+        let first = census_snapshot(&census, "original");
+        let clone = first.clone();
+        assert!(Arc::ptr_eq(
+            &first.resource_census(),
+            &clone.resource_census()
+        ));
+        assert_eq!(census_count(&census, ResourceKind::Snapshot).live, 2);
+        drop(clone);
+        let store = SnapshotStore::new(first);
+        let held = store.pin();
+        let weak = Arc::downgrade(&held);
+        let pins = (0..16).map(|_| Arc::clone(&held)).collect::<Vec<_>>();
+        assert_eq!(census_count(&census, ResourceKind::Snapshot).created, 2);
+        let next = census_snapshot(&census, "replacement");
+        let returned_old = store.publish(next);
+        assert!(Arc::ptr_eq(&held, &returned_old));
+        assert_eq!(
+            census_state(&census, ResourceKind::Snapshot, ResourceState::Current),
+            1
+        );
+        assert_eq!(
+            census_state(&census, ResourceKind::Snapshot, ResourceState::Retired),
+            1
+        );
+        assert_eq!(census_count(&census, ResourceKind::Snapshot).published, 2);
+        drop((pins, held, returned_old));
+        assert!(
+            weak.upgrade().is_none(),
+            "observer does not own the retired snapshot"
+        );
+        let row = census_count(&census, ResourceKind::Snapshot);
+        assert_eq!((row.created, row.destroyed, row.live), (3, 2, 1));
+        let before = census.sample();
+        store.set_serving_state(ServingState::Draining);
+        store.set_serving_state(ServingState::Drained);
+        assert_eq!(
+            census.sample().sequence_end,
+            before.sequence_end,
+            "serving-state wrappers share the same snapshot instance"
+        );
+        assert_eq!(
+            census_state(&census, ResourceKind::Snapshot, ResourceState::Current),
+            1
+        );
+        drop(store);
+        let row = census_count(&census, ResourceKind::Snapshot);
+        assert_eq!((row.created, row.destroyed, row.live), (3, 3, 0));
+        assert_eq!(census.sample().detailed_records, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[test]
+    fn resource_census_actual_concurrent_publication_is_monotonic_and_conserved() {
+        let census = Arc::new(ResourceCensus::default());
+        let store = Arc::new(SnapshotStore::new(census_snapshot(&census, "initial")));
+        let snapshots = (0..16)
+            .map(|index| census_snapshot(&census, &format!("version-{index}")))
+            .collect::<Vec<_>>();
+        let start = std::sync::Barrier::new(snapshots.len());
+        std::thread::scope(|scope| {
+            for snapshot in snapshots {
+                let store = Arc::clone(&store);
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    drop(store.publish(snapshot));
+                });
+            }
+        });
+        assert_eq!(store.published().runtime_revision, 17);
+        let row = census_count(&census, ResourceKind::Snapshot);
+        assert_eq!(
+            (row.created, row.destroyed, row.live, row.published),
+            (17, 16, 1, 17)
+        );
+        assert_eq!(
+            census_state(&census, ResourceKind::Snapshot, ResourceState::Current),
+            1
+        );
+        assert_eq!(
+            census_state(&census, ResourceKind::Snapshot, ResourceState::Retired),
+            0
+        );
+        drop(store);
+        let row = census_count(&census, ResourceKind::Snapshot);
+        assert_eq!((row.created, row.destroyed, row.live), (17, 17, 0));
+        assert_eq!(census.sample().detailed_records, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[test]
+    fn failed_preparation_work_exits_without_fabricating_a_snapshot_instance() {
+        let directory = tempdir().expect("source fixture");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(&config, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n").expect("source fixture");
+        let census = Arc::new(ResourceCensus::default());
+        let cancelled = CandidateWorkControl::default();
+        cancelled.cancel();
+        assert!(
+            RuntimeSnapshot::prepare_reusing_with_resources_controlled_in(
+                Compiler::compile_path(config).expect("compile"),
+                None,
+                None,
+                &cancelled,
+                Arc::clone(&census)
+            )
+            .is_err()
+        );
+        let work = census_count(&census, ResourceKind::SnapshotPreparation);
+        assert_eq!((work.created, work.destroyed, work.live), (1, 1, 0));
+        assert_eq!(census_count(&census, ResourceKind::Snapshot).created, 0);
+        assert_eq!(
+            census_count(&census, ResourceKind::HealthSupervisor).created,
+            0
+        );
+        assert_eq!(
+            census_count(&census, ResourceKind::DiscoverySupervisor).created,
+            0
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[test]
+    fn source_free_bundle_preparation_keeps_the_census_scope_without_starting_work() {
+        let directory = tempdir().expect("portable source fixture");
+        let config = directory.path().join("oxidase.yaml");
+        fs::write(&config, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      discovery:\n        dns:\n          name: api.example.test\n          port: 8080\n          origin: http://logical.example.test/base/\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: proxy\n      cluster: api\n").expect("source fixture");
+        let gateway = Compiler::compile_path(&config).expect("compile offline DNS source");
+        let census = Arc::new(ResourceCensus::default());
+        let source =
+            RuntimeSnapshot::prepare_reusing_in(gateway.clone(), None, Arc::clone(&census))
+                .expect("offline source prepare")
+                .0;
+        let plan = source
+            .export_portable(&gateway)
+            .expect("stable portable plans")
+            .plan;
+        fs::remove_file(&config).expect("YAML is absent for the Bundle path");
+        let (bundle, reuse) = plan
+            .prepare_with_assets(
+                ContentDigest::of_bytes(b"source-free-census-test"),
+                directory.path(),
+                Vec::new(),
+                |_, _, _| unreachable!("fixture has no Assets"),
+                Some(&source),
+            )
+            .expect("source-free Bundle prepare");
+        assert!(Arc::ptr_eq(
+            &source.resource_census(),
+            &bundle.resource_census()
+        ));
+        assert_eq!(reuse.clusters, 1, "same immutable resource remains shared");
+        assert_eq!(census_count(&census, ResourceKind::Snapshot).live, 2);
+        assert_eq!(census_count(&census, ResourceKind::Cluster).live, 1);
+        for kind in [
+            ResourceKind::HealthSupervisor,
+            ResourceKind::DiscoverySupervisor,
+            ResourceKind::DnsQuery,
+            ResourceKind::ProxyPoolFamily,
+            ResourceKind::HealthPoolFamily,
+        ] {
+            assert_eq!(
+                census_count(&census, kind).created,
+                0,
+                "preparation cannot activate background work"
+            );
+        }
+        drop((source, bundle));
+        for kind in [
+            ResourceKind::SnapshotPreparation,
+            ResourceKind::Snapshot,
+            ResourceKind::Cluster,
+            ResourceKind::ClusterRuntime,
+        ] {
+            let row = census_count(&census, kind);
+            assert_eq!(row.created, row.destroyed);
+            assert_eq!(row.live, 0);
+        }
+        assert_eq!(census.sample().detailed_records, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
 
     #[test]
     fn dns_fingerprint_covers_each_policy_boundary_but_not_diagnostic_origin() {
