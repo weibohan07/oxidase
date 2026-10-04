@@ -44,6 +44,11 @@ const STATE_DEADLINE: Duration = Duration::from_secs(6);
 // 8 s logical deadline + 500 ms ejection + at most 1 s fixture refresh, rounded up.
 const SETTLING: Duration = Duration::from_secs(10);
 const RECOVERY_NS: u64 = 12_000_000_000;
+// A validation witness, not a replacement for any production request timeout.
+// All before/probe/after operations must finish inside this fixed window.
+const SRV_AAAA_WITNESS_NS: u64 = 30_000_000_000;
+const SRV_POSITIVE_METRIC: &str =
+    "oxidase_discovery_queries_total{cluster=\"upstream\",family=\"srv\",result=\"positive\"}";
 const MAX_PROBE_FILE: u64 = 64 * 1024 * 1024;
 const MAX_PROBE_ROW: usize = 64 * 1024;
 
@@ -174,10 +179,18 @@ async fn metrics(root: &Path) -> Result<String, SoakError> {
 }
 
 fn upstream_cluster(value: &Value) -> Result<&Value, SoakError> {
-    value["clusters"]
+    let mut matching = value["clusters"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["cluster"] == "upstream"))
-        .ok_or_else(|| fail("resource.control_cluster_unavailable"))
+        .ok_or_else(|| fail("resource.control_cluster_unavailable"))?
+        .iter()
+        .filter(|row| row["cluster"] == "upstream");
+    let cluster = matching
+        .next()
+        .ok_or_else(|| fail("resource.control_cluster_unavailable"))?;
+    if matching.next().is_some() {
+        return Err(fail("resource.control_cluster_duplicate"));
+    }
+    Ok(cluster)
 }
 fn endpoint_counter(value: &Value, name: &str) -> Result<u64, SoakError> {
     upstream_cluster(value)?["endpoints"]
@@ -846,6 +859,34 @@ fn srv_weights(document: &Value, a: u16, b: u16) -> Result<bool, SoakError> {
         }))
 }
 
+fn srv_aaaa_refresh(
+    before_clusters: &Value,
+    after_clusters: &Value,
+    before_metrics: &str,
+    after_metrics: &str,
+    before_fixture: &Value,
+    after_fixture: &Value,
+) -> Result<bool, SoakError> {
+    let before = &upstream_cluster(before_clusters)?["discovery"];
+    let after = &upstream_cluster(after_clusters)?["discovery"];
+    // The configured supervisor resolves SRV. Its internal target AAAA query is
+    // proved by the real fixture, never by inventing a top-level AAAA metric.
+    Ok(before["name"] == "_https._tcp.api.discovery.test."
+        && after["name"] == before["name"]
+        && before["generation"]
+            .as_u64()
+            .zip(after["generation"].as_u64())
+            .is_some_and(|(before, after)| after > before)
+        && after["resolution"] == "fresh"
+        && after["eligible_endpoints"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        && metric(after_metrics, SRV_POSITIVE_METRIC)?
+            > metric(before_metrics, SRV_POSITIVE_METRIC)?
+        && counter(after_fixture, "positive_aaaa_answers")?
+            > counter(before_fixture, "positive_aaaa_answers")?)
+}
+
 fn allowed_data_failures(mode: &str, target: &str) -> Value {
     let mut allowed = if mode == "mid_body_error" {
         vec![json!({"error_stage":"response_body","error_code":"body_error"})]
@@ -1302,8 +1343,10 @@ async fn control_round_inner(
             .await?
         }
         7 => {
+            let witness_start = monotonic_ns()?;
             let before = metrics(plan.root).await?;
             let fixture_before = dns.recorded_command(FixtureCommand::Status).await?;
+            let before_clusters = clusters(plan.root).await?;
             dns_change(&plan, dns, "v6", 1, round, events).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let peer = upstream
@@ -1322,6 +1365,23 @@ async fn control_round_inner(
             .await?;
             let after = metrics(plan.root).await?;
             let fixture_after = dns.recorded_command(FixtureCommand::Status).await?;
+            let after_clusters = clusters(plan.root).await?;
+            let witness_end = monotonic_ns()?;
+            let witness_deadline = witness_start
+                .checked_add(SRV_AAAA_WITNESS_NS)
+                .ok_or_else(|| fail("resource.control_aaaa_witness_clock"))?;
+            if witness_end > witness_deadline
+                || !srv_aaaa_refresh(
+                    &before_clusters,
+                    &after_clusters,
+                    &before,
+                    &after,
+                    &fixture_before,
+                    &fixture_after,
+                )?
+            {
+                return Err(fail("resource.control_srv_aaaa_refresh_unproven"));
+            }
             fixture_coverage(
                 events,
                 "positive_aaaa_answers",
@@ -1331,15 +1391,15 @@ async fn control_round_inner(
             )?;
             metric_coverage(
                 events,
-                "positive_aaaa_counter",
-                "oxidase_discovery_queries_total{cluster=\"upstream\",family=\"aaaa\",result=\"positive\"}",
+                "positive_srv_round_counter",
+                SRV_POSITIVE_METRIC,
                 &before,
                 &after,
             )?;
             coverage(
                 events,
                 "positive_aaaa",
-                json!({"source":"control_probe","operation_id":seen.id,"expected_peer":peer.to_string(),"before_metrics":before,"after_metrics":after,"before_raw":fixture_before,"after_raw":fixture_after}),
+                json!({"source":"control_probe","operation_id":seen.id,"expected_peer":peer.to_string(),"observation_window":{"start_ns":witness_start,"end_ns":witness_end,"deadline_ns":witness_deadline},"before_metrics":before,"after_metrics":after,"before_raw":fixture_before,"after_raw":fixture_after,"before_clusters":before_clusters,"after_clusters":after_clusters}),
             )?;
         }
         8 => weights(&plan, dns, round, events).await?,
@@ -1429,6 +1489,97 @@ async fn control_round_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn srv_target_aaaa_witness_requires_real_refresh_and_exact_metric_scope() {
+        let before = json!({"clusters":[{"cluster":"upstream","discovery":{"name":"_https._tcp.api.discovery.test.","generation":4,"resolution":"fresh","eligible_endpoints":2}}]});
+        let duplicate =
+            json!({"clusters":[before["clusters"][0].clone(),before["clusters"][0].clone()]});
+        assert!(upstream_cluster(&duplicate).is_err());
+        let mut after = before.clone();
+        after["clusters"][0]["discovery"]["generation"] = 5.into();
+        let before_metric = format!(
+            "{SRV_POSITIVE_METRIC} 10\noxidase_discovery_queries_total{{cluster=\"upstream\",family=\"aaaa\",result=\"positive\"}} 0\n"
+        );
+        let after_metric = before_metric.replace(" 10\n", " 11\n");
+        let first = json!({"positive_aaaa_answers":0});
+        let last = json!({"positive_aaaa_answers":3});
+        assert!(
+            srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("actual SRV target AAAA")
+        );
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &before_metric,
+                &first,
+                &last
+            )
+            .expect("no supervisor refresh")
+        );
+        assert!(
+            !srv_aaaa_refresh(&before, &after, &before_metric, &after_metric, &last, &last)
+                .expect("no actual AAAA answer")
+        );
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &before,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("no membership generation")
+        );
+        after["clusters"][0]["discovery"]["name"] = "other.discovery.test.".into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("wrong declared origin")
+        );
+        after["clusters"][0]["discovery"]["name"] = "_https._tcp.api.discovery.test.".into();
+        after["clusters"][0]["discovery"]["resolution"] = "stale".into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("stale data")
+        );
+        after["clusters"][0]["discovery"]["resolution"] = "fresh".into();
+        after["clusters"][0]["discovery"]["eligible_endpoints"] = 0.into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("no usable endpoint")
+        );
+    }
+
     fn control_journal(directory: &Path) -> Arc<std::sync::Mutex<ProbeJournal>> {
         Arc::new(std::sync::Mutex::new(
             ProbeJournal::named(

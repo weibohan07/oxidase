@@ -931,9 +931,12 @@ class Analyzer:
                 proven = classification == "expected_injected_failure" and raw.get("status") == 200 and raw.get("error_stage") == "response_body"
             elif name == "positive_aaaa":
                 expected = self.receipt.get("fixture_peers", {}).get("ipv6")
-                proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
+                proven = (classification == "completed_success" and expected is not None and
+                          raw.get("upstream_peer") == expected and reference.get("expected_peer") == expected and
+                          self.ipv6_resolution_proven(reference, probe))
                 if proven:
                     self.coverage["positive_aaaa_probe"] += 1
+                    self.coverage["positive_aaaa"] += 1
             elif name in ("dns_readd", "recovery_a", "fault_recovery"):
                 expected = reference.get("expected_peer", self.receipt.get("fixture_peers", {}).get("a"))
                 proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
@@ -941,6 +944,54 @@ class Analyzer:
                     self.coverage[name] += 1
             if not proven:
                 self.finding("RL_TRIGGER", "control probe does not prove its claimed behavior", behavior=name)
+
+    def ipv6_resolution_proven(self, evidence, probe):
+        """SRV resolves target AAAA internally: never relabel its round as AAAA."""
+        window = evidence.get("observation_window")
+        if not isinstance(window, dict):
+            return False
+        start, end, deadline = (integer(required(window, key), f"AAAA proof {key}")
+                                for key in ("start_ns", "end_ns", "deadline_ns"))
+        if (not start < end <= deadline or deadline - start > 30 * NS or
+                not start <= probe["start_ns"] <= probe["end_ns"] <= end or
+                self.phase_at(start) != "steady" or self.phase_at(end) != "steady"):
+            return False
+        before, after = evidence.get("before_raw"), evidence.get("after_raw")
+        field = "positive_aaaa_answers"
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return False
+        old, new = before.get(field), after.get(field)
+        if (not isinstance(old, int) or isinstance(old, bool) or not isinstance(new, int) or isinstance(new, bool) or
+                old < 0 or new <= old):
+            return False
+        # Check the originals, rather than any optional claimed numeric delta.
+        if evidence.get("before") is not None and (evidence["before"] != old or evidence.get("after") != new):
+            return False
+        def discovery(document):
+            if not isinstance(document, dict) or not isinstance(document.get("clusters"), list):
+                return None
+            rows = [row for row in document["clusters"] if isinstance(row, dict) and row.get("cluster") == "upstream"]
+            if len(rows) != 1 or rows[0].get("protocol") != "h2":
+                return None
+            return rows[0].get("discovery")
+        left, right = discovery(evidence.get("before_clusters")), discovery(evidence.get("after_clusters"))
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        name = "_https._tcp.api.discovery.test."
+        old_generation, new_generation = left.get("generation"), right.get("generation")
+        if (left.get("name") != name or right.get("name") != name or
+                not isinstance(old_generation, int) or isinstance(old_generation, bool) or old_generation < 0 or
+                not isinstance(new_generation, int) or isinstance(new_generation, bool) or new_generation <= old_generation or
+                right.get("resolution") != "fresh" or not isinstance(right.get("eligible_endpoints"), int) or
+                isinstance(right["eligible_endpoints"], bool) or right["eligible_endpoints"] < 1 or
+                not isinstance(right.get("srv_targets"), list) or not right["srv_targets"]):
+            return False
+        first, last = evidence.get("before_metrics"), evidence.get("after_metrics")
+        if not isinstance(first, str) or not isinstance(last, str):
+            return False
+        series = 'oxidase_discovery_queries_total{cluster="upstream",family="srv",result="positive"}'
+        old_metric, new_metric = self.metrics(first).get(series), self.metrics(last).get(series)
+        return old_metric is not None and new_metric is not None and new_metric > old_metric >= 0
 
     def retained_proof(self, evidence):
         """Verify raw old/new streams, not the legacy controller booleans."""
@@ -1639,12 +1690,6 @@ class Analyzer:
         return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denominator if denominator else None
 
     def final_checks(self):
-        positive_aaaa = sum(max(0, value - self.first_metric.get(name, value))
-                            for name, value in self.last_metric.items()
-                            if name.startswith("oxidase_discovery_queries_total{") and
-                            'family="aaaa"' in name and 'result="positive"' in name)
-        if self.actual_ipv6_responses and positive_aaaa:
-            self.coverage["positive_aaaa"] = min(self.actual_ipv6_responses, positive_aaaa)
         total_deadline = self.last_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0) - self.first_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0)
         if self.coverage["deadline_timeout_probe"] and total_deadline > 0:
             self.coverage["deadline_timeout"] = min(self.coverage["deadline_timeout_probe"], total_deadline)

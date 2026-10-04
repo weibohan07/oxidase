@@ -146,6 +146,19 @@ pair with exactly one Started. Its recipe is independently reconstructed from
 the fixed fixture request, not the reply. Coverage references `operation_id`.
 These probes are classified separately and cannot inflate worker denominators.
 
+For the fixed SRV campaign, `positive_aaaa` is an end-to-end proof, not a
+top-level A/AAAA supervisor metric. Coverage references the complete actual
+IPv6 probe and contains an explicit <=30s `observation_window`, original
+`before_raw/after_raw` DNS fixture status, `before_metrics/after_metrics` and
+`before_clusters/after_clusters`. The same finite window must prove positive
+AAAA replies, a successful `family="srv"` supervisor round, unchanged canonical
+service name `_https._tcp.api.discovery.test.`, an advanced membership generation
+and fresh eligible members. The physical IPv6 response must fall inside that
+window and still pass full DATA/EOF/trailer/SNI/authority/path validation.
+Internal target AAAA resolution does not increment a top-level
+`family="aaaa"` discovery-plan metric, and the verifier never relabels SRV as
+AAAA. An unrelated global counter or IPv6 response alone grants no coverage.
+
 `control-operations.jsonl` uses `oxidase.resource-control-operation/v1` and
 records only `control_round` Admin reads, fixture IPC and CLI mutations. Started
 has `writer_seq,operation_id,start_ns,operation,request`; Terminal adds

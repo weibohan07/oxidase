@@ -103,6 +103,30 @@ def retirement_corpus():
     return data
 
 
+def positive_aaaa_corpus():
+    data = probe_corpus()
+    data["receipt.json"]["parameters"]["campaign"] = "C"
+    peer = "[::1]:23456"
+    data["receipt.json"]["fixture_peers"] = {"ipv6": peer}
+    data["receipt.json"]["recipes"]["download"]["allowed_peers"].append(peer)
+    terminal = data["control-probes.jsonl"][1]
+    terminal["raw"]["upstream_peer"] = peer
+    before = {"clusters": [{"cluster": "upstream", "protocol": "h2", "discovery": {
+        "name": "_https._tcp.api.discovery.test.", "generation": 4, "resolution": "fresh",
+        "eligible_endpoints": 2, "srv_targets": [{"target": "a.discovery.test.", "port": 23456, "priority": 0, "weight": 1}]}}]}
+    after = copy.deepcopy(before)
+    after["clusters"][0]["discovery"]["generation"] = 5
+    after["clusters"][0]["discovery"]["srv_targets"] = [{"target": "v6.discovery.test.", "port": 23456, "priority": 0, "weight": 1}]
+    series = 'oxidase_discovery_queries_total{cluster="upstream",family="srv",result="positive"}'
+    evidence = {"source": "control_probe", "operation_id": terminal["operation_id"], "expected_peer": peer,
+                "observation_window": {"start_ns": 11 * NS, "end_ns": 11 * NS + 100, "deadline_ns": 11 * NS + 30 * NS},
+                "before_raw": {"positive_aaaa_answers": 0}, "after_raw": {"positive_aaaa_answers": 3},
+                "before_metrics": series + " 7\n", "after_metrics": series + " 8\n",
+                "before_clusters": before, "after_clusters": after}
+    insert_event(data, {"kind": "coverage", "t_ns": 11 * NS + 101, "name": "positive_aaaa", "evidence": evidence})
+    return data
+
+
 def prelude_corpus():
     data = retained_corpus()
     proof = data["events.jsonl"][1]["evidence"]["raw"]
@@ -474,6 +498,52 @@ class IndependentJournalTests(unittest.TestCase):
         backwards.update(writer_seq=3, connection_epoch=2, retirement_id="0:2")
         data["client-retirements.jsonl"].append(backwards)
         self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_srv_internal_aaaa_requires_real_counter_refresh_and_complete_physical_ipv6(self):
+        report = self.verify(positive_aaaa_corpus())
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["coverage"]["positive_aaaa"], 1)
+        # A top-level A/AAAA supervisor metric is deliberately absent: its zero
+        # is not relabelled or replaced by the SRV counter.
+        self.assertNotIn('family="aaaa"', str(report["curves"]))
+
+    def test_positive_aaaa_wrong_peer_forged_counter_or_wrong_supervisor_scope_rejects(self):
+        for change in ("peer", "counter", "claimed", "metric_family", "generation", "name", "freshness", "window", "outside"):
+            with self.subTest(change=change):
+                data = positive_aaaa_corpus()
+                evidence = next(row["evidence"] for row in data["events.jsonl"] if row.get("name") == "positive_aaaa")
+                if change == "peer":
+                    data["control-probes.jsonl"][1]["raw"]["upstream_peer"] = "127.0.0.1:12345"
+                elif change == "counter":
+                    evidence["after_raw"]["positive_aaaa_answers"] = 0
+                elif change == "claimed":
+                    evidence.update(before=10, after=99)
+                elif change == "metric_family":
+                    evidence["after_metrics"] = evidence["after_metrics"].replace('family="srv"', 'family="aaaa"')
+                elif change in ("generation", "name", "freshness"):
+                    discovery = evidence["after_clusters"]["clusters"][0]["discovery"]
+                    if change == "generation":
+                        discovery["generation"] = 4
+                    elif change == "name":
+                        discovery["name"] = "_https._tcp.other.test."
+                    else:
+                        discovery["resolution"] = "stale"
+                elif change == "window":
+                    evidence.pop("observation_window")
+                else:
+                    evidence["observation_window"]["end_ns"] = 11 * NS + 40
+                self.fail(data, "RL_TRIGGER")
+
+    def test_ipv6_response_plus_unrelated_global_counter_does_not_grant_aaaa_coverage(self):
+        data = positive_aaaa_corpus()
+        data["events.jsonl"] = [row for row in data["events.jsonl"] if row.get("name") != "positive_aaaa"]
+        for index, row in enumerate(data["events.jsonl"], 1):
+            row["writer_seq"] = index
+        data["receipt.json"]["coverage_required"].append("positive_aaaa")
+        for row in data["samples.jsonl"]:
+            if row["source"] == "admin":
+                row["metrics"] += 'oxidase_discovery_queries_total{cluster="other",family="aaaa",result="positive"} 999\n'
+        self.fail(data, "RL_TRIGGER_COVERAGE")
 
 
 if __name__ == "__main__":
