@@ -565,7 +565,7 @@ def listen_address(log, process, deadline):
         if log.stat().st_size > MAX_LOG:
             raise Unavailable("gateway startup log capacity exhausted")
         text = log.read_text(errors="replace")
-        matches = re.findall(r"listener allocation accepting http on (127\.0\.0\.1):(\d+)", text)
+        matches = re.findall(r"listener allocation accepting HTTP/1\.1 on (127\.0\.0\.1):(\d+)", text)
         if len(matches) == 1:
             return matches[0][0], int(matches[0][1])
         time.sleep(0.1)

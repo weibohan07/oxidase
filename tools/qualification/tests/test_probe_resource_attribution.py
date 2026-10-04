@@ -22,6 +22,23 @@ SPEC.loader.exec_module(PROBE)
 
 
 class Boundaries(unittest.TestCase):
+    def test_readiness_uses_actual_hosted_cli_protocol_text_and_rejects_ambiguity(self):
+        process = MagicMock()
+        process.poll.return_value = None
+        # Original Linux run 37203019994: the real gateway started, but the old
+        # validator expected a lowercase `http` that this CLI does not print.
+        actual = "listener allocation accepting HTTP/1.1 on 127.0.0.1:42099\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "collector.log"
+            log.write_text("heaptrack output will be written\n" + actual)
+            with patch.object(PROBE, "now", return_value=10):
+                self.assertEqual(PROBE.listen_address(log, process, 100), ("127.0.0.1", 42099))
+            for invalid in (actual.replace("HTTP/1.1", "http"), actual + actual):
+                log.write_text(invalid)
+                with patch.object(PROBE, "now", side_effect=[10, 200]), patch.object(PROBE.time, "sleep"):
+                    with self.assertRaisesRegex(PROBE.Unavailable, "readiness deadline"):
+                        PROBE.listen_address(log, process, 100)
+
     def sampler_failure_experiment(self, *, stuck=False, late=False):
         class OwnedProcess:
             pid = 424242
