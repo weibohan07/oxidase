@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future as _;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
@@ -96,6 +98,9 @@ struct DnsCounts {
     nxdomain_answers: AtomicU64,
     nodata_answers: AtomicU64,
     server_failure_answers: AtomicU64,
+    positive_aaaa_answers: AtomicU64,
+    srv_equal_weight_answers: AtomicU64,
+    srv_weighted_answers: AtomicU64,
 }
 
 impl DnsCounts {
@@ -163,9 +168,38 @@ impl DnsCounts {
                 &self.server_failure_answers,
                 message.response_code == ResponseCode::ServFail,
             ),
+            (&self.positive_aaaa_answers,message.answers.iter().any(|record|matches!(&record.data,RData::AAAA(_)))),
         ] {
             if present {
                 counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let rows: Vec<_> = message
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::SRV(data) => Some((
+                    data.target.to_ascii(),
+                    data.priority,
+                    data.weight,
+                    data.port,
+                )),
+                _ => None,
+            })
+            .collect();
+        if rows.len() == 2
+            && rows[0].0 == "a.discovery.test."
+            && rows[1].0 == "b.discovery.test."
+            && rows[0].1 == 0
+            && rows[1].1 == 0
+            && rows[0].3 == rows[1].3
+        {
+            if rows[0].2 == 1 && rows[1].2 == 1 {
+                self.srv_equal_weight_answers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if rows[0].2 == 3 && rows[1].2 == 1 {
+                self.srv_weighted_answers.fetch_add(1, Ordering::Relaxed);
             }
         }
         let mut rows = message.answers.iter().filter_map(|record| {
@@ -200,6 +234,9 @@ impl DnsCounts {
             "nxdomain_answers":self.nxdomain_answers.load(Ordering::Relaxed),
             "nodata_answers":self.nodata_answers.load(Ordering::Relaxed),
             "server_failure_answers":self.server_failure_answers.load(Ordering::Relaxed),
+            "positive_aaaa_answers":self.positive_aaaa_answers.load(Ordering::Relaxed),
+            "srv_equal_weight_answers":self.srv_equal_weight_answers.load(Ordering::Relaxed),
+            "srv_weighted_answers":self.srv_weighted_answers.load(Ordering::Relaxed),
         })
     }
 }
@@ -286,6 +323,7 @@ pub(super) async fn dns(root: PathBuf) -> Result<(), SoakError> {
             pid: std::process::id(),
             address,
             alternate: None,
+            ipv6: None,
         },
         |command| {
             if let FixtureCommand::Dns { mode, ttl } = command {
@@ -293,7 +331,12 @@ pub(super) async fn dns(root: PathBuf) -> Result<(), SoakError> {
                     "a", "b", "both", "reverse", "ttl0", "nxdomain", "nodata", "servfail", "tcp",
                     "cname", "withdraw",
                 ];
-                if !allowed.contains(&mode.as_str()) && mode != "timeout" {
+                if !allowed.contains(&mode.as_str())
+                    && !matches!(
+                        mode.as_str(),
+                        "timeout" | "v6" | "both_v6" | "weights" | "weights_equal"
+                    )
+                {
                     return json!({"ok":false});
                 }
                 *state
@@ -336,7 +379,15 @@ fn dns_answer(query: Message, state: &DnsState, upstream: &Ready, tcp: bool) -> 
                         RData::SRV(SRV::new(0, 0, 0, Name::root())),
                     ));
                 } else {
-                    let mut rows = if state.mode == "b" {
+                    let mut rows = if state.mode == "v6" {
+                        vec![("ipv6.discovery.test", 0, 1)]
+                    } else if state.mode == "both_v6" {
+                        vec![("a.discovery.test", 0, 1), ("ipv6.discovery.test", 0, 1)]
+                    } else if state.mode == "weights" {
+                        vec![("a.discovery.test", 0, 3), ("b.discovery.test", 0, 1)]
+                    } else if state.mode == "weights_equal" {
+                        vec![("a.discovery.test", 0, 1), ("b.discovery.test", 0, 1)]
+                    } else if state.mode == "b" {
                         vec![("b.discovery.test", 0, 1)]
                     } else if state.mode == "a" {
                         vec![("a.discovery.test", 0, 1)]
@@ -375,7 +426,13 @@ fn dns_answer(query: Message, state: &DnsState, upstream: &Ready, tcp: bool) -> 
                         RData::CNAME(CNAME(Name::from_ascii(alias?).ok()?)),
                     ));
                 } else {
-                    let mut addresses = if matches!(
+                    let mut addresses = if text.as_str() == "ipv6.discovery.test."
+                        || state.mode == "v6"
+                    {
+                        vec![upstream.ipv6?.ip()]
+                    } else if state.mode == "both_v6" && text.as_str() == "api.discovery.test." {
+                        vec![upstream.address.ip(), upstream.ipv6?.ip()]
+                    } else if matches!(
                         text.as_str(),
                         "a.discovery.test." | "a-canonical.discovery.test."
                     ) || state.mode == "a"
@@ -447,6 +504,392 @@ struct UpstreamState {
     active_tunnels: Arc<AtomicU64>,
     payload_size: usize,
     request_read_delay: Duration,
+    resource_fault: Mutex<ResourceFault>,
+    resource_header_delays_started: AtomicU64,
+    resource_mid_body_errors_emitted: AtomicU64,
+    resource_cancelled_bodies: AtomicU64,
+    resource_completed_bodies: AtomicU64,
+    resource_uploads_verified: AtomicU64,
+    resource_upload_bytes: AtomicU64,
+    resource_cancellations: Mutex<VecDeque<ResourceCancelReceipt>>,
+    resource_cancel_receipt_evictions: AtomicU64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ResourceCancelReceipt {
+    operation_id: String,
+    body_bytes: u64,
+    dropped_ns: Option<u64>,
+}
+
+fn record_cancellation(state: &UpstreamState, operation_id: String, body_bytes: u64) {
+    let mut receipts = state
+        .resource_cancellations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if receipts.len() >= 128 {
+        receipts.pop_front();
+        state
+            .resource_cancel_receipt_evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    receipts.push_back(ResourceCancelReceipt {
+        operation_id,
+        body_bytes,
+        dropped_ns: super::resource_identity::monotonic_ns().ok(),
+    });
+}
+
+#[derive(Clone, Default)]
+struct ResourceFault {
+    mode: String,
+    target: String,
+    delay_ms: u64,
+    after_bytes: u64,
+    case_id: u64,
+}
+
+impl ResourceFault {
+    fn applies(&self, target: &str) -> bool {
+        self.mode != "none"
+            && !self.mode.is_empty()
+            && (self.target == target || self.target == "all")
+    }
+}
+
+struct ResourceStreamBody {
+    prefix: Option<Bytes>,
+    remaining: usize,
+    trailers: Option<HeaderMap>,
+    state: Arc<UpstreamState>,
+    operation_id: String,
+    cancelled_lane: bool,
+    completed: bool,
+    failed: bool,
+    sent: u64,
+    fault: Option<ResourceFault>,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Body for ResourceStreamBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if self.failed {
+            return Poll::Ready(None);
+        }
+        if let Some(prefix) = self.prefix.take() {
+            self.sent += prefix.len() as u64;
+            return Poll::Ready(Some(Ok(Frame::data(prefix))));
+        }
+        if self.cancelled_lane && self.sent > 0 {
+            return Poll::Pending;
+        }
+        if let Some(fault) = &self.fault
+            && self.sent >= fault.after_bytes.max(1)
+        {
+            if self.delay.is_none() {
+                self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                    fault.delay_ms.max(100),
+                ))));
+            }
+            if self
+                .delay
+                .as_mut()
+                .expect("error timer installed")
+                .as_mut()
+                .poll(cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.state
+                .resource_mid_body_errors_emitted
+                .fetch_add(1, Ordering::Release);
+            self.fault = None;
+            self.failed = true;
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "test-only injected resource body reset",
+            ))));
+        }
+        if self.remaining > 0 {
+            let length = self.remaining.min(1024);
+            self.remaining -= length;
+            self.sent += length as u64;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; length])))));
+        }
+        if let Some(trailers) = self.trailers.take() {
+            self.completed = true;
+            self.state
+                .resource_completed_bodies
+                .fetch_add(1, Ordering::Release);
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        if !self.completed {
+            self.completed = true;
+            self.state
+                .resource_completed_bodies
+                .fetch_add(1, Ordering::Release);
+        }
+        Poll::Ready(None)
+    }
+}
+
+impl Drop for ResourceStreamBody {
+    fn drop(&mut self) {
+        if self.cancelled_lane && self.sent > 0 && !self.completed {
+            self.state
+                .resource_cancelled_bodies
+                .fetch_add(1, Ordering::Release);
+            record_cancellation(&self.state, self.operation_id.clone(), self.sent);
+        }
+    }
+}
+
+type ResourceFixtureBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+async fn serve_route(
+    request: Request<Incoming>,
+    id: &'static str,
+    target: std::net::SocketAddr,
+    sni: String,
+    state: Arc<UpstreamState>,
+) -> Result<Response<ResourceFixtureBody>, Infallible> {
+    if request.uri().path() == "/__resource_cancel_ack" {
+        let operation_id = request
+            .headers()
+            .get("x-resource-operation-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .unwrap_or("");
+        let acknowledged = state
+            .resource_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|value| value.operation_id == operation_id)
+            .cloned();
+        let receipt = serde_json::to_vec(
+            &json!({"operation_id":operation_id,"body_dropped_after_data":acknowledged.is_some(),"body_bytes":acknowledged.as_ref().map(|receipt|receipt.body_bytes),"dropped_ns":acknowledged.and_then(|receipt|receipt.dropped_ns),"termination":"cancelled_after_data"}),
+        )
+        .expect("fixed scalar fixture receipt");
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                Full::new(Bytes::from(receipt))
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .expect("fixture receipt metadata"));
+    }
+    if request.uri().path().starts_with("/base/resource/") {
+        return Ok(serve_resource(request, id, target, sni, state).await);
+    }
+    serve(request, id, target, sni, state)
+        .await
+        .map(|response| response.map(|body| body.map_err(|never| match never {}).boxed_unsync()))
+}
+
+async fn serve_resource(
+    mut request: Request<Incoming>,
+    id: &'static str,
+    target: std::net::SocketAddr,
+    sni: String,
+    state: Arc<UpstreamState>,
+) -> Response<ResourceFixtureBody> {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_owned();
+    let authority = request
+        .uri()
+        .authority()
+        .map(|authority| authority.to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let operation_id = request
+        .headers()
+        .get("x-resource-operation-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+        .unwrap_or("")
+        .to_owned();
+    let grpc = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value == "application/grpc");
+    let length = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|length| *length <= 16 * 1024 * 1024)
+    };
+    let (Some(upload_size), Some(payload_size)) = (
+        length("x-resource-upload-length"),
+        length("x-resource-response-length"),
+    ) else {
+        return resource_empty_response(StatusCode::BAD_REQUEST);
+    };
+    if operation_id.is_empty() || payload_size == 0 {
+        return resource_empty_response(StatusCode::BAD_REQUEST);
+    }
+    state.requests.fetch_add(1, Ordering::Relaxed);
+    let uploaded = match tokio::time::timeout(
+        Duration::from_secs(10),
+        verify_resource_upload(request.body_mut(), grpc, upload_size),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => receipt,
+        _ => {
+            state.request_faults.fetch_add(1, Ordering::Relaxed);
+            return resource_empty_response(StatusCode::BAD_REQUEST);
+        }
+    };
+    state
+        .resource_uploads_verified
+        .fetch_add(1, Ordering::Release);
+    state
+        .resource_upload_bytes
+        .fetch_add(uploaded.0, Ordering::Release);
+    let configured = state
+        .resource_fault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let fault = configured.applies(id).then_some(configured);
+    if let Some(fault) = &fault
+        && fault.mode == "header_delay"
+    {
+        state
+            .resource_header_delays_started
+            .fetch_add(1, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(fault.delay_ms)).await;
+    }
+    let mut trailers = HeaderMap::new();
+    if grpc {
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        trailers.insert("grpc-message", HeaderValue::from_static("ok"));
+    }
+    let prefix = if grpc {
+        let mut prefix = vec![0];
+        prefix.extend_from_slice(&(payload_size as u32).to_be_bytes());
+        Some(Bytes::from(prefix))
+    } else {
+        None
+    };
+    let body = ResourceStreamBody {
+        prefix,
+        remaining: payload_size,
+        trailers: grpc.then_some(trailers),
+        state: Arc::clone(&state),
+        operation_id: operation_id.clone(),
+        cancelled_lane: path.starts_with("/base/resource/cancel"),
+        completed: false,
+        failed: false,
+        sent: 0,
+        fault: fault
+            .as_ref()
+            .filter(|fault| fault.mode == "mid_body_error")
+            .cloned(),
+        delay: None,
+    }
+    .boxed_unsync();
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            if grpc {
+                "application/grpc"
+            } else {
+                "application/octet-stream"
+            },
+        )
+        .header("x-fixture-upstream", id)
+        .header("x-fixture-peer", target.to_string())
+        .header("x-fixture-authority", authority)
+        .header("x-fixture-path", path)
+        .header("x-fixture-sni", sni)
+        .header("x-resource-operation-id", operation_id)
+        .header("x-resource-upload-bytes", uploaded.0)
+        .header("x-resource-upload-sha256", uploaded.1)
+        .header("x-resource-upload-eof", "true");
+    if grpc {
+        response = response.header(header::TRAILER, "grpc-status, grpc-message");
+    }
+    if let Some(fault) = fault {
+        response = response.header("x-resource-fault-case-id", fault.case_id);
+    }
+    response
+        .body(body)
+        .expect("test-only bounded resource metadata")
+}
+
+fn resource_empty_response(status: StatusCode) -> Response<ResourceFixtureBody> {
+    Response::builder()
+        .status(status)
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .expect("resource empty response")
+}
+
+async fn verify_resource_upload<B: Body<Data = Bytes> + Unpin>(
+    body: &mut B,
+    grpc: bool,
+    size: usize,
+) -> Result<(u64, String), RequestFault> {
+    let mut prefix = vec![0];
+    prefix.extend_from_slice(&(size as u32).to_be_bytes());
+    let length = size + if grpc { 5 } else { 0 };
+    let mut seen = 0usize;
+    let mut digest = Sha256::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| RequestFault::Body)?;
+        if let Some(data) = frame.data_ref() {
+            let end = seen
+                .checked_add(data.len())
+                .filter(|end| *end <= length)
+                .ok_or(RequestFault::Content)?;
+            for (offset, byte) in data.iter().enumerate() {
+                let at = seen + offset;
+                let expected = if grpc && at < 5 { prefix[at] } else { b'u' };
+                if *byte != expected {
+                    return Err(RequestFault::Content);
+                }
+            }
+            digest.update(data);
+            seen = end;
+        }
+    }
+    if seen != length {
+        return Err(RequestFault::Content);
+    }
+    Ok((
+        seen as u64,
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
 }
 
 struct StreamBody {
@@ -458,6 +901,8 @@ struct StreamBody {
     remaining: usize,
     release_epoch: u64,
     wait: Option<Pin<Box<tokio::time::Sleep>>>,
+    capture_operation_id: Option<String>,
+    sent: u64,
 }
 impl Body for StreamBody {
     type Data = Bytes;
@@ -467,6 +912,7 @@ impl Body for StreamBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
         if let Some(data) = self.data.take() {
+            self.sent += data.len() as u64;
             return Poll::Ready(Some(Ok(Frame::data(data))));
         }
         if self.hold && self.state.release_epoch.load(Ordering::Acquire) == self.release_epoch {
@@ -489,6 +935,7 @@ impl Body for StreamBody {
         if self.remaining > 0 {
             let size = self.remaining.min(1024);
             self.remaining -= size;
+            self.sent += size as u64;
             return Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; size])))));
         }
         if let Some(trailers) = self.trailers.take() {
@@ -506,6 +953,11 @@ impl Drop for StreamBody {
             && self.state.release_epoch.load(Ordering::Acquire) == self.release_epoch
         {
             self.state.cancellations.fetch_add(1, Ordering::Relaxed);
+            if self.sent > 0
+                && let Some(operation_id) = &self.capture_operation_id
+            {
+                record_cancellation(&self.state, operation_id.clone(), self.sent);
+            }
         }
     }
 }
@@ -541,6 +993,25 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
         Err(error) => return Err(io_error(error)),
     };
     let alternate = second.local_addr().map_err(io_error)?;
+    // The additional fixture listener is explicit on Linux too: the second
+    // IPv4 address is never reported as positive AAAA coverage.
+    let ipv6_listener = if alternate.is_ipv6() {
+        None
+    } else {
+        Some(
+            TcpListener::bind(std::net::SocketAddr::new(
+                std::net::Ipv6Addr::LOCALHOST.into(),
+                address.port(),
+            ))
+            .await
+            .map_err(io_error)?,
+        )
+    };
+    let ipv6_address = if let Some(listener) = &ipv6_listener {
+        listener.local_addr().map_err(io_error)?
+    } else {
+        alternate
+    };
     let plan: Value =
         serde_json::from_slice(&std::fs::read(root.join("fixture-plan.json")).map_err(io_error)?)
             .map_err(json_error)?;
@@ -559,13 +1030,20 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
     state.healthy_a.store(true, Ordering::Relaxed);
     state.healthy_b.store(true, Ordering::Relaxed);
     let mut tasks = tokio::task::JoinSet::new();
-    for (listener, id) in [(first, "a"), (second, "b")] {
+    let mut listeners = vec![(first, "a"), (second, "b")];
+    if let Some(listener) = ipv6_listener {
+        listeners.push((listener, "ipv6"));
+    }
+    for (listener, id) in listeners {
         let tls = Arc::new(tls.clone());
         let state = Arc::clone(&state);
-        tasks.spawn(async move{let gate=Arc::new(Semaphore::new(256));let mut conns=tokio::task::JoinSet::new();loop{tokio::select!{Some(_)=conns.join_next(),if !conns.is_empty()=>{},accepted=listener.accept()=>{let Ok((socket,_))=accepted else{break};let Ok(target)=socket.local_addr()else{continue};let Ok(permit)=Arc::clone(&gate).try_acquire_owned()else{continue};let tls=Arc::clone(&tls);let state=Arc::clone(&state);conns.spawn(async move{let _permit=permit;let Ok(socket)=TlsAcceptor::from(tls).accept(socket).await else{return};state.connections.fetch_add(1,Ordering::Relaxed);let sni=socket.get_ref().1.server_name().unwrap_or("").to_owned();let h2=socket.get_ref().1.alpn_protocol()==Some(b"h2");let narrow_upload_window=!state.request_read_delay.is_zero();let service=service_fn(move|request|serve(request,id,target,sni.clone(),Arc::clone(&state)));if h2{let mut builder=http2::Builder::new(TokioExecutor::new());if narrow_upload_window{builder.initial_stream_window_size(1);}let _=builder.serve_connection(TokioIo::new(socket),service).await;}else{let _=http1::Builder::new().serve_connection(TokioIo::new(socket),service).with_upgrades().await;}});}}}});
+        tasks.spawn(async move{let gate=Arc::new(Semaphore::new(256));let mut conns=tokio::task::JoinSet::new();loop{tokio::select!{Some(_)=conns.join_next(),if !conns.is_empty()=>{},accepted=listener.accept()=>{let Ok((socket,_))=accepted else{break};let Ok(target)=socket.local_addr()else{continue};let Ok(permit)=Arc::clone(&gate).try_acquire_owned()else{continue};let tls=Arc::clone(&tls);let state=Arc::clone(&state);conns.spawn(async move{let _permit=permit;let Ok(socket)=TlsAcceptor::from(tls).accept(socket).await else{return};state.connections.fetch_add(1,Ordering::Relaxed);let sni=socket.get_ref().1.server_name().unwrap_or("").to_owned();let h2=socket.get_ref().1.alpn_protocol()==Some(b"h2");let narrow_upload_window=!state.request_read_delay.is_zero();let service=service_fn(move|request|serve_route(request,id,target,sni.clone(),Arc::clone(&state)));if h2{let mut builder=http2::Builder::new(TokioExecutor::new());if narrow_upload_window{builder.initial_stream_window_size(1);}let _=builder.serve_connection(TokioIo::new(socket),service).await;}else{let _=http1::Builder::new().serve_connection(TokioIo::new(socket),service).with_upgrades().await;}});}}}});
     }
-    control(Ready{role:"upstream".into(),pid:std::process::id(),address,alternate:Some(alternate)},|command|{match command{FixtureCommand::Health{healthy_a,healthy_b,retry_a}=>{state.healthy_a.store(healthy_a,Ordering::Relaxed);state.healthy_b.store(healthy_b,Ordering::Relaxed);state.retry_a.store(retry_a,Ordering::Relaxed);},FixtureCommand::Release=>{state.release_epoch.fetch_add(1,Ordering::Release);},_=>{}}
-        json!({"ok":true,"requests":state.requests.load(Ordering::Relaxed),"request_faults":state.request_faults.load(Ordering::Relaxed),"request_body_errors":state.request_body_errors.load(Ordering::Relaxed),"request_content_faults":state.request_content_faults.load(Ordering::Relaxed),"request_timeouts":state.request_timeouts.load(Ordering::Relaxed),"retries":state.retries.load(Ordering::Relaxed),"retryable_status_replies":state.retries.load(Ordering::Relaxed),"health_success_replies":state.health_success_replies.load(Ordering::Relaxed),"health_failure_replies":state.health_failure_replies.load(Ordering::Relaxed),"body_drops":state.cancellations.load(Ordering::Relaxed),"connections":state.connections.load(Ordering::Relaxed),"active_tunnels":state.active_tunnels.load(Ordering::Relaxed)})}).await?;
+    control(Ready{role:"upstream".into(),pid:std::process::id(),address,alternate:Some(alternate),ipv6:Some(ipv6_address)},|command|{match command{FixtureCommand::Health{healthy_a,healthy_b,retry_a}=>{state.healthy_a.store(healthy_a,Ordering::Relaxed);state.healthy_b.store(healthy_b,Ordering::Relaxed);state.retry_a.store(retry_a,Ordering::Relaxed);},FixtureCommand::Release=>{state.release_epoch.fetch_add(1,Ordering::Release);},FixtureCommand::ResourceFault{mode,target,delay_ms,after_bytes,case_id}=>{
+        if !matches!(mode.as_str(),"none"|"header_delay"|"mid_body_error") || !matches!(target.as_str(),"all"|"a"|"b"|"ipv6") || delay_ms>60_000 || after_bytes>16*1024*1024 { return json!({"ok":false,"code":"fixture.invalid_resource_fault"}); }
+        *state.resource_fault.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=ResourceFault{mode,target,delay_ms,after_bytes,case_id};
+    },_=>{}}
+        json!({"ok":true,"requests":state.requests.load(Ordering::Relaxed),"request_faults":state.request_faults.load(Ordering::Relaxed),"request_body_errors":state.request_body_errors.load(Ordering::Relaxed),"request_content_faults":state.request_content_faults.load(Ordering::Relaxed),"request_timeouts":state.request_timeouts.load(Ordering::Relaxed),"retries":state.retries.load(Ordering::Relaxed),"retryable_status_replies":state.retries.load(Ordering::Relaxed),"health_success_replies":state.health_success_replies.load(Ordering::Relaxed),"health_failure_replies":state.health_failure_replies.load(Ordering::Relaxed),"body_drops":state.cancellations.load(Ordering::Relaxed),"connections":state.connections.load(Ordering::Relaxed),"active_tunnels":state.active_tunnels.load(Ordering::Relaxed),"resource_header_delays_started":state.resource_header_delays_started.load(Ordering::Acquire),"resource_mid_body_errors_emitted":state.resource_mid_body_errors_emitted.load(Ordering::Acquire),"resource_cancelled_bodies":state.resource_cancelled_bodies.load(Ordering::Acquire),"resource_completed_bodies":state.resource_completed_bodies.load(Ordering::Acquire),"resource_uploads_verified":state.resource_uploads_verified.load(Ordering::Acquire),"resource_upload_bytes":state.resource_upload_bytes.load(Ordering::Acquire),"resource_cancelled_operation_ids":state.resource_cancellations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),"resource_cancel_receipt_evictions":state.resource_cancel_receipt_evictions.load(Ordering::Relaxed)})}).await?;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     let mut tunnels = std::mem::take(
@@ -640,6 +1118,11 @@ async fn serve(
                         break;
                     }
                 }
+                // Finish the fixture's transport side, rather than dropping a
+                // TLS socket without close-notify and inventing a graceful EOF.
+                if io.shutdown().await.is_err() {
+                    eprintln!("{}", json!({"event":"fixture_tunnel_shutdown_error"}));
+                }
             }
         });
         return Ok(Response::builder()
@@ -709,6 +1192,13 @@ async fn serve(
         state,
         completed: false,
         wait: None,
+        capture_operation_id: request
+            .headers()
+            .get("x-resource-operation-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("prelude:") && value.len() <= 128)
+            .map(str::to_owned),
+        sent: 0,
     }
     .boxed_unsync();
     let mut response = Response::builder()
@@ -814,6 +1304,342 @@ mod tests {
     use hickory_resolver::proto::op::Query;
 
     use super::*;
+
+    fn resource_body(
+        state: Arc<UpstreamState>,
+        size: usize,
+        cancellation: bool,
+    ) -> ResourceStreamBody {
+        ResourceStreamBody {
+            prefix: None,
+            remaining: size,
+            trailers: None,
+            state,
+            operation_id: "cancel-op".into(),
+            cancelled_lane: cancellation,
+            completed: false,
+            failed: false,
+            sent: 0,
+            fault: None,
+            delay: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_completion_cancellation_and_failure_use_actual_body_events() {
+        let state = Arc::new(UpstreamState::default());
+        let unpolled = resource_body(Arc::clone(&state), 1025, true);
+        drop(unpolled);
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 0);
+        let mut cancelled = resource_body(Arc::clone(&state), 1025, true);
+        assert_eq!(
+            cancelled
+                .frame()
+                .await
+                .expect("first DATA")
+                .expect("DATA")
+                .data_ref()
+                .expect("DATA")
+                .len(),
+            1024
+        );
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 0);
+        assert!(
+            state
+                .resource_cancellations
+                .lock()
+                .expect("receipt lock")
+                .is_empty()
+        );
+        drop(cancelled);
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 1);
+        let receipt = state.resource_cancellations.lock().expect("receipt lock")[0].clone();
+        assert_eq!(receipt.operation_id, "cancel-op");
+        assert_eq!(receipt.body_bytes, 1024);
+        assert!(receipt.dropped_ns.is_some());
+
+        let mut complete = resource_body(Arc::clone(&state), 1025, false);
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        complete.trailers = Some(trailers);
+        let mut bytes = 0;
+        let mut trailer_seen = false;
+        while let Some(frame) = complete.frame().await {
+            let frame = frame.expect("normal frame");
+            if let Some(data) = frame.data_ref() {
+                bytes += data.len();
+                assert!(data.iter().all(|byte| *byte == b'x'));
+            }
+            if let Some(trailers) = frame.trailers_ref() {
+                trailer_seen = trailers["grpc-status"] == "0";
+            }
+        }
+        assert_eq!(bytes, 1025);
+        assert!(trailer_seen);
+        drop(complete);
+        assert_eq!(state.resource_completed_bodies.load(Ordering::Acquire), 1);
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 1);
+
+        let mut failed = resource_body(Arc::clone(&state), 4096, false);
+        failed.fault = Some(ResourceFault {
+            mode: "mid_body_error".into(),
+            target: "a".into(),
+            delay_ms: 0,
+            after_bytes: 1,
+            case_id: 7,
+        });
+        assert!(
+            failed
+                .frame()
+                .await
+                .expect("actual DATA")
+                .expect("DATA")
+                .data_ref()
+                .is_some()
+        );
+        assert_eq!(
+            state
+                .resource_mid_body_errors_emitted
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), failed.frame())
+                .await
+                .expect("bounded fixture timer")
+                .expect("actual error frame")
+                .is_err()
+        );
+        assert!(
+            failed.frame().await.is_none(),
+            "error is terminal, not followed by successful EOF accounting"
+        );
+        drop(failed);
+        assert_eq!(
+            state
+                .resource_mid_body_errors_emitted
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(state.resource_completed_bodies.load(Ordering::Acquire), 1);
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_upload_verifier_requires_every_wire_byte_and_eof() {
+        for grpc in [false, true] {
+            let mut bytes = Vec::new();
+            if grpc {
+                bytes.extend_from_slice(&[0, 0, 0, 0, 3]);
+            }
+            bytes.extend_from_slice(b"uuu");
+            let expected: String = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let mut valid = Full::new(Bytes::from(bytes.clone()));
+            assert_eq!(
+                verify_resource_upload(&mut valid, grpc, 3)
+                    .await
+                    .expect("verified upload"),
+                (bytes.len() as u64, expected)
+            );
+            for candidate in [
+                bytes[..bytes.len() - 1].to_vec(),
+                {
+                    let mut v = bytes.clone();
+                    v.push(b'u');
+                    v
+                },
+                {
+                    let mut v = bytes.clone();
+                    *v.last_mut().expect("payload") = b'x';
+                    v
+                },
+            ] {
+                let mut invalid = Full::new(Bytes::from(candidate));
+                assert!(matches!(
+                    verify_resource_upload(&mut invalid, grpc, 3).await,
+                    Err(RequestFault::Content)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_receipts_are_bounded_and_do_not_count_unpolled_bodies() {
+        let state = Arc::new(UpstreamState::default());
+        for sequence in 0..130 {
+            let mut body = resource_body(Arc::clone(&state), 1024, true);
+            body.operation_id = format!("cancel-{sequence}");
+            body.frame().await.expect("DATA").expect("frame");
+            drop(body);
+        }
+        let receipts = state
+            .resource_cancellations
+            .lock()
+            .expect("bounded receipts");
+        assert_eq!(receipts.len(), 128);
+        assert_eq!(
+            receipts.front().expect("oldest retained").operation_id,
+            "cancel-2"
+        );
+        assert_eq!(
+            state
+                .resource_cancel_receipt_evictions
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(state.resource_cancelled_bodies.load(Ordering::Acquire), 130);
+    }
+
+    #[test]
+    fn resource_dns_modes_emit_actual_ipv6_and_explicit_srv_weights() {
+        let ipv6 = answer("v6", "api.discovery.test.", RecordType::AAAA);
+        assert!(ipv6.answers.iter().any(|record|matches!(&record.data,RData::AAAA(data) if data.0==std::net::Ipv6Addr::LOCALHOST)));
+        assert!(
+            answer("v6", "api.discovery.test.", RecordType::A)
+                .answers
+                .is_empty()
+        );
+        let service = "_https._tcp.api.discovery.test.";
+        assert_eq!(
+            srv_rows(&answer("v6", service, RecordType::SRV)),
+            vec![("ipv6.discovery.test.".into(), 0, 1, 8443)]
+        );
+        assert_eq!(
+            srv_rows(&answer("weights", service, RecordType::SRV)),
+            vec![
+                ("a.discovery.test.".into(), 0, 3, 8443),
+                ("b.discovery.test.".into(), 0, 1, 8443)
+            ]
+        );
+        let equal = srv_rows(&answer("weights_equal", service, RecordType::SRV));
+        let weighted = srv_rows(&answer("weights", service, RecordType::SRV));
+        assert_eq!(
+            equal,
+            vec![
+                ("a.discovery.test.".into(), 0, 1, 8443),
+                ("b.discovery.test.".into(), 0, 1, 8443)
+            ]
+        );
+        assert_eq!(
+            equal
+                .iter()
+                .map(|(target, priority, _, port)| (target, priority, port))
+                .collect::<Vec<_>>(),
+            weighted
+                .iter()
+                .map(|(target, priority, _, port)| (target, priority, port))
+                .collect::<Vec<_>>(),
+            "only weights change, not priority, port or identity"
+        );
+        let counts = DnsCounts::default();
+        assert_eq!(counts.status()["positive_aaaa_answers"], 0);
+        assert_eq!(counts.status()["srv_equal_weight_answers"], 0);
+        assert_eq!(
+            counts.status()["srv_weighted_answers"],
+            0,
+            "preparing answers alone is not coverage"
+        );
+        for (mode, name, kind) in [
+            ("v6", "api.discovery.test.", RecordType::AAAA),
+            ("weights_equal", service, RecordType::SRV),
+            ("weights", service, RecordType::SRV),
+        ] {
+            counts.response_written(
+                &answer(mode, name, kind).to_vec().expect("encoded packet"),
+                false,
+            );
+        }
+        assert_eq!(counts.status()["positive_aaaa_answers"], 1);
+        assert_eq!(counts.status()["srv_equal_weight_answers"], 1);
+        assert_eq!(counts.status()["srv_weighted_answers"], 1);
+    }
+
+    #[tokio::test]
+    async fn resource_upgrade_raw_uses_actual_echo_bytes_and_peer_eof() {
+        let identity = crate::common::identity().expect("test-only TLS identity");
+        let client = crate::common::client_config(&[&identity], &[b"http/1.1"])
+            .expect("verified test client");
+        let key =
+            PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes()).expect("test key");
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![identity.certificate_der], key)
+        .expect("test chain and key");
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral fixture");
+        let address = listener.local_addr().expect("actual physical socket");
+        let state = Arc::new(UpstreamState::default());
+        let serving = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("client");
+            let socket = TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .expect("real TLS handshake");
+            let sni = socket
+                .get_ref()
+                .1
+                .server_name()
+                .expect("verified fixture SNI")
+                .to_owned();
+            let service = service_fn(move |request| {
+                serve_route(request, "a", address, sni.clone(), Arc::clone(&serving))
+            });
+            http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .with_upgrades()
+                .await
+                .expect("actual HTTP/1 upgrade driver");
+        });
+        let facts = super::super::client::measure_resource_upgrade(
+            address,
+            client,
+            "wire-upgrade-1".into(),
+        )
+        .await;
+        assert_eq!(facts.status, Some(101));
+        assert!(facts.request_head_sent && facts.tunnel_client_shutdown && facts.eof);
+        assert_eq!(facts.error_code, None);
+        assert_eq!(facts.echo_iterations, 4);
+        assert_eq!(facts.body_bytes, 80);
+        let expected: String = Sha256::digest(b"qualification-tunnel".repeat(4))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(facts.body_sha256, expected);
+        assert_eq!(
+            facts.upstream_peer.as_deref(),
+            Some(address.to_string().as_str())
+        );
+        assert_eq!(
+            facts.path.as_deref(),
+            Some("/ws"),
+            "this tests the fixture/client directly, not a surrogate gateway"
+        );
+        assert_eq!(facts.authority.as_deref(), Some("gateway.example.test"));
+        assert_eq!(facts.server_name.as_deref(), Some("gateway.example.test"));
+        server.await.expect("HTTP/1 driver did not panic");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.active_tunnels.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual fixture tunnel finished while owner is alive");
+        let mut tasks = std::mem::take(&mut *state.tunnels.lock().expect("task ownership"));
+        while let Some(result) = tasks.join_next().await {
+            result.expect("actual tunnel exit acknowledged");
+        }
+    }
 
     #[tokio::test]
     async fn forced_pre_head_drop_is_body_error_but_planned_stop_preserves_opaque_post() {
@@ -1024,6 +1850,7 @@ mod tests {
             pid: 1,
             address: "127.0.0.1:8443".parse().expect("fixture A"),
             alternate: Some("127.0.0.2:8443".parse().expect("fixture B")),
+            ipv6: Some("[::1]:8443".parse().expect("fixture IPv6")),
         }
     }
 
@@ -1296,6 +2123,8 @@ mod tests {
             remaining: 0,
             release_epoch: 0,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         assert!(body.frame().await.expect("DATA").expect("frame").is_data());
         assert!(
@@ -1317,6 +2146,8 @@ mod tests {
             remaining: 0,
             release_epoch: 0,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         state.release_epoch.fetch_add(1, Ordering::Release);
         assert!(released.frame().await.is_none());
@@ -1331,9 +2162,53 @@ mod tests {
             remaining: 0,
             release_epoch: 1,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         drop(cancelled);
         assert_eq!(state.cancellations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_only_legacy_cancel_has_operation_bound_actual_drop_ack() {
+        let state = Arc::new(UpstreamState::default());
+        for polled in [false, true] {
+            let mut body = StreamBody {
+                data: Some(Bytes::from_static(b"data")),
+                trailers: None,
+                hold: true,
+                state: Arc::clone(&state),
+                completed: false,
+                remaining: 0,
+                release_epoch: 0,
+                wait: None,
+                capture_operation_id: Some(if polled { "prelude:2" } else { "prelude:1" }.into()),
+                sent: 0,
+            };
+            if polled {
+                body.frame().await.expect("actual DATA").expect("frame");
+            }
+            drop(body);
+        }
+        assert_eq!(
+            state.cancellations.load(Ordering::Acquire),
+            2,
+            "legacy counter policy remains unchanged"
+        );
+        assert_eq!(
+            state.resource_cancelled_bodies.load(Ordering::Acquire),
+            0,
+            "legacy body is not mislabeled as the new resource lane"
+        );
+        let receipts = state.resource_cancellations.lock().expect("bound receipt");
+        assert_eq!(
+            receipts.len(),
+            1,
+            "no actual DATA means no cancellation qualification ACK"
+        );
+        assert_eq!(receipts[0].operation_id, "prelude:2");
+        assert_eq!(receipts[0].body_bytes, 4);
+        assert!(receipts[0].dropped_ns.is_some());
     }
 
     #[tokio::test]

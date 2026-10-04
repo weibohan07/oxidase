@@ -108,3 +108,45 @@ analyzer. Phase 7A.3 must obtain attribution before changing retention policy an
 must validate Running recovery separately from explicit drain. At this point
 Linux resource/memory qualification remains NOT RUN/INCONCLUSIVE, not implied by
 unit tests, an interface or a configured workflow.
+
+## Validation-only Running workload tools
+
+The separate-process `oxidase-discovery-soak resource-run` controller uses the
+actual CLI, authenticated mutations, Rust wire clients and independent fixtures.
+It does not own a second publication/resolver/data plane. `resource-build-record`
+records source-set and full binary hashes **after** the documented locked build;
+it is not a reproducible-build attestation. An independent sampler records the
+gateway's Linux PID/start identity, actual OS capture windows, raw Admin reads and
+explicit gaps. The Python verifier reconstructs results from the raw evidence,
+not from the controller's verdict. The original phase-six tool is unchanged.
+
+H is full healthy TLS H1/H2/gRPC/upload/download traffic; intentional cancellation
+and Upgrade have separate low-frequency lanes and denominators. C adds finite
+named, physically scoped fault windows with actual triggers and fresh full-peer
+recovery, real AAAA/SRV updates and signed publication/source operations. No
+blanket epoch-wide 503 allowance applies. Both keep independent Recovery and
+Quiet windows **Running** before the final explicit drain.
+
+I selectors include `respond`, `static-proxy`, `dns-only` (Proxy + DNS changes),
+`publish-only` (fixed static upstream), `health-only`, `dns-background-only`
+(no business traffic), `h2-only`, `h2-cancel`, `grpc-only`, `upgrade-only`, and
+`scrape-only`. Respond/scrape remove the Cluster plan entirely; health-only has
+static endpoints and DNS-only background has no health policy. No selector
+silently interprets routing around a still-prepared Cluster as absent background
+work. These selectors are validation code, not additional product services.
+
+`--operation-interval-ms` can pace complete-response workers for matched-rate
+isolation; zero is ordinary closed-loop fixed concurrency. Actual completed
+rates must still be compared: a slower scenario cannot be assumed to have
+achieved the offered pacing. Cancellation/Upgrade remain separately paced.
+Periodic Admin scrape may be disabled with `--scrape-interval-ms 0`; independent
+OS sampling and explicit first/final checkpoints continue. Missing resource data
+stays unavailable/INCONCLUSIVE, never zero.
+
+Formal H/C require their original 3/60/10-or-15/5/5-minute minima. The manual
+workflow reserves build/startup/collection/upload time before measurement;
+invalid duration budgets are rejected before build. CI uses a short Linux
+implementation smoke and negative synthetic oracle corpus, neither of which is
+hour-scale qualification. Exact source/head, raw artifact checksums and original
+failures belong in the acceptance ledger. A library-private idle sweep or a
+configured registry limit is not a proof of all physical connection capacities.

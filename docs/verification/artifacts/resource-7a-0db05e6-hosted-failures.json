@@ -1,0 +1,35 @@
+{
+  "schema_version": "oxidase.resource-evidence-index/v1",
+  "pr": 21,
+  "head_commit": "0db05e61bcf1763e62c8f4b2193d3b8eeaca08b4",
+  "run_id": 37195361755,
+  "run_url": "https://github.com/weibohan07/oxidase/actions/runs/37195361755",
+  "result": "FAIL",
+  "local_macOS_gates": "all nine passed without source change; Linux smoke was not executed on macOS",
+  "stable": {
+    "job_id": 111415987136,
+    "raw_log_sha256": "ca2b376ce36aa9424c3263d52c6a9ae4e7c42bf298a89ae4d230eb81e21dc722",
+    "failure": "Rust 1.99 chunks_exact_to_as_chunks denied-warning lint; test/doc/release skipped"
+  },
+  "msrv": {
+    "job_id": 111415987153,
+    "raw_log_sha256": "bfac46b2a96ca8f9e2ff4f7249849526f32bf72c9df8e8fb46dd35f505c8d9bf",
+    "artifact_id": 11301305852,
+    "archive_sha256": "3a5e3486d791876ef82ceafae1715463bbb94e3238d959125b5822575497b022",
+    "controller_complete": true,
+    "independent_analysis": "FAIL",
+    "worker_offered": 543,
+    "worker_received": 543,
+    "admitted_http_operations": 536,
+    "admitted_upgrade_operations": 7,
+    "connection_attempts": 12,
+    "raw_old_held_grpc_peer": "A",
+    "raw_old_upgrade_peer": "B",
+    "raw_admin_captures": 74,
+    "required_labelled_gauges_present_in_original_captures": true,
+    "sampler_self_binary_hash_seconds": 16.536330851,
+    "conclusion": "Invalid old-A Upgrade proof; receipt requested wrong metric keys. Later repairs do not relabel original bytes."
+  },
+  "retention": "Bounded GitHub artifact lifetime; download original archive by ID and verify checksum before independent replay.",
+  "qualification": "No hour-scale or memory qualification"
+}
