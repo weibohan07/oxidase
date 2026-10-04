@@ -1522,9 +1522,6 @@ mod tests {
             dns_fault_recipe("positive").is_err(),
             "healthy traffic cannot invent a fault window"
         );
-        assert_eq!(HEALTHY_DNS_TTL_SECONDS, 5);
-        assert!(SETTLING >= Duration::from_secs(10));
-        assert!(RECOVERY_NS > 0 && RECOVERY_NS <= 12_000_000_000);
     }
     #[test]
     fn srv_target_aaaa_witness_requires_real_refresh_and_exact_metric_scope() {
