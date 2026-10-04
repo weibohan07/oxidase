@@ -17,6 +17,7 @@ pub(super) struct Sample {
     pub discovery_tasks: Option<u64>,
     pub health_tasks: Option<u64>,
     pub pools: Option<u64>,
+    pub retired_pools: Option<u64>,
     pub old_snapshots: Option<u64>,
     pub cluster_permits: Option<u64>,
     pub retry_permits: Option<u64>,
@@ -87,11 +88,39 @@ pub(super) fn sample(
         active_tunnels: metrics.and_then(|m| metric_sum(m, "oxidase_active_tunnels")),
         discovery_tasks: metrics
             .and_then(|m| metric_sum(m, "oxidase_discovery_active_supervisors")),
-        // Not currently exposed by the public runtime/metrics API. Unknown is
-        // deliberately null, never fabricated from task intentions or maps.
-        health_tasks: None,
-        pools: None,
-        old_snapshots: None,
+        // Actual scheduled/running supervisor futures, actual Client clone
+        // families, and retired snapshot instances; never manager/map lengths.
+        // Missing/disabled observations stay unavailable, not fake zero.
+        health_tasks: metrics.and_then(|m| {
+            selected_metric(m, "oxidase_resource_live", &["kind=\"health_supervisor\""])
+        }),
+        pools: metrics.and_then(|m| {
+            selected_metric(m, "oxidase_resource_live", &["kind=\"proxy_pool_family\""])?
+                .checked_add(selected_metric(
+                    m,
+                    "oxidase_resource_live",
+                    &["kind=\"health_pool_family\""],
+                )?)
+        }),
+        retired_pools: metrics.and_then(|m| {
+            selected_metric(
+                m,
+                "oxidase_resource_state",
+                &["kind=\"proxy_pool_family\"", "state=\"retired\""],
+            )?
+            .checked_add(selected_metric(
+                m,
+                "oxidase_resource_state",
+                &["kind=\"health_pool_family\"", "state=\"retired\""],
+            )?)
+        }),
+        old_snapshots: metrics.and_then(|m| {
+            selected_metric(
+                m,
+                "oxidase_resource_state",
+                &["kind=\"snapshot\"", "state=\"retired\""],
+            )
+        }),
         cluster_permits: sum_json("active_requests"),
         retry_permits: sum_json("active_retries"),
         endpoints: discovery_sum("endpoint_count"),
@@ -120,6 +149,21 @@ fn status_number(text: &str, name: &str) -> Option<u64> {
         .nth(1)?
         .parse()
         .ok()
+}
+
+fn selected_metric(text: &str, name: &str, selectors: &[&str]) -> Option<u64> {
+    let mut rows = text
+        .lines()
+        .filter(|line| {
+            line.starts_with(name)
+                && line.as_bytes().get(name.len()) == Some(&b'{')
+                && selectors.iter().all(|selector| line.contains(selector))
+        })
+        .peekable();
+    rows.peek()?;
+    rows.try_fold(0u64, |sum, line| {
+        sum.checked_add(line.split_whitespace().last()?.parse::<u64>().ok()?)
+    })
 }
 
 pub(super) fn metric_sum(text: &str, name: &str) -> Option<u64> {
@@ -189,6 +233,21 @@ mod tests {
         assert!(value.open_fds.is_none());
         assert!(value.active_requests.is_none());
         assert!(value.health_tasks.is_none());
+    }
+    #[test]
+    fn real_lifetime_units_require_all_their_exact_series() {
+        let metrics = "oxidase_resource_live{kind=\"health_supervisor\"} 2\noxidase_resource_live{kind=\"health_probe\"} 99\noxidase_resource_live{kind=\"proxy_pool_family\"} 3\noxidase_resource_live{kind=\"health_pool_family\"} 4\noxidase_resource_live{kind=\"proxy_pool_entry\"} 100\noxidase_resource_state{kind=\"snapshot\",state=\"retired\"} 1\noxidase_resource_state{kind=\"snapshot\",state=\"current\"} 9\n";
+        let value = sample(u32::MAX, 0, "steady", Some(metrics), None);
+        assert_eq!(value.health_tasks, Some(2));
+        assert_eq!(value.pools, Some(7));
+        assert_eq!(value.old_snapshots, Some(1));
+        let incomplete =
+            metrics.replace("oxidase_resource_live{kind=\"health_pool_family\"} 4\n", "");
+        assert!(
+            sample(u32::MAX, 0, "steady", Some(&incomplete), None)
+                .pools
+                .is_none()
+        );
     }
     #[test]
     fn missing_fields_and_overflow_are_unknown_not_fabricated_zero() {

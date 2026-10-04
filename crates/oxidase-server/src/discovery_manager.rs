@@ -10,7 +10,8 @@ use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use oxidase_config::{DnsDiscoverySpec, DnsRecordType, MAX_DNS_DISCOVERY_CLUSTERS};
 use oxidase_core::{ContentDigestBuilder, Diagnostic, ResourceId};
 use oxidase_runtime::{
-    DnsFamily, DnsObservation, PreparedCluster, RuntimeSnapshot, SrvObservation,
+    DnsFamily, DnsObservation, PreparedCluster, ResourceCancellationHandle, ResourceCensus,
+    ResourceKind, ResourceState, RuntimeSnapshot, SrvObservation,
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -65,6 +66,7 @@ pub fn validate_discovery_policy_bootstrap<'a>(
 struct Owner {
     cluster: Weak<PreparedCluster>,
     task: JoinHandle<()>,
+    observation: ResourceCancellationHandle,
 }
 
 /// Local-only preparation result. Resolver inputs are frozen before the final
@@ -74,6 +76,7 @@ pub(crate) struct PreparedDiscoveryOwners(BTreeMap<ResourceId, DnsResolver>);
 pub(crate) struct DiscoveryPreparation {
     plans: Vec<(ResourceId, DnsDiscoverySpec)>,
     queries: Arc<Semaphore>,
+    census: Arc<ResourceCensus>,
 }
 
 impl DiscoveryPreparation {
@@ -81,7 +84,11 @@ impl DiscoveryPreparation {
         let mut prepared = BTreeMap::new();
         let mut diagnostics = Vec::new();
         for (id, plan) in self.plans {
-            match DnsResolver::new(&plan.resolver, Arc::clone(&self.queries)) {
+            match DnsResolver::with_census(
+                &plan.resolver,
+                Arc::clone(&self.queries),
+                Arc::clone(&self.census),
+            ) {
                 Ok(resolver) => {
                     prepared.insert(id, resolver);
                 }
@@ -109,24 +116,31 @@ pub(crate) struct DiscoveryManager {
     owners: BTreeMap<ResourceId, Owner>,
     queries: Arc<Semaphore>,
     jitter_seed: u64,
+    census: Arc<ResourceCensus>,
 }
 
 impl DiscoveryManager {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::new_with_census(ResourceCensus::process())
+    }
+
+    pub(crate) fn new_with_census(census: Arc<ResourceCensus>) -> Self {
         // RandomState receives per-process OS-seeded hash keys. Its empty hash
         // is used only to desynchronize refresh scheduling, never as identity,
         // authentication material or a correctness/content digest.
         let seed = std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish();
-        Self::with_seed(seed)
+        Self::with_seed_and_census(seed, census)
     }
 
-    fn with_seed(seed: u64) -> Self {
+    fn with_seed_and_census(seed: u64, census: Arc<ResourceCensus>) -> Self {
         Self {
             owners: BTreeMap::new(),
             queries: Arc::new(Semaphore::new(MAX_DNS_QUERIES)),
             jitter_seed: seed,
+            census,
         }
     }
 
@@ -150,6 +164,7 @@ impl DiscoveryManager {
         DiscoveryPreparation {
             plans,
             queries: Arc::clone(&self.queries),
+            census: Arc::clone(&self.census),
         }
     }
 
@@ -183,6 +198,7 @@ impl DiscoveryManager {
                 if let Some(cluster) = owner.cluster.upgrade() {
                     cluster.retire_discovery_policy();
                 }
+                owner.observation.cancel_requested();
                 owner.task.abort();
                 let _ = owner.task.await;
             }
@@ -204,20 +220,27 @@ impl DiscoveryManager {
                 continue;
             };
             let _ = cluster.activate_discovery_policy();
-            let task = tokio::spawn(run_owner(
-                Arc::downgrade(cluster),
-                plan.clone(),
-                resolver,
-                Arc::clone(proxy),
-                Arc::clone(metrics),
-                id.clone(),
-                self.jitter_seed,
-            ));
+            let lifetime = self
+                .census
+                .token(ResourceKind::DiscoverySupervisor, ResourceState::Scheduled);
+            let observation = lifetime.cancellation_handle();
+            let weak = Arc::downgrade(cluster);
+            let plan = plan.clone();
+            let proxy = Arc::clone(proxy);
+            let metrics = Arc::clone(metrics);
+            let task_id = id.clone();
+            let seed = self.jitter_seed;
+            let task = tokio::spawn(async move {
+                lifetime.transition(ResourceState::Running);
+                run_owner(weak, plan, resolver, proxy, metrics, task_id, seed).await;
+                drop(lifetime);
+            });
             self.owners.insert(
                 id.clone(),
                 Owner {
                     cluster: Arc::downgrade(cluster),
                     task,
+                    observation,
                 },
             );
         }
@@ -228,6 +251,7 @@ impl DiscoveryManager {
             if let Some(cluster) = owner.cluster.upgrade() {
                 cluster.retire_discovery_policy();
             }
+            owner.observation.cancel_requested();
             owner.task.abort();
             let _ = owner.task.await;
         }
@@ -240,6 +264,7 @@ impl Drop for DiscoveryManager {
             if let Some(cluster) = owner.cluster.upgrade() {
                 cluster.retire_discovery_policy();
             }
+            owner.observation.cancel_requested();
             owner.task.abort();
         }
     }
@@ -293,6 +318,9 @@ async fn run_owner(
         let Some(query) = cluster.begin_discovery_query() else {
             break;
         };
+        let _round = resolver
+            .resource_census()
+            .token(ResourceKind::DiscoveryRound, ResourceState::Running);
         let mut work = due
             .into_iter()
             .map(|family| {
@@ -378,6 +406,9 @@ async fn run_srv_owner(
         let Some(query) = cluster.begin_discovery_query() else {
             break;
         };
+        let _round = resolver
+            .resource_census()
+            .token(ResourceKind::DiscoveryRound, ResourceState::Running);
         let mut answer = tokio::select! {
             biased;
             _ = retired.changed() => break,
@@ -595,6 +626,202 @@ mod tests {
             RuntimeSnapshot::prepare(Compiler::compile_path(path).expect("compile policy"))
                 .expect("prepare policy");
         (dir, snapshot)
+    }
+
+    fn resource_count(
+        census: &ResourceCensus,
+        kind: ResourceKind,
+    ) -> oxidase_runtime::ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("fixed census kind")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_census_counts_scheduled_owner_until_actual_abort_drop_without_scrape() {
+        let (_dir, snapshot) = fixture();
+        let census = Arc::new(ResourceCensus::default());
+        let mut manager = DiscoveryManager::with_seed_and_census(1, Arc::clone(&census));
+        let prepared = manager
+            .preparation_for(&snapshot)
+            .prepare()
+            .expect("local preparation");
+        assert_eq!(
+            resource_count(&census, ResourceKind::DiscoverySupervisor).live,
+            0,
+            "preparation cannot start permanent work"
+        );
+        assert_eq!(resource_count(&census, ResourceKind::DnsQuery).created, 0);
+        let proxy = Arc::new(ProxyClient::new().expect("proxy pools"));
+        let metrics = Arc::new(Metrics::default());
+        manager
+            .activate_snapshot(&snapshot, &proxy, &metrics, prepared)
+            .await;
+        let scheduled = resource_count(&census, ResourceKind::DiscoverySupervisor);
+        assert_eq!(
+            (scheduled.created, scheduled.destroyed, scheduled.live),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            scheduled
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Scheduled)
+                .expect("scheduled state")
+                .live,
+            1
+        );
+        let owner = manager.owners.values().next().expect("owner");
+        owner.observation.cancel_requested();
+        owner.task.abort();
+        let cancelling = resource_count(&census, ResourceKind::DiscoverySupervisor);
+        assert_eq!(
+            cancelling.live, 1,
+            "abort does not synchronously drop the unpolled future"
+        );
+        assert_eq!(
+            cancelling
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Exiting)
+                .expect("exiting state")
+                .live,
+            1
+        );
+        manager.shutdown().await;
+        let completed = resource_count(&census, ResourceKind::DiscoverySupervisor);
+        assert_eq!(
+            (completed.created, completed.destroyed, completed.live),
+            (1, 1, 0)
+        );
+        assert_eq!(resource_count(&census, ResourceKind::DnsQuery).created, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_discovery_drops_real_round_and_query_before_late_reply_without_scrape() {
+        use crate::dns_test_fixture::{DnsFixture, FixtureReply};
+        use hickory_resolver::proto::rr::rdata::A;
+        use hickory_resolver::proto::rr::{RData, Record, RecordType};
+        use tokio::sync::oneshot;
+        let (received, arrival) = oneshot::channel();
+        let received = Arc::new(std::sync::Mutex::new(Some(received)));
+        let response_gate = Arc::new(Semaphore::new(0));
+        let gate = Arc::clone(&response_gate);
+        let dns_fixture = DnsFixture::start(move |question, _| {
+            if question.query_type() != RecordType::A {
+                return FixtureReply::answers(Vec::new());
+            }
+            if let Some(sender) = received.lock().expect("arrival signal").take() {
+                let _ = sender.send(());
+            }
+            let mut reply = FixtureReply::answers(vec![Record::from_rdata(
+                question.name().clone(),
+                30,
+                RData::A(A::new(192, 0, 2, 1)),
+            )]);
+            reply.response_gate = Some(Arc::clone(&gate));
+            reply
+        })
+        .await;
+        let (_dir, mut snapshot) = fixture();
+        let mut spec = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster")
+            .spec()
+            .clone();
+        let discovery = spec.discovery.as_mut().expect("DNS policy");
+        discovery.resolver.source =
+            oxidase_config::DnsResolverSource::NameServers(vec![dns_fixture.address]);
+        discovery.resolver.query_timeout = Duration::from_secs(30);
+        let cluster = Arc::new(PreparedCluster::prepare(spec, None).0);
+        snapshot
+            .resources
+            .clusters
+            .insert(cluster.id().clone(), Arc::clone(&cluster));
+        let census = Arc::new(ResourceCensus::default());
+        let mut manager = DiscoveryManager::with_seed_and_census(1, Arc::clone(&census));
+        let prepared = manager
+            .preparation_for(&snapshot)
+            .prepare()
+            .expect("local preparation");
+        let proxy = Arc::new(ProxyClient::new().expect("proxy pools"));
+        let metrics = Arc::new(Metrics::default());
+        manager
+            .activate_snapshot(&snapshot, &proxy, &metrics, prepared)
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), arrival)
+            .await
+            .expect("actual A query arrived")
+            .expect("arrival sender");
+        assert_eq!(
+            resource_count(&census, ResourceKind::DiscoverySupervisor).live,
+            1
+        );
+        assert_eq!(
+            resource_count(&census, ResourceKind::DiscoveryRound).live,
+            1
+        );
+        assert!(resource_count(&census, ResourceKind::DnsQuery).live >= 1);
+        let mut removed = snapshot.clone();
+        removed.resources.clusters.clear();
+        let empty_preparation = manager
+            .preparation_for(&removed)
+            .prepare()
+            .expect("empty preparation");
+        manager
+            .activate_snapshot(&removed, &proxy, &metrics, empty_preparation)
+            .await;
+        for kind in [
+            ResourceKind::DiscoverySupervisor,
+            ResourceKind::DiscoveryRound,
+            ResourceKind::DnsQuery,
+        ] {
+            let row = resource_count(&census, kind);
+            assert_eq!(
+                row.live, 0,
+                "actual retired work dropped before reading any Admin/metrics path"
+            );
+            assert_eq!(row.created, row.destroyed);
+        }
+        let generation = cluster
+            .discovery_status()
+            .expect("retired membership")
+            .generation;
+        let sent = dns_fixture
+            .counts
+            .responses_for_type("fixture.oxidase.invalid.", RecordType::A);
+        response_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while dns_fixture
+                .counts
+                .responses_for_type("fixture.oxidase.invalid.", RecordType::A)
+                == sent
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late UDP reply actually sent");
+        assert_eq!(
+            cluster
+                .discovery_status()
+                .expect("still retired")
+                .generation,
+            generation
+        );
+        assert!(
+            cluster.endpoints().is_empty(),
+            "late retired answer cannot revive endpoint selection"
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
+        manager.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

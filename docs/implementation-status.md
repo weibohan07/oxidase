@@ -1,6 +1,12 @@
 # Implementation status
 
-Last updated: 2026-10-03
+Last updated: 2026-10-04
+
+Phase 7A.1 is in progress on `hardening/v0.4-resource-census` from protected
+`495a906`; actual object/task/IO census and pure authenticated read observation
+have development regressions, but final-head/main CI and Linux resource/memory
+qualification are not yet acceptance evidence. See
+`docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
 ## Baseline
 

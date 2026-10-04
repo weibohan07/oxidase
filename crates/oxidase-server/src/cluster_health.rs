@@ -19,12 +19,15 @@ use http_body::Body;
 use http_body_util::{BodyExt, Empty};
 use oxidase_config::ActiveHealthSpec;
 use oxidase_core::ResourceId;
-use oxidase_runtime::{PreparedCluster, PreparedEndpoint, RuntimeSnapshot};
+use oxidase_runtime::{
+    PreparedCluster, PreparedEndpoint, ResourceCancellationHandle, ResourceCensus, ResourceKind,
+    ResourceState, RuntimeSnapshot,
+};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::static_targets::{StaticTargetCache, static_upstream_pool_observed};
-use crate::upstream_pool::BoundedPoolRegistry;
+use crate::upstream_pool::{BoundedPoolRegistry, PoolPurpose};
 use crate::upstream_transport::{TransportError, TransportErrorKind, TransportPhase};
 
 const MAX_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
@@ -38,6 +41,7 @@ const MAX_CONCURRENT_CLUSTER_PROBES: usize = 32;
 /// tasks; normal shutdown first asks tasks to stop cooperatively.
 pub(crate) struct ClusterHealthManager {
     client: Arc<HealthClient>,
+    census: Arc<ResourceCensus>,
     supervisors: BTreeMap<ResourceId, HealthSupervisor>,
     tasks: JoinSet<()>,
     #[cfg(test)]
@@ -48,20 +52,28 @@ struct HealthSupervisor {
     owner: Weak<PreparedCluster>,
     cancel: watch::Sender<bool>,
     task: tokio::task::AbortHandle,
+    observation: ResourceCancellationHandle,
 }
 
 impl HealthSupervisor {
     fn stop(&self) {
+        self.observation.cancel_requested();
         let _ = self.cancel.send(true);
         self.task.abort();
     }
 }
 
 impl ClusterHealthManager {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, String> {
-        let client = Arc::new(HealthClient::new()?);
+        Self::with_census(ResourceCensus::process())
+    }
+
+    pub(crate) fn with_census(census: Arc<ResourceCensus>) -> Result<Self, String> {
+        let client = Arc::new(HealthClient::with_census(Arc::clone(&census))?);
         Ok(Self {
             client,
+            census,
             supervisors: BTreeMap::new(),
             tasks: JoinSet::new(),
             #[cfg(test)]
@@ -99,20 +111,33 @@ impl ClusterHealthManager {
             }
             activated += 1;
             let (cancel, receiver) = watch::channel(false);
-            let task = run_cluster_supervisor(
-                Arc::downgrade(cluster),
-                Arc::clone(&self.client),
-                receiver,
-                #[cfg(test)]
-                Arc::clone(&self.counters),
-            );
-            let task = self.tasks.spawn(task);
+            let lifetime = self
+                .census
+                .token(ResourceKind::HealthSupervisor, ResourceState::Scheduled);
+            let observation = lifetime.cancellation_handle();
+            let weak = Arc::downgrade(cluster);
+            let client = Arc::clone(&self.client);
+            #[cfg(test)]
+            let counters = Arc::clone(&self.counters);
+            let task = self.tasks.spawn(async move {
+                lifetime.transition(ResourceState::Running);
+                run_cluster_supervisor(
+                    weak,
+                    client,
+                    receiver,
+                    #[cfg(test)]
+                    counters,
+                )
+                .await;
+                drop(lifetime);
+            });
             self.supervisors.insert(
                 cluster.id().clone(),
                 HealthSupervisor {
                     owner: Arc::downgrade(cluster),
                     cancel,
                     task,
+                    observation,
                 },
             );
         }
@@ -122,6 +147,7 @@ impl ClusterHealthManager {
     /// Stops all health work and waits for task termination.
     pub(crate) async fn shutdown(&mut self) {
         for supervisor in self.supervisors.values() {
+            supervisor.observation.cancel_requested();
             let _ = supervisor.cancel.send(true);
         }
         while self.tasks.join_next().await.is_some() {}
@@ -154,16 +180,27 @@ struct HealthClient {
     pool_registry: BoundedPoolRegistry<Empty<Bytes>>,
     targets: StaticTargetCache,
     admission: Semaphore,
+    census: Arc<ResourceCensus>,
     #[cfg(test)]
     peak_concurrency: AtomicU64,
 }
 
 impl HealthClient {
+    #[cfg(test)]
     fn new() -> Result<Self, String> {
+        Self::with_census(ResourceCensus::process())
+    }
+
+    fn with_census(census: Arc<ResourceCensus>) -> Result<Self, String> {
         Ok(Self {
-            pool_registry: BoundedPoolRegistry::new(1024),
+            pool_registry: BoundedPoolRegistry::with_census(
+                1024,
+                PoolPurpose::Health,
+                Arc::clone(&census),
+            ),
             targets: StaticTargetCache::new(1024),
             admission: Semaphore::new(MAX_CONCURRENT_HEALTH_PROBES),
+            census,
             #[cfg(test)]
             peak_concurrency: AtomicU64::new(0),
         })
@@ -180,6 +217,11 @@ impl HealthClient {
         endpoint: &Arc<PreparedEndpoint>,
         plan: &ActiveHealthSpec,
     ) -> Option<bool> {
+        // This is an entered logical probe future, not a separately spawned
+        // Tokio task or proof that a Hyper connection has closed.
+        let observation = self
+            .census
+            .token(ResourceKind::HealthProbe, ResourceState::Waiting);
         // Fair local health admission is independent of business permits. Its
         // queue does not consume an endpoint's network deadline or count as a
         // failed endpoint observation. A cancelled round drops these waits and
@@ -192,6 +234,7 @@ impl HealthClient {
         if !cluster.contains_endpoint(endpoint) {
             return None;
         }
+        observation.transition(ResourceState::Running);
         #[cfg(test)]
         self.peak_concurrency.fetch_max(
             (MAX_CONCURRENT_HEALTH_PROBES - self.admission.available_permits()) as u64,
@@ -1219,6 +1262,258 @@ listeners:
         .expect("failed candidate source is written");
         let error = Compiler::compile_path(path).expect_err("candidate compilation must fail");
         assert_eq!(error.diagnostics[0].code, "resource.cluster_health_path");
+    }
+
+    fn resource_count(
+        census: &oxidase_runtime::ResourceCensus,
+        kind: oxidase_runtime::ResourceKind,
+    ) -> oxidase_runtime::ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("fixed census kind")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_census_tracks_abort_before_first_poll_until_actual_future_drop_without_scrape()
+    {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let snapshot = prepare_snapshot(
+            &fixture,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+            1,
+        );
+        let census = Arc::new(ResourceCensus::default());
+        let mut manager = ClusterHealthManager::with_census(Arc::clone(&census))
+            .expect("isolated health manager");
+        assert_eq!(manager.activate_snapshot(&snapshot), 1);
+        let before = resource_count(&census, ResourceKind::HealthSupervisor);
+        assert_eq!((before.created, before.destroyed, before.live), (1, 0, 1));
+        assert_eq!(
+            before
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Scheduled)
+                .expect("scheduled state")
+                .live,
+            1
+        );
+        let mut removed = snapshot.clone();
+        removed.resources.clusters.clear();
+        assert_eq!(manager.activate_snapshot(&removed), 0);
+        let cancelling = resource_count(&census, ResourceKind::HealthSupervisor);
+        assert_eq!(
+            cancelling.live, 1,
+            "abort is a request, not completion; current-thread task has not run"
+        );
+        assert_eq!(
+            cancelling
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Exiting)
+                .expect("exiting state")
+                .live,
+            1
+        );
+        assert!(
+            manager
+                .tasks
+                .join_next()
+                .await
+                .expect("scheduled task exists")
+                .expect_err("task was aborted")
+                .is_cancelled()
+        );
+        let completed = resource_count(&census, ResourceKind::HealthSupervisor);
+        assert_eq!(
+            (completed.created, completed.destroyed, completed.live),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            resource_count(&census, ResourceKind::HealthProbe).created,
+            0
+        );
+        assert_eq!(fixture.requests.load(Ordering::Acquire), 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+        manager.shutdown().await;
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_probe_census_distinguishes_admission_wait_and_cancellation_without_scrape() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        let fixture = HealthFixture::spawn(StatusCode::OK).await;
+        let snapshot = prepare_snapshot(
+            &fixture,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+            1,
+        );
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let endpoints = cluster.endpoints();
+        let endpoint = &endpoints[0];
+        let plan = cluster
+            .spec()
+            .health
+            .active
+            .as_ref()
+            .expect("active health policy");
+        let census = Arc::new(ResourceCensus::default());
+        let client =
+            super::HealthClient::with_census(Arc::clone(&census)).expect("isolated health client");
+        let quota = client
+            .admission
+            .acquire_many(MAX_CONCURRENT_HEALTH_PROBES as u32)
+            .await
+            .expect("hold global quota");
+        let mut probe = Box::pin(client.probe(cluster, endpoint, plan));
+        assert!(futures_util::poll!(probe.as_mut()).is_pending());
+        let waiting = resource_count(&census, ResourceKind::HealthProbe);
+        assert_eq!(
+            (waiting.created, waiting.destroyed, waiting.live),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            waiting
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Waiting)
+                .expect("waiting state")
+                .live,
+            1
+        );
+        assert_eq!(
+            waiting
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Running)
+                .expect("running state")
+                .live,
+            0
+        );
+        drop(probe);
+        let cancelled = resource_count(&census, ResourceKind::HealthProbe);
+        assert_eq!(
+            (cancelled.created, cancelled.destroyed, cancelled.live),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            client.admission.available_permits(),
+            0,
+            "only test-held quota remains"
+        );
+        drop(quota);
+        assert_eq!(
+            client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        assert_eq!(fixture.requests.load(Ordering::Acquire), 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_health_probe_retirement_counts_future_exit_not_abort_or_manager_entry() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::sync::oneshot;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("controlled health socket");
+        let address = listener.local_addr().expect("health address");
+        let (arrived, request_arrived) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let fixture_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("real probe connected");
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).await.expect("probe header byte"), 1);
+                headers.push(byte[0]);
+                assert!(headers.len() <= 8192, "test health head is bounded");
+            }
+            arrived.send(()).expect("probe reception acknowledged");
+            released.await.expect("controlled server release");
+            // A cancelled probe may already have closed its socket. This test
+            // deliberately proves logical future lifetime, not that all Hyper
+            // drivers or physical sockets exit when its token exits.
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        let mut fixture = HealthFixture::spawn(StatusCode::OK).await;
+        fixture.address = address;
+        let snapshot = prepare_snapshot(
+            &fixture,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+            1,
+        );
+        let census = Arc::new(ResourceCensus::default());
+        let mut manager = ClusterHealthManager::with_census(Arc::clone(&census))
+            .expect("isolated health manager");
+        assert_eq!(manager.activate_snapshot(&snapshot), 1);
+        tokio::time::timeout(Duration::from_secs(3), request_arrived)
+            .await
+            .expect("actual probe reached fixture")
+            .expect("probe acknowledgement");
+        assert_eq!(resource_count(&census, ResourceKind::HealthProbe).live, 1);
+        let mut removed = snapshot.clone();
+        removed.resources.clusters.clear();
+        assert_eq!(manager.activate_snapshot(&removed), 0);
+        assert!(manager.supervisors.is_empty());
+        let requested = resource_count(&census, ResourceKind::HealthSupervisor);
+        assert_eq!(
+            requested.live, 1,
+            "manager entry removal is not task destruction"
+        );
+        assert_eq!(
+            requested
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Exiting)
+                .expect("exiting state")
+                .live,
+            1
+        );
+        assert_eq!(resource_count(&census, ResourceKind::HealthProbe).live, 1);
+        assert!(
+            manager
+                .tasks
+                .join_next()
+                .await
+                .expect("retired task")
+                .expect_err("supervisor cancelled")
+                .is_cancelled()
+        );
+        for kind in [ResourceKind::HealthSupervisor, ResourceKind::HealthProbe] {
+            let row = resource_count(&census, kind);
+            assert_eq!((row.created, row.destroyed, row.live), (1, 1, 0));
+        }
+        assert_eq!(
+            manager.client.admission.available_permits(),
+            MAX_CONCURRENT_HEALTH_PROBES
+        );
+        release
+            .send(())
+            .expect("release blocked fixture explicitly");
+        fixture_task.await.expect("actual fixture task finished");
+        assert_eq!(census.sample().invariant_failures, 0);
+        manager.shutdown().await;
+        fixture.shutdown().await;
     }
 
     struct CountingBody {

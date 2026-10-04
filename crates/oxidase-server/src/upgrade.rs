@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use oxidase_runtime::{ClusterRequestPermit, ConcurrencyPermit, PreparedCluster, RuntimeSnapshot};
+use oxidase_runtime::{
+    ClusterRequestPermit, ConcurrencyPermit, PreparedCluster, ResourceKind, ResourceState,
+    ResourceToken, RuntimeSnapshot,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -175,6 +178,10 @@ impl TrustedUpgrade {
         upstream: OnUpgrade,
     ) -> Result<TunnelPlan, UpgradeValidationError> {
         validate_upstream_switch(response, &self.token)?;
+        let resource = self
+            .snapshot
+            .resource_census()
+            .token(ResourceKind::Tunnel, ResourceState::Scheduled);
         Ok(TunnelPlan {
             token: self.token,
             downstream: self.downstream,
@@ -182,6 +189,7 @@ impl TrustedUpgrade {
             snapshot: self.snapshot,
             cluster_lease: None,
             concurrency_permits: Vec::new(),
+            resource,
         })
     }
 }
@@ -204,6 +212,7 @@ pub struct TunnelPlan {
     snapshot: Arc<RuntimeSnapshot>,
     cluster_lease: Option<TunnelClusterLease>,
     concurrency_permits: Vec<ConcurrencyPermit>,
+    resource: ResourceToken,
 }
 
 impl TunnelPlan {
@@ -243,7 +252,9 @@ impl TunnelPlan {
             snapshot: _snapshot,
             cluster_lease,
             concurrency_permits: _concurrency_permits,
+            resource,
         } = self;
+        resource.transition(ResourceState::Running);
         let upgrades = tokio::try_join!(
             async {
                 downstream

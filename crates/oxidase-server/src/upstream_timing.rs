@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
 use hyper_util::client::legacy::connect::CaptureConnection;
-use oxidase_runtime::{ClusterRequestPermit, PreparedEndpoint};
+use oxidase_runtime::{
+    ClusterRequestPermit, PreparedEndpoint, ResourceCancellationHandle, ResourceCensus,
+    ResourceKind, ResourceState, ResourceToken,
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 
@@ -435,10 +438,14 @@ impl RequestProgress {
 struct UploadTaskCancellation {
     cancelled: AtomicBool,
     changed: Notify,
+    observation: Option<ResourceCancellationHandle>,
 }
 
 impl UploadTaskCancellation {
     fn cancel(&self) {
+        if let Some(observation) = &self.observation {
+            observation.cancel_requested();
+        }
         self.cancelled.store(true, Ordering::Release);
         self.changed.notify_waiters();
     }
@@ -462,14 +469,21 @@ pub(crate) struct DispatchRetirementBudget {
     admission: Arc<Semaphore>,
     shutdown: watch::Sender<bool>,
     workers: Arc<AtomicUsize>,
+    census: Arc<ResourceCensus>,
 }
 
 impl DispatchRetirementBudget {
+    #[cfg(test)]
     pub(crate) fn new(max_connecting: usize) -> Self {
+        Self::with_census(max_connecting, ResourceCensus::process())
+    }
+
+    pub(crate) fn with_census(max_connecting: usize, census: Arc<ResourceCensus>) -> Self {
         Self {
             admission: Arc::new(Semaphore::new(max_connecting.max(1))),
             shutdown: watch::channel(false).0,
             workers: Arc::new(AtomicUsize::new(0)),
+            census,
         }
     }
 
@@ -500,6 +514,7 @@ impl DispatchRetirementBudget {
             deadline,
             shutdown: self.shutdown.subscribe(),
             workers: Arc::clone(&self.workers),
+            census: Arc::clone(&self.census),
             started: false,
         })
     }
@@ -544,6 +559,7 @@ pub(crate) struct ProtectedDispatch {
     deadline: Instant,
     shutdown: watch::Receiver<bool>,
     workers: Arc<AtomicUsize>,
+    census: Arc<ResourceCensus>,
     started: bool,
 }
 
@@ -569,11 +585,15 @@ impl Future for ProtectedDispatch {
     }
 }
 
-struct RetirementWorker(Arc<AtomicUsize>);
+struct RetirementWorker {
+    workers: Arc<AtomicUsize>,
+    lifecycle: ResourceToken,
+}
 
 impl Drop for RetirementWorker {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.workers.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(previous, 0, "retirement worker accounting underflow");
     }
 }
 
@@ -602,9 +622,20 @@ impl Drop for ProtectedDispatch {
         let mut shutdown = self.shutdown.clone();
         let deadline = self.deadline;
         let workers = Arc::clone(&self.workers);
+        let census = Arc::clone(&self.census);
         workers.fetch_add(1, Ordering::AcqRel);
+        // The guard must already be owned by the spawned future. Tokio may
+        // drop it without ever polling it during runtime teardown.
+        let worker = RetirementWorker {
+            workers,
+            lifecycle: census.token(
+                ResourceKind::DispatchRetirementTask,
+                ResourceState::Scheduled,
+            ),
+        };
         runtime.spawn(async move {
-            let _worker = RetirementWorker(workers);
+            let _worker = worker;
+            _worker.lifecycle.transition(ResourceState::Running);
             let _permit = permit;
             // Capture and dispatch happen in one Hyper poll. Cancellation can
             // suppress DATA, but cannot retract a head already queued to I/O.
@@ -635,50 +666,98 @@ tokio::task_local! {
 /// Locked Hyper 1.11 `ClientTask::poll_pipe` synchronously invokes Executor(Pipe)
 /// immediately after an eager Pending body poll. A completed eager body is
 /// dropped first and clears the slot. The shared dispatcher is never bound.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UpstreamExecutor;
 
+/// Same existing Hyper executor and cancellation contract, with an isolated
+/// census for deterministic tests. It owns observation metadata, not a pool.
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedUpstreamExecutor {
+    census: Arc<ResourceCensus>,
+}
+
+impl ObservedUpstreamExecutor {
+    pub(crate) fn new(census: Arc<ResourceCensus>) -> Self {
+        Self { census }
+    }
+}
+
+#[cfg(test)]
 impl<F> hyper::rt::Executor<F> for UpstreamExecutor
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        let bound = UPSTREAM_TASK
-            .try_with(|task| {
-                task.pending
+        spawn_upstream_task(future, &ResourceCensus::process());
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for ObservedUpstreamExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        spawn_upstream_task(future, &self.census);
+    }
+}
+
+fn spawn_upstream_task<F>(future: F, census: &Arc<ResourceCensus>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let bound = UPSTREAM_TASK
+        .try_with(|task| {
+            task.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
+        .ok()
+        .flatten()
+        .filter(|pending| {
+            pending.upgrade().is_some_and(|progress| {
+                !progress
+                    .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
+                    .upload_done
             })
-            .ok()
-            .flatten()
-            .filter(|pending| {
-                pending.upgrade().is_some_and(|progress| {
-                    !progress
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .upload_done
-                })
-            });
-        let cancel = Arc::new(UploadTaskCancellation::default());
-        if let Some(progress) = bound.as_ref().and_then(Weak::upgrade) {
-            RequestProgress(progress).bind_upload_task(Arc::clone(&cancel));
-        }
-        let scope = UpstreamTaskScope {
-            cancel: Arc::clone(&cancel),
-            bound,
-            pending: Mutex::new(None),
-        };
-        tokio::spawn(UPSTREAM_TASK.scope(scope, async move {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {},
-                _ = future => {},
-            }
-        }));
+        });
+    let task_lifecycle = census.token(
+        if bound.is_some() {
+            ResourceKind::UpstreamUploadTask
+        } else {
+            ResourceKind::UpstreamTask
+        },
+        ResourceState::Scheduled,
+    );
+    let cancel = Arc::new(UploadTaskCancellation {
+        observation: Some(task_lifecycle.cancellation_handle()),
+        ..UploadTaskCancellation::default()
+    });
+    if let Some(progress) = bound.as_ref().and_then(Weak::upgrade) {
+        RequestProgress(progress).bind_upload_task(Arc::clone(&cancel));
     }
+    let scope = UpstreamTaskScope {
+        cancel: Arc::clone(&cancel),
+        bound,
+        pending: Mutex::new(None),
+    };
+    tokio::spawn(UPSTREAM_TASK.scope(scope, async move {
+        // Constructed before spawn, so teardown before the first poll is
+        // also an actual destruction event. Cancellation only marks exit.
+        let _lifecycle = task_lifecycle;
+        _lifecycle.transition(ResourceState::Running);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = future => {},
+        }
+    }));
 }
 
 /// Owns the response/pre-head leg of one attempt. Dropping an executor future
@@ -788,6 +867,105 @@ pub(crate) async fn await_response_head<F: Future>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    fn resource_count(
+        census: &oxidase_runtime::ResourceCensus,
+        kind: oxidase_runtime::ResourceKind,
+    ) -> oxidase_runtime::ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("resource row")
+    }
+
+    #[test]
+    fn hyper_owned_future_cancelled_before_first_poll_is_destroyed_without_observation_cleanup() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        let census = Arc::new(ResourceCensus::new(true));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("controlled runtime");
+        runtime.block_on(async {
+            hyper::rt::Executor::execute(
+                &super::ObservedUpstreamExecutor::new(Arc::clone(&census)),
+                std::future::pending::<()>(),
+            );
+            let task = resource_count(&census, ResourceKind::UpstreamTask);
+            assert_eq!((task.created, task.destroyed, task.live), (1, 0, 1));
+            assert_eq!(
+                task.states
+                    .into_iter()
+                    .find(|row| row.state == ResourceState::Scheduled)
+                    .expect("scheduled")
+                    .live,
+                1
+            );
+        });
+        drop(runtime);
+        let task = resource_count(&census, ResourceKind::UpstreamTask);
+        assert_eq!((task.created, task.destroyed, task.live), (1, 1, 0));
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_cancel_handle_marks_exit_without_retaining_or_completing_the_owned_task() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        struct DropAcknowledgement(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropAcknowledgement {
+            fn drop(&mut self) {
+                if let Some(sent) = self.0.take() {
+                    let _ = sent.send(());
+                }
+            }
+        }
+        let census = Arc::new(ResourceCensus::new(true));
+        let progress = super::RequestProgress::new(false);
+        let scope = super::UpstreamTaskScope {
+            cancel: Arc::new(super::UploadTaskCancellation::default()),
+            bound: None,
+            pending: std::sync::Mutex::new(Some(Arc::downgrade(&progress.0))),
+        };
+        let (dropped, actually_dropped) = tokio::sync::oneshot::channel();
+        let ownership = DropAcknowledgement(Some(dropped));
+        super::UPSTREAM_TASK
+            .scope(scope, async {
+                hyper::rt::Executor::execute(
+                    &super::ObservedUpstreamExecutor::new(Arc::clone(&census)),
+                    async move {
+                        let _ownership = ownership;
+                        std::future::pending::<()>().await;
+                    },
+                );
+            })
+            .await;
+        progress.cancel_upload();
+        let task = resource_count(&census, ResourceKind::UpstreamUploadTask);
+        assert_eq!(task.live, 1, "cancel request is not task destruction");
+        assert_eq!(
+            task.states
+                .into_iter()
+                .find(|row| row.state == ResourceState::Exiting)
+                .expect("exiting")
+                .live,
+            1
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), actually_dropped)
+            .await
+            .expect("actual future drop")
+            .expect("acknowledged");
+        let task = resource_count(&census, ResourceKind::UpstreamUploadTask);
+        assert_eq!((task.created, task.destroyed, task.live), (1, 1, 0));
+        progress.cancel_upload();
+        assert_eq!(
+            resource_count(&census, ResourceKind::UpstreamUploadTask).live,
+            0,
+            "retained weak cancellation metadata cannot resurrect or retain a task"
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
     use std::time::Duration;
 
     use super::{
@@ -1101,7 +1279,8 @@ mod tests {
             .expect("blocked request");
         let capture = capture_connection(&mut request);
         progress.capture_transport(capture.clone(), true);
-        let client = Client::builder(UpstreamExecutor)
+        let census = Arc::new(oxidase_runtime::ResourceCensus::new(true));
+        let client = Client::builder(super::ObservedUpstreamExecutor::new(Arc::clone(&census)))
             .http2_only(true)
             .build_http::<ProxyRequestBody>();
         // Observe a response on the existing connection first. This guarantees
@@ -1147,6 +1326,11 @@ mod tests {
             !progress.0.state.lock().expect("progress lock").upload_done,
             "body pipe is flow blocked"
         );
+        assert_eq!(
+            resource_count(&census, oxidase_runtime::ResourceKind::UpstreamUploadTask).live,
+            1,
+            "actual H2 upload pipe is distinct from its dispatcher"
+        );
         let response = ClusterResponseBody::new_with_lease(
             response.into_body(),
             Arc::clone(&cluster),
@@ -1181,6 +1365,14 @@ mod tests {
             .await
             .expect("blocked pipe is cancelled");
         assert_eq!(cluster.active_requests(), 0);
+        assert_eq!(
+            resource_count(&census, oxidase_runtime::ResourceKind::UpstreamUploadTask).live,
+            0
+        );
+        assert!(
+            resource_count(&census, oxidase_runtime::ResourceKind::UpstreamTask).live > 0,
+            "shared dispatcher survives cancellation"
+        );
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             client.request(
@@ -1219,6 +1411,14 @@ mod tests {
         drop(client);
         shutdown.send(true).expect("fixture shutdown");
         fixture.await.expect("fixture joins");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while resource_count(&census, oxidase_runtime::ResourceKind::UpstreamTask).live != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all actual owned dispatcher futures drop");
+        assert_eq!(census.sample().invariant_failures, 0);
     }
 
     #[tokio::test]
@@ -1351,6 +1551,58 @@ mod tests {
         driver.abort();
         let _ = driver.await;
         running.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[test]
+    fn retirement_cleanup_cancelled_before_first_poll_releases_its_worker_count() {
+        use bytes::Bytes;
+        use http::Request;
+        use http_body_util::Empty;
+        use hyper_util::client::legacy::{Client, connect::capture_connection};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("controlled runtime");
+        let census = Arc::new(oxidase_runtime::ResourceCensus::new(true));
+        let workers = runtime.block_on(async {
+            let connector = gated_connector("127.0.0.1:0".parse().expect("gated address"));
+            let client = Client::builder(UpstreamExecutor)
+                .http2_only(true)
+                .build::<_, Empty<Bytes>>(connector);
+            let retirement = super::DispatchRetirementBudget::with_census(1, Arc::clone(&census));
+            let workers = Arc::clone(&retirement.workers);
+            let mut request = Request::builder()
+                .uri("http://fixture.invalid/")
+                .body(Empty::<Bytes>::new())
+                .expect("owner request");
+            let capture = capture_connection(&mut request);
+            let owner = retirement
+                .protect(
+                    client.request(request),
+                    capture,
+                    RequestProgress::new(true),
+                    Duration::from_secs(60),
+                )
+                .unwrap_or_else(|_| panic!("one acquisition is admitted"));
+            let mut owner = Box::pin(owner);
+            assert!(futures_util::poll!(&mut owner).is_pending());
+            drop(owner);
+            assert_eq!(retirement.active_workers(), 1);
+            // Do not yield: the spawned cleanup has never been polled. Runtime
+            // teardown must drop its ownership guard, not lose the decrement.
+            workers
+        });
+        drop(runtime);
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 0);
+        let worker = census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == oxidase_runtime::ResourceKind::DispatchRetirementTask)
+            .expect("cleanup census row");
+        assert_eq!((worker.created, worker.destroyed, worker.live), (1, 1, 0));
+        assert_eq!(census.sample().invariant_failures, 0);
     }
 
     #[derive(Clone)]

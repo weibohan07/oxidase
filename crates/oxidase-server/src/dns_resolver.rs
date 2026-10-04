@@ -21,8 +21,8 @@ use oxidase_config::{
     MAX_DNS_NAMESERVERS, MAX_DNS_RECORDS, MAX_DNS_RESPONSE_BYTES, normalize_dns_ip,
 };
 use oxidase_runtime::{
-    DiscoveryErrorCode, DnsAddressRecord, DnsFamily, DnsObservation, SrvObservation, SrvRecord,
-    SrvTargetAddressObservation,
+    DiscoveryErrorCode, DnsAddressRecord, DnsFamily, DnsObservation, ResourceCensus, ResourceKind,
+    ResourceState, ResourceToken, SrvObservation, SrvRecord, SrvTargetAddressObservation,
 };
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -34,6 +34,7 @@ pub(crate) struct DnsResolver {
     query_timeout: Duration,
     admission: Arc<Semaphore>,
     target_failures: Mutex<BTreeMap<(String, bool), TargetFailureMemo>>,
+    census: Arc<ResourceCensus>,
 }
 
 pub(crate) struct ResolvedFamily {
@@ -51,6 +52,7 @@ pub(crate) struct ResolvedSrv {
 }
 
 struct TargetFailureMemo {
+    _lifetime: ResourceToken,
     observation: DnsObservation,
     /// Operational query suppression, capped by the resource refresh policy.
     not_before: Instant,
@@ -182,6 +184,14 @@ impl DnsResolver {
         spec: &DnsResolverSpec,
         admission: Arc<Semaphore>,
     ) -> Result<Self, DnsResolverBootstrapError> {
+        Self::with_census(spec, admission, ResourceCensus::process())
+    }
+
+    pub(crate) fn with_census(
+        spec: &DnsResolverSpec,
+        admission: Arc<Semaphore>,
+        census: Arc<ResourceCensus>,
+    ) -> Result<Self, DnsResolverBootstrapError> {
         let mut servers = match &spec.source {
             DnsResolverSource::NameServers(addresses) => addresses
                 .iter()
@@ -239,7 +249,12 @@ impl DnsResolver {
             query_timeout: spec.query_timeout,
             admission,
             target_failures: Mutex::new(BTreeMap::new()),
+            census,
         })
+    }
+
+    pub(crate) fn resource_census(&self) -> &Arc<ResourceCensus> {
+        &self.census
     }
 
     /// A and AAAA complete independently. Every selected RR's expiration is
@@ -261,6 +276,11 @@ impl DnsResolver {
         spec: &DnsDiscoverySpec,
         family: DnsFamily,
     ) -> ResolvedFamily {
+        // One logical family resolution including its CNAME chain; this is
+        // not a count of packets or Hickory's private transport tasks.
+        let observation = self
+            .census
+            .token(ResourceKind::DnsQuery, ResourceState::Waiting);
         let Some(deadline) = Instant::now().checked_add(self.query_timeout) else {
             return ResolvedFamily {
                 observation: DnsObservation::InvalidAnswer,
@@ -274,6 +294,7 @@ impl DnsResolver {
                     code: DiscoveryErrorCode::Network,
                 };
             };
+            observation.transition(ResourceState::Running);
             self.resolve_admitted(spec, family, &mut retry_after).await
         };
         let observation = match tokio::time::timeout_at(deadline, work).await {
@@ -540,6 +561,9 @@ impl DnsResolver {
         memo.insert(
             key,
             TargetFailureMemo {
+                _lifetime: self
+                    .census
+                    .token(ResourceKind::DnsFailureMemo, ResourceState::Live),
                 observation: result.observation.clone(),
                 not_before,
                 retry_after: result.retry_after,
@@ -611,8 +635,12 @@ impl DnsResolver {
                         };
                     }
                     let mut retry_after = None;
+                    let query = self
+                        .census
+                        .token(ResourceKind::DnsQuery, ResourceState::Waiting);
                     let observation = match self.admission.acquire().await {
                         Ok(_permit) => {
+                            query.transition(ResourceState::Running);
                             self.resolve_address_chain(
                                 spec,
                                 &target,
@@ -723,6 +751,9 @@ impl DnsResolver {
         spec: &DnsDiscoverySpec,
         round: &SrvRoundBudget,
     ) -> Result<Vec<SrvRecord>, ResolvedSrv> {
+        let observation = self
+            .census
+            .token(ResourceKind::DnsQuery, ResourceState::Waiting);
         let Ok(_permit) = self.admission.acquire().await else {
             return Err(srv_failure(
                 DnsObservation::TransientFailure {
@@ -731,6 +762,7 @@ impl DnsResolver {
                 None,
             ));
         };
+        observation.transition(ResourceState::Running);
         let mut name = canonical_service_name(&spec.name)
             .map_err(|_| srv_failure(DnsObservation::InvalidAnswer, None))?;
         let mut local = AnswerBudget::default();
@@ -2224,6 +2256,135 @@ mod tests {
             );
         }
         assert_eq!(fixture.counts.udp.load(Ordering::Relaxed), 30);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_query_census_separates_waiting_admission_from_execution_and_drops_without_scrape()
+    {
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+        let fixture = DnsFixture::start(|question, _| {
+            FixtureReply::answers(vec![address_record(question.name(), "192.0.2.1", 30)])
+        })
+        .await;
+        let policy = spec(fixture.address);
+        let census = Arc::new(ResourceCensus::default());
+        let admission = Arc::new(Semaphore::new(1));
+        let held = admission.acquire().await.expect("held DNS admission");
+        let resolver = DnsResolver::with_census(
+            &policy.resolver,
+            Arc::clone(&admission),
+            Arc::clone(&census),
+        )
+        .expect("local resolver");
+        let mut query = Box::pin(resolver.resolve_family_with_schedule(&policy, DnsFamily::A));
+        assert!(futures_util::poll!(query.as_mut()).is_pending());
+        let waiting = census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == ResourceKind::DnsQuery)
+            .expect("query count");
+        assert_eq!(
+            (waiting.created, waiting.destroyed, waiting.live),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            waiting
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Waiting)
+                .expect("waiting")
+                .live,
+            1
+        );
+        assert_eq!(
+            waiting
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Running)
+                .expect("running")
+                .live,
+            0
+        );
+        assert_eq!(
+            fixture.counts.udp.load(Ordering::Acquire),
+            0,
+            "no DNS IO before quota"
+        );
+        drop(query);
+        let cancelled = census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == ResourceKind::DnsQuery)
+            .expect("query count");
+        assert_eq!(
+            (cancelled.created, cancelled.destroyed, cancelled.live),
+            (1, 1, 0)
+        );
+        drop(held);
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_failure_memo_census_counts_real_entries_and_owner_drop_not_cached_reads() {
+        use oxidase_runtime::{ResourceCensus, ResourceKind};
+        let policy = spec("127.0.0.1:59999".parse().expect("local unused resolver"));
+        let census = Arc::new(ResourceCensus::default());
+        let resolver = DnsResolver::with_census(
+            &policy.resolver,
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&census),
+        )
+        .expect("local resolver");
+        let failed = ResolvedFamily {
+            observation: DnsObservation::NoData,
+            retry_after: Some(Instant::now() + Duration::from_secs(30)),
+        };
+        let memo_count = || {
+            census
+                .sample()
+                .resources
+                .into_iter()
+                .find(|row| row.kind == ResourceKind::DnsFailureMemo)
+                .expect("memo count")
+        };
+        resolver.memo_target_result("target.example.test.", DnsFamily::A, &failed, &policy);
+        for _ in 0..100 {
+            assert!(
+                resolver
+                    .cached_target_failure("target.example.test.", DnsFamily::A)
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            (
+                memo_count().created,
+                memo_count().destroyed,
+                memo_count().live
+            ),
+            (1, 0, 1)
+        );
+        resolver.memo_target_result("target.example.test.", DnsFamily::A, &failed, &policy);
+        assert_eq!(
+            (
+                memo_count().created,
+                memo_count().destroyed,
+                memo_count().live
+            ),
+            (2, 1, 1)
+        );
+        drop(resolver);
+        assert_eq!(
+            (
+                memo_count().created,
+                memo_count().destroyed,
+                memo_count().live
+            ),
+            (2, 2, 0)
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
     }
 
     #[tokio::test]

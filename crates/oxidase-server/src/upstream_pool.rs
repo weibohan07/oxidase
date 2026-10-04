@@ -11,13 +11,39 @@ use http_body::Body;
 use hyper_util::client::legacy::Client;
 use oxidase_config::ClusterProtocol;
 use oxidase_core::ResourceId;
-use oxidase_runtime::{PreparedCluster, RuntimeSnapshot};
+use oxidase_runtime::{
+    PreparedCluster, ResourceCensus, ResourceKind, ResourceState, ResourceToken, RuntimeSnapshot,
+};
 
 use crate::body::BoxError;
-use crate::upstream_transport::{DirectConnector, PoolIdentity, build_upstream_pool};
+use crate::upstream_transport::{DirectConnector, PoolIdentity, build_observed_upstream_pool};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PoolPurpose {
+    Proxy,
+    Health,
+}
+
+impl PoolPurpose {
+    const fn entry_kind(self) -> ResourceKind {
+        match self {
+            Self::Proxy => ResourceKind::ProxyPoolEntry,
+            Self::Health => ResourceKind::HealthPoolEntry,
+        }
+    }
+
+    const fn family_kind(self) -> ResourceKind {
+        match self {
+            Self::Proxy => ResourceKind::ProxyPoolFamily,
+            Self::Health => ResourceKind::HealthPoolFamily,
+        }
+    }
+}
 
 pub(crate) struct BoundedPoolRegistry<B> {
     max_entries: usize,
+    purpose: PoolPurpose,
+    census: Arc<ResourceCensus>,
     inner: Mutex<Registry<B>>,
 }
 
@@ -35,6 +61,16 @@ struct PoolEntry<B> {
     endpoint: String,
     connector: DirectConnector,
     last_used: u64,
+    family: Arc<ResourceToken>,
+    _lifecycle: ResourceToken,
+}
+
+impl<B> Drop for PoolEntry<B> {
+    fn drop(&mut self) {
+        // Removing a selectable registry owner does not destroy an issued
+        // Client clone family, its response body, or its actual socket.
+        self.family.mark_retired();
+    }
 }
 
 impl<B> BoundedPoolRegistry<B>
@@ -43,9 +79,20 @@ where
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
+    #[cfg(test)]
     pub(crate) fn new(max_entries: usize) -> Self {
+        Self::with_census(max_entries, PoolPurpose::Proxy, ResourceCensus::process())
+    }
+
+    pub(crate) fn with_census(
+        max_entries: usize,
+        purpose: PoolPurpose,
+        census: Arc<ResourceCensus>,
+    ) -> Self {
         Self {
             max_entries: max_entries.max(1),
+            purpose,
+            census,
             inner: Mutex::new(Registry {
                 reconciled: false,
                 clock: 0,
@@ -53,6 +100,10 @@ where
                 entries: BTreeMap::new(),
             }),
         }
+    }
+
+    pub(crate) fn census(&self) -> Arc<ResourceCensus> {
+        Arc::clone(&self.census)
     }
 
     pub(crate) fn reconcile_snapshot(&self, snapshot: &RuntimeSnapshot) {
@@ -84,7 +135,7 @@ where
             }
         });
         drop(registry);
-        debug_assert!(self.pools_count() <= self.max_entries);
+        debug_assert!(self.registry_count() <= self.max_entries);
     }
 
     pub(crate) fn get_or_build(
@@ -112,7 +163,13 @@ where
             entry.last_used = now;
             return Arc::clone(&entry.pool);
         }
-        let pool = Arc::new(build_upstream_pool(connector.clone(), protocol, max_idle));
+        let (client, family) = build_observed_upstream_pool(
+            connector.clone().with_census(Arc::clone(&self.census)),
+            protocol,
+            max_idle,
+            self.purpose.family_kind(),
+        );
+        let pool = Arc::new(client);
         let current_owner = !registry.reconciled
             || registry
                 .current
@@ -127,6 +184,7 @@ where
             // A request pinned before publication can reach Proxy afterwards.
             // Its private Arc dies with that attempt instead of retaining the
             // retired resource in a global strong or weak-key map.
+            family.mark_retired();
             return pool;
         }
         if registry.entries.len() >= self.max_entries {
@@ -145,6 +203,7 @@ where
             .expect("membership checked above")
             .name()
             .to_owned();
+        family.mark_current();
         registry.entries.insert(
             key,
             PoolEntry {
@@ -154,6 +213,10 @@ where
                 endpoint,
                 connector,
                 last_used: now,
+                family,
+                _lifecycle: self
+                    .census
+                    .token(self.purpose.entry_kind(), ResourceState::Current),
             },
         );
         pool
@@ -181,7 +244,8 @@ where
         Some(Arc::clone(&entry.pool))
     }
 
-    pub(crate) fn pools_count(&self) -> usize {
+    /// Normal owner/membership maintenance, never invoked by a census scrape.
+    pub(crate) fn prune(&self) {
         let mut registry = self
             .inner
             .lock()
@@ -193,7 +257,16 @@ where
                     .compatible_with_cluster(&owner, &entry.endpoint)
             })
         });
-        registry.entries.len()
+    }
+
+    /// Passive entry count. In particular this never checks endpoint expiry or
+    /// drops pool ownership while an observation is being collected.
+    pub(crate) fn registry_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
     }
 
     /// A physical reconnect failure retires only this exact Client. Existing
@@ -253,6 +326,167 @@ mod tests {
         registry.get_or_build(key, cluster, connector, cluster.protocol(), 2)
     }
 
+    fn count(census: &ResourceCensus, kind: ResourceKind) -> oxidase_runtime::ResourceCount {
+        census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .expect("resource row")
+    }
+
+    #[tokio::test]
+    async fn native_client_clones_outlive_the_outer_arc_without_creating_a_new_family() {
+        let snapshot = snapshot(1);
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let census = Arc::new(ResourceCensus::new(true));
+        let registry = BoundedPoolRegistry::with_census(2, PoolPurpose::Proxy, Arc::clone(&census));
+        registry.reconcile_snapshot(&snapshot);
+        let issued = pool(&registry, cluster, 0);
+        assert_eq!(
+            count(&census, ResourceKind::ProxyPoolFamily)
+                .states
+                .into_iter()
+                .find(|row| row.state == ResourceState::Current)
+                .expect("registered family state")
+                .live,
+            1
+        );
+        let outer = Arc::downgrade(&issued);
+        let native_clone = issued.as_ref().clone();
+        let unpolled_request = native_clone.request(
+            http::Request::builder()
+                .uri("http://127.0.0.1:8001/")
+                .body(Empty::<Bytes>::new())
+                .expect("request"),
+        );
+        registry.retire_failed_pool(&issued);
+        drop(issued);
+        drop(native_clone);
+        assert!(
+            outer.upgrade().is_none(),
+            "outer Arc is not the native Client clone family"
+        );
+        assert_eq!(registry.registry_count(), 0);
+        assert_eq!(count(&census, ResourceKind::ProxyPoolEntry).live, 0);
+        let family = count(&census, ResourceKind::ProxyPoolFamily);
+        assert_eq!((family.created, family.destroyed, family.live), (1, 0, 1));
+        assert_eq!(
+            family
+                .states
+                .iter()
+                .find(|row| row.state == ResourceState::Retired)
+                .expect("retired state")
+                .live,
+            1
+        );
+        drop(unpolled_request);
+        let family = count(&census, ResourceKind::ProxyPoolFamily);
+        assert_eq!((family.created, family.destroyed, family.live), (1, 1, 0));
+        assert_eq!(
+            count(&census, ResourceKind::UpstreamTcpConnection).created,
+            0,
+            "unpolled request never dials"
+        );
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn private_late_pools_and_health_entries_have_independent_actual_lifetimes() {
+        let snapshot = snapshot(1);
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let census = Arc::new(ResourceCensus::new(true));
+        let proxy = BoundedPoolRegistry::with_census(2, PoolPurpose::Proxy, Arc::clone(&census));
+        let health = BoundedPoolRegistry::with_census(2, PoolPurpose::Health, Arc::clone(&census));
+        proxy.reconcile_snapshot(&snapshot);
+        health.reconcile_snapshot(&snapshot);
+        let active_health = pool(&health, cluster, 0);
+        let mut removed = snapshot.clone();
+        removed.resources.clusters.clear();
+        proxy.reconcile_snapshot(&removed);
+        health.reconcile_snapshot(&removed);
+        let late = pool(&proxy, cluster, 0);
+        assert_eq!(proxy.registry_count(), 0);
+        assert_eq!(health.registry_count(), 0);
+        assert_eq!(count(&census, ResourceKind::HealthPoolEntry).live, 0);
+        assert_eq!(count(&census, ResourceKind::ProxyPoolEntry).created, 0);
+        for kind in [
+            ResourceKind::ProxyPoolFamily,
+            ResourceKind::HealthPoolFamily,
+        ] {
+            let family = count(&census, kind);
+            assert_eq!((family.created, family.destroyed, family.live), (1, 0, 1));
+            assert_eq!(
+                family
+                    .states
+                    .iter()
+                    .find(|row| row.state == ResourceState::Retired)
+                    .expect("retired state")
+                    .live,
+                1
+            );
+        }
+        drop(late);
+        drop(active_health);
+        for kind in [
+            ResourceKind::ProxyPoolFamily,
+            ResourceKind::HealthPoolFamily,
+        ] {
+            let family = count(&census, kind);
+            assert_eq!((family.created, family.destroyed, family.live), (1, 1, 0));
+        }
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn thousands_of_pool_generations_release_without_a_scrape_and_reads_do_not_prune() {
+        let snapshot = snapshot(1);
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let census = Arc::new(ResourceCensus::new(true));
+        let registry = BoundedPoolRegistry::with_census(2, PoolPurpose::Proxy, Arc::clone(&census));
+        registry.reconcile_snapshot(&snapshot);
+        for _ in 0..5000 {
+            let issued = pool(&registry, cluster, 0);
+            registry.retire_failed_pool(&issued);
+            drop(issued);
+        }
+        // No census reads participated in any release.
+        let family = count(&census, ResourceKind::ProxyPoolFamily);
+        assert_eq!(
+            (family.created, family.destroyed, family.live),
+            (5000, 5000, 0)
+        );
+        assert_eq!(census.sample().detailed_records, 0);
+        let issued = pool(&registry, cluster, 0);
+        let mut removed = snapshot.clone();
+        removed.resources.clusters.clear();
+        let before = census.sample().sequence_end;
+        for _ in 0..100 {
+            assert_eq!(registry.registry_count(), 1);
+            assert_eq!(census.sample().sequence_end, before);
+        }
+        registry.reconcile_snapshot(&removed);
+        drop(issued);
+        assert_eq!(count(&census, ResourceKind::ProxyPoolFamily).live, 0);
+        assert_eq!(census.sample().detailed_records, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
     #[tokio::test]
     async fn strong_pool_entries_are_bounded_idle_lru_is_reclaimed_and_active_arc_survives() {
         let snapshot = snapshot(1);
@@ -271,7 +505,7 @@ mod tests {
         let idle_weak = Arc::downgrade(&idle);
         drop(idle);
         let third = pool(&registry, &cluster, 2);
-        assert_eq!(registry.pools_count(), 2);
+        assert_eq!(registry.registry_count(), 2);
         assert!(
             idle_weak.upgrade().is_none(),
             "no weak-key registry resurrects retired idle pool"
@@ -302,11 +536,11 @@ mod tests {
         let mut removed = snapshot.clone();
         removed.resources.clusters.clear();
         registry.reconcile_snapshot(&removed);
-        assert_eq!(registry.pools_count(), 0);
+        assert_eq!(registry.registry_count(), 0);
         let retired = pool(&registry, &cluster, 0);
         assert!(!Arc::ptr_eq(&old, &retired));
         assert_eq!(
-            registry.pools_count(),
+            registry.registry_count(),
             0,
             "late pinned attempt is not reinserted"
         );
@@ -360,7 +594,7 @@ mod tests {
             .clusters
             .insert(changed.id().clone(), Arc::clone(&changed));
         registry.reconcile_snapshot(&snapshot_changed);
-        assert_eq!(registry.pools_count(), 0);
+        assert_eq!(registry.registry_count(), 0);
         assert!(!Arc::ptr_eq(&pool_a, &pool(&registry, &changed, 0)));
     }
 
@@ -398,7 +632,7 @@ mod tests {
         .for_http1_upgrade();
         let upgrade_key = connector.pool_identity(h2.id(), endpoint.name());
         let upgrade = registry.get_or_build(upgrade_key, &h2, connector, ClusterProtocol::Http1, 2);
-        assert_eq!(registry.pools_count(), 2);
+        assert_eq!(registry.registry_count(), 2);
         let mut http1 = source;
         http1.protocol = ClusterProtocol::Http1;
         let http1 = Arc::new(PreparedCluster::prepare(http1, Some(&h2)).0);
@@ -408,7 +642,7 @@ mod tests {
             .insert(http1.id().clone(), Arc::clone(&http1));
         registry.reconcile_snapshot(&snapshot);
         assert_eq!(
-            registry.pools_count(),
+            registry.registry_count(),
             1,
             "ordinary old H2 protocol cannot survive policy change"
         );
@@ -437,11 +671,11 @@ mod tests {
         let failed = pool(&registry, cluster, 0);
         let sibling = pool(&registry, cluster, 1);
         registry.retire_failed_pool(&failed);
-        assert_eq!(registry.pools_count(), 1);
+        assert_eq!(registry.registry_count(), 1);
         let replacement = pool(&registry, cluster, 0);
         assert!(!Arc::ptr_eq(&failed, &replacement));
         registry.retire_failed_pool(&failed);
-        assert_eq!(registry.pools_count(), 2);
+        assert_eq!(registry.registry_count(), 2);
         assert!(Arc::ptr_eq(&replacement, &pool(&registry, cluster, 0)));
         assert!(Arc::ptr_eq(&sibling, &pool(&registry, cluster, 1)));
         assert_eq!(
@@ -501,7 +735,7 @@ mod tests {
         let old_key = old_connector.pool_identity(cluster.id(), old_endpoint.name());
         let issued = registry.get_or_build(old_key, &cluster, old_connector, cluster.protocol(), 2);
         let old_pool = Arc::downgrade(&issued);
-        assert_eq!(registry.pools_count(), 1);
+        assert_eq!(registry.registry_count(), 1);
         let query = cluster.begin_discovery_query().expect("withdrawal");
         cluster.reconcile_dns(
             &query,
@@ -510,7 +744,13 @@ mod tests {
             tokio::time::Instant::now(),
         );
         drop(query);
-        assert_eq!(registry.pools_count(), 0);
+        assert_eq!(
+            registry.registry_count(),
+            1,
+            "a pure read cannot perform owner maintenance"
+        );
+        registry.prune();
+        assert_eq!(registry.registry_count(), 0);
         assert!(registry.get_existing(old_key).is_none());
         assert!(
             old_pool.upgrade().is_some(),
@@ -531,7 +771,7 @@ mod tests {
         assert_ne!(old_key, new_key);
         let new_pool = registry.get_or_build(new_key, &cluster, connector, cluster.protocol(), 2);
         assert!(!Arc::ptr_eq(&issued, &new_pool));
-        assert_eq!(registry.pools_count(), 1);
+        assert_eq!(registry.registry_count(), 1);
         drop(issued);
         assert!(old_pool.upgrade().is_none());
     }

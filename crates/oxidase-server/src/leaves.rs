@@ -195,11 +195,22 @@ impl ProxyPoolKind {
 }
 
 impl ProxyClient {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, String> {
+        Self::with_census(oxidase_runtime::ResourceCensus::process())
+    }
+
+    pub(crate) fn with_census(
+        census: Arc<oxidase_runtime::ResourceCensus>,
+    ) -> Result<Self, String> {
         Ok(Self {
-            pool_registry: BoundedPoolRegistry::new(1024),
+            pool_registry: BoundedPoolRegistry::with_census(
+                1024,
+                crate::upstream_pool::PoolPurpose::Proxy,
+                Arc::clone(&census),
+            ),
             static_targets: StaticTargetCache::new(1024),
-            connecting: DispatchRetirementBudget::new(1024),
+            connecting: DispatchRetirementBudget::with_census(1024, census),
         })
     }
 
@@ -210,7 +221,7 @@ impl ProxyClient {
 
     pub(crate) fn prune_pools(&self) {
         // Registry pruning drops only idle ownership, never issued streams.
-        let _ = self.pool_registry.pools_count();
+        self.pool_registry.prune();
     }
 
     async fn pool(
@@ -1821,6 +1832,226 @@ mod tests {
     enum FixtureProtocol {
         Http1,
         Http2,
+    }
+
+    async fn assert_retired_pool_follows_held_h2_body(cancel: bool) {
+        use crate::proxy_body::ProxyRequestBody;
+        use crate::upstream_pool::{BoundedPoolRegistry, PoolPurpose};
+        use crate::upstream_transport::{
+            DialTarget, DirectConnector, LogicalOrigin, TransportTimeouts,
+        };
+        use http_body::Body as _;
+        use oxidase_runtime::{ResourceCensus, ResourceKind, ResourceState};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("physical H2 fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let (terminal, terminal_received) = tokio::sync::oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("actual selected socket");
+            let mut connection = h2::server::handshake(socket)
+                .await
+                .expect("H2 fixture handshake");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("one stream")
+                .expect("valid request");
+            assert_eq!(
+                request.uri().authority().expect("logical origin").as_str(),
+                "logical.oxidase.invalid"
+            );
+            assert_eq!(request.uri().path(), "/held");
+            let mut response = Response::new(());
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            );
+            let mut send = respond
+                .send_response(response, false)
+                .expect("held response head");
+            send.send_data(Bytes::from_static(&[0, 0, 0, 0, 4, b'o']), false)
+                .expect("gRPC prefix");
+            let response_task = tokio::spawn(async move {
+                if cancel {
+                    let reset = std::future::poll_fn(|context| send.poll_reset(context))
+                        .await
+                        .expect("peer reset");
+                    assert_eq!(reset, h2::Reason::CANCEL);
+                    terminal.send(()).expect("cancellation acknowledgement");
+                } else {
+                    finished.await.expect("release held stream");
+                    send.send_data(Bytes::from_static(b"ld!"), false)
+                        .expect("remaining gRPC DATA");
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                    send.send_trailers(trailers).expect("gRPC trailers");
+                    terminal.send(()).expect("completion acknowledgement");
+                }
+                drop(request);
+            });
+            if let Some(request) = connection.accept().await {
+                panic!(
+                    "unexpected sibling request: {:?}",
+                    request.map(|(request, _)| request.uri().clone())
+                );
+            }
+            response_task.await.expect("fixture response task joins");
+        });
+        let directory = tempdir().expect("source directory");
+        let source = directory.path().join("gateway.yaml");
+        fs::write(&source, "api_version: oxidase.dev/v1alpha1\nkind: gateway\nresources:\n  clusters:\n    api:\n      protocol: h2\n      endpoints: [http://logical.oxidase.invalid/]\nlisteners:\n  - name: public\n    bind: 127.0.0.1:0\n    service:\n      type: respond\n").expect("source");
+        let snapshot = RuntimeSnapshot::prepare(Compiler::compile_path(&source).expect("compile"))
+            .expect("prepare");
+        let cluster = snapshot
+            .resources
+            .clusters
+            .values()
+            .next()
+            .expect("cluster");
+        let endpoint = &cluster.endpoints()[0];
+        let census = Arc::new(ResourceCensus::new(true));
+        let registry = BoundedPoolRegistry::<ProxyRequestBody>::with_census(
+            2,
+            PoolPurpose::Proxy,
+            Arc::clone(&census),
+        );
+        registry.reconcile_snapshot(&snapshot);
+        let origin = LogicalOrigin::from_url(endpoint.url()).expect("origin");
+        let connector = DirectConnector::new(
+            origin.clone(),
+            DialTarget::new(address).expect("approved target"),
+            ClusterProtocol::H2,
+            None,
+            TransportTimeouts::for_cluster(cluster),
+        )
+        .expect("connector")
+        .with_census(Arc::clone(&census));
+        let key = connector.pool_identity(cluster.id(), endpoint.name());
+        let pool = registry.get_or_build(key, cluster, connector, ClusterProtocol::H2, 2);
+        let response = pool
+            .request(
+                Request::builder()
+                    .uri(origin.request_uri("/held").expect("URI"))
+                    .body(ProxyRequestBody::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response head");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/grpc");
+        let mut body = super::PhaseMetricsBody::new(
+            response.into_body(),
+            Arc::new(crate::metrics::Metrics::default()),
+            Some(Arc::clone(&pool)),
+        );
+        let prefix = body
+            .frame()
+            .await
+            .expect("first DATA")
+            .expect("valid frame")
+            .into_data()
+            .expect("DATA");
+        assert_eq!(prefix, Bytes::from_static(&[0, 0, 0, 0, 4, b'o']));
+        registry.retire_failed_pool(&pool);
+        drop(pool);
+        assert_eq!(registry.registry_count(), 0);
+        let family = census
+            .sample()
+            .resources
+            .into_iter()
+            .find(|row| row.kind == ResourceKind::ProxyPoolFamily)
+            .expect("family count");
+        assert_eq!((family.created, family.destroyed, family.live), (1, 0, 1));
+        assert_eq!(
+            family
+                .states
+                .into_iter()
+                .find(|row| row.state == ResourceState::Retired)
+                .expect("retired state")
+                .live,
+            1
+        );
+        if cancel {
+            drop(body);
+            drop(finish);
+        } else {
+            finish.send(()).expect("finish original stream naturally");
+            let mut data = prefix.to_vec();
+            let mut trailers = None;
+            while let Some(frame) = body.frame().await {
+                let frame = frame.expect("stream remains valid after registry retirement");
+                if let Some(bytes) = frame.data_ref() {
+                    data.extend_from_slice(bytes);
+                }
+                if let Some(headers) = frame.trailers_ref() {
+                    trailers = Some(headers.clone());
+                }
+            }
+            assert_eq!(data, [0, 0, 0, 0, 4, b'o', b'l', b'd', b'!']);
+            assert_eq!(trailers.expect("grpc-status trailers")["grpc-status"], "0");
+            assert!(body.is_end_stream());
+            // Preserve the existing body ownership contract: EOS does not
+            // forcibly strip a still-live wrapper's Client handle.
+            assert_eq!(
+                census
+                    .sample()
+                    .resources
+                    .into_iter()
+                    .find(|row| row.kind == ResourceKind::ProxyPoolFamily)
+                    .expect("family")
+                    .live,
+                1
+            );
+            drop(body);
+        }
+        tokio::time::timeout(Duration::from_secs(2), terminal_received)
+            .await
+            .expect("actual fixture terminal event")
+            .expect("terminal sent");
+        tokio::time::timeout(Duration::from_secs(2), fixture)
+            .await
+            .expect("peer H2 connection actually closes")
+            .expect("fixture joins");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sample = census.sample();
+                if [
+                    ResourceKind::ProxyPoolFamily,
+                    ResourceKind::UpstreamTcpConnection,
+                    ResourceKind::UpstreamTask,
+                    ResourceKind::UpstreamUploadTask,
+                ]
+                .into_iter()
+                .all(|kind| {
+                    sample
+                        .resources
+                        .iter()
+                        .find(|row| row.kind == kind)
+                        .expect("resource row")
+                        .live
+                        == 0
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real pool, IO and owned tasks finish without maintenance scrape");
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn retired_pool_remains_alive_until_held_h2_data_and_trailers_finish() {
+        assert_retired_pool_follows_held_h2_body(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_held_h2_body_releases_retired_pool_after_actual_peer_reset() {
+        assert_retired_pool_follows_held_h2_body(true).await;
     }
 
     async fn spawn_protocol_fixture(
