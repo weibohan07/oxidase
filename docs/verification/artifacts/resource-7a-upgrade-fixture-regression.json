@@ -1,0 +1,126 @@
+{
+  "schema_version": "oxidase.regression-evidence/v1",
+  "scope": "Resource qualification fixture namespace isolation only; actual wire regressions, not production Gateway changes",
+  "base_commit": "9df68ef93382247a3184b68ef6c443153cd22df6",
+  "red": {
+    "command": "cargo test -p oxidase-soak --lib resource_payload_retry_does_not_contaminate_independent_upgrade_lane --locked -- --nocapture",
+    "exit_code": 101,
+    "test_seconds": 0.22,
+    "source_state": "Added cfg-test real upgrade support and regression only; legacy retry policy still unguarded",
+    "client_sha256": "e726360d91afee3f56db2315df24b7695cdf16d82eb6fc871d8ed6dc7e03dc80",
+    "fixture_sha256": "2743f55db9f4d626607b9d69a35aaa2f2de2566296fd8837b8f976c8c375e6ae",
+    "started_handshakes": 6,
+    "collected_handshakes": 6,
+    "statuses": [
+      503,
+      101,
+      101,
+      503,
+      101,
+      101
+    ],
+    "actual_retryable_reply_counter": 2,
+    "expected_counter": 0,
+    "complete_echo_tunnels": 4,
+    "echo_iterations_per_tunnel": 4,
+    "echo_bytes_per_tunnel": 80,
+    "complete_content_length_rejections": 2,
+    "assertion": "ordinary payload retry must not emit unplanned Upgrade failures: left 2, right 0"
+  },
+  "repair": {
+    "fixture_plan_field": "resource_mode",
+    "field_status": "already emitted true by resource campaign; now read and used",
+    "type": "immutable bool",
+    "missing": "false (legacy)",
+    "invalid_type": "fixture.invalid_resource_mode",
+    "behavior": "The legacy serve route skips its retryable_reply injection only in explicit resource mode. The newer /base/resource/payload ordinary empty-body GET injection still uses its A/method/every-third rule. No named fault window, Gateway policy, protocol body adapter or deadline was relaxed."
+  },
+  "green": {
+    "source_state": "local WIP on 9df68ef; not Hosted final-head qualification",
+    "client_sha256": "478084cbc34c067170804d783392441a8dd3635689c13a4be9f3590d19a842ef",
+    "fixture_sha256": "f02cf2fc5a766f1f80ac4f9f870a9e0b09440e191e81368368624fa76d19d737",
+    "resource_mode_true": {
+      "started_handshakes": 6,
+      "collected_handshakes": 6,
+      "statuses": [
+        101,
+        101,
+        101,
+        101,
+        101,
+        101
+      ],
+      "actual_retryable_reply_counter": 0,
+      "echo_iterations_per_tunnel": 4,
+      "echo_bytes_per_tunnel": 80,
+      "tls_close_result": "clean_eof",
+      "wire_metadata": "Every response checks actual peer, A name, requested authority/SNI/path, Connection/Upgrade/Sec-WebSocket-Accept; each echo digest is checked."
+    },
+    "legacy_mode_false": {
+      "started_handshakes": 6,
+      "collected_handshakes": 6,
+      "statuses": [
+        503,
+        101,
+        101,
+        503,
+        101,
+        101
+      ],
+      "actual_retryable_reply_counter": 2,
+      "complete_content_length_rejections": 2,
+      "rejection_bytes": 9,
+      "rejection_content": "retryable",
+      "complete_echo_tunnels": 4,
+      "echo_iterations_per_tunnel": 4,
+      "echo_bytes_per_tunnel": 80,
+      "tls_close_result": "clean_eof"
+    },
+    "commands": [
+      {
+        "command": "cargo test -p oxidase-soak --lib process_campaign --locked",
+        "exit_code": 0,
+        "passed": 94,
+        "test_seconds": 5.44,
+        "final_source": true
+      },
+      {
+        "command": "cargo +1.88.0 test -p oxidase-soak --lib process_campaign --locked",
+        "exit_code": 0,
+        "passed": 94,
+        "test_seconds": 5.79,
+        "final_source": false,
+        "note": "Before the final Upgrade metadata assertions; those assertions were rerun separately below."
+      },
+      {
+        "command": "cargo +1.88.0 test -p oxidase-soak --lib fixture --locked",
+        "exit_code": 0,
+        "passed": 20,
+        "test_seconds": 0.23,
+        "final_source": true
+      },
+      {
+        "command": "cargo +1.88.0 test -p oxidase-soak --lib resource_payload_retry_does_not_contaminate_independent_upgrade_lane --locked",
+        "exit_code": 0,
+        "passed": 1,
+        "test_seconds": 0.32,
+        "final_source": true
+      },
+      {
+        "command": "cargo clippy -p oxidase-soak --all-targets --all-features --locked -- -D warnings",
+        "exit_code": 0,
+        "final_source": true
+      },
+      {
+        "command": "git diff --check -- crates/oxidase-soak/src/process_campaign/client.rs crates/oxidase-soak/src/process_campaign/fixture.rs",
+        "exit_code": 0,
+        "final_source": true
+      }
+    ]
+  },
+  "limits": [
+    "This isolates the confirmed validation-tool fault; no production Upgrade/retry logic changed.",
+    "It neither retroactively passes the failed Hosted C campaign nor replaces the required repaired same-config Linux run.",
+    "All fixture connection and tunnel tasks were joined; cancellation/unclean EOF was not relabelled clean EOF."
+  ]
+}

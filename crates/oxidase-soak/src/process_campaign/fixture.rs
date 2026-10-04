@@ -486,6 +486,9 @@ fn dns_answer(query: Message, state: &DnsState, upstream: &Ready, tcp: bool) -> 
 
 #[derive(Default)]
 struct UpstreamState {
+    // Immutable namespace for the newer resource campaign's explicit payload
+    // faults. Absent in the old fixture plan, preserving legacy 6D behavior.
+    resource_mode: bool,
     healthy_a: AtomicBool,
     healthy_b: AtomicBool,
     retry_a: AtomicBool,
@@ -676,6 +679,11 @@ impl ResourceTestFixture {
     pub(super) async fn stop(self) {
         let _ = self.stop.send(());
         self.task.await.expect("all real fixture tasks joined");
+        let mut tunnels =
+            std::mem::take(&mut *self.state.tunnels.lock().expect("fixture tunnel owners"));
+        while let Some(result) = tunnels.join_next().await {
+            result.expect("actual fixture tunnel task joined");
+        }
     }
 }
 
@@ -690,6 +698,15 @@ pub(super) async fn resource_test_fixture(
 pub(super) async fn resource_test_fixture_named(
     identity: &crate::common::TestIdentity,
     id: &'static str,
+) -> ResourceTestFixture {
+    resource_test_fixture_in_mode(identity, id, true).await
+}
+
+#[cfg(test)]
+pub(super) async fn resource_test_fixture_in_mode(
+    identity: &crate::common::TestIdentity,
+    id: &'static str,
+    resource_mode: bool,
 ) -> ResourceTestFixture {
     let key = PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
         .expect("ephemeral test-only key");
@@ -708,7 +725,10 @@ pub(super) async fn resource_test_fixture_named(
         .expect("ephemeral upstream");
     let address = listener.local_addr().expect("actual upstream socket");
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
-    let state = Arc::new(UpstreamState::default());
+    let state = Arc::new(UpstreamState {
+        resource_mode,
+        ..UpstreamState::default()
+    });
     let serving = Arc::clone(&state);
     let task = tokio::spawn(async move {
         let state = serving;
@@ -731,7 +751,7 @@ pub(super) async fn resource_test_fixture_named(
                         if h2 {
                             let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket), service).await;
                         } else {
-                            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).await;
+                            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).with_upgrades().await;
                         }
                     });
                 }
@@ -1147,6 +1167,7 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
         .filter(|v| *v > 0 && *v <= 16 * 1024 * 1024)
         .ok_or_else(|| fail("fixture payload bound"))?;
     let state = Arc::new(UpstreamState {
+        resource_mode: fixture_resource_mode(&plan)?,
         payload_size,
         request_read_delay: Duration::from_millis(
             plan["request_read_delay_ms"].as_u64().unwrap_or(0).min(500),
@@ -1183,6 +1204,14 @@ pub(super) async fn upstream(root: PathBuf) -> Result<(), SoakError> {
     Ok(())
 }
 
+fn fixture_resource_mode(plan: &Value) -> Result<bool, SoakError> {
+    match plan.get("resource_mode") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(fail("fixture.invalid_resource_mode")),
+    }
+}
+
 async fn serve(
     mut request: Request<Incoming>,
     id: &'static str,
@@ -1213,7 +1242,7 @@ async fn serve(
             .expect("fixture health response"));
     }
     let attempt = state.requests.fetch_add(1, Ordering::Relaxed);
-    if retryable_reply(&state, id, request.method(), attempt) {
+    if !state.resource_mode && retryable_reply(&state, id, request.method(), attempt) {
         return Ok(Response::builder()
             .status(503)
             .body(Full::new(Bytes::from_static(b"retryable")).boxed_unsync())
@@ -2182,6 +2211,19 @@ mod tests {
         assert_eq!(state.retries.load(Ordering::Relaxed), 0);
         assert!(retryable_reply(&state, "a", &http::Method::GET, 3));
         assert_eq!(state.retries.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resource_fixture_mode_is_explicit_typed_and_defaults_to_legacy() {
+        assert!(!fixture_resource_mode(&json!({})).expect("old plan remains legacy"));
+        assert!(!fixture_resource_mode(&json!({"resource_mode":false})).expect("explicit legacy"));
+        assert!(
+            fixture_resource_mode(&json!({"resource_mode":true}))
+                .expect("explicit resource isolation")
+        );
+        for invalid in [json!(null), json!("true"), json!(0), json!([]), json!({})] {
+            assert!(fixture_resource_mode(&json!({"resource_mode":invalid})).is_err());
+        }
     }
 
     #[tokio::test]

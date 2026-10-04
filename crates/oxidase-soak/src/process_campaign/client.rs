@@ -3779,6 +3779,133 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 mod tests {
     use super::*;
 
+    async fn six_fixture_upgrade_receipts(
+        address: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Vec<Result<ResourceResponseFacts, String>> {
+        let mut results = Vec::new();
+        for sequence in 0..6 {
+            let operation_id = format!("fixture-upgrade:{sequence}");
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let (socket, raw) =
+                    open_upgrade_capture(address, Arc::clone(&config), true, None).await?;
+                let mut raw = raw.ok_or_else(|| fail("missing actual Upgrade head"))?;
+                raw.operation_id = operation_id;
+                if let Some(mut socket) = socket {
+                    let mut digest = Sha256::new();
+                    echo_upgrade_capture(&mut socket, Some(&mut raw), Some(&mut digest), None)
+                        .await?;
+                    observe_tunnel_close(&mut socket, &mut raw, 4).await?;
+                    raw.ended_ns = Some(super::super::resource_identity::monotonic_ns()?);
+                }
+                Ok::<_, SoakError>(raw)
+            })
+            .await;
+            results.push(match result {
+                Ok(Ok(raw)) => Ok(raw),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("actual fixture Upgrade deadline".into()),
+            });
+        }
+        results
+    }
+
+    #[tokio::test]
+    async fn resource_payload_retry_does_not_contaminate_independent_upgrade_lane() {
+        let identity = identity().expect("ephemeral TLS identity");
+        let config = client_config(&[&identity], &[b"http/1.1"]).expect("verified client");
+        let fixture = super::super::fixture::resource_test_fixture(&identity).await;
+        fixture.set_retry_a(true);
+        let peer = fixture.address.to_string();
+        let results = six_fixture_upgrade_receipts(fixture.address, config).await;
+        let replies = fixture.retryable_status_replies();
+        fixture.stop().await;
+        assert_eq!(results.len(), 6, "every started handshake was collected");
+        let statuses: Vec<_> = results
+            .iter()
+            .map(|result| result.as_ref().map(|raw| raw.status))
+            .collect();
+        assert_eq!(
+            replies, 0,
+            "ordinary payload retry must not emit unplanned Upgrade failures: {statuses:?}"
+        );
+        let digest: String = Sha256::digest(b"qualification-tunnel".repeat(4))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        for raw in results {
+            let raw = raw.expect("actual handshake and tunnel outcome, not omitted work");
+            assert_eq!(raw.status, Some(101));
+            assert!(raw.request_head_sent && raw.tunnel_client_shutdown && raw.eof);
+            assert_eq!(raw.tunnel_close_result.as_deref(), Some("clean_eof"));
+            assert_eq!(raw.echo_iterations, 4);
+            assert_eq!(raw.body_bytes, 80);
+            assert_eq!(raw.body_sha256, digest);
+            assert_eq!(raw.upstream_peer.as_deref(), Some(peer.as_str()));
+            assert_eq!(raw.upstream_name.as_deref(), Some("a"));
+            assert_eq!(raw.authority.as_deref(), Some("gateway.example.test"));
+            assert_eq!(raw.server_name.as_deref(), Some("gateway.example.test"));
+            assert_eq!(raw.path.as_deref(), Some("/ws"));
+            assert_eq!(
+                raw.upgrade_headers.get("connection").map(String::as_str),
+                Some("upgrade")
+            );
+            assert_eq!(
+                raw.upgrade_headers.get("upgrade").map(String::as_str),
+                Some("websocket")
+            );
+            assert_eq!(
+                raw.upgrade_headers
+                    .get("sec-websocket-accept")
+                    .map(String::as_str),
+                Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_fixture_keeps_original_upgrade_retry_behavior_when_resource_mode_is_absent() {
+        let identity = identity().expect("ephemeral identity");
+        let config = client_config(&[&identity], &[b"http/1.1"]).expect("verified legacy client");
+        let fixture =
+            super::super::fixture::resource_test_fixture_in_mode(&identity, "a", false).await;
+        fixture.set_retry_a(true);
+        let results = six_fixture_upgrade_receipts(fixture.address, config).await;
+        let retries = fixture.retryable_status_replies();
+        fixture.stop().await;
+        assert_eq!(results.len(), 6, "all legacy operations collected");
+        assert_eq!(
+            retries, 2,
+            "legacy every-third GET retry semantics unchanged"
+        );
+        let tunnel_digest: String = Sha256::digest(b"qualification-tunnel".repeat(4))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let rejection_digest: String = Sha256::digest(b"retryable")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        for (sequence, raw) in results.into_iter().enumerate() {
+            let raw = raw.expect("actual legacy wire outcome collected");
+            assert!(raw.request_head_sent && raw.eof);
+            if sequence % 3 == 0 {
+                assert_eq!(raw.status, Some(503));
+                assert_eq!(raw.body_bytes, 9);
+                assert_eq!(raw.body_sha256, rejection_digest);
+                assert_eq!(raw.echo_iterations, 0);
+                assert!(!raw.tunnel_client_shutdown);
+            } else {
+                assert_eq!(raw.status, Some(101));
+                assert_eq!(raw.body_bytes, 80);
+                assert_eq!(raw.body_sha256, tunnel_digest);
+                assert_eq!(raw.echo_iterations, 4);
+                assert!(raw.tunnel_client_shutdown);
+                assert_eq!(raw.tunnel_close_result.as_deref(), Some("clean_eof"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn resource_retry_fixture_drives_real_gateway_a_to_b_pre_head_retry() {
         let directory = tempfile::tempdir().expect("isolated test source");
