@@ -4,12 +4,17 @@ Last updated: 2026-10-04
 
 Phase 7A.1 was delivered through protected PR #20 from
 `495a906`; actual object/task/IO census and pure authenticated read observation
-passed final-head and merged-main CI. Phase 7A.2 Draft PR #21 starts from
-`7bd6d48`: separate-process healthy/churn/isolated workloads, raw operation
-conservation, Running recovery/quiet windows, independent sampling and an offline
-positive/negative oracle are implemented. Real Linux smoke initially failed;
-those original artifacts are preserved while tool repairs undergo new checks.
-Formal Linux resource/memory qualification and attribution remain unclosed. See
+passed final-head and merged-main CI. Phase 7A.2 was normally merged through
+PR #21 as `54b0fc6`: final head `98c5de6` passed `37196664266`, and its separate
+main push passed `37197386244`. Separate-process healthy/churn/isolated workloads,
+raw operation conservation, Running recovery/quiet windows, independent sampling
+and an offline positive/negative oracle are implemented. Initial Linux smoke and
+the first short H/C campaign failed; their original artifacts remain unchanged.
+PR #22 addresses the observed validation defects (connection request-budget
+retirement and canonical SRV target comparison) with independent raw-journal
+regressions. It does not infer a production leak or change retention policy.
+Formal Linux resource/memory qualification and allocation attribution remain
+unclosed. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
 ## Baseline

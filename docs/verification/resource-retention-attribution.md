@@ -104,6 +104,36 @@ C artifact `11301424456`, SHA-256
 Original per-file manifests verified 33 H / 35 C files; repeated independent
 analysis equals the uploaded original reports. New repairs require new runs.
 
+The first repair repeat, normal release `37199862567` at `6ccab8e`, seed 700212,
+kept the same phase/load parameters. Both sealed originals remain **FAIL**;
+[their verified source/binary/PID/phase/counter/curve index](artifacts/resource-7a-6ccab8e-hosted-failures.json)
+records 34 H / 36 C checked files and identical independent replay. H conserved
+111263 operations and 105 actual connection-retirement pairs, but retained three
+unexpected replies: one warmup HTTP/1 transport failure and two complete safe
+503s in healthy steady traffic. These are **not** whitelisted or explained by the
+quota repair. Their causal investigation is separate from resident attribution.
+
+C conserved 69828 operations and 53 retirement pairs before stopping at
+`resource.control_not_triggered:positive_aaaa_counter`. The same-window probe
+actually completed 200, all 32768 bytes and EOF through `[::1]`; the fixture's
+AAAA answer counter increased by three. This configuration resolves **SRV**:
+the supervisor's round metric has `family="srv"`, not a top-level `aaaa` plan.
+The validation repair requires all of the original raw fixture AAAA delta,
+complete physical IPv6 response, actual SRV positive-round increase and fresh
+canonical SRV membership generation in a predeclared 30-second window. It does
+not relabel production metrics, change DNS leases, extend request deadlines or
+accept an unrelated global counter. Original C lacks Recovery/Quiet evidence.
+
+An external allocation-stack experiment is deliberately separate: fixed
+heaptrack 1.5.0 source/checksum, dependency/license/permission inventory and
+own-process PID/start/binary validation; no allocator replacement or Yama bypass.
+`allocation-launch` / `allocation-attach` on the registered manual workflow use
+`{"duration_seconds":60,"concurrency":4}`. The separate release-with-debug
+fixture is HTTP/1 Proxy/Asset, not TLS/H2 H/C qualification. `CAPTURED` means
+only a bounded trace was actually collected and parsed; unfreed-at-exit values
+are not proof of a leak. Late/unjoined sampler, full-response deadline and PID
+ownership negative tests must reject false capture. Actual Linux run pending.
+
 Formal H/C must preserve original minima and complete operation conservation,
 full content/trailer validation, finite faults with fresh affected-peer recovery,
 old A held/Upgrade proof, and Running-only reclamation before drain. Missing

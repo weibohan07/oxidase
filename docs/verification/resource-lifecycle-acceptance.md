@@ -21,6 +21,22 @@ The independent main push run `37187599520` also passed all four jobs. Those are
 implementation receipts, not a Linux memory/campaign qualification. 7A.2 starts
 from this merged main and preserves all historical failures.
 
+7A.2 final head `98c5de65c1d515ea60cab9a956533c4386de2be0` passed all nine
+local gates and four final-head required jobs (`37196664266`). Normal merge
+`54b0fc65be52b72f3354791674905b9205277f3a` independently passed main push
+`37197386244`. Both stable and Rust 1.88 Linux jobs executed the actual resource
+implementation smoke and independent adversarial corpus; earlier failures below
+were not overwritten. The 61-second ASan `discovery_runtime` campaign at that
+head executed 3304 inputs with seed 600401, no crash/timeout/OOM; 538 MiB peak RSS
+belongs to the **fuzzer**, not the gateway. This does not prove retention bounds.
+
+7A.3 Draft PR #22 starts from `54b0fc6`. Its first normal-release, separate-runner
+H/C pilot (`37197630141`, seed 700211) failed. The original archives and replay,
+confirmed validation defects, resident curves and remaining attribution gaps are
+in [the attribution ledger](resource-retention-attribution.md). New tool head
+`6ccab8e81602f549f0d2a0c1138d659e9c2006bc` requires separate repeat evidence;
+its green build alone cannot close those failures.
+
 All nine requested local commands executed on unchanged `495a906` and PASS:
 fmt; locked workspace all-target/all-feature denied-warning Clippy; locked
 workspace tests; locked no-deps denied-warning docs; cargo-deny; locked workspace
@@ -39,14 +55,14 @@ This is local macOS validation, not a Linux campaign or new Hosted check.
 | RL-03 | scheduled / waiting / executing / cancellation requested / actual task exit | PASS_IMPLEMENTATION: blocked probe/query, pre-poll cancellation and late callback regressions |
 | RL-04 | observation owns no resources, pure reads and bounded scalar detail | PASS_IMPLEMENTATION: 5000 generations, disabled/missing series and authenticated pure reads |
 | RL-05 | old issued streams pin resources, new leases honor retirement | PASS_IMPLEMENTATION: real old TLS/H2 stream/Asset publication and cancellation; campaign pending |
-| RL-06 | no-scrape Running retirement, 0/low/high scrape controls | NOT RUN |
-| RL-07 | healthy and fault lanes fully validate DATA/trailers with all operations classified | NOT RUN |
-| RL-08 | bounded fault windows and real recovery deadlines, AAAA/timeout/post-head failure | NOT RUN |
-| RL-09 | warm / steady / recovery-running / quiet-running / post-drain measurements | NOT RUN |
-| RL-10 | independent verifier rejects missing data, false healthy, leak and lost results | NOT RUN |
-| RL-11 | exact implementation/tool/binary/PID identity and untruncated raw evidence | NOT RUN |
-| RL-12 | evidence-driven attribution, necessary regression-backed fixes and Linux repeat | INCONCLUSIVE until executed |
-| RL-13 | final-head and independent main CI for all three PRs | PR #20 PASS; PR #21 Draft with failures preserved; third PR NOT RUN |
+| RL-06 | no-scrape Running retirement, 0/low/high scrape controls | PASS_IMPLEMENTATION: pure-read and no-scrape regressions; matched Linux memory controls pending |
+| RL-07 | healthy and fault lanes fully validate DATA/trailers with all operations classified | PASS_IMPLEMENTATION; original pilot FAIL, repeat pending |
+| RL-08 | bounded fault windows and real recovery deadlines, AAAA/timeout/post-head failure | PASS_IMPLEMENTATION: adversarial oracle and real fixture corpus; complete C qualification pending |
+| RL-09 | warm / steady / recovery-running / quiet-running / post-drain measurements | first short H measured; C stopped early; formal qualification pending |
+| RL-10 | independent verifier rejects missing data, false healthy, leak and lost results | PASS_IMPLEMENTATION: negative corpus and actual Hosted artifact rejections; never promotes controller claim to PASS |
+| RL-11 | exact implementation/tool/binary/PID identity and untruncated raw evidence | PASS_IMPLEMENTATION: verified source/binary/PID records and byte-identical original replay; final campaign pending |
+| RL-12 | evidence-driven attribution, necessary regression-backed fixes and Linux repeat | INCONCLUSIVE: two evidence-backed tool fixes; no proven production-retention defect |
+| RL-13 | final-head and independent main CI for all three PRs | PR #20 and #21 PASS; PR #22 Draft, final delivery pending |
 
 ## 7A.1 implemented boundaries and development executions
 
