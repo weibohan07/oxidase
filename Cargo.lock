@@ -1430,6 +1430,7 @@ version = "0.3.0-alpha.1"
 dependencies = [
  "bytes",
  "clap",
+ "h2",
  "hickory-resolver",
  "http",
  "http-body",

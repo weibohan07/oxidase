@@ -30,6 +30,7 @@ MAX_ROWS = 5_000_000
 MAX_ERRORS = 100_000
 MAX_PROBES = 50_000
 MAX_FINDINGS = 200
+MAX_FINDING_CODES = 128
 ROLES = ("gateway", "controller", "dns", "upstream", "sampler")
 HEX256 = re.compile(r"^[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -50,6 +51,7 @@ FIXTURE_GAUGES = (
     'oxidase_http2_active_streams{listener="qualification"}',
     'oxidase_active_tunnels{listener="qualification"}',
 )
+FIXTURE_REQUEST_BUDGET = 1000
 
 
 class EvidenceError(Exception):
@@ -118,7 +120,7 @@ class Inputs:
             raise EvidenceError(f"evidence file exceeds size limit: {name}")
         return path
 
-    def rows(self, name):
+    def rows(self, name, maximum=MAX_FILE_BYTES):
         path = self.path(name)
         opener = gzip.open if path.suffix == ".gz" else open
         total = 0
@@ -128,7 +130,7 @@ class Inputs:
                 if not line:
                     break
                 total += len(line)
-                if len(line) > MAX_LINE_BYTES or total > MAX_FILE_BYTES or index > MAX_ROWS:
+                if len(line) > MAX_LINE_BYTES or total > maximum or index > MAX_ROWS:
                     raise EvidenceError(f"uncompressed evidence limit exceeded: {name}")
                 if not line.endswith(b"\n"):
                     raise EvidenceError(f"truncated/non-terminated row: {name}:{index}")
@@ -163,13 +165,21 @@ class Analyzer:
         self.inputs = Inputs(directory)
         self.findings = []
         self.finding_count = Counter()
+        self.finding_code_counts = {}
+        self.finding_code_counts_omitted = 0
         self.phases = []
         self.windows = {}
         self.drain_windows = []
         self.coverage = Counter()
         self.errors = {}
         self.errors_by_worker = defaultdict(dict)
+        self.error_order = defaultdict(list)
+        self.error_cursors = defaultdict(int)
         self.consumed_errors = set()
+        self.compact_by_worker = defaultdict(list)
+        self.compact_cursors = defaultdict(int)
+        self.compact_rows = 0
+        self.consumed_compact = set()
         self.counts = Counter()
         self.workers = defaultdict(Counter)
         self.last_operation = defaultdict(int)
@@ -196,12 +206,25 @@ class Analyzer:
         self.retained_proofs = []
         self.unbounded_kinds = set()
         self.required_gauges = []
+        self.retirements = []
+        self.retirement_journal = False
+        self.epoch_submissions = Counter()
+        self.epoch_protocols = {}
+        self.bucket_boundaries = defaultdict(list)
         self.first_metric = {}
         self.last_metric = {}
         self.actual_ipv6_responses = 0
 
     def finding(self, code, message, result="FAIL", **context):
         self.finding_count[result] += 1
+        # Codes are fixed internal diagnostics, never raw request/error labels.
+        # Count before detail truncation so repeated tunnel notices cannot hide
+        # later capacity/memory criteria. The defensive distinct-code bound
+        # changes visibility only, never severity totals or the final verdict.
+        if code in self.finding_code_counts or len(self.finding_code_counts) < MAX_FINDING_CODES:
+            self.finding_code_counts.setdefault(code, Counter())[result] += 1
+        else:
+            self.finding_code_counts_omitted += 1
         if len(self.findings) < MAX_FINDINGS:
             row = {"code": code, "result": result, "message": message}
             if context:
@@ -538,8 +561,74 @@ class Analyzer:
             if head is not None and not start <= integer(head, "head_ns") <= end:
                 raise EvidenceError("response head timestamp outside operation interval")
             required(row, "raw")
+            ordered = self.error_order[key[0]]
+            if ordered and key[1] <= ordered[-1][0][1]:
+                raise EvidenceError("individual error operation order moved backwards")
             self.errors[key] = row
             self.errors_by_worker[key[0]][key[1]] = row
+            ordered.append((key, row))
+
+    def load_compact_faults(self):
+        """Bounded range encoding, never a new allowance for any wire result."""
+        storage = self.receipt.get("fault_result_storage")
+        present = self.optional_file("compact-fault-results.jsonl")
+        if storage is None:
+            if present:
+                raise EvidenceError("compact fault file has no declared storage schema")
+            return
+        if storage != "contiguous_safe_503_v1":
+            raise EvidenceError("unknown compact fault storage schema")
+        # Even a run with no compactable terminal must contain this empty file.
+        self.inputs.path("compact-fault-results.jsonl")
+        for index, row in self.inputs.rows("compact-fault-results.jsonl", 64 << 20):
+            if row.get("schema_version") != "oxidase.resource-compact-fault/v1":
+                raise EvidenceError("unknown compact fault row schema")
+            if integer(required(row, "writer_seq"), "compact writer_seq", 1) != index or index > MAX_ERRORS:
+                raise EvidenceError("compact writer sequence missing, duplicated or excessive")
+            worker = integer(required(row, "worker_id"), "compact worker_id")
+            first = integer(required(row, "first_operation_seq"), "compact first sequence", 1)
+            last = integer(required(row, "last_operation_seq"), "compact last sequence", 1)
+            count = integer(required(row, "count"), "compact count", 1)
+            if last < first or count != last - first + 1:
+                raise EvidenceError("compact range count differs from contiguous operation range")
+            previous = self.compact_by_worker[worker]
+            if previous and first <= previous[-1]["last_operation_seq"]:
+                raise EvidenceError("compact worker ranges overlap or move backwards")
+            start, last_start, end, min_head, max_head = (
+                integer(required(row, key), f"compact {key}") for key in
+                ("first_start_ns", "last_start_ns", "last_end_ns", "min_head_ns", "max_head_ns"))
+            if (not start <= last_start <= end or not start <= min_head <= max_head <= end or
+                    last_start > max_head or (count == 1 and (start != last_start or min_head != max_head)) or
+                    (previous and start < previous[-1]["last_end_ns"])):
+                raise EvidenceError("compact operation timing/response-head extrema are impossible")
+            phase, lane, protocol = (required(row, key) for key in ("phase", "lane", "protocol"))
+            self.check_phase(phase, start, end, f"compact range {worker}:{first}-{last}")
+            window_id = required(row, "window_id")
+            window = self.windows.get(window_id) if isinstance(window_id, str) else None
+            raw = required(row, "raw")
+            attempts = integer(required(row, "connection_attempts"), "compact per-operation connections")
+            if (phase != "steady" or lane != "churn" or protocol not in ("http1", "h2") or
+                    row.get("target") != "upstream" or row.get("admitted") is not True or attempts not in (0, 1) or
+                    not window or window["target"] != row["target"] or lane not in window["lanes"] or
+                    not window["start_ns"] <= min_head <= max_head <= window["end_ns"] or
+                    not any(choice.get("status") == 503 for choice in window["allowed"])):
+                self.finding("RL_COMPACT_SCOPE", "compact range is outside exact finite churn/status/target/head window")
+            if (not isinstance(raw, dict) or raw.get("status") != 503 or raw.get("eof") is not True or
+                    raw.get("admitted") is not True or raw.get("connection_attempted") is not bool(attempts) or
+                    raw.get("cancelled") is not False or raw.get("upgrade") is not False or
+                    raw.get("diagnostics") != [] or raw.get("h2_reason") is not None or
+                    raw.get("h2_error_kind") is not None or raw.get("error_stage", "missing") is not None or
+                    raw.get("error_code", "missing") is not None or
+                    any(key in raw for key in ("operation_id", "started_ns", "head_ns", "ended_ns"))):
+                raise EvidenceError("compact row is not a complete, identical safe-503 raw terminal")
+            integer(required(raw, "connection_epoch"), "compact actual connection epoch", 1)
+            if (raw.get("trailers") != {} or raw.get("data_observed") is not True or
+                    any(raw.get(key) is not None for key in
+                        ("upstream_peer", "upstream_name", "authority", "server_name", "path"))):
+                self.finding("RL_COMPACT_CONTENT", "compact safe gateway response has inconsistent metadata/trailers")
+            required(row, "recipe")
+            previous.append(row)
+            self.compact_rows += 1
 
     def optional_file(self, name):
         return (self.inputs.directory / name).is_file() or (self.inputs.directory / (name + ".gz")).is_file()
@@ -624,6 +713,87 @@ class Analyzer:
                 self.finding("RL_CONTROL_CLASSIFICATION", "control classification contradicts independently derived facts", operation_id=operation_id)
         if pending:
             self.finding("RL_CONTROL_RESULT", "begun control operations lack terminal receipts", ids=list(pending))
+
+    def load_retirements(self):
+        """Client retirement is control work, never a silently retried request."""
+        self.retirement_journal = self.optional_file("client-retirements.jsonl")
+        if not self.retirement_journal:
+            if self.receipt["parameters"].get("formal"):
+                self.finding("RL_RETIREMENT_RESULT", "formal load lacks independently paired client retirements", "INCONCLUSIVE")
+            return
+        pending, identities, epochs, sequence = {}, set(), defaultdict(int), 0
+        for _, row in self.inputs.rows("client-retirements.jsonl"):
+            if row.get("schema_version") != "oxidase.resource-client-retirement/v1":
+                raise EvidenceError("unknown client retirement schema")
+            current = integer(required(row, "writer_seq"), "retirement writer_seq", 1)
+            if current != sequence + 1:
+                raise EvidenceError("retirement writer sequence missing or duplicated")
+            sequence = current
+            retirement_id = required(row, "retirement_id")
+            worker = integer(required(row, "worker_id"), "retirement worker")
+            epoch = integer(required(row, "connection_epoch"), "retirement epoch", 1)
+            start = integer(required(row, "start_ns"), "retirement start")
+            after = integer(required(row, "after_operation_seq"), "retirement after sequence", 1)
+            next_seq = integer(required(row, "next_operation_seq"), "retirement next sequence", 1)
+            if retirement_id != f"{worker}:{epoch}" or next_seq != after + 1:
+                raise EvidenceError("retirement identity/next operation sequence changed")
+            if row.get("protocol") not in ("http1", "h2"):
+                raise EvidenceError("unknown budget-retired client protocol")
+            if (integer(required(row, "request_budget"), "retirement request budget", 1) != FIXTURE_REQUEST_BUDGET or
+                    integer(required(row, "submitted_requests"), "retirement submitted requests") != FIXTURE_REQUEST_BUDGET):
+                self.finding("RL_RETIREMENT_BUDGET", "client retirement does not match exact predeclared listener request budget")
+            kind = required(row, "kind")
+            if kind == "started":
+                if retirement_id in identities or worker in pending or len(identities) >= MAX_PROBES or epoch <= epochs[worker]:
+                    raise EvidenceError("duplicate/concurrent/backwards client retirement identity")
+                identities.add(retirement_id)
+                epochs[worker] = epoch
+                pending[worker] = row
+                self.counts["client_retirements.offered"] += 1
+                continue
+            if kind != "terminal" or worker not in pending:
+                raise EvidenceError("retirement terminal lacks its Started or is duplicated")
+            started = pending.pop(worker)
+            fields = ("retirement_id", "worker_id", "connection_epoch", "start_ns", "after_operation_seq",
+                      "next_operation_seq", "protocol", "request_budget", "submitted_requests")
+            if any(row.get(field) != started.get(field) for field in fields):
+                raise EvidenceError("retirement terminal changed actual connection/counter identity")
+            end = integer(required(row, "end_ns"), "retirement end")
+            if end < start or self.phase_at(start) not in ("warmup", "steady", "recovery"):
+                self.finding("RL_RETIREMENT_BOUNDARY", "budget retirement did not occur during active load before next admission")
+            driver = required(row, "driver_exit")
+            if not isinstance(driver, dict) or driver.get("result") != "completed" or driver.get("join_acknowledged") is not True:
+                self.finding("RL_RETIREMENT_DRIVER", "budget-retired connection has no actual completed driver join")
+            elif not start <= integer(required(driver, "exit_ns"), "retired driver exit") <= end:
+                self.finding("RL_RETIREMENT_DRIVER", "actual driver exit lies outside retirement interval")
+            self.retirements.append(row)
+            self.counts["client_retirements.received"] += 1
+        if pending:
+            self.finding("RL_RETIREMENT_RESULT", "begun client retirement did not receive a terminal join", workers=list(pending))
+
+    def retirement_boundaries(self):
+        for row in self.retirements:
+            worker, epoch, after, next_seq = (row[key] for key in
+                                            ("worker_id", "connection_epoch", "after_operation_seq", "next_operation_seq"))
+            known = self.bucket_boundaries.get(worker, [])
+            prior = [bucket for bucket in known if bucket[1] == after]
+            following = [bucket for bucket in known if bucket[0] == next_seq]
+            if len(prior) != 1 or prior[0][3] > row["start_ns"]:
+                self.finding("RL_RETIREMENT_BOUNDARY", "old operation terminal bucket was not flushed before retirement", worker_id=worker, epoch=epoch)
+            if self.last_operation[worker] > after:
+                if len(following) != 1 or row["end_ns"] > following[0][2]:
+                    self.finding("RL_RETIREMENT_BOUNDARY", "new operation was admitted before actual retirement/join", worker_id=worker, epoch=epoch)
+            elif self.last_operation[worker] != after:
+                self.finding("RL_RETIREMENT_BOUNDARY", "retirement references an operation absent from the conserved worker ledger")
+            # An admission stop may follow the join; that does not invent a new
+            # request. The last conserved sequence must then be exactly `after`.
+            if self.epoch_submissions[(worker, epoch)] != row["submitted_requests"]:
+                self.finding("RL_RETIREMENT_BUDGET", "actual submitted operations in retired epoch do not match counter receipt", worker_id=worker, epoch=epoch)
+            if self.epoch_protocols.get((worker, epoch)) != row["protocol"]:
+                self.finding("RL_RETIREMENT_IDENTITY", "retirement protocol differs from the real retired client epoch")
+            if self.last_operation[worker] > after and not any(
+                    item[0] == next_seq and item[4] is not None and item[4] > epoch for item in known):
+                self.finding("RL_RETIREMENT_IDENTITY", "next operation reused the retired epoch instead of a new successful connection")
 
     def load_prelude(self):
         """Preserve every connection preparation and old/new flow operation."""
@@ -844,9 +1014,12 @@ class Analyzer:
                 proven = classification == "expected_injected_failure" and raw.get("status") == 200 and raw.get("error_stage") == "response_body"
             elif name == "positive_aaaa":
                 expected = self.receipt.get("fixture_peers", {}).get("ipv6")
-                proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
+                proven = (classification == "completed_success" and expected is not None and
+                          raw.get("upstream_peer") == expected and reference.get("expected_peer") == expected and
+                          self.ipv6_resolution_proven(reference, probe))
                 if proven:
                     self.coverage["positive_aaaa_probe"] += 1
+                    self.coverage["positive_aaaa"] += 1
             elif name in ("dns_readd", "recovery_a", "fault_recovery"):
                 expected = reference.get("expected_peer", self.receipt.get("fixture_peers", {}).get("a"))
                 proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
@@ -854,6 +1027,54 @@ class Analyzer:
                     self.coverage[name] += 1
             if not proven:
                 self.finding("RL_TRIGGER", "control probe does not prove its claimed behavior", behavior=name)
+
+    def ipv6_resolution_proven(self, evidence, probe):
+        """SRV resolves target AAAA internally: never relabel its round as AAAA."""
+        window = evidence.get("observation_window")
+        if not isinstance(window, dict):
+            return False
+        start, end, deadline = (integer(required(window, key), f"AAAA proof {key}")
+                                for key in ("start_ns", "end_ns", "deadline_ns"))
+        if (not start < end <= deadline or deadline - start > 30 * NS or
+                not start <= probe["start_ns"] <= probe["end_ns"] <= end or
+                self.phase_at(start) != "steady" or self.phase_at(end) != "steady"):
+            return False
+        before, after = evidence.get("before_raw"), evidence.get("after_raw")
+        field = "positive_aaaa_answers"
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return False
+        old, new = before.get(field), after.get(field)
+        if (not isinstance(old, int) or isinstance(old, bool) or not isinstance(new, int) or isinstance(new, bool) or
+                old < 0 or new <= old):
+            return False
+        # Check the originals, rather than any optional claimed numeric delta.
+        if evidence.get("before") is not None and (evidence["before"] != old or evidence.get("after") != new):
+            return False
+        def discovery(document):
+            if not isinstance(document, dict) or not isinstance(document.get("clusters"), list):
+                return None
+            rows = [row for row in document["clusters"] if isinstance(row, dict) and row.get("cluster") == "upstream"]
+            if len(rows) != 1 or rows[0].get("protocol") != "h2":
+                return None
+            return rows[0].get("discovery")
+        left, right = discovery(evidence.get("before_clusters")), discovery(evidence.get("after_clusters"))
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        name = "_https._tcp.api.discovery.test."
+        old_generation, new_generation = left.get("generation"), right.get("generation")
+        if (left.get("name") != name or right.get("name") != name or
+                not isinstance(old_generation, int) or isinstance(old_generation, bool) or old_generation < 0 or
+                not isinstance(new_generation, int) or isinstance(new_generation, bool) or new_generation <= old_generation or
+                right.get("resolution") != "fresh" or not isinstance(right.get("eligible_endpoints"), int) or
+                isinstance(right["eligible_endpoints"], bool) or right["eligible_endpoints"] < 1 or
+                not isinstance(right.get("srv_targets"), list) or not right["srv_targets"]):
+            return False
+        first, last = evidence.get("before_metrics"), evidence.get("after_metrics")
+        if not isinstance(first, str) or not isinstance(last, str):
+            return False
+        series = 'oxidase_discovery_queries_total{cluster="upstream",family="srv",result="positive"}'
+        old_metric, new_metric = self.metrics(first).get(series), self.metrics(last).get(series)
+        return old_metric is not None and new_metric is not None and new_metric > old_metric >= 0
 
     def retained_proof(self, evidence):
         """Verify raw old/new streams, not the legacy controller booleans."""
@@ -967,6 +1188,18 @@ class Analyzer:
         raw = required(outcome, "raw")
         if not isinstance(raw, dict):
             raise EvidenceError("raw outcome must be an object")
+        reason, kind = raw.get("h2_reason"), raw.get("h2_error_kind")
+        if (reason not in (None, "no_error", "protocol_error", "internal_error",
+                           "flow_control_error", "settings_timeout", "stream_closed",
+                           "frame_size_error", "refused_stream", "cancel",
+                           "compression_error", "connect_error", "enhance_your_calm",
+                           "inadequate_security", "http_1_1_required", "unknown") or
+                kind not in (None, "reset", "goaway", "io", "other") or
+                reason is not None and kind is None or
+                (reason is not None or kind is not None) and
+                not (raw.get("error_stage") and raw.get("error_code"))):
+            self.finding("RL_H2_ERROR_FACTS", "typed H2 error facts are unknown or contradict a successful wire terminal")
+            return "content_error"
         lane, phase = required(outcome, "lane"), required(outcome, "phase")
         recipe_name = required(outcome, "recipe")
         recipe = required(required(self.receipt, "recipes"), recipe_name)
@@ -1189,6 +1422,7 @@ class Analyzer:
                 raise EvidenceError("worker bucket time moves backwards")
             self.last_operation[worker] = last
             self.last_bucket_time[worker] = end
+            epoch_at_first = None
             offered = last - first + 1
             for key in COUNT_KEYS + OPTIONAL_COUNT_KEYS:
                 value = integer(row.get(key, 0) if key in OPTIONAL_COUNT_KEYS else required(row, key), f"bucket {key}")
@@ -1198,15 +1432,43 @@ class Analyzer:
                 self.finding("RL_RESULT_CONSERVATION", "offered operation range does not equal received terminals")
             if offered > MAX_ROWS:
                 raise EvidenceError("bucket exceeds bounded operation capacity")
-            error_rows = [((worker, operation), self.errors_by_worker[worker][operation])
-                          for operation in range(first, last + 1) if operation in self.errors_by_worker[worker]]
+            error_rows = []
+            ordered_errors = self.error_order[worker]
+            cursor = self.error_cursors[worker]
+            while cursor < len(ordered_errors) and ordered_errors[cursor][0][1] <= last:
+                key, item = ordered_errors[cursor]
+                if key[1] < first:
+                    self.finding("RL_ABANDONED_RESULT", "individual error is outside its worker bucket")
+                error_rows.append((key, item))
+                cursor += 1
+            self.error_cursors[worker] = cursor
             anomaly_hist = Counter()
             for key, item in error_rows:
                 self.consumed_errors.add(key)
                 if not start <= item["start_ns"] <= item["end_ns"] <= end:
                     self.finding("RL_BUCKET_INTERVAL", "operation evidence lies outside its bucket interval", worker_id=worker)
                 anomaly_hist[self.fingerprint(item)] += 1
+            compact_rows = []
+            ranges = self.compact_by_worker[worker]
+            cursor = self.compact_cursors[worker]
+            while cursor < len(ranges) and ranges[cursor]["first_operation_seq"] <= last:
+                item = ranges[cursor]
+                left, right = item["first_operation_seq"], item["last_operation_seq"]
+                self.consumed_compact.add(item["writer_seq"])
+                if not first <= left <= right <= last:
+                    self.finding("RL_COMPACT_BUCKET", "compact range is orphaned or crosses a worker bucket boundary")
+                if not start <= item["first_start_ns"] <= item["last_start_ns"] <= item["last_end_ns"] <= end:
+                    self.finding("RL_COMPACT_BUCKET", "compact timing lies outside its one worker bucket")
+                if any(left <= key[1] <= right for key, _ in error_rows):
+                    self.finding("RL_COMPACT_OVERLAP", "compact range double-counts an individual error terminal")
+                compact_rows.append(item)
+                anomaly_hist[self.fingerprint(item)] += item["count"]
+                self.counts["compact_503_rows"] += 1
+                self.counts["compact_503_operations"] += item["count"]
+                cursor += 1
+            self.compact_cursors[worker] = cursor
             total = attempts = admitted = upgrades = 0
+            bucket_histogram = Counter()
             for outcome in required(row, "outcomes"):
                 count = integer(required(outcome, "count"), "outcome count", 1)
                 total += count
@@ -1218,6 +1480,17 @@ class Analyzer:
                         upgrades += count
                     else:
                         admitted += count
+                        if self.retirement_journal:
+                            epoch = integer(required(raw, "connection_epoch"), "actual submitted client epoch", 1)
+                            self.epoch_submissions[(worker, epoch)] += count
+                            protocol = required(outcome, "protocol")
+                            known = self.epoch_protocols.setdefault((worker, epoch), protocol)
+                            if known != protocol:
+                                self.finding("RL_RETIREMENT_IDENTITY", "one successful connection epoch changed protocol")
+                            if self.epoch_submissions[(worker, epoch)] > FIXTURE_REQUEST_BUDGET:
+                                self.finding("RL_RETIREMENT_BUDGET", "new request reused an epoch beyond its listener budget")
+                            if outcome.get("first_start_ns", start) == start:
+                                epoch_at_first = epoch
                 outcome_start = outcome.get("first_start_ns", start)
                 self.check_phase(required(outcome, "phase"), outcome_start, end, "bucket")
                 if "first_start_ns" in outcome:
@@ -1227,18 +1500,41 @@ class Analyzer:
                         raise EvidenceError("histogram operation timing lies outside bucket")
                     self.check_phase(outcome["phase"], last_start, last_end, "histogram end")
                 fingerprint = self.fingerprint(outcome)
+                bucket_histogram[fingerprint] += count
                 matching_errors = [item for _, item in error_rows if self.fingerprint(item) == fingerprint]
+                matching_compact = [item for item in compact_rows if self.fingerprint(item) == fingerprint]
+                if matching_compact:
+                    starts = [item["start_ns"] for item in matching_errors] + [item["first_start_ns"] for item in matching_compact]
+                    last_starts = [item["start_ns"] for item in matching_errors] + [item["last_start_ns"] for item in matching_compact]
+                    ends = [item["end_ns"] for item in matching_errors] + [item["last_end_ns"] for item in matching_compact]
+                    measured = (min(starts), max(last_starts), max(ends))
+                    declared = tuple(outcome.get(key) for key in ("first_start_ns", "last_start_ns", "last_end_ns"))
+                    if declared != measured:
+                        self.finding("RL_COMPACT_BUCKET", "compact/full terminal extrema differ from exact matching histogram timestamps")
                 nonnormal = (raw.get("cancelled") or raw.get("error_stage") or raw.get("error_code") or
                              not raw.get("admitted") or raw.get("eof") is not True or
                              raw.get("status") != self.receipt.get("recipes", {}).get(outcome.get("recipe"), {}).get("status"))
                 if nonnormal and anomaly_hist[fingerprint] != count:
                     self.finding("RL_MISSING_RESULT", "anomaly histogram does not match all individual terminal receipts")
-                if matching_errors:
-                    if len(matching_errors) != count:
+                if matching_errors or matching_compact:
+                    if len(matching_errors) + sum(item["count"] for item in matching_compact) != count:
                         self.finding("RL_RESULT_CONSERVATION", "individual terminal evidence count differs from histogram")
                     for error in matching_errors:
                         derived = self.wire(outcome, error)
                         self.counts[derived] += 1
+                    for compact in matching_compact:
+                        # The actual extrema bound every recorded head. Check
+                        # both with the same independent wire oracle; never
+                        # materialize the operation IDs represented by a range.
+                        derived = None
+                        for head in (compact["min_head_ns"], compact["max_head_ns"]):
+                            evidence = {**compact, "start_ns": compact["first_start_ns"],
+                                        "end_ns": compact["last_end_ns"], "head_ns": head}
+                            current_derived = self.wire(outcome, evidence)
+                            if current_derived != "expected_injected_failure":
+                                self.finding("RL_COMPACT_SCOPE", "compact encoding cannot independently prove every terminal expected")
+                            derived = current_derived
+                        self.counts[derived] += compact["count"]
                 else:
                     derived = self.wire(outcome)
                     self.counts[derived] += count
@@ -1250,11 +1546,23 @@ class Analyzer:
                     self.verified_wire_responses += count
                 if outcome["phase"] in ("quiet", "post_drain"):
                     self.finding("RL_QUIET_ADMISSION", "business admission continued after quiet Running began")
+            for item in compact_rows:
+                fingerprint = self.fingerprint(item)
+                if anomaly_hist[fingerprint] != bucket_histogram[fingerprint]:
+                    self.finding("RL_COMPACT_MATCH", "compact range has no exact complete matching raw histogram")
             if total != offered or attempts != row["connection_attempts"] or admitted != row["admitted_http_operations"] or upgrades != row.get("admitted_upgrade_operations", 0):
                 self.finding("RL_RESULT_CONSERVATION", "raw histogram does not conserve offered/connect/admitted/terminal counts")
+            self.bucket_boundaries[worker].append((first, last, start, end, epoch_at_first))
+        self.retirement_boundaries()
         if set(self.errors) != self.consumed_errors:
             self.finding("RL_ABANDONED_RESULT", "operation-level errors are not covered by a worker bucket")
+        if len(self.consumed_compact) != self.compact_rows:
+            self.finding("RL_ABANDONED_RESULT", "compact fault range is not covered by exactly one worker bucket")
         final = required(self.receipt, "final_counts")
+        if self.receipt.get("fault_result_storage") is not None:
+            for key in ("compact_503_rows", "compact_503_operations"):
+                if self.counts[key] != integer(required(final, key), f"final {key}"):
+                    self.finding("RL_RESULT_CONSERVATION", "compact final storage counts differ from raw ranges", counter=key)
         for key in COUNT_KEYS + OPTIONAL_COUNT_KEYS:
             if self.counts[key] != integer(final.get(key, 0) if key in OPTIONAL_COUNT_KEYS else required(final, key), f"final {key}"):
                 self.finding("RL_RESULT_CONSERVATION", "final independently started count differs from raw received", counter=key)
@@ -1538,12 +1846,6 @@ class Analyzer:
         return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denominator if denominator else None
 
     def final_checks(self):
-        positive_aaaa = sum(max(0, value - self.first_metric.get(name, value))
-                            for name, value in self.last_metric.items()
-                            if name.startswith("oxidase_discovery_queries_total{") and
-                            'family="aaaa"' in name and 'result="positive"' in name)
-        if self.actual_ipv6_responses and positive_aaaa:
-            self.coverage["positive_aaaa"] = min(self.actual_ipv6_responses, positive_aaaa)
         total_deadline = self.last_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0) - self.first_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0)
         if self.coverage["deadline_timeout_probe"] and total_deadline > 0:
             self.coverage["deadline_timeout"] = min(self.coverage["deadline_timeout_probe"], total_deadline)
@@ -1592,6 +1894,10 @@ class Analyzer:
                              "source_set_sha256": self.receipt.get("source_set_sha256")},
                 "findings": self.findings, "finding_counts": dict(self.finding_count),
                 "findings_truncated": sum(self.finding_count.values()) > len(self.findings),
+                "finding_code_counts": {code: dict(sorted(counts.items()))
+                                        for code, counts in sorted(self.finding_code_counts.items())},
+                "finding_code_counts_truncated": self.finding_code_counts_omitted > 0,
+                "finding_code_counts_omitted": self.finding_code_counts_omitted,
                 "counts": dict(self.counts), "verified_wire_responses": self.verified_wire_responses,
                 "coverage": dict(self.coverage), "actual_publications": self.publications,
                 "quiescent_resource_captures": self.stable_captures,
@@ -1614,7 +1920,9 @@ class Analyzer:
             self.timeline()
             self.load_prelude()
             self.load_controls()
+            self.load_retirements()
             self.load_errors()
+            self.load_compact_faults()
             self.load_probes()
             self.operations()
             self.samples()

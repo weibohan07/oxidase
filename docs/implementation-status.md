@@ -4,13 +4,32 @@ Last updated: 2026-10-04
 
 Phase 7A.1 was delivered through protected PR #20 from
 `495a906`; actual object/task/IO census and pure authenticated read observation
-passed final-head and merged-main CI. Phase 7A.2 Draft PR #21 starts from
-`7bd6d48`: separate-process healthy/churn/isolated workloads, raw operation
-conservation, Running recovery/quiet windows, independent sampling and an offline
-positive/negative oracle are implemented. Real Linux smoke initially failed;
-those original artifacts are preserved while tool repairs undergo new checks.
-Formal Linux resource/memory qualification and attribution remain unclosed. See
+passed final-head and merged-main CI. Phase 7A.2 was normally merged through
+PR #21 as `54b0fc6`: final head `98c5de6` passed `37196664266`, and its separate
+main push passed `37197386244`. Separate-process healthy/churn/isolated workloads,
+raw operation conservation, Running recovery/quiet windows, independent sampling
+and an offline positive/negative oracle are implemented. Initial Linux smoke and
+the first short H/C campaign failed; their original artifacts remain unchanged.
+PR #22 addresses evidence-backed validation defects: explicit connection-budget
+retirement, dispatcher readiness, canonical SRV/AAAA witnesses, finite TTL-zero
+faults, lossless bounded safe-503 storage, and common-deadline multi-peer recovery.
+Three actual Respond scrape controls fully validated about 170000 replies each,
+but their positive resident drift remains INCONCLUSIVE. Formal C's original
+unacknowledged cancellation and H2 upload errors remain failures, not whitelisted
+expected faults. No production leak is inferred and retention policy is unchanged.
+Formal Linux resource/memory qualification and allocation attribution remain
+unclosed. Formal healthy H completed its full hour and Running recovery/Quiet
+with all 1185958 operations classified and no unexpected outcome, but its sealed
+report remains INCONCLUSIVE (TLS close, capacity and resident attribution gaps).
+Actual external heaptrack collection/parsing succeeded only for a separate
+60-second debug-enabled H1 experiment, not normal H/C attribution. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
+
+Final implementation C repeat (`37211766238`, `c0db6cd`) remains FAIL: five
+unwindowed worker 504s, one missing cancellation ACK and a normal IPv6 control
+504. All 62870 offered operations were received; recovery/Quiet were not entered.
+No production fix is asserted without attribution. 7A has not fully passed;
+Access Log, OpenTelemetry, packaging and version/release work remain out of scope.
 
 ## Baseline
 

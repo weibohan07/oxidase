@@ -12,9 +12,9 @@ on:
         default: both
         required: true
         type: choice
-        options: [both, healthy, churn, respond, static-proxy, dns-only, publish-only, health-only, dns-background-only, h2-only, h2-cancel, grpc-only, upgrade-only, scrape-only]
+        options: [both, healthy, churn, respond, static-proxy, dns-only, publish-only, health-only, dns-background-only, h2-only, h2-cancel, grpc-only, upgrade-only, scrape-only, allocation-launch, allocation-attach]
       parameters:
-        description: Explicit bounded phase/load/sampling parameters (profiling defaults off)
+        description: Normal phase/load parameters, or explicit allocation duration_seconds/concurrency
         required: true
         type: string
         default: '{"duration":"60m","warm_up":"3m","recovery_running":"15m","quiet_running":"5m","post_drain":"5m","concurrency":8,"payload_size":32768,"upload_size":1048576,"seed":700201,"scrape_interval_ms":1000,"sample_interval_ms":1000,"formal":true,"profiling":false}'
@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   qualification:
+    if: ${{ !startsWith(inputs.campaign, 'allocation-') }}
     name: Running resources (${{ matrix.campaign }})
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -65,3 +66,11 @@ jobs:
           path: ${{ runner.temp }}/resource-results/
           if-no-files-found: error
           retention-days: 30
+  allocation:
+    if: ${{ startsWith(inputs.campaign, 'allocation-') }}
+    uses: ./.github/workflows/resource-attribution.yml
+    with:
+      source_ref: ${{ inputs.source_ref }}
+      mode: ${{ inputs.campaign == 'allocation-launch' && 'launch' || 'attach' }}
+      duration_seconds: ${{ format('{0}', fromJSON(inputs.parameters).duration_seconds) }}
+      concurrency: ${{ format('{0}', fromJSON(inputs.parameters).concurrency) }}

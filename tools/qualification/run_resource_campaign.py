@@ -25,6 +25,29 @@ def capture(args):
     return subprocess.check_output(args, text=True).strip()
 
 
+def host_environment():
+    """Fixed, bounded host facts; unavailable memory is never a synthetic zero."""
+    memory = None
+    error = None
+    try:
+        with Path("/proc/meminfo").open("rb") as stream:
+            data = stream.read(65537)
+        if len(data) > 65536:
+            raise ValueError("meminfo exceeds observation bound")
+        matched = re.search(rb"^MemTotal:\s+([0-9]+) kB$", data, re.M)
+        if matched is None:
+            raise ValueError("MemTotal unavailable")
+        memory = int(matched[1])
+        if memory <= 0:
+            raise ValueError("MemTotal invalid")
+    except (OSError, ValueError):
+        memory = None
+        error = "host memory observation unavailable"
+    return {"logical_cpus": os.cpu_count(), "libc": list(platform.libc_ver()),
+            "memory_total_kib": memory, "memory_error": error,
+            "runner_image": {"os": os.environ.get("ImageOS"), "version": os.environ.get("ImageVersion")}}
+
+
 def parameters():
     params = json.loads(os.environ["RESOURCE_PARAMETERS"])
     allowed = {"duration", "warm_up", "recovery_running", "quiet_running", "post_drain",
@@ -81,6 +104,7 @@ def preflight(output):
               "parameters": params, "campaign": os.environ["RESOURCE_CAMPAIGN"],
               "run_id": os.environ.get("GITHUB_RUN_ID"), "job": os.environ.get("GITHUB_JOB"),
               "os": platform.platform(), "kernel": platform.release(), "machine": platform.machine(),
+              "host": host_environment(),
               "rustc": capture(["rustc", "-Vv"]), "cargo": capture(["cargo", "-V"]),
               "python": sys.version, "build_profile": "release", "allocator": "default Rust/system allocator; no substitution",
               "build_flags": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")},

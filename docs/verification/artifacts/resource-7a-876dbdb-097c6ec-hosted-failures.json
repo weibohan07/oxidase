@@ -1,0 +1,1541 @@
+{
+  "schema_version": "oxidase.resource-original-index/v1",
+  "scope": "two original failed Churn attempts, validation-only index; not a qualification pass",
+  "notes": [
+    "Original archives and analysis results are unchanged.",
+    "Missing phases and unavailable values remain null; a phase announcement is not completed Running evidence.",
+    "The canonical replay aborts on the incomplete timeline. Additional raw anomaly facts listed here are not a complete behavioral qualification.",
+    "Partial RSS/PSS/private-dirty/FD captures do not establish a leak, an allocator explanation or resource reclamation after a completed recovery/quiet window.",
+    "The ongoing healthy formal artifact is not covered by this index."
+  ],
+  "attempts": [
+    {
+      "run_id": 37201451796,
+      "run_url": "https://github.com/weibohan07/oxidase/actions/runs/37201451796",
+      "campaign": "C",
+      "head": "876dbdb8844efaa71ffb820d27b4a03597291fd5",
+      "original_result": "FAIL",
+      "formal_requested": false,
+      "source_set_sha256": "5230934136f59c999c05e27a848ec4fcd5438c7c7c044004ada6f817cb56f500",
+      "source_files": 168,
+      "binaries": [
+        {
+          "role": "gateway",
+          "sha256": "a531946c0340b885586e94b013d3bd3eb96f8f3f488df7842db95700f912be2b"
+        },
+        {
+          "role": "controller",
+          "sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40"
+        },
+        {
+          "role": "dns",
+          "sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40"
+        },
+        {
+          "role": "upstream",
+          "sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40"
+        },
+        {
+          "role": "sampler",
+          "sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40"
+        }
+      ],
+      "boot_id": "3054b75e-9627-4b7a-be06-ff0d7f488c99",
+      "roles": [
+        {
+          "role": "gateway",
+          "pid": 6259,
+          "start_ticks": 30027,
+          "binary_sha256": "a531946c0340b885586e94b013d3bd3eb96f8f3f488df7842db95700f912be2b",
+          "exe_sha256": "a531946c0340b885586e94b013d3bd3eb96f8f3f488df7842db95700f912be2b",
+          "proc_verified": true
+        },
+        {
+          "role": "controller",
+          "pid": 6239,
+          "start_ticks": 30022,
+          "binary_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "exe_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "proc_verified": true
+        },
+        {
+          "role": "dns",
+          "pid": 6253,
+          "start_ticks": 30027,
+          "binary_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "exe_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "proc_verified": true
+        },
+        {
+          "role": "upstream",
+          "pid": 6247,
+          "start_ticks": 30027,
+          "binary_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "exe_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "proc_verified": true
+        },
+        {
+          "role": "sampler",
+          "pid": 6267,
+          "start_ticks": 30038,
+          "binary_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "exe_sha256": "49d20fcfebb1388a957a634fc2298f30353701dae525749f8b2730d6861b4e40",
+          "proc_verified": true
+        }
+      ],
+      "artifact": {
+        "id": 11302922713,
+        "url": "https://github.com/weibohan07/oxidase/actions/runs/37201451796/artifacts/11302922713",
+        "provider_digest": "sha256:0d62292c9b2aa69abf9efb7ae85ded08a7ffdd60ee28ae064efb9562378dd2d9",
+        "archive_sha256": "0d62292c9b2aa69abf9efb7ae85ded08a7ffdd60ee28ae064efb9562378dd2d9",
+        "archive_matches_provider": true,
+        "checksums_file_sha256": "0185ac76fbc6de56d0352413902823738219e00fa6ddc04382fa5f1965c678d2",
+        "manifest_files": 37,
+        "manifest_mismatches": []
+      },
+      "independent_replay_equal_original": true,
+      "replay_verifier_sha256": "1c5321e65523d3713a5833826be049eb237c529c9bd385f3fa800d5a85d0b0be",
+      "parameters": {
+        "actual_worker_count": 10,
+        "admitted_worker_count": 10,
+        "campaign": "C",
+        "concurrency": 8,
+        "connection_request_budget": 1000,
+        "durations_ns": {
+          "post_drain": 60000000000,
+          "quiet": 60000000000,
+          "recovery": 120000000000,
+          "steady": 300000000000,
+          "warmup": 30000000000
+        },
+        "formal": false,
+        "isolation": "churn",
+        "max_sample_gap_ns": 4000000000,
+        "operation_interval_ns": 0,
+        "payload_bytes": 32768,
+        "sample_interval_ns": 1000000000,
+        "scrape_interval_ns": 1000000000,
+        "seed": 700213,
+        "traffic_required": true,
+        "upload_bytes": 1048576
+      },
+      "original_findings": [
+        {
+          "code": "RL_INCOMPLETE",
+          "result": "FAIL",
+          "message": "run did not finish with complete untruncated evidence"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "receipt contains fatal collection/worker/process errors"
+        },
+        {
+          "code": "RL_GRACEFUL_TLS_CLOSE",
+          "result": "INCONCLUSIVE",
+          "message": "full tunnel exchange ended with observed peer closure without TLS close_notify"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "fatal raw event",
+          "context": {
+            "error": null
+          }
+        },
+        {
+          "code": "RL_INVALID_EVIDENCE",
+          "result": "FAIL",
+          "message": "exactly five ordered phases and an end event are required"
+        }
+      ],
+      "fatal_errors": [
+        "qualification failed after collecting started work: [\"evidence artifact capacity exhausted; qualification incomplete\"]"
+      ],
+      "complete": false,
+      "artifact_truncated": true,
+      "phase_intervals": {
+        "warmup": {
+          "start_ns": 300405590891,
+          "next_phase_ns": 330494376160,
+          "interval_until_fatal_ns": null,
+          "status": "completed_warmup",
+          "observed_to_next_phase_ns": 30088785269
+        },
+        "steady": {
+          "start_ns": 330494376160,
+          "next_phase_ns": 458013752799,
+          "interval_until_fatal_ns": null,
+          "status": "incomplete_due_to_fatal",
+          "observed_to_next_phase_ns": 127519376639
+        },
+        "recovery": {
+          "start_ns": 458013752799,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": 728443,
+          "status": "announced_before_fatal_without_capture",
+          "observed_to_next_phase_ns": null
+        },
+        "quiet": {
+          "start_ns": null,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": null,
+          "status": "not_started",
+          "observed_to_next_phase_ns": null
+        },
+        "post_drain": {
+          "start_ns": null,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": null,
+          "status": "not_started",
+          "observed_to_next_phase_ns": null
+        }
+      },
+      "raw_conservation": {
+        "receipt_totals": {
+          "offered": 88516,
+          "connection_attempts": 266,
+          "admitted_http_operations": 88368,
+          "admitted_upgrade_operations": 148,
+          "received_operations": 88516
+        },
+        "stored_bucket_totals": {
+          "offered": 87648,
+          "connection_attempts": 263,
+          "admitted_http_operations": 87500,
+          "admitted_upgrade_operations": 148,
+          "received_operations": 87648
+        },
+        "stored_bucket_totals_match_receipt": false,
+        "missing_bucket_terminals": 868,
+        "per_worker_stored_ranges_contiguous": true,
+        "abandoned_operations": [],
+        "individual_non_normal_rows": 61071,
+        "compact_503_rows": 0,
+        "compact_503_operations": 0,
+        "receipt_non_complete": null
+      },
+      "retirements": {
+        "started": 70,
+        "terminal": 70,
+        "driver_results": {
+          "completed": 70
+        }
+      },
+      "partial_os_curves": {
+        "warmup": {
+          "os_captures": 30,
+          "metrics": {
+            "rss_kib": {
+              "observations": 30,
+              "first": 21240,
+              "peak": 28888,
+              "last": 28104
+            },
+            "pss_kib": {
+              "observations": 2,
+              "first": 25193,
+              "peak": 25432,
+              "last": 25432
+            },
+            "private_dirty_kib": {
+              "observations": 2,
+              "first": 25088,
+              "peak": 25324,
+              "last": 25324
+            },
+            "open_fds": {
+              "observations": 30,
+              "first": 18,
+              "peak": 35,
+              "last": 33
+            }
+          }
+        },
+        "steady": {
+          "os_captures": 127,
+          "metrics": {
+            "rss_kib": {
+              "observations": 127,
+              "first": 28788,
+              "peak": 30892,
+              "last": 28156
+            },
+            "pss_kib": {
+              "observations": 13,
+              "first": 26347,
+              "peak": 28438,
+              "last": 25714
+            },
+            "private_dirty_kib": {
+              "observations": 13,
+              "first": 26236,
+              "peak": 26236,
+              "last": 10208
+            },
+            "open_fds": {
+              "observations": 127,
+              "first": 34,
+              "peak": 35,
+              "last": 22
+            }
+          }
+        },
+        "recovery": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        },
+        "quiet": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        },
+        "post_drain": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        }
+      },
+      "last_running_resources": [
+        {
+          "kind": "snapshot",
+          "created": 14,
+          "destroyed": 13,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 1,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "cluster_permit",
+          "created": 88562,
+          "destroyed": 88562,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "endpoint_permit",
+          "created": 27784,
+          "destroyed": 27784,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "health_supervisor",
+          "created": 1,
+          "destroyed": 0,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 1,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "discovery_supervisor",
+          "created": 1,
+          "destroyed": 0,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 1,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "proxy_pool_family",
+          "created": 24,
+          "destroyed": 24,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "health_pool_family",
+          "created": 12,
+          "destroyed": 10,
+          "live": 2,
+          "state_live": {
+            "candidate": 0,
+            "current": 2,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_tcp_connection",
+          "created": 170,
+          "destroyed": 168,
+          "live": 2,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 2,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_tls_connection",
+          "created": 170,
+          "destroyed": 168,
+          "live": 2,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 2,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_task",
+          "created": 29387,
+          "destroyed": 29381,
+          "live": 6,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 6,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_upload_task",
+          "created": 5564,
+          "destroyed": 5564,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "response_body",
+          "created": 88539,
+          "destroyed": 88539,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "tunnel",
+          "created": 140,
+          "destroyed": 140,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        }
+      ],
+      "last_running_capture_ns": 458014559278,
+      "independent_coverage_before_timeline_failure": {
+        "tls_h2": 9,
+        "grpc_trailers": 9,
+        "complete_download": 9,
+        "upgrade": 1,
+        "old_held_grpc_and_upgrade": 1,
+        "srv_equal_answers": 4,
+        "srv_weighted_answers": 4,
+        "srv_weight_change": 4,
+        "header_deadline_counter": 9,
+        "total_deadline_counter": 1,
+        "signed_activate": 1,
+        "dns_nxdomain": 3,
+        "dns_all_withdraw": 15,
+        "positive_aaaa_answers": 3,
+        "positive_srv_round_counter": 3,
+        "signed_rollback": 1,
+        "dns_ttl_zero": 7
+      },
+      "runner_environment": {
+        "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "kernel": "6.17.0-1022-azure",
+        "machine": "x86_64",
+        "host": null,
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+        "build_profile": "release",
+        "allocator": "default Rust/system allocator; no substitution",
+        "build_flags": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null
+        },
+        "profiling": false
+      },
+      "confirmed_findings": [
+        {
+          "code": "tool.full_error_evidence_capacity",
+          "severity": "error",
+          "facts": {
+            "file": "campaign/errors.jsonl",
+            "bytes": 67108146,
+            "declared_limit_bytes": 67108864,
+            "individual_rows": 61071,
+            "last_stored_terminal_ns": 455486758607,
+            "missing_bucket_terminals": 868
+          },
+          "status": "FAIL; exact receipt counters do not replace missing raw terminals"
+        },
+        {
+          "code": "tool.ttl_zero_window_missing",
+          "severity": "error",
+          "facts": {
+            "control_ns": 451006431386,
+            "unwindowed_503_full_rows": 21656,
+            "closed_ttl_zero_window_present": false
+          },
+          "status": "FAIL; no retrospective whitelist"
+        }
+      ]
+    },
+    {
+      "run_id": 37204003262,
+      "run_url": "https://github.com/weibohan07/oxidase/actions/runs/37204003262",
+      "campaign": "C",
+      "head": "097c6ec373439fadd0a3204314fa47309740918c",
+      "original_result": "FAIL",
+      "formal_requested": true,
+      "source_set_sha256": "883e78c249876e13260145c138927317b33bdf6187c94b1e3f7ed9672c9f8076",
+      "source_files": 168,
+      "binaries": [
+        {
+          "role": "gateway",
+          "sha256": "28cb12fd9d5480f6f8366ad082b4ad66d1eea609c505cd37a001af28107e46d9"
+        },
+        {
+          "role": "controller",
+          "sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b"
+        },
+        {
+          "role": "dns",
+          "sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b"
+        },
+        {
+          "role": "upstream",
+          "sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b"
+        },
+        {
+          "role": "sampler",
+          "sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b"
+        }
+      ],
+      "boot_id": "8ede5924-30ab-4f54-8abf-89f75b44928b",
+      "roles": [
+        {
+          "role": "gateway",
+          "pid": 6420,
+          "start_ticks": 41753,
+          "binary_sha256": "28cb12fd9d5480f6f8366ad082b4ad66d1eea609c505cd37a001af28107e46d9",
+          "exe_sha256": "28cb12fd9d5480f6f8366ad082b4ad66d1eea609c505cd37a001af28107e46d9",
+          "proc_verified": true
+        },
+        {
+          "role": "controller",
+          "pid": 6398,
+          "start_ticks": 41748,
+          "binary_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "exe_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "proc_verified": true
+        },
+        {
+          "role": "dns",
+          "pid": 6412,
+          "start_ticks": 41753,
+          "binary_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "exe_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "proc_verified": true
+        },
+        {
+          "role": "upstream",
+          "pid": 6406,
+          "start_ticks": 41753,
+          "binary_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "exe_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "proc_verified": true
+        },
+        {
+          "role": "sampler",
+          "pid": 6428,
+          "start_ticks": 41765,
+          "binary_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "exe_sha256": "61e074bbbfbcda763e9f082ed9089f0fd9883488c30eeaaef29248e672d6444b",
+          "proc_verified": true
+        }
+      ],
+      "artifact": {
+        "id": 11303503786,
+        "url": "https://github.com/weibohan07/oxidase/actions/runs/37204003262/artifacts/11303503786",
+        "provider_digest": "sha256:eb0762eca9d840cb096b537fb80c681c11a44ceccb35ddcbd24c2e01776ca975",
+        "archive_sha256": "eb0762eca9d840cb096b537fb80c681c11a44ceccb35ddcbd24c2e01776ca975",
+        "archive_matches_provider": true,
+        "checksums_file_sha256": "3177d4f14528337b291b1e981690cc4b87403780af891c50049e0049cf89f858",
+        "manifest_files": 36,
+        "manifest_mismatches": []
+      },
+      "independent_replay_equal_original": true,
+      "replay_verifier_sha256": "1c5321e65523d3713a5833826be049eb237c529c9bd385f3fa800d5a85d0b0be",
+      "parameters": {
+        "actual_worker_count": 10,
+        "admitted_worker_count": 10,
+        "campaign": "C",
+        "concurrency": 8,
+        "connection_request_budget": 1000,
+        "durations_ns": {
+          "post_drain": 300000000000,
+          "quiet": 300000000000,
+          "recovery": 900000000000,
+          "steady": 3600000000000,
+          "warmup": 180000000000
+        },
+        "formal": true,
+        "isolation": "churn",
+        "max_sample_gap_ns": 4000000000,
+        "normal_dns_ttl_seconds": 5,
+        "operation_interval_ns": 0,
+        "payload_bytes": 32768,
+        "sample_interval_ns": 1000000000,
+        "scrape_interval_ns": 1000000000,
+        "seed": 700214,
+        "traffic_required": true,
+        "upload_bytes": 1048576
+      },
+      "original_findings": [
+        {
+          "code": "RL_INCOMPLETE",
+          "result": "FAIL",
+          "message": "run did not finish with complete untruncated evidence"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "receipt contains fatal collection/worker/process errors"
+        },
+        {
+          "code": "RL_GRACEFUL_TLS_CLOSE",
+          "result": "INCONCLUSIVE",
+          "message": "full tunnel exchange ended with observed peer closure without TLS close_notify"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "fatal raw event",
+          "context": {
+            "error": null
+          }
+        },
+        {
+          "code": "RL_INVALID_EVIDENCE",
+          "result": "FAIL",
+          "message": "exactly five ordered phases and an end event are required"
+        }
+      ],
+      "fatal_errors": [
+        "qualification failed after collecting started work: [\"resource.control_peer_recovery_unproven:dns_readd\"]"
+      ],
+      "complete": false,
+      "artifact_truncated": false,
+      "phase_intervals": {
+        "warmup": {
+          "start_ns": 417679207807,
+          "next_phase_ns": 597725731922,
+          "interval_until_fatal_ns": null,
+          "status": "completed_warmup",
+          "observed_to_next_phase_ns": 180046524115
+        },
+        "steady": {
+          "start_ns": 597725731922,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": 54465164354,
+          "status": "incomplete_due_to_fatal",
+          "observed_to_next_phase_ns": null
+        },
+        "recovery": {
+          "start_ns": null,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": null,
+          "status": "not_started",
+          "observed_to_next_phase_ns": null
+        },
+        "quiet": {
+          "start_ns": null,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": null,
+          "status": "not_started",
+          "observed_to_next_phase_ns": null
+        },
+        "post_drain": {
+          "start_ns": null,
+          "next_phase_ns": null,
+          "interval_until_fatal_ns": null,
+          "status": "not_started",
+          "observed_to_next_phase_ns": null
+        }
+      },
+      "raw_conservation": {
+        "receipt_totals": {
+          "offered": 88364,
+          "connection_attempts": 333,
+          "admitted_http_operations": 88135,
+          "admitted_upgrade_operations": 229,
+          "received_operations": 88364
+        },
+        "stored_bucket_totals": {
+          "offered": 88364,
+          "connection_attempts": 333,
+          "admitted_http_operations": 88135,
+          "admitted_upgrade_operations": 229,
+          "received_operations": 88364
+        },
+        "stored_bucket_totals_match_receipt": true,
+        "missing_bucket_terminals": 0,
+        "per_worker_stored_ranges_contiguous": true,
+        "abandoned_operations": [],
+        "individual_non_normal_rows": 465,
+        "compact_503_rows": 214,
+        "compact_503_operations": 24015,
+        "receipt_non_complete": 24480
+      },
+      "retirements": {
+        "started": 74,
+        "terminal": 74,
+        "driver_results": {
+          "completed": 74
+        }
+      },
+      "partial_os_curves": {
+        "warmup": {
+          "os_captures": 180,
+          "metrics": {
+            "rss_kib": {
+              "observations": 180,
+              "first": 21172,
+              "peak": 30736,
+              "last": 29908
+            },
+            "pss_kib": {
+              "observations": 16,
+              "first": 24996,
+              "peak": 28266,
+              "last": 27678
+            },
+            "private_dirty_kib": {
+              "observations": 16,
+              "first": 24908,
+              "peak": 25932,
+              "last": 12316
+            },
+            "open_fds": {
+              "observations": 180,
+              "first": 18,
+              "peak": 33,
+              "last": 33
+            }
+          }
+        },
+        "steady": {
+          "os_captures": 54,
+          "metrics": {
+            "rss_kib": {
+              "observations": 54,
+              "first": 29124,
+              "peak": 30552,
+              "last": 30176
+            },
+            "pss_kib": {
+              "observations": 6,
+              "first": 26654,
+              "peak": 27846,
+              "last": 27482
+            },
+            "private_dirty_kib": {
+              "observations": 6,
+              "first": 11292,
+              "peak": 12484,
+              "last": 12120
+            },
+            "open_fds": {
+              "observations": 54,
+              "first": 33,
+              "peak": 35,
+              "last": 33
+            }
+          }
+        },
+        "recovery": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        },
+        "quiet": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        },
+        "post_drain": {
+          "os_captures": 0,
+          "metrics": {
+            "rss_kib": null,
+            "pss_kib": null,
+            "private_dirty_kib": null,
+            "open_fds": null
+          }
+        }
+      },
+      "last_running_resources": [
+        {
+          "kind": "snapshot",
+          "created": 10,
+          "destroyed": 9,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 1,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "cluster_permit",
+          "created": 88403,
+          "destroyed": 88403,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "endpoint_permit",
+          "created": 64369,
+          "destroyed": 64369,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "health_supervisor",
+          "created": 1,
+          "destroyed": 0,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 1,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "discovery_supervisor",
+          "created": 1,
+          "destroyed": 0,
+          "live": 1,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 1,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "proxy_pool_family",
+          "created": 10,
+          "destroyed": 6,
+          "live": 4,
+          "state_live": {
+            "candidate": 0,
+            "current": 4,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "health_pool_family",
+          "created": 5,
+          "destroyed": 3,
+          "live": 2,
+          "state_live": {
+            "candidate": 0,
+            "current": 2,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_tcp_connection",
+          "created": 242,
+          "destroyed": 238,
+          "live": 4,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 4,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_tls_connection",
+          "created": 242,
+          "destroyed": 238,
+          "live": 4,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 4,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_task",
+          "created": 66910,
+          "destroyed": 66898,
+          "live": 12,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 12,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "upstream_upload_task",
+          "created": 12507,
+          "destroyed": 12507,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "response_body",
+          "created": 88393,
+          "destroyed": 88393,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        },
+        {
+          "kind": "tunnel",
+          "created": 227,
+          "destroyed": 227,
+          "live": 0,
+          "state_live": {
+            "candidate": 0,
+            "current": 0,
+            "live": 0,
+            "scheduled": 0,
+            "running": 0,
+            "waiting": 0,
+            "exiting": 0,
+            "retired": 0
+          }
+        }
+      ],
+      "last_running_capture_ns": 652190999608,
+      "independent_coverage_before_timeline_failure": {
+        "tls_h2": 9,
+        "grpc_trailers": 9,
+        "complete_download": 9,
+        "upgrade": 1,
+        "old_held_grpc_and_upgrade": 1,
+        "srv_equal_answers": 2,
+        "srv_weighted_answers": 2,
+        "srv_weight_change": 2,
+        "total_deadline_counter": 2,
+        "dns_nxdomain": 3
+      },
+      "runner_environment": {
+        "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "kernel": "6.17.0-1022-azure",
+        "machine": "x86_64",
+        "host": {
+          "logical_cpus": 4,
+          "libc": [
+            "glibc",
+            "2.39"
+          ],
+          "memory_total_kib": 16372432,
+          "memory_error": null,
+          "runner_image": {
+            "os": "ubuntu24",
+            "version": "20260927.320.1"
+          }
+        },
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+        "build_profile": "release",
+        "allocator": "default Rust/system allocator; no substitution",
+        "build_flags": {
+          "RUSTFLAGS": null,
+          "CARGO_ENCODED_RUSTFLAGS": null
+        },
+        "profiling": false
+      },
+      "confirmed_findings": [
+        {
+          "code": "tool.recovery_helper_discards_previously_proven_peer",
+          "severity": "error",
+          "facts": {
+            "window_id": "dns-nxdomain-3",
+            "window_end_ns": 650765329011,
+            "recovery_deadline_ns": 662765329011,
+            "complete_post_window_peer_proofs": [
+              {
+                "operation_id": "control-3-25",
+                "start_ns": 650765416726,
+                "end_ns": 650808217622,
+                "raw": {
+                  "status": 200,
+                  "eof": true,
+                  "body_bytes": 32768,
+                  "body_sha256": "427965f49a857174e308658227325dbd23ff4eccbe399d5ad4817dda3ec79f87",
+                  "content_type": "application/octet-stream",
+                  "trailers": {},
+                  "upstream_peer": "127.0.0.2:43941",
+                  "upstream_name": "b",
+                  "authority": "gateway.example.test",
+                  "server_name": "gateway.example.test",
+                  "path": "/base/resource/payload?b=2&a=1&a=3",
+                  "error_stage": null,
+                  "error_code": null
+                }
+              },
+              {
+                "operation_id": "control-3-26",
+                "start_ns": 650909492708,
+                "end_ns": 650952174295,
+                "raw": {
+                  "status": 200,
+                  "eof": true,
+                  "body_bytes": 32768,
+                  "body_sha256": "427965f49a857174e308658227325dbd23ff4eccbe399d5ad4817dda3ec79f87",
+                  "content_type": "application/octet-stream",
+                  "trailers": {},
+                  "upstream_peer": "127.0.0.1:43941",
+                  "upstream_name": "a",
+                  "authority": "gateway.example.test",
+                  "server_name": "gateway.example.test",
+                  "path": "/base/resource/payload?b=2&a=1&a=3",
+                  "error_stage": null,
+                  "error_code": null
+                }
+              }
+            ],
+            "later_probe_ids": [
+              "control-3-27",
+              "control-3-28",
+              "control-3-29",
+              "control-3-30",
+              "control-3-31",
+              "control-3-32",
+              "control-3-33",
+              "control-3-34"
+            ],
+            "later_probes_all_peer": "a"
+          },
+          "status": "controller FAIL preserved; does not prove B unavailable"
+        }
+      ],
+      "unresolved_actual_anomalies": [
+        {
+          "worker_id": 8,
+          "operation_seq": 3,
+          "phase": "warmup",
+          "lane": "cancel",
+          "start_ns": 428004227451,
+          "end_ns": 433739192252,
+          "window_id": null,
+          "raw": {
+            "started_ns": 428004235406,
+            "head_ns": 430698096876,
+            "ended_ns": 430738377384,
+            "status": 200,
+            "body_bytes": 1024,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 1,
+            "upstream_peer": "127.0.0.1:43941",
+            "error_stage": "fixture_ack",
+            "error_code": "cancellation_ack_missing",
+            "sender_ready": true,
+            "sender_closed_on_error": null,
+            "sender_error_category": null,
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 4080,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 638866571970,
+          "end_ns": 638867337625,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 638866573744,
+            "head_ns": null,
+            "ended_ns": 638867319568,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 5,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 3,
+          "operation_seq": 3934,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 639042902539,
+          "end_ns": 639043959282,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 639042903430,
+            "head_ns": null,
+            "ended_ns": 639043932777,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 6,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": false,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 4463,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 639399556172,
+          "end_ns": 639402108425,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 639399558064,
+            "head_ns": null,
+            "ended_ns": 639402083151,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 6,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 3,
+          "operation_seq": 4379,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 639633171328,
+          "end_ns": 639634314260,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 639633173031,
+            "head_ns": null,
+            "ended_ns": 639634293197,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 7,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 4870,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 639967802822,
+          "end_ns": 639968666683,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 639967803947,
+            "head_ns": null,
+            "ended_ns": 639968618772,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 7,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": false,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 3,
+          "operation_seq": 4796,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 640204717792,
+          "end_ns": 640208183757,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 640204719720,
+            "head_ns": null,
+            "ended_ns": 640208159704,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 8,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": false,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 5204,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 640396111380,
+          "end_ns": 640400115696,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 640396112380,
+            "head_ns": null,
+            "ended_ns": 640400095358,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 8,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 3,
+          "operation_seq": 5190,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 640733064418,
+          "end_ns": 640734446237,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 640733066435,
+            "head_ns": null,
+            "ended_ns": 640734317165,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 9,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": false,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 5643,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 640979384360,
+          "end_ns": 640979906823,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 640979385534,
+            "head_ns": null,
+            "ended_ns": 640979886938,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 9,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 3,
+          "operation_seq": 5675,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 641366898253,
+          "end_ns": 641366966392,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 641366899035,
+            "head_ns": null,
+            "ended_ns": 641366945633,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 10,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "cancelled",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        },
+        {
+          "worker_id": 7,
+          "operation_seq": 6021,
+          "phase": "steady",
+          "lane": "churn",
+          "start_ns": 641452395923,
+          "end_ns": 641454197041,
+          "window_id": "dns-nxdomain-3",
+          "raw": {
+            "started_ns": 641452397322,
+            "head_ns": null,
+            "ended_ns": 641454164768,
+            "status": null,
+            "body_bytes": 0,
+            "eof": false,
+            "protocol": "h2",
+            "connection_epoch": 10,
+            "upstream_peer": null,
+            "error_stage": "response_head",
+            "error_code": "transport_error",
+            "sender_ready": true,
+            "sender_closed_on_error": true,
+            "sender_error_category": "transport",
+            "cancel_ack": null,
+            "fixture_cancel_ack": false
+          },
+          "status": "unresolved; not whitelisted"
+        }
+      ]
+    }
+  ]
+}

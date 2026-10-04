@@ -3,7 +3,9 @@
 The independent analyzer reads `receipt.json`, `identity.json`, `events.jsonl`,
 `buckets.jsonl`, `errors.jsonl`, and `samples.jsonl`, plus the applicable
 `prelude-operations.json`, `control-probes.jsonl`, and
-`control-operations.jsonl` journals (a `.gz` suffix is also supported).
+`control-operations.jsonl` journals (a `.gz` suffix is also supported). The
+declared bounded fault representation additionally requires
+`compact-fault-results.jsonl`, including when it is empty.
 All timestamps are integer Linux `CLOCK_MONOTONIC` nanoseconds, not
 wall clock or an index. Files retain capture order. Unknown optional fields are
 allowed; missing required evidence is never filled with zero.
@@ -88,6 +90,50 @@ Stop halts admission, not collection. Upgrade handshakes use the separate
 `raw.admitted=true,raw.upgrade=true`; they are not ordinary HTTP response
 successes. `parameters.actual_worker_count` includes the separate low-frequency
 cancel/Upgrade workers; `concurrency` remains the number of normal workers.
+
+### Bounded contiguous safe-503 representation
+
+New receipts may explicitly declare
+`fault_result_storage: contiguous_safe_503_v1`. Old receipts without that marker
+retain the individual `errors.jsonl` contract; an undeclared compact file or an
+unknown marker is rejected. This is an encoding change, not an expected-fault
+verdict. Every Started and Terminal is still consumed by the producer. The
+producer and independent analyzer retain their bounded file/row limits; a full
+file fails collection instead of dropping evidence.
+
+Only consecutive, identical, fully received safe gateway 503 responses in the
+same worker/connection epoch and finite `churn`/`steady` window are compactable.
+Healthy or unwindowed failures, transport/post-head errors, cancellation and
+Upgrade still require individual rows. Each compact row has:
+
+```text
+schema_version: oxidase.resource-compact-fault/v1
+writer_seq, worker_id, first_operation_seq, last_operation_seq, count
+first_start_ns, last_start_ns, last_end_ns, min_head_ns, max_head_ns
+phase, lane, protocol, recipe, target, window_id
+connection_attempts, admitted, raw
+```
+
+`count` equals the inclusive consecutive sequence range length.
+`connection_attempts` is the same per-operation count, not the range total.
+`raw` is exactly the corresponding bucket's normalized wire object, without
+`operation_id`, `started_ns`, `head_ns`, or `ended_ns`; `connection_epoch` remains
+mandatory. Error stage/code are explicit nulls, diagnostics are empty, and
+cancelled/upgrade are false. Safe gateway metadata has no claimed upstream
+peer/name, authority, SNI or path, no trailers, and the complete independently
+checked `Service Unavailable` DATA bytes, SHA-256, Content-Type and EOF.
+
+The actual minimum/maximum response-head clocks must both fall inside the same
+declared finite target/lane/status window. First/last starts and last end must
+lie inside exactly one worker bucket. A context/epoch/bucket/retirement change,
+normal terminal or EOF flushes the pending range. Per-worker ranges retain raw
+capture order, cannot overlap individual error IDs or each other, and cannot
+cross bucket boundaries. Range counts must exactly match their bucket anomaly
+fingerprints and the final `compact_503_rows` / `compact_503_operations` storage
+counts. The independent analyzer checks ranges directly without expanding all
+represented operation IDs in memory; missing, orphaned, overlapping, corrupted
+or out-of-window ranges fail. No archive from a previous failed campaign is
+rewritten into this representation.
 Isolation modes without traffic explicitly set `traffic_required=false` and
 `actual_worker_count=0`. Control and probe lanes retain separate counters.
 
@@ -146,6 +192,19 @@ pair with exactly one Started. Its recipe is independently reconstructed from
 the fixed fixture request, not the reply. Coverage references `operation_id`.
 These probes are classified separately and cannot inflate worker denominators.
 
+For the fixed SRV campaign, `positive_aaaa` is an end-to-end proof, not a
+top-level A/AAAA supervisor metric. Coverage references the complete actual
+IPv6 probe and contains an explicit <=30s `observation_window`, original
+`before_raw/after_raw` DNS fixture status, `before_metrics/after_metrics` and
+`before_clusters/after_clusters`. The same finite window must prove positive
+AAAA replies, a successful `family="srv"` supervisor round, unchanged canonical
+service name `_https._tcp.api.discovery.test.`, an advanced membership generation
+and fresh eligible members. The physical IPv6 response must fall inside that
+window and still pass full DATA/EOF/trailer/SNI/authority/path validation.
+Internal target AAAA resolution does not increment a top-level
+`family="aaaa"` discovery-plan metric, and the verifier never relabels SRV as
+AAAA. An unrelated global counter or IPv6 response alone grants no coverage.
+
 `control-operations.jsonl` uses `oxidase.resource-control-operation/v1` and
 records only `control_round` Admin reads, fixture IPC and CLI mutations. Started
 has `writer_seq,operation_id,start_ns,operation,request`; Terminal adds
@@ -157,6 +216,29 @@ separately accepted only with actual cancellation/join acknowledgement.
 Mutation acknowledgement alone cannot prove publication: actual revision,
 ETag and origin transitions are independently checked. This scope does not
 claim that bootstrap, sampler startup or every legacy internal action is journaled.
+
+`client-retirements.jsonl` uses `oxidase.resource-client-retirement/v1` and a
+separate Started/Terminal denominator. It records `retirement_id:worker:epoch`,
+`worker_id,protocol,connection_epoch,start_ns,after_operation_seq,
+next_operation_seq,request_budget,submitted_requests`; Terminal adds `end_ns`
+and the actual `driver_exit` receipt. The validation fixture explicitly uses
+the existing listener budget of 1000 requests: the retired client's actual
+submitted count must equal that budget, and its driver must complete and join.
+This never silently retries an offered request or relaxes healthy-wire failures.
+Successful normal/cancel operations retain `raw.connection_epoch`; failed
+connection preparation preserves null, and reconnections may skip retirement
+epochs but cannot move them backwards. Upgrade uses its separate short-lived
+connection and is not this quota counter.
+
+At RetirementStarted the FIFO collector flushes that worker's normal bucket.
+The analyzer requires its last sequence N and terminal time to precede retirement,
+the next bucket to start with N+1 only after actual driver join, and a new epoch
+for that admission. A stop after joining can legitimately leave the last offered
+sequence at N; it cannot fabricate an N+1 response. Epoch counts are independently
+summed from the raw histogram, not accepted from the retirement counter alone.
+Missing/duplicate join results, 999/1001 counters, unjoined/error/timeout drivers,
+unflushed boundary buckets or reused retired epochs fail. Retirement control
+counts are not added to the normal offered/admitted/terminal denominator.
 
 `prelude-operations.json` has `schema_version: oxidase.resource-prelude/v1`,
 advisory `result`, and `evidence:{prelude_counts,prelude_operations}`. Every
@@ -174,6 +256,16 @@ The cancellation ACK is the fixture's actual Body Drop receipt:
 It must identify the offered operation and contain a legal DATA prefix; a bare
 `fixture_cancel_ack:true` cannot qualify a formal cancel lane. The Drop may race
 the client's local timestamp but must remain inside the collected ACK deadline.
+
+Multi-peer recovery uses one shared set of fresh, fully verified physical-peer
+responses, not separate A-then-B searches that discard a previously seen B.
+The original `fault_window.end_ns + 12s` deadline applies to every peer and is
+not refreshed per peer or probe. Each probe is recorded Started/Terminal with
+its actual connection/driver outcome; its wire timeout is at most nine seconds
+and the remaining original window budget. A timeout, bad body, absent peer or
+late driver join cannot establish recovery. The bounded 64-probe cap does not
+replace the time bound. Ordinary business operations are never replayed by
+this validation controller.
 
 Upgrade telemetry distinguishes normal DATA EOF from tunnel shutdown. A planned
 close requires all four (steady) or eight (retained) exact echo responses,
@@ -194,3 +286,14 @@ Reports use `PASS_IMPLEMENTATION`, `PASS_BOUNDED_QUALIFICATION`, `INCONCLUSIVE`,
 or `FAIL` per criterion. Formal minimum duration is not inferred from the requested
 duration. RSS drift alone neither proves a leak nor proves allocator retention.
 Unattributed persistent growth prevents a whole-run memory qualification pass.
+
+New wire facts may include nullable `h2_reason` and `h2_error_kind`. They are
+obtained by bounded traversal/downcast of the actual Hyper error chain, not
+formatted diagnostics or guesses about the remote endpoint. Kind is only
+`reset`, `goaway`, `io` or `other`; reason is a fixed RFC reason name or
+`unknown`. Missing legacy fields stay unavailable, not reconstructed from a
+coarse transport error. These facts do not change error classification or
+permit a transport failure inside a status-only fault window. Non-null error
+facts contradicting a complete success/safe-503 terminal fail independent
+validation. An actual single-send TLS/H2 REFUSED_STREAM fixture proves the
+reason capture; a non-reproducing test does not explain the original campaign.

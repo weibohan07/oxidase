@@ -230,6 +230,13 @@ pub(super) struct ResourceResponseFacts {
     pub(super) path: Option<String>,
     pub(super) error_stage: Option<String>,
     pub(super) error_code: Option<String>,
+    pub(super) sender_ready: Option<bool>,
+    pub(super) sender_closed_on_error: Option<bool>,
+    pub(super) sender_error_category: Option<String>,
+    /// Fixed protocol facts from the actual Hyper error source chain. Absence
+    /// means no H2 cause was available, not an inferred remote reset.
+    pub(super) h2_reason: Option<String>,
+    pub(super) h2_error_kind: Option<String>,
     pub(super) cancelled: bool,
     pub(super) data_observed: bool,
     pub(super) fixture_cancel_ack: bool,
@@ -265,6 +272,11 @@ impl ResourceResponseFacts {
             path: None,
             error_stage: None,
             error_code: None,
+            sender_ready: None,
+            sender_closed_on_error: None,
+            sender_error_category: None,
+            h2_reason: None,
+            h2_error_kind: None,
             cancelled: false,
             data_observed: false,
             fixture_cancel_ack: false,
@@ -356,6 +368,7 @@ pub(super) struct ResourceDataClient {
     h2: bool,
     targets: Vec<(String, SocketAddr)>,
     local_response: bool,
+    submitted_requests: u64,
 }
 
 impl Drop for ResourceDataClient {
@@ -441,7 +454,26 @@ impl ResourceDataClient {
             h2,
             targets,
             local_response,
+            submitted_requests: 0,
         })
+    }
+
+    /// Submitted attempts, not successful responses: an error or cancellation
+    /// after handing the request to Hyper still consumes the fixture budget.
+    pub(super) fn submitted_requests(&self) -> u64 {
+        self.submitted_requests
+    }
+
+    pub(super) fn needs_retirement(&self) -> bool {
+        self.submitted_requests >= super::RESOURCE_REQUESTS_PER_CONNECTION
+    }
+
+    fn count_request_submission(&mut self) -> Result<(), SoakError> {
+        self.submitted_requests = self
+            .submitted_requests
+            .checked_add(1)
+            .ok_or_else(|| fail("resource client request counter exhausted"))?;
+        Ok(())
     }
 
     pub(super) async fn close(self) -> Result<(), SoakError> {
@@ -515,6 +547,16 @@ impl ResourceDataClient {
             .header("x-resource-operation-id", operation_id)
             .body(GeneratedUpload::new(false, 0))
             .map_err(io_error)?;
+        if self.sender.is_none() {
+            return Err(fail("fixture acknowledgement client closed"));
+        }
+        match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.ready().await,
+            Some(ResourceSender::H2(sender)) => sender.ready().await,
+            None => return Err(fail("fixture acknowledgement client closed")),
+        }
+        .map_err(io_error)?;
+        self.count_request_submission()?;
         let response = match self.sender.as_mut() {
             Some(ResourceSender::H1(sender)) => sender.send_request(request).await,
             Some(ResourceSender::H2(sender)) => sender.send_request(request).await,
@@ -634,6 +676,28 @@ impl ResourceDataClient {
             resource_error(facts, "request", "request_headers_invalid");
             return;
         };
+        if self.sender.is_none() {
+            resource_error(facts, "response_head", "client_closed");
+            return;
+        }
+        // Body EOF and owning a SendRequest are not dispatcher admission. This
+        // wait stays inside measure's existing total deadline; it neither sends
+        // nor consumes body bytes, and never retries an already-started request.
+        let ready = match self.sender.as_mut() {
+            Some(ResourceSender::H1(sender)) => sender.ready().await,
+            Some(ResourceSender::H2(sender)) => sender.ready().await,
+            None => unreachable!("sender existence checked without cancellation gap"),
+        };
+        facts.sender_ready = Some(ready.is_ok());
+        if let Err(error) = ready {
+            self.record_sender_error(facts, &error);
+            resource_error(facts, "response_head", "transport_error");
+            return;
+        }
+        if self.count_request_submission().is_err() {
+            resource_error(facts, "request", "client_request_counter_exhausted");
+            return;
+        }
         let response = match self.sender.as_mut() {
             Some(ResourceSender::H1(sender)) => sender.send_request(built).await,
             Some(ResourceSender::H2(sender)) => sender.send_request(built).await,
@@ -642,9 +706,13 @@ impl ResourceDataClient {
                 return;
             }
         };
-        let Ok(response) = response else {
-            resource_error(facts, "response_head", "transport_error");
-            return;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_sender_error(facts, &error);
+                resource_error(facts, "response_head", "transport_error");
+                return;
+            }
         };
         facts.status = Some(response.status().as_u16());
         match super::resource_identity::monotonic_ns() {
@@ -684,9 +752,13 @@ impl ResourceDataClient {
         };
         let mut trailers_seen = false;
         while let Some(frame) = body.frame().await {
-            let Ok(frame) = frame else {
-                resource_error(facts, "response_body", "body_error");
-                return;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    record_h2_error(facts, &error);
+                    resource_error(facts, "response_body", "body_error");
+                    return;
+                }
             };
             if let Some(data) = frame.data_ref() {
                 if trailers_seen {
@@ -740,6 +812,28 @@ impl ResourceDataClient {
         facts.eof = true;
     }
 
+    fn record_sender_error(&self, facts: &mut ResourceResponseFacts, error: &hyper::Error) {
+        record_h2_error(facts, error);
+        facts.sender_closed_on_error = self.sender.as_ref().map(|sender| match sender {
+            ResourceSender::H1(sender) => sender.is_closed(),
+            ResourceSender::H2(sender) => sender.is_closed(),
+        });
+        facts.sender_error_category = Some(
+            if error.is_canceled() {
+                "cancelled"
+            } else if error.is_closed() {
+                "closed"
+            } else if error.is_parse() {
+                "parse"
+            } else if error.is_timeout() {
+                "timeout"
+            } else {
+                "transport"
+            }
+            .to_owned(),
+        );
+    }
+
     fn check_peer_metadata(&self, facts: &mut ResourceResponseFacts, path: &str) {
         if facts.status == Some(200) && self.local_response {
             if facts.upstream_peer.is_some()
@@ -769,6 +863,51 @@ impl ResourceDataClient {
                 facts.diagnostics.push("path_mismatch".into());
             }
         }
+    }
+}
+
+fn record_h2_error(facts: &mut ResourceResponseFacts, error: &hyper::Error) {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    // The trusted library chain is finite, but keep traversal bounded rather
+    // than formatting arbitrary diagnostic strings into operation evidence.
+    for _ in 0..16 {
+        let Some(error) = source else { return };
+        if let Some(error) = error.downcast_ref::<h2::Error>() {
+            facts.h2_error_kind = Some(
+                if error.is_reset() {
+                    "reset"
+                } else if error.is_go_away() {
+                    "goaway"
+                } else if error.is_io() {
+                    "io"
+                } else {
+                    "other"
+                }
+                .into(),
+            );
+            facts.h2_reason = error.reason().map(|reason| {
+                match reason {
+                    h2::Reason::NO_ERROR => "no_error",
+                    h2::Reason::PROTOCOL_ERROR => "protocol_error",
+                    h2::Reason::INTERNAL_ERROR => "internal_error",
+                    h2::Reason::FLOW_CONTROL_ERROR => "flow_control_error",
+                    h2::Reason::SETTINGS_TIMEOUT => "settings_timeout",
+                    h2::Reason::STREAM_CLOSED => "stream_closed",
+                    h2::Reason::FRAME_SIZE_ERROR => "frame_size_error",
+                    h2::Reason::REFUSED_STREAM => "refused_stream",
+                    h2::Reason::CANCEL => "cancel",
+                    h2::Reason::COMPRESSION_ERROR => "compression_error",
+                    h2::Reason::CONNECT_ERROR => "connect_error",
+                    h2::Reason::ENHANCE_YOUR_CALM => "enhance_your_calm",
+                    h2::Reason::INADEQUATE_SECURITY => "inadequate_security",
+                    h2::Reason::HTTP_1_1_REQUIRED => "http_1_1_required",
+                    _ => "unknown",
+                }
+                .into()
+            });
+            return;
+        }
+        source = error.source();
     }
 }
 
@@ -3640,6 +3779,859 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 mod tests {
     use super::*;
 
+    async fn six_fixture_upgrade_receipts(
+        address: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Vec<Result<ResourceResponseFacts, String>> {
+        let mut results = Vec::new();
+        for sequence in 0..6 {
+            let operation_id = format!("fixture-upgrade:{sequence}");
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let (socket, raw) =
+                    open_upgrade_capture(address, Arc::clone(&config), true, None).await?;
+                let mut raw = raw.ok_or_else(|| fail("missing actual Upgrade head"))?;
+                raw.operation_id = operation_id;
+                if let Some(mut socket) = socket {
+                    let mut digest = Sha256::new();
+                    echo_upgrade_capture(&mut socket, Some(&mut raw), Some(&mut digest), None)
+                        .await?;
+                    observe_tunnel_close(&mut socket, &mut raw, 4).await?;
+                    raw.ended_ns = Some(super::super::resource_identity::monotonic_ns()?);
+                }
+                Ok::<_, SoakError>(raw)
+            })
+            .await;
+            results.push(match result {
+                Ok(Ok(raw)) => Ok(raw),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("actual fixture Upgrade deadline".into()),
+            });
+        }
+        results
+    }
+
+    #[tokio::test]
+    async fn resource_payload_retry_does_not_contaminate_independent_upgrade_lane() {
+        let identity = identity().expect("ephemeral TLS identity");
+        let config = client_config(&[&identity], &[b"http/1.1"]).expect("verified client");
+        let fixture = super::super::fixture::resource_test_fixture(&identity).await;
+        fixture.set_retry_a(true);
+        let peer = fixture.address.to_string();
+        let results = six_fixture_upgrade_receipts(fixture.address, config).await;
+        let replies = fixture.retryable_status_replies();
+        fixture.stop().await;
+        assert_eq!(results.len(), 6, "every started handshake was collected");
+        let statuses: Vec<_> = results
+            .iter()
+            .map(|result| result.as_ref().map(|raw| raw.status))
+            .collect();
+        assert_eq!(
+            replies, 0,
+            "ordinary payload retry must not emit unplanned Upgrade failures: {statuses:?}"
+        );
+        let digest: String = Sha256::digest(b"qualification-tunnel".repeat(4))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        for raw in results {
+            let raw = raw.expect("actual handshake and tunnel outcome, not omitted work");
+            assert_eq!(raw.status, Some(101));
+            assert!(raw.request_head_sent && raw.tunnel_client_shutdown && raw.eof);
+            assert_eq!(raw.tunnel_close_result.as_deref(), Some("clean_eof"));
+            assert_eq!(raw.echo_iterations, 4);
+            assert_eq!(raw.body_bytes, 80);
+            assert_eq!(raw.body_sha256, digest);
+            assert_eq!(raw.upstream_peer.as_deref(), Some(peer.as_str()));
+            assert_eq!(raw.upstream_name.as_deref(), Some("a"));
+            assert_eq!(raw.authority.as_deref(), Some("gateway.example.test"));
+            assert_eq!(raw.server_name.as_deref(), Some("gateway.example.test"));
+            assert_eq!(raw.path.as_deref(), Some("/ws"));
+            assert_eq!(
+                raw.upgrade_headers.get("connection").map(String::as_str),
+                Some("upgrade")
+            );
+            assert_eq!(
+                raw.upgrade_headers.get("upgrade").map(String::as_str),
+                Some("websocket")
+            );
+            assert_eq!(
+                raw.upgrade_headers
+                    .get("sec-websocket-accept")
+                    .map(String::as_str),
+                Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_fixture_keeps_original_upgrade_retry_behavior_when_resource_mode_is_absent() {
+        let identity = identity().expect("ephemeral identity");
+        let config = client_config(&[&identity], &[b"http/1.1"]).expect("verified legacy client");
+        let fixture =
+            super::super::fixture::resource_test_fixture_in_mode(&identity, "a", false).await;
+        fixture.set_retry_a(true);
+        let results = six_fixture_upgrade_receipts(fixture.address, config).await;
+        let retries = fixture.retryable_status_replies();
+        fixture.stop().await;
+        assert_eq!(results.len(), 6, "all legacy operations collected");
+        assert_eq!(
+            retries, 2,
+            "legacy every-third GET retry semantics unchanged"
+        );
+        let tunnel_digest: String = Sha256::digest(b"qualification-tunnel".repeat(4))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let rejection_digest: String = Sha256::digest(b"retryable")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        for (sequence, raw) in results.into_iter().enumerate() {
+            let raw = raw.expect("actual legacy wire outcome collected");
+            assert!(raw.request_head_sent && raw.eof);
+            if sequence % 3 == 0 {
+                assert_eq!(raw.status, Some(503));
+                assert_eq!(raw.body_bytes, 9);
+                assert_eq!(raw.body_sha256, rejection_digest);
+                assert_eq!(raw.echo_iterations, 0);
+                assert!(!raw.tunnel_client_shutdown);
+            } else {
+                assert_eq!(raw.status, Some(101));
+                assert_eq!(raw.body_bytes, 80);
+                assert_eq!(raw.body_sha256, tunnel_digest);
+                assert_eq!(raw.echo_iterations, 4);
+                assert!(raw.tunnel_client_shutdown);
+                assert_eq!(raw.tunnel_close_result.as_deref(), Some("clean_eof"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_retry_fixture_drives_real_gateway_a_to_b_pre_head_retry() {
+        let directory = tempfile::tempdir().expect("isolated test source");
+        let identity = identity().expect("ephemeral TLS identity");
+        write_identity(directory.path(), &identity).expect("test certificate files");
+        let a = super::super::fixture::resource_test_fixture_named(&identity, "a").await;
+        let b = super::super::fixture::resource_test_fixture_named(&identity, "b").await;
+        a.set_retry_a(true);
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  trust_stores:
+    fixture:
+      ca_bundle: gateway.pem
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: a
+          url: https://{}/base
+        - name: b
+          url: https://{}/base
+      load_balance:
+        policy: round_robin
+      tls:
+        server_name: gateway.example.test
+        trust:
+          system_roots: false
+          trust_store: fixture
+      retry:
+        max_attempts: 2
+        methods: [GET]
+        statuses: [503]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 8
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    service:
+      ref: root
+"#,
+            a.address, b.address
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real cluster preparation");
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("ephemeral admin"))
+            .await
+            .expect("test-only read-only admin")
+            .spawn();
+        let mut client = ResourceDataClient::connect(
+            gateway.local_addresses()[0].1,
+            client_config(&[&identity], &[b"h2"]).expect("verified TLS/H2 client"),
+            true,
+            vec![("a".into(), a.address), ("b".into(), b.address)],
+        )
+        .await
+        .expect("actual downstream connection");
+        let raw = client
+            .measure(ResourceRequest {
+                operation_id: "actual-retry:0".into(),
+                path: "/resource/payload?b=2&a=1&a=3".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        let mut metrics_socket =
+            TcpStream::connect(gateway.admin_address().expect("actual admin socket"))
+                .await
+                .expect("metrics connection");
+        metrics_socket
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("actual metrics request");
+        let mut metrics = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            metrics_socket.take(256 * 1024).read_to_end(&mut metrics),
+        )
+        .await
+        .expect("bounded metrics collection")
+        .expect("complete metrics response");
+        let retries_a = a.retryable_status_replies();
+        let retries_b = b.retryable_status_replies();
+        let expected_b = b.address.to_string();
+        gateway
+            .shutdown()
+            .await
+            .expect("all gateway work collected");
+        a.stop().await;
+        b.stop().await;
+        assert_eq!(
+            submitted, 1,
+            "one logical downstream operation, not client retry"
+        );
+        assert_eq!(retries_a, 1, "actual A returned the retryable status");
+        assert_eq!(retries_b, 0);
+        assert_eq!(raw.status, Some(200));
+        assert!(
+            raw.eof && raw.error_code.is_none(),
+            "actual retry wire facts: {raw:?}"
+        );
+        // This exact static-endpoint control intentionally uses B's numeric
+        // origin authority, unlike the resource campaign's logical DNS origin.
+        // Assert it explicitly; do not weaken the ordinary campaign oracle.
+        assert_eq!(raw.diagnostics, ["authority_mismatch"]);
+        assert_eq!(raw.authority.as_deref(), Some(expected_b.as_str()));
+        assert_eq!(raw.server_name.as_deref(), Some("gateway.example.test"));
+        assert!(raw.h2_reason.is_none() && raw.h2_error_kind.is_none());
+        assert_eq!(raw.upstream_name.as_deref(), Some("b"));
+        assert_eq!(raw.upstream_peer.as_deref(), Some(expected_b.as_str()));
+        assert_eq!(
+            raw.path.as_deref(),
+            Some("/base/resource/payload?b=2&a=1&a=3")
+        );
+        assert_eq!(raw.body_bytes, 32768);
+        let digest: String = Sha256::digest(vec![b'x'; 32768])
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(raw.body_sha256, digest);
+        assert_eq!(
+            raw.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert!(raw.trailers.is_empty());
+        assert_eq!(close["result"], "completed");
+        let metrics = String::from_utf8(metrics).expect("fixed Prometheus UTF-8");
+        assert!(
+            metrics.len() < 256 * 1024,
+            "metrics reached real EOF before the collection bound"
+        );
+        assert!(metrics.starts_with("HTTP/1.1 200"));
+        assert!(
+            metrics
+                .lines()
+                .any(|line| line == "oxidase_cluster_retry_attempts_total{cluster=\"api\"} 1"),
+            "actual gateway retry metric: {metrics}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_h2_cancel_ack_is_actual_upstream_drop_while_connection_remains_open() {
+        let directory = tempfile::tempdir().expect("isolated test source");
+        let identity = identity().expect("ephemeral TLS identity");
+        write_identity(directory.path(), &identity).expect("test certificate files");
+        let upstream = super::super::fixture::resource_test_fixture(&identity).await;
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  trust_stores:
+    fixture:
+      ca_bundle: gateway.pem
+  clusters:
+    api:
+      protocol: h2
+      endpoints: ["https://{}/base"]
+      tls:
+        server_name: gateway.example.test
+        trust:
+          system_roots: false
+          trust_store: fixture
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    service:
+      ref: root
+"#,
+            upstream.address
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real TLS/cluster preparation");
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let h2 = client_config(&[&identity], &[b"h2"]).expect("H2 test trust");
+        let ack = client_config(&[&identity], &[b"http/1.1"]).expect("H1 ACK test trust");
+        let mut client = ResourceDataClient::connect(
+            gateway.local_addresses()[0].1,
+            h2,
+            true,
+            vec![("a".into(), upstream.address)],
+        )
+        .await
+        .expect("actual TLS/H2 downstream");
+        let mut operations = Vec::new();
+        for sequence in 0..8 {
+            let operation_id = format!("cancel-proof:{sequence}");
+            let raw = client
+                .measure(ResourceRequest {
+                    operation_id: operation_id.clone(),
+                    path: "/resource/cancel?b=2&a=1&a=3".into(),
+                    grpc: false,
+                    cancel_after_first_data: true,
+                    payload_size: 32768,
+                    upload_bytes: 0,
+                })
+                .await;
+            let receipt =
+                await_fixture_cancel_receipt(upstream.address, Arc::clone(&ack), &operation_id)
+                    .await;
+            operations.push((raw, receipt));
+        }
+        let sibling = client
+            .measure(ResourceRequest {
+                operation_id: "same-connection-normal:8".into(),
+                path: "/resource/payload?b=2&a=1&a=3".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        gateway.shutdown().await.expect("real gateway tasks joined");
+        upstream.stop().await;
+        for (raw, receipt) in operations {
+            let receipt =
+                receipt.expect("same H2 connection was still open while actual Drop ACK arrived");
+            assert_eq!(raw.status, Some(200));
+            assert!(raw.cancelled && raw.data_observed && !raw.eof && raw.error_code.is_none());
+            assert_eq!(raw.body_bytes, 1024);
+            assert_eq!(receipt["operation_id"], raw.operation_id);
+            assert_eq!(receipt["body_dropped_after_data"], true);
+            assert_eq!(receipt["body_bytes"], 1024);
+            let dropped = receipt["dropped_ns"]
+                .as_u64()
+                .expect("actual upstream Drop clock");
+            assert!(dropped >= raw.head_ns.expect("real response head"));
+            assert!(dropped <= raw.ended_ns.expect("actual body cancellation") + 3_000_000_000);
+        }
+        assert_eq!(sibling.status, Some(200));
+        assert!(sibling.eof && sibling.error_code.is_none());
+        assert_eq!(sibling.body_bytes, 32768);
+        assert_eq!(
+            submitted, 9,
+            "eight cancellations plus one same-connection operation, no retry"
+        );
+        assert_eq!(close["result"], "completed");
+        assert_eq!(close["join_acknowledged"], true);
+    }
+
+    #[tokio::test]
+    async fn resource_h2_reset_reason_is_from_actual_tls_wire_without_retry() {
+        use rustls::pki_types::pem::PemObject as _;
+        let identity = identity().expect("ephemeral test identity");
+        let config = client_config(&[&identity], &[b"h2"]).expect("verified client");
+        let key =
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+                .expect("test-only private key");
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS defaults")
+        .with_no_client_auth()
+        .with_single_cert(vec![identity.certificate_der], key)
+        .expect("matching key");
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral fixture");
+        let address = listener.local_addr().expect("actual socket");
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("one client");
+            let socket = tokio_rustls::TlsAcceptor::from(Arc::new(server))
+                .accept(socket)
+                .await
+                .expect("verified TLS");
+            let mut connection = h2::server::handshake(socket).await.expect("real H2");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("one submitted operation")
+                .expect("valid request");
+            assert_eq!(request.uri().path(), "/resource/respond");
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            assert!(
+                connection.accept().await.is_none(),
+                "no retry or fixture transport error"
+            );
+        });
+        let mut client = ResourceDataClient::connect_local(address, config, true)
+            .await
+            .expect("real TLS/H2 client");
+        let raw = client
+            .measure(ResourceRequest {
+                operation_id: "wire-reset:1".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let driver = client.close_receipt().await;
+        tokio::time::timeout(Duration::from_secs(2), fixture)
+            .await
+            .expect("all fixture work collected")
+            .expect("fixture did not panic");
+        assert_eq!(raw.status, None);
+        assert_eq!(raw.error_stage.as_deref(), Some("response_head"));
+        assert_eq!(raw.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(raw.h2_reason.as_deref(), Some("refused_stream"));
+        assert_eq!(raw.h2_error_kind.as_deref(), Some("reset"));
+        assert_eq!(submitted, 1, "no retry of refused logical request");
+        assert_eq!(driver["join_acknowledged"], true);
+    }
+
+    #[tokio::test]
+    async fn resource_tls_h2_unavailable_discovery_preserves_complete_503_for_uploads() {
+        let directory = tempfile::tempdir().expect("isolated test-only source");
+        let identity = identity().expect("ephemeral test-only TLS identity");
+        write_identity(directory.path(), &identity).expect("test-only certificate files");
+        // A bound local resolver that deliberately supplies no answers: the
+        // prepared discovery resource has no eligible endpoints throughout.
+        // There is no public DNS or upstream server to influence this control.
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral controlled resolver");
+        let dns_address = dns.local_addr().expect("actual resolver socket");
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  clusters:
+    api:
+      protocol: h2
+      discovery:
+        dns:
+          name: endpoint.example.invalid
+          record: a_aaaa
+          port: 8443
+          origin: https://gateway.example.test:8443/base
+          resolver:
+            nameservers: ["{dns_address}"]
+            query_timeout: 100ms
+          refresh:
+            min_interval: 50ms
+            max_interval: 100ms
+            jitter_percent: 0
+            stale_if_error: 0ms
+          limits:
+            max_endpoints: 2
+            max_targets: 2
+          address_policy:
+            allow_private: true
+            allow_loopback: true
+            allow_link_local: false
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    limits:
+      max_requests_per_connection: 1000
+    service:
+      ref: root
+"#
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded test source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real discovery preparation without resolution");
+        let cluster =
+            Arc::clone(&snapshot.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")]);
+        assert!(cluster.endpoints().is_empty());
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("real gateway binds")
+            .spawn();
+        let address = gateway.local_addresses()[0].1;
+        let config = client_config(&[&identity], &[b"h2"]).expect("verified TLS/H2 client");
+        let mut lanes = Vec::new();
+        for upload_bytes in [0, 1024 * 1024] {
+            let mut client = ResourceDataClient::connect(
+                address,
+                Arc::clone(&config),
+                true,
+                vec![(
+                    "unreachable".into(),
+                    "127.0.0.1:8443".parse().expect("fixture peer"),
+                )],
+            )
+            .await
+            .expect("actual downstream TLS/H2 connection");
+            let mut operations = Vec::new();
+            for sequence in 0..512 {
+                let raw = client
+                    .measure(ResourceRequest {
+                        operation_id: format!("unavailable-{upload_bytes}:{sequence}"),
+                        path: "/resource/upload?b=2&a=1&a=3".into(),
+                        grpc: false,
+                        cancel_after_first_data: false,
+                        payload_size: 1,
+                        upload_bytes,
+                    })
+                    .await;
+                let failed = raw.error_code.is_some();
+                operations.push(raw);
+                // No hidden reconnection/retry after a started failure; keep
+                // every actual result and close the same transport explicitly.
+                if failed {
+                    break;
+                }
+            }
+            let submitted = client.submitted_requests();
+            let close = client.close_receipt().await;
+            lanes.push((upload_bytes, operations, submitted, close));
+        }
+        let empty_at_end = cluster.endpoints().is_empty();
+        gateway.shutdown().await.expect("gateway work collected");
+        drop(dns);
+        let expected_digest: String = Sha256::digest(b"Service Unavailable")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(empty_at_end, "control never acquired an eligible endpoint");
+        for (upload_bytes, operations, submitted, close) in lanes {
+            assert_eq!(
+                submitted,
+                operations.len() as u64,
+                "one actual send per operation"
+            );
+            let failures: Vec<_> = operations
+                .iter()
+                .filter(|raw| {
+                    raw.status != Some(503)
+                        || !raw.eof
+                        || raw.body_bytes != 19
+                        || raw.body_sha256 != expected_digest
+                        || raw.content_type.as_deref() != Some("text/plain; charset=utf-8")
+                        || raw.error_code.is_some()
+                        || raw.h2_reason.is_some()
+                        || raw.h2_error_kind.is_some()
+                        || !raw.trailers.is_empty()
+                })
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "upload_bytes={upload_bytes}; actual={failures:?}; driver={close}"
+            );
+            assert_eq!(operations.len(), 512);
+            assert_eq!(close["join_acknowledged"], true);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_http1_waits_for_occupied_dispatcher_without_retry() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            let service =
+                hyper::service::service_fn(move |_request: Request<hyper::body::Incoming>| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                                .body(Full::new(Bytes::from_static(b"resource-respond")))
+                                .expect("bounded local response"),
+                        )
+                    }
+                });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+        });
+        let (mut sender, connection) = http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("handshake returns a sender before driver polling");
+        // Hyper allows one initial queued request before the driver asks for
+        // work. Keep that real HEAD operation and collect it below, so the
+        // next operation must observe actual dispatcher backpressure.
+        let queued = sender.send_request(
+            Request::builder()
+                .method(http::Method::HEAD)
+                .uri("/resource/respond")
+                .header(header::HOST, "gateway.example.test")
+                .body(GeneratedUpload::new(false, 0))
+                .expect("first real operation"),
+        );
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        // No yield: the current-thread runtime has not polled the spawned
+        // driver. Merely having a sender does not mean its dispatcher is ready.
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 1,
+        };
+        let facts = client
+            .measure(ResourceRequest {
+                operation_id: "fresh-dispatcher".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        let prior = tokio::time::timeout(Duration::from_secs(2), queued).await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("all server work collected")
+            .expect("server task did not panic")
+            .expect("server transport ended normally");
+        assert_eq!(close["result"], "completed");
+        assert_eq!(close["join_acknowledged"], true);
+        let mut prior = prior
+            .expect("queued operation bounded")
+            .expect("queued operation completed");
+        assert_eq!(prior.status(), http::StatusCode::OK);
+        assert_eq!(prior.headers()[header::CONTENT_LENGTH], "16");
+        assert!(
+            prior.body_mut().frame().await.is_none(),
+            "HEAD observed EOS"
+        );
+        assert_eq!(
+            facts.status,
+            Some(200),
+            "dispatcher admission must not become a fake transport failure: {facts:?}; actual server received {} requests",
+            received.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(facts.eof && facts.error_code.is_none());
+        assert_eq!(facts.body_bytes, 16);
+        assert_eq!(submitted, 2, "two actual operations, not hidden retries");
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn resource_client_retires_at_the_exact_declared_submission_budget() {
+        let mut client = ResourceDataClient {
+            sender: None,
+            driver: None,
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        assert_eq!(super::super::RESOURCE_REQUESTS_PER_CONNECTION, 1000);
+        for _ in 0..999 {
+            client.count_request_submission().expect("bounded attempt");
+        }
+        assert_eq!(client.submitted_requests(), 999);
+        assert!(!client.needs_retirement(), "not an artificial early close");
+        client.count_request_submission().expect("1000th attempt");
+        assert_eq!(client.submitted_requests(), 1000);
+        assert!(
+            client.needs_retirement(),
+            "retire before submitting request 1001"
+        );
+        client
+            .count_request_submission()
+            .expect("no hidden counter reset");
+        assert_eq!(client.submitted_requests(), 1001);
+        assert!(client.needs_retirement());
+        client.submitted_requests = u64::MAX;
+        assert!(client.count_request_submission().is_err());
+        assert_eq!(client.submitted_requests(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn resource_client_closed_before_ready_is_failed_without_submission_or_retry() {
+        let (socket, peer) = tokio::io::duplex(1024);
+        let (sender, connection) = http1::handshake(TokioIo::new(socket))
+            .await
+            .expect("real Hyper sender");
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        drop(peer);
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        let failed = client
+            .measure(ResourceRequest {
+                operation_id: "actual-failed-attempt".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        assert_eq!(failed.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(failed.error_stage.as_deref(), Some("response_head"));
+        assert!(failed.status.is_none() && !failed.eof);
+        assert_eq!(failed.sender_ready, Some(false));
+        assert_eq!(failed.sender_closed_on_error, Some(true));
+        assert_eq!(failed.sender_error_category.as_deref(), Some("closed"));
+        assert_eq!(client.submitted_requests(), 0, "closed before actual send");
+        assert!(!client.needs_retirement());
+        let closed = client.close_receipt().await;
+        assert_eq!(closed["join_acknowledged"], true);
+        assert!(closed["exit_ns"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn resource_client_counts_actual_submitted_head_failure_without_retry() {
+        let (socket, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(peer.read_u8().await.expect("actual submitted request"));
+                assert!(head.len() <= 16384);
+            }
+            assert!(head.starts_with(b"GET /resource/respond HTTP/1.1\r\n"));
+            // A real post-submission transport failure, not dispatcher capacity.
+            drop(peer);
+        });
+        let (sender, connection) = http1::handshake(TokioIo::new(socket))
+            .await
+            .expect("real Hyper sender");
+        let driver = tokio::spawn(async move {
+            connection
+                .await
+                .map_err(|_| "http1_driver_error".to_owned())
+        });
+        let mut client = ResourceDataClient {
+            sender: Some(ResourceSender::H1(sender)),
+            driver: Some(driver),
+            h2: false,
+            targets: Vec::new(),
+            local_response: true,
+            submitted_requests: 0,
+        };
+        let failed = client
+            .measure(ResourceRequest {
+                operation_id: "actual-failed-submission".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        assert_eq!(failed.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(failed.error_stage.as_deref(), Some("response_head"));
+        assert!(failed.status.is_none() && !failed.eof);
+        assert_eq!(failed.sender_ready, Some(true));
+        assert_eq!(client.submitted_requests(), 1);
+        let closed = client.close_receipt().await;
+        assert_eq!(closed["join_acknowledged"], true);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture failure collected")
+            .expect("fixture did not panic");
+    }
+
     #[test]
     fn retained_upgrade_requires_actual_a_socket_and_all_logical_metadata() {
         let fixture_a: SocketAddr = "127.0.0.1:43210".parse().expect("numeric fixture address");
@@ -3776,6 +4768,7 @@ mod tests {
             h2: true,
             targets: Vec::new(),
             local_response: true,
+            submitted_requests: 0,
         };
         let mut facts = ResourceResponseFacts::blank("local".into(), "h2");
         facts.status = Some(200);
@@ -3800,6 +4793,7 @@ mod tests {
             h2: true,
             targets: vec![("a".into(), "127.0.0.1:8080".parse().expect("numeric peer"))],
             local_response: false,
+            submitted_requests: 0,
         };
         let mut missing = ResourceResponseFacts::blank("proxy".into(), "h2");
         missing.status = Some(200);
@@ -3888,6 +4882,21 @@ mod tests {
             let mut client = ResourceDataClient::connect_local(address, config, h2)
                 .await
                 .expect("explicit local transport");
+            let invalid = client
+                .measure(ResourceRequest {
+                    operation_id: "not-submitted".into(),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 0,
+                    upload_bytes: 0,
+                })
+                .await;
+            assert_eq!(
+                invalid.error_code.as_deref(),
+                Some("request_parameters_invalid")
+            );
+            assert_eq!(client.submitted_requests(), 0);
             let raw = client
                 .measure(ResourceRequest {
                     operation_id: "local-wire".into(),
@@ -3899,6 +4908,8 @@ mod tests {
                 })
                 .await;
             assert_eq!(raw.status, Some(200));
+            assert_eq!(client.submitted_requests(), 1);
+            assert!(!client.needs_retirement());
             assert!(raw.eof && raw.error_code.is_none() && raw.diagnostics.is_empty());
             assert_eq!(raw.body_bytes, 16);
             let expected: String = Sha256::digest(b"resource-respond")
@@ -3918,6 +4929,19 @@ mod tests {
                     && raw.path.is_none(),
                 "local response does not fabricate fixture metadata from transport"
             );
+            client.sender.take();
+            let closed = client
+                .measure(ResourceRequest {
+                    operation_id: "not-submitted-closed".into(),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 1,
+                    upload_bytes: 0,
+                })
+                .await;
+            assert_eq!(closed.error_code.as_deref(), Some("client_closed"));
+            assert_eq!(client.submitted_requests(), 1);
             client.close().await.expect("actual client driver exit");
             tokio::time::timeout(Duration::from_secs(2), task)
                 .await
@@ -4158,6 +5182,7 @@ mod tests {
                 h2: false,
                 targets: Vec::new(),
                 local_response: false,
+                submitted_requests: 0,
             };
             let receipt = client.close_receipt().await;
             assert_eq!(receipt["result"], expected);
@@ -4174,6 +5199,7 @@ mod tests {
             h2: false,
             targets: Vec::new(),
             local_response: false,
+            submitted_requests: 0,
         }
         .close_receipt()
         .await;
@@ -4196,6 +5222,11 @@ mod tests {
             "authority",
             "server_name",
             "path",
+            "sender_ready",
+            "sender_closed_on_error",
+            "sender_error_category",
+            "h2_reason",
+            "h2_error_kind",
         ] {
             assert!(raw[key].is_null(), "unavailable {key} is not fabricated");
         }

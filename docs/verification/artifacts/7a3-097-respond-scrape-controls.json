@@ -1,0 +1,214 @@
+{
+  "source_commit": "097c6ec373439fadd0a3204314fa47309740918c",
+  "schema_version": "oxidase.scrape-isolation-comparison/v1",
+  "scope": "Respond-only matched controls; independent hosts; not H/C qualification or performance guarantee",
+  "controls": [
+    {
+      "run_id": 37204272371,
+      "result": "INCONCLUSIVE",
+      "counts": {
+        "client_retirements.offered": 168,
+        "client_retirements.received": 168,
+        "offered": 170467,
+        "connection_attempts": 176,
+        "admitted_http_operations": 170467,
+        "received_operations": 170467,
+        "admitted_upgrade_operations": 0,
+        "completed_success": 170467
+      },
+      "verified_wire_responses": 170467,
+      "findings": [
+        {
+          "code": "RL_SAMPLE_COVERAGE",
+          "result": "INCONCLUSIVE",
+          "message": "first/final-only isolation sampling cannot prove Running lifecycle intervals",
+          "context": {
+            "source": "admin"
+          }
+        },
+        {
+          "code": "RL_MEMORY_ATTRIBUTION",
+          "result": "INCONCLUSIVE",
+          "message": "positive RSS drift has no retained-allocation attribution in this evidence",
+          "context": {
+            "phase": "steady",
+            "delta_kib": 676
+          }
+        }
+      ],
+      "sampling": {
+        "os": {
+          "captures": 570,
+          "capture_duration_ns": {
+            "min": 208947,
+            "median": 276125,
+            "p95": 521716,
+            "max": 723802
+          },
+          "start_interval_ns": {
+            "min": 999302312,
+            "median": 1000343186,
+            "p95": 1000557513,
+            "max": 1000777660
+          }
+        },
+        "admin": {
+          "captures": 1,
+          "capture_duration_ns": {
+            "min": 879168,
+            "median": 879168,
+            "p95": 879168,
+            "max": 879168
+          },
+          "start_interval_ns": null
+        }
+      },
+      "phase_durations_ns": {
+        "warmup": 30001328959,
+        "steady": 300001247386,
+        "recovery": 120002036535,
+        "quiet": 60009363482,
+        "post_drain": 60004733883
+      }
+    },
+    {
+      "run_id": 37204274513,
+      "result": "INCONCLUSIVE",
+      "counts": {
+        "client_retirements.offered": 168,
+        "client_retirements.received": 168,
+        "offered": 170443,
+        "connection_attempts": 176,
+        "admitted_http_operations": 170443,
+        "received_operations": 170443,
+        "admitted_upgrade_operations": 0,
+        "completed_success": 170443
+      },
+      "verified_wire_responses": 170443,
+      "findings": [
+        {
+          "code": "RL_MEMORY_ATTRIBUTION",
+          "result": "INCONCLUSIVE",
+          "message": "positive RSS drift has no retained-allocation attribution in this evidence",
+          "context": {
+            "phase": "steady",
+            "delta_kib": 620
+          }
+        }
+      ],
+      "sampling": {
+        "os": {
+          "captures": 570,
+          "capture_duration_ns": {
+            "min": 434101,
+            "median": 659819,
+            "p95": 1279463,
+            "max": 1785182
+          },
+          "start_interval_ns": {
+            "min": 999055937,
+            "median": 1000022438,
+            "p95": 1000576327,
+            "max": 1000968804
+          }
+        },
+        "admin": {
+          "captures": 570,
+          "capture_duration_ns": {
+            "min": 785742,
+            "median": 1116902,
+            "p95": 1354921,
+            "max": 2399682
+          },
+          "start_interval_ns": {
+            "min": 16827971,
+            "median": 1000023413,
+            "p95": 1000556614,
+            "max": 1000977829
+          }
+        }
+      },
+      "phase_durations_ns": {
+        "warmup": 30001376303,
+        "steady": 300000995395,
+        "recovery": 120002409990,
+        "quiet": 60008071881,
+        "post_drain": 60005649756
+      }
+    },
+    {
+      "run_id": 37204276220,
+      "result": "INCONCLUSIVE",
+      "counts": {
+        "client_retirements.offered": 168,
+        "client_retirements.received": 168,
+        "offered": 170522,
+        "connection_attempts": 176,
+        "admitted_http_operations": 170522,
+        "received_operations": 170522,
+        "admitted_upgrade_operations": 0,
+        "completed_success": 170522
+      },
+      "verified_wire_responses": 170522,
+      "findings": [
+        {
+          "code": "RL_MEMORY_ATTRIBUTION",
+          "result": "INCONCLUSIVE",
+          "message": "positive RSS drift has no retained-allocation attribution in this evidence",
+          "context": {
+            "phase": "steady",
+            "delta_kib": 480
+          }
+        },
+        {
+          "code": "RL_MEMORY_ATTRIBUTION",
+          "result": "INCONCLUSIVE",
+          "message": "positive RSS drift has no retained-allocation attribution in this evidence",
+          "context": {
+            "phase": "recovery",
+            "delta_kib": 144
+          }
+        }
+      ],
+      "sampling": {
+        "admin": {
+          "captures": 2280,
+          "capture_duration_ns": {
+            "min": 671321,
+            "median": 1001861,
+            "p95": 1219908,
+            "max": 2036242
+          },
+          "start_interval_ns": {
+            "min": 17989518,
+            "median": 250199766,
+            "p95": 250571286,
+            "max": 251111057
+          }
+        },
+        "os": {
+          "captures": 570,
+          "capture_duration_ns": {
+            "min": 388095,
+            "median": 644605,
+            "p95": 1244234,
+            "max": 1508428
+          },
+          "start_interval_ns": {
+            "min": 999106664,
+            "median": 1000004956,
+            "p95": 1000705573,
+            "max": 1001017845
+          }
+        }
+      },
+      "phase_durations_ns": {
+        "warmup": 30001160722,
+        "steady": 300001739227,
+        "recovery": 120002759177,
+        "quiet": 60008875334,
+        "post_drain": 60005976300
+      }
+    }
+  ]
+}

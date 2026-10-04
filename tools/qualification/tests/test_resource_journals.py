@@ -73,6 +73,107 @@ def labelled_metrics_corpus():
     return data
 
 
+def retirement_corpus():
+    data = corpus()
+    for bucket in data["buckets.jsonl"]:
+        bucket["outcomes"][0]["raw"]["connection_epoch"] = 1 if bucket["worker_id"] != 0 or bucket["first_operation_seq"] == 1 else 2
+    first = data["buckets.jsonl"][0]
+    second = copy.deepcopy(first["outcomes"][0])
+    second["count"] = 999
+    second["raw"]["connection_attempted"] = False
+    first["outcomes"].append(second)
+    first.update(last_operation_seq=1000, offered=1000, received_operations=1000, admitted_http_operations=1000)
+    for bucket in data["buckets.jsonl"]:
+        if bucket["worker_id"] == 0 and bucket is not first:
+            bucket["first_operation_seq"] += 999
+            bucket["last_operation_seq"] += 999
+    final = data["receipt.json"]["final_counts"]
+    for key in ("offered", "received_operations", "admitted_http_operations"):
+        final[key] += 999
+        final["workers"][0][key] += 999
+    final["workers"][0]["last_operation_seq"] += 999
+    start = first["bucket_end_ns"] + 10
+    started = {"schema_version": "oxidase.resource-client-retirement/v1", "kind": "started", "writer_seq": 1,
+               "retirement_id": "0:1", "worker_id": 0, "protocol": "http1", "connection_epoch": 1,
+               "start_ns": start, "after_operation_seq": 1000, "next_operation_seq": 1001,
+               "request_budget": 1000, "submitted_requests": 1000}
+    terminal = {**started, "kind": "terminal", "writer_seq": 2, "end_ns": start + 10,
+                "driver_exit": {"result": "completed", "join_acknowledged": True, "abort_requested": False, "exit_ns": start + 5}}
+    data["client-retirements.jsonl"] = [started, terminal]
+    return data
+
+
+def positive_aaaa_corpus():
+    data = probe_corpus()
+    data["receipt.json"]["parameters"]["campaign"] = "C"
+    peer = "[::1]:23456"
+    data["receipt.json"]["fixture_peers"] = {"ipv6": peer}
+    data["receipt.json"]["recipes"]["download"]["allowed_peers"].append(peer)
+    terminal = data["control-probes.jsonl"][1]
+    terminal["raw"]["upstream_peer"] = peer
+    before = {"clusters": [{"cluster": "upstream", "protocol": "h2", "discovery": {
+        "name": "_https._tcp.api.discovery.test.", "generation": 4, "resolution": "fresh",
+        "eligible_endpoints": 2, "srv_targets": [{"target": "a.discovery.test.", "port": 23456, "priority": 0, "weight": 1}]}}]}
+    after = copy.deepcopy(before)
+    after["clusters"][0]["discovery"]["generation"] = 5
+    after["clusters"][0]["discovery"]["srv_targets"] = [{"target": "v6.discovery.test.", "port": 23456, "priority": 0, "weight": 1}]
+    series = 'oxidase_discovery_queries_total{cluster="upstream",family="srv",result="positive"}'
+    evidence = {"source": "control_probe", "operation_id": terminal["operation_id"], "expected_peer": peer,
+                "observation_window": {"start_ns": 11 * NS, "end_ns": 11 * NS + 100, "deadline_ns": 11 * NS + 30 * NS},
+                "before_raw": {"positive_aaaa_answers": 0}, "after_raw": {"positive_aaaa_answers": 3},
+                "before_metrics": series + " 7\n", "after_metrics": series + " 8\n",
+                "before_clusters": before, "after_clusters": after}
+    insert_event(data, {"kind": "coverage", "t_ns": 11 * NS + 101, "name": "positive_aaaa", "evidence": evidence})
+    return data
+
+
+def compact_fault_corpus(count=3):
+    """New bounded encoding for the same independently checked safe 503s."""
+    data = fault_corpus()
+    for bucket in data["buckets.jsonl"]:
+        for outcome in bucket["outcomes"]:
+            outcome["target"] = "upstream"
+    window = next(row for row in data["events.jsonl"] if row["kind"] == "fault_window")
+    window.update(target="upstream", lanes=["churn"])
+    bucket = data["buckets.jsonl"][2]
+    outcome = bucket["outcomes"][0]
+    outcome.update(lane="churn", count=count)
+    raw = outcome["raw"]
+    raw.update(error_stage=None, error_code=None, cancelled=False, upgrade=False,
+               diagnostics=[], data_observed=True, connection_epoch=1,
+               upstream_peer=None, upstream_name=None, authority=None, server_name=None,
+               path=None, trailers={})
+    start, end = bucket["bucket_start_ns"], bucket["bucket_end_ns"]
+    last_start = start if count == 1 else start + 10
+    minimum, maximum = start + 1, (start + 1 if count == 1 else start + 11)
+    outcome.update(first_start_ns=start, last_start_ns=last_start, last_end_ns=end)
+    compact = {"schema_version": "oxidase.resource-compact-fault/v1", "writer_seq": 1,
+               "worker_id": bucket["worker_id"], "first_operation_seq": 2,
+               "last_operation_seq": count + 1, "count": count, "first_start_ns": start,
+               "last_start_ns": last_start, "last_end_ns": end,
+               "min_head_ns": minimum, "max_head_ns": maximum,
+               "phase": "steady", "lane": "churn", "protocol": outcome["protocol"],
+               "recipe": outcome["recipe"], "target": "upstream", "window_id": outcome["window_id"],
+               "connection_attempts": 0, "admitted": True, "raw": copy.deepcopy(raw)}
+    data["compact-fault-results.jsonl"] = [compact]
+    data["errors.jsonl"] = []
+    bucket.update(last_operation_seq=count + 1, offered=count,
+                  admitted_http_operations=count, received_operations=count)
+    for later in data["buckets.jsonl"][3:]:
+        if later["worker_id"] == bucket["worker_id"]:
+            later["first_operation_seq"] += count - 1
+            later["last_operation_seq"] += count - 1
+    receipt = data["receipt.json"]
+    receipt["fault_result_storage"] = "contiguous_safe_503_v1"
+    final = receipt["final_counts"]
+    final.update(compact_503_rows=1, compact_503_operations=count)
+    for key in ("offered", "received_operations", "admitted_http_operations"):
+        final[key] += count - 1
+        final["workers"][0][key] += count - 1
+    final["workers"][0]["last_operation_seq"] += count - 1
+    return data
+
+
 def prelude_corpus():
     data = retained_corpus()
     proof = data["events.jsonl"][1]["evidence"]["raw"]
@@ -119,6 +220,134 @@ class IndependentJournalTests(unittest.TestCase):
                 self.assertEqual(report["counts"]["control_operations.offered"], 1)
                 self.assertEqual(report["counts"]["control_operations.completed"], 1)
                 self.assertEqual(report["counts"]["offered"], 6)
+
+    def test_compact_safe_503_uses_same_independent_wire_and_conserves_range(self):
+        data = compact_fault_corpus()
+        report = self.verify(data)
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["expected_injected_failure"], 3)
+        self.assertEqual(report["counts"]["compact_503_rows"], 1)
+        self.assertEqual(report["counts"]["compact_503_operations"], 3)
+        self.assertEqual(report["counts"]["offered"], 8)
+        self.assertEqual(report, self.verify(copy.deepcopy(data)))
+
+    def test_compact_large_range_is_not_expanded_to_individual_ids(self):
+        report = self.verify(compact_fault_corpus(5_000_000))
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["expected_injected_failure"], 5_000_000)
+        self.assertEqual(report["counts"]["compact_503_rows"], 1)
+
+    def test_compact_marker_requires_empty_file_and_rejects_unknown_version(self):
+        data = corpus()
+        data["receipt.json"]["fault_result_storage"] = "contiguous_safe_503_v1"
+        data["receipt.json"]["final_counts"].update(compact_503_rows=0, compact_503_operations=0)
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data["compact-fault-results.jsonl"] = []
+        self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
+        data["receipt.json"]["fault_result_storage"] = "unknown"
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data["receipt.json"].pop("fault_result_storage")
+        self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_compact_missing_range_count_orphan_overlap_and_double_count(self):
+        for change, code in (("missing", "RL_MISSING_RESULT"), ("count", "RL_INVALID_EVIDENCE"),
+                             ("orphan", "RL_ABANDONED_RESULT"), ("overlap", "RL_INVALID_EVIDENCE"),
+                             ("double", "RL_COMPACT_OVERLAP")):
+            with self.subTest(change=change):
+                data = compact_fault_corpus()
+                row = data["compact-fault-results.jsonl"][0]
+                if change == "missing":
+                    data["compact-fault-results.jsonl"].clear()
+                elif change == "count":
+                    row["count"] += 1
+                elif change == "orphan":
+                    row["worker_id"] = 99
+                elif change == "overlap":
+                    duplicate = copy.deepcopy(row)
+                    duplicate["writer_seq"] = 2
+                    data["compact-fault-results.jsonl"].append(duplicate)
+                else:
+                    data["errors.jsonl"] = [{**copy.deepcopy(row), "operation_seq": row["first_operation_seq"],
+                        "start_ns": row["first_start_ns"], "end_ns": row["last_end_ns"], "head_ns": row["min_head_ns"]}]
+                self.fail(data, code)
+
+    def test_compact_never_crosses_bucket_or_retirement_boundary(self):
+        data = compact_fault_corpus()
+        row = data["compact-fault-results.jsonl"][0]
+        row["last_operation_seq"] += 1
+        row["count"] += 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+        data = compact_fault_corpus()
+        row = data["compact-fault-results.jsonl"][0]
+        row["last_end_ns"] = data["buckets.jsonl"][2]["bucket_end_ns"] + 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+        data = compact_fault_corpus()
+        data["buckets.jsonl"][2]["outcomes"][0]["first_start_ns"] += 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+
+    def test_compact_extrema_cannot_escape_window_or_fabricate_order(self):
+        for field in ("min_head_ns", "max_head_ns", "last_start_ns"):
+            data = compact_fault_corpus()
+            row = data["compact-fault-results.jsonl"][0]
+            row[field] = row["last_end_ns"] + 1
+            self.fail(data, "RL_INVALID_EVIDENCE")
+        data = compact_fault_corpus()
+        window = next(row for row in data["events.jsonl"] if row["kind"] == "fault_window")
+        window["end_ns"] = data["compact-fault-results.jsonl"][0]["max_head_ns"] - 1
+        self.fail(data, "RL_COMPACT_SCOPE")
+        data = compact_fault_corpus(1)
+        data["compact-fault-results.jsonl"][0]["max_head_ns"] += 1
+        self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_compact_healthy_wrong_phase_lane_target_window_or_epoch_is_not_whitelisted(self):
+        for field, value in (("lane", "healthy"), ("phase", "warmup"), ("target", "other"),
+                             ("window_id", "missing")):
+            with self.subTest(field=field):
+                data = compact_fault_corpus()
+                data["compact-fault-results.jsonl"][0][field] = value
+                self.fail(data, "RL_COMPACT_SCOPE")
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["raw"]["connection_epoch"] = 2
+        self.fail(data, "RL_MISSING_RESULT")
+        data = compact_fault_corpus()
+        for row in (data["buckets.jsonl"][2]["outcomes"][0], data["compact-fault-results.jsonl"][0]):
+            row["lane"] = "healthy"
+        self.fail(data, "RL_COMPACT_SCOPE")
+
+    def test_compact_bad_safe_body_and_metadata_are_not_excused_by_window(self):
+        for key, value, code in (("body_sha256", "0" * 64, "RL_CONTENT"),
+                                 ("content_type", "application/grpc", "RL_CONTENT"),
+                                 ("trailers", {"grpc-status": "0"}, "RL_COMPACT_CONTENT"),
+                                 ("authority", "forged", "RL_COMPACT_CONTENT"),
+                                 ("eof", False, "RL_INVALID_EVIDENCE"),
+                                 ("cancelled", True, "RL_INVALID_EVIDENCE"),
+                                 ("error_stage", "response_body", "RL_INVALID_EVIDENCE")):
+            with self.subTest(key=key):
+                data = compact_fault_corpus()
+                for row in (data["buckets.jsonl"][2]["outcomes"][0], data["compact-fault-results.jsonl"][0]):
+                    row["raw"][key] = value
+                self.fail(data, code)
+
+    def test_compact_writer_counter_and_uncompressed_gap_cannot_be_forged(self):
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["writer_seq"] = 2
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data = compact_fault_corpus()
+        data["receipt.json"]["final_counts"]["compact_503_operations"] = 2
+        self.fail(data, "RL_RESULT_CONSERVATION")
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["first_operation_seq"] += 1
+        data["compact-fault-results.jsonl"][0]["count"] -= 1
+        self.fail(data, "RL_MISSING_RESULT")
+        data = compact_fault_corpus()
+        # A range cannot hide beside a normal-success histogram just because
+        # its IDs are inside a valid worker bucket and storage totals match.
+        raw = data["buckets.jsonl"][2]["outcomes"][0]["raw"]
+        recipe = data["receipt.json"]["recipes"]["download"]
+        raw.update(status=200, body_bytes=17, body_sha256=hashlib.sha256(b"x" * 17).hexdigest(),
+                   content_type=None, upstream_peer=recipe["allowed_peers"][0], upstream_name="a",
+                   authority=recipe["authority"], server_name=recipe["server_name"], path=recipe["path"])
+        self.fail(data, "RL_COMPACT_MATCH")
 
     def test_control_missing_duplicate_and_changed_terminal_identity(self):
         for change in ("missing", "duplicate", "time"):
@@ -366,6 +595,130 @@ class IndependentJournalTests(unittest.TestCase):
         measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin" and row["phase"] == "warmup")
         measured["metrics"] = ""
         self.fail(data, "RL_MISSING_GAUGE")
+
+    def test_budget_retirement_has_independent_counter_and_actual_before_admission_boundary(self):
+        report = self.verify(retirement_corpus())
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["client_retirements.offered"], 1)
+        self.assertEqual(report["counts"]["client_retirements.received"], 1)
+        self.assertEqual(report["counts"]["offered"], 1005)
+
+    def test_missing_duplicate_and_changed_retirement_terminal_are_not_received(self):
+        for change in ("missing", "duplicate", "epoch", "next_sequence"):
+            data = retirement_corpus()
+            if change == "missing":
+                data["client-retirements.jsonl"].pop()
+                code = "RL_RETIREMENT_RESULT"
+            elif change == "duplicate":
+                row = copy.deepcopy(data["client-retirements.jsonl"][1])
+                row["writer_seq"] = 3
+                data["client-retirements.jsonl"].append(row)
+                code = "RL_INVALID_EVIDENCE"
+            else:
+                row = data["client-retirements.jsonl"][1]
+                row["connection_epoch" if change == "epoch" else "next_operation_seq"] += 1
+                code = "RL_INVALID_EVIDENCE"
+            self.fail(data, code)
+
+    def test_driver_exit_error_timeout_unknown_or_unjoined_cannot_qualify_retirement(self):
+        for result in ("error", "cancelled", "panicked", "timeout", "unavailable"):
+            data = retirement_corpus()
+            data["client-retirements.jsonl"][1]["driver_exit"]["result"] = result
+            self.fail(data, "RL_RETIREMENT_DRIVER")
+        data = retirement_corpus()
+        data["client-retirements.jsonl"][1]["driver_exit"]["join_acknowledged"] = False
+        self.fail(data, "RL_RETIREMENT_DRIVER")
+
+    def test_early_or_over_budget_retirement_counter_cannot_replace_actual_count(self):
+        for submitted in (999, 1001):
+            data = retirement_corpus()
+            for row in data["client-retirements.jsonl"]:
+                row["submitted_requests"] = submitted
+            self.fail(data, "RL_RETIREMENT_BUDGET")
+        data = retirement_corpus()
+        data["buckets.jsonl"][0]["outcomes"][0]["raw"]["connection_epoch"] = 2
+        self.fail(data, "RL_RETIREMENT_BUDGET")
+
+    def test_old_terminal_must_precede_close_and_new_admission_must_follow_join(self):
+        for change in ("old_end", "new_start", "reused_epoch", "protocol"):
+            data = retirement_corpus()
+            if change == "old_end":
+                data["buckets.jsonl"][0]["bucket_end_ns"] = data["client-retirements.jsonl"][0]["start_ns"] + 1
+                code = "RL_RETIREMENT_BOUNDARY"
+            elif change == "new_start":
+                terminal = data["client-retirements.jsonl"][1]
+                terminal["end_ns"] = data["buckets.jsonl"][2]["bucket_start_ns"] + 1
+                code = "RL_RETIREMENT_BOUNDARY"
+            elif change == "reused_epoch":
+                data["buckets.jsonl"][2]["outcomes"][0]["raw"]["connection_epoch"] = 1
+                code = "RL_RETIREMENT_IDENTITY"
+            else:
+                for row in data["client-retirements.jsonl"]:
+                    row["protocol"] = "h2"
+                code = "RL_RETIREMENT_IDENTITY"
+            self.fail(data, code)
+
+    def test_connection_failure_epochs_can_skip_but_cannot_go_backwards(self):
+        data = retirement_corpus()
+        for bucket in data["buckets.jsonl"]:
+            if bucket["worker_id"] == 0:
+                epoch = bucket["outcomes"][0]["raw"]["connection_epoch"]
+                for outcome in bucket["outcomes"]:
+                    outcome["raw"]["connection_epoch"] = epoch + 2
+        for row in data["client-retirements.jsonl"]:
+            row["connection_epoch"] = 3
+            row["retirement_id"] = "0:3"
+        self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
+        backwards = copy.deepcopy(data["client-retirements.jsonl"][0])
+        backwards.update(writer_seq=3, connection_epoch=2, retirement_id="0:2")
+        data["client-retirements.jsonl"].append(backwards)
+        self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_srv_internal_aaaa_requires_real_counter_refresh_and_complete_physical_ipv6(self):
+        report = self.verify(positive_aaaa_corpus())
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["coverage"]["positive_aaaa"], 1)
+        # A top-level A/AAAA supervisor metric is deliberately absent: its zero
+        # is not relabelled or replaced by the SRV counter.
+        self.assertNotIn('family="aaaa"', str(report["curves"]))
+
+    def test_positive_aaaa_wrong_peer_forged_counter_or_wrong_supervisor_scope_rejects(self):
+        for change in ("peer", "counter", "claimed", "metric_family", "generation", "name", "freshness", "window", "outside"):
+            with self.subTest(change=change):
+                data = positive_aaaa_corpus()
+                evidence = next(row["evidence"] for row in data["events.jsonl"] if row.get("name") == "positive_aaaa")
+                if change == "peer":
+                    data["control-probes.jsonl"][1]["raw"]["upstream_peer"] = "127.0.0.1:12345"
+                elif change == "counter":
+                    evidence["after_raw"]["positive_aaaa_answers"] = 0
+                elif change == "claimed":
+                    evidence.update(before=10, after=99)
+                elif change == "metric_family":
+                    evidence["after_metrics"] = evidence["after_metrics"].replace('family="srv"', 'family="aaaa"')
+                elif change in ("generation", "name", "freshness"):
+                    discovery = evidence["after_clusters"]["clusters"][0]["discovery"]
+                    if change == "generation":
+                        discovery["generation"] = 4
+                    elif change == "name":
+                        discovery["name"] = "_https._tcp.other.test."
+                    else:
+                        discovery["resolution"] = "stale"
+                elif change == "window":
+                    evidence.pop("observation_window")
+                else:
+                    evidence["observation_window"]["end_ns"] = 11 * NS + 40
+                self.fail(data, "RL_TRIGGER")
+
+    def test_ipv6_response_plus_unrelated_global_counter_does_not_grant_aaaa_coverage(self):
+        data = positive_aaaa_corpus()
+        data["events.jsonl"] = [row for row in data["events.jsonl"] if row.get("name") != "positive_aaaa"]
+        for index, row in enumerate(data["events.jsonl"], 1):
+            row["writer_seq"] = index
+        data["receipt.json"]["coverage_required"].append("positive_aaaa")
+        for row in data["samples.jsonl"]:
+            if row["source"] == "admin":
+                row["metrics"] += 'oxidase_discovery_queries_total{cluster="other",family="aaaa",result="positive"} 999\n'
+        self.fail(data, "RL_TRIGGER_COVERAGE")
 
 
 if __name__ == "__main__":

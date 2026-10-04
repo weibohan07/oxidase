@@ -19,7 +19,8 @@ use super::resource_controls::{ControlPlan, control_round};
 use super::resource_evidence::{self, JsonLines, OperationEvent};
 use super::resource_identity::{self, ProcessRole, monotonic_ns};
 use super::{
-    Campaign, FixtureCommand, FixtureProcess, ResourceArguments, ResourceCampaign, SoakError, fail,
+    Campaign, FixtureCommand, FixtureProcess, HEALTHY_DNS_TTL_SECONDS,
+    RESOURCE_REQUESTS_PER_CONNECTION, ResourceArguments, ResourceCampaign, SoakError, fail,
     io_error, json_error,
 };
 use crate::common::{client_config, identity, write_identity};
@@ -442,6 +443,9 @@ pub(super) async fn run(args: ResourceArguments) -> Result<(), SoakError> {
         // recorded, and an I run cannot grant formal H/C qualification.
         receipt["required_gauges"] = json!(["oxidase_active_requests"]);
     }
+    receipt["parameters"]["connection_request_budget"] = RESOURCE_REQUESTS_PER_CONNECTION.into();
+    receipt["parameters"]["normal_dns_ttl_seconds"] = HEALTHY_DNS_TTL_SECONDS.into();
+    receipt["fault_result_storage"] = "contiguous_safe_503_v1".into();
     persist_receipt(&args.output, &receipt)?;
     let result = run_inner(&args, &mut receipt).await;
     receipt["complete"] = result.is_ok().into();
@@ -701,7 +705,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     };
     dns.command(FixtureCommand::Dns {
         mode: "both".into(),
-        ttl: 1,
+        ttl: HEALTHY_DNS_TTL_SECONDS,
     })
     .await?;
     upstream
@@ -901,7 +905,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
                     .await?;
                 dns.command(FixtureCommand::Dns {
                     mode: "both".into(),
-                    ttl: 1,
+                    ttl: HEALTHY_DNS_TTL_SECONDS,
                 })
                 .await?;
             }
@@ -1034,7 +1038,8 @@ fn resource_source_for_address(
     .replace(
         "      health:\n",
         "      load_balance:\n        policy: weighted_round_robin\n      health:\n",
-    );
+    )
+    .replace("    protocol: https\n", &format!("    protocol: https\n    limits:\n      max_requests_per_connection: {RESOURCE_REQUESTS_PER_CONNECTION}\n"));
     if matches!(
         campaign,
         ResourceCampaign::StaticProxy
@@ -1107,7 +1112,8 @@ async fn worker_loop(
     admission: Arc<LoadAdmission>,
 ) -> Result<(), SoakError> {
     let mut sequence = 0u64;
-    let mut client = None;
+    let mut connection_epoch = 0u64;
+    let mut client: Option<ResourceDataClient> = None;
     let h2 = plan.lane == "cancel"
         || plan.lane != "upgrade"
             && (!plan.worker.is_multiple_of(4)
@@ -1118,6 +1124,44 @@ async fn worker_loop(
     loop {
         if *stop.borrow() || failed.load(Ordering::Acquire) {
             break;
+        }
+        if client
+            .as_ref()
+            .is_some_and(ResourceDataClient::needs_retirement)
+        {
+            let retired = client.take().expect("budgeted client exists");
+            let submitted = retired.submitted_requests();
+            let start_ns = monotonic_ns()?;
+            let protocol = if h2 { "h2" } else { "http1" };
+            send.send(OperationEvent::RetirementStarted {
+                worker: plan.worker,
+                connection_epoch,
+                after_sequence: sequence,
+                start_ns,
+                protocol,
+                submitted,
+            })
+            .await
+            .map_err(io_error)?;
+            let exit = retired.close_receipt().await;
+            let acknowledged = exit["result"] == "completed" && exit["join_acknowledged"] == true;
+            send.send(OperationEvent::RetirementTerminal {
+                worker: plan.worker,
+                connection_epoch,
+                after_sequence: sequence,
+                start_ns,
+                end_ns: monotonic_ns()?,
+                protocol,
+                submitted,
+                driver_exit: exit,
+            })
+            .await
+            .map_err(io_error)?;
+            if !acknowledged {
+                return Err(fail(
+                    "normal client connection budget retirement was not completed/joined",
+                ));
+            }
         }
         let Some(guard) = admission.begin(&stop, &failed).await else {
             break;
@@ -1152,7 +1196,12 @@ async fn worker_loop(
             })
             .await
             {
-                Ok(Ok(connected)) => client = Some(connected),
+                Ok(Ok(connected)) => {
+                    connection_epoch = connection_epoch
+                        .checked_add(1)
+                        .ok_or_else(|| fail("client connection epoch exhausted"))?;
+                    client = Some(connected);
+                }
                 Ok(Err(error)) => connection_error = Some(error.to_string()),
                 Err(_) => connection_error = Some("connection deadline".into()),
             }
@@ -1228,6 +1277,11 @@ async fn worker_loop(
             json!({"status":null,"eof":false,"body_bytes":0,"body_sha256":digest(b""),"error_stage":"connection","error_code":"connect_failure","error":connection_error})
         };
         raw["connection_attempted"] = (connection_attempts != 0).into();
+        raw["connection_epoch"] = if client.is_some() {
+            json!(connection_epoch)
+        } else {
+            Value::Null
+        };
         raw["admitted"] = admitted.into();
         if raw["cancelled"] == true
             && let Some(peer) = raw["upstream_peer"].as_str().and_then(|p| p.parse().ok())

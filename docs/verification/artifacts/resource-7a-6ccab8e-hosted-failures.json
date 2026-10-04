@@ -1,0 +1,561 @@
+{
+  "schema_version": "oxidase.resource-original-index/v1",
+  "run_id": 37199862567,
+  "head": "6ccab8e81602f549f0d2a0c1138d659e9c2006bc",
+  "formal": false,
+  "source_set_sha256": "d87d70f1948476dd4f8df049af36b7fcc28614295ae8e9b09944f5f0b003011d",
+  "gateway_binary_sha256": "a531946c0340b885586e94b013d3bd3eb96f8f3f488df7842db95700f912be2b",
+  "controller_fixture_sampler_binary_sha256": "0f3bc4469e962e89d1d5dcf7421daa8ae86ec952ea10b18a66c1f7eb38c07b1e",
+  "parameters": {
+    "seed": 700212,
+    "concurrency": 8,
+    "actual_worker_count": 10,
+    "payload_bytes": 32768,
+    "upload_bytes": 1048576,
+    "sample_interval_ns": 1000000000,
+    "scrape_interval_ns": 1000000000
+  },
+  "role_identity_array_fields": [
+    "role",
+    "pid",
+    "start_ticks"
+  ],
+  "curve_array_fields": [
+    "baseline",
+    "peak",
+    "final"
+  ],
+  "curves_note": "Only actual captures; absent phases stay absent, null age fields are unavailable, and PSS is not forward-filled.",
+  "healthy": {
+    "artifact_id": 11303035027,
+    "archive_sha256": "a030a3548ab6a76b9825e6d75c11c182551b8c17807dd2e13b703cf1ca2be7c0",
+    "manifest_files": 34,
+    "manifest_mismatches": [],
+    "independent_replay_equal_original": true,
+    "original_result": "FAIL",
+    "boot_id": "aaf2b453-72f6-4fbc-993e-5f30be91a74e",
+    "roles": [
+      [
+        "gateway",
+        6095,
+        24291
+      ],
+      [
+        "controller",
+        6075,
+        24286
+      ],
+      [
+        "dns",
+        6089,
+        24291
+      ],
+      [
+        "upstream",
+        6083,
+        24291
+      ],
+      [
+        "sampler",
+        6103,
+        24300
+      ]
+    ],
+    "phase_closed_seconds": {
+      "warmup": 30.122423202,
+      "steady": 300.099003443,
+      "recovery": 120.115869264,
+      "quiet": 60.00867728,
+      "quiet_running": 60.002020228,
+      "post_drain": 60.012658432
+    },
+    "counters": {
+      "offered": 111263,
+      "received": 111263,
+      "connection_attempts": 550,
+      "admitted_http": 110828,
+      "admitted_upgrade": 435,
+      "complete_success": 110398,
+      "actual_cancel": 427,
+      "complete_upgrade_exchange": 435,
+      "unexpected_errors": 3,
+      "abandoned": 0
+    },
+    "retirements": {
+      "started": 105,
+      "terminal": 105,
+      "pending": 0,
+      "raw_driver_counter_errors": [],
+      "oracle_boundary_errors": 0
+    },
+    "fatal_errors": [],
+    "wire_failures": [
+      {
+        "worker": 0,
+        "operation": 685,
+        "phase": "warmup",
+        "epoch": 1,
+        "status": null,
+        "stage": "response_head",
+        "start_ns": 255554247281,
+        "end_ns": 255554366286,
+        "driver_exit": "completed"
+      },
+      {
+        "worker": 4,
+        "operation": 13376,
+        "phase": "steady",
+        "epoch": 14,
+        "status": 503,
+        "start_ns": 423602620779,
+        "end_ns": 423602842417
+      },
+      {
+        "worker": 4,
+        "operation": 13377,
+        "phase": "steady",
+        "epoch": 14,
+        "status": 503,
+        "start_ns": 423602848115,
+        "end_ns": 423602989313
+      }
+    ],
+    "coverage": {
+      "old_held_grpc_and_upgrade": 1,
+      "tls_h2": 5514,
+      "tls_http1": 1989,
+      "grpc_trailers": 1838,
+      "large_upload": 1828,
+      "complete_download": 7503,
+      "client_cancellation": 428,
+      "upgrade": 437
+    },
+    "coverage_count_note": "Presence counters include independently checked histogram classes/control proof; worker outcomes are separately conserved above.",
+    "closed_fault_windows": [],
+    "curves": {
+      "warmup": {
+        "rss_kib": [
+          21472,
+          29252,
+          28896
+        ],
+        "pss_kib": [
+          26037,
+          26439,
+          26439
+        ],
+        "private_dirty_kib": [
+          25948,
+          26344,
+          26344
+        ],
+        "fd": [
+          18,
+          35,
+          26
+        ],
+        "os_samples": 30,
+        "smaps_samples": 3
+      },
+      "steady": {
+        "rss_kib": [
+          29036,
+          31604,
+          31284
+        ],
+        "pss_kib": [
+          26383,
+          29095,
+          29095
+        ],
+        "private_dirty_kib": [
+          11020,
+          13732,
+          13732
+        ],
+        "fd": [
+          27,
+          35,
+          28
+        ],
+        "rss_slope_kib_per_second": 6.978863920167637,
+        "pss_slope_kib_per_second": 7.534581896936072,
+        "os_samples": 300,
+        "smaps_samples": 28
+      },
+      "recovery": {
+        "rss_kib": [
+          31332,
+          32620,
+          30256
+        ],
+        "pss_kib": [
+          29067,
+          29739,
+          27887
+        ],
+        "private_dirty_kib": [
+          13704,
+          14376,
+          12524
+        ],
+        "fd": [
+          33,
+          35,
+          33
+        ],
+        "rss_slope_kib_per_second": -15.404505683618762,
+        "os_samples": 120,
+        "smaps_samples": 11
+      },
+      "quiet": {
+        "rss_kib": [
+          30256,
+          30256,
+          30256
+        ],
+        "pss_kib": [
+          27799,
+          27799,
+          27799
+        ],
+        "private_dirty_kib": [
+          12436,
+          12436,
+          12436
+        ],
+        "fd": [
+          24,
+          24,
+          22
+        ],
+        "rss_slope_kib_per_second": 0,
+        "os_samples": 60,
+        "smaps_samples": 6
+      },
+      "post_drain": {
+        "rss_kib": [
+          30256,
+          30568,
+          30568
+        ],
+        "pss_kib": [
+          27799,
+          28111,
+          28111
+        ],
+        "private_dirty_kib": [
+          12436,
+          12748,
+          12748
+        ],
+        "fd": [
+          21,
+          21,
+          21
+        ],
+        "os_samples": 60,
+        "smaps_samples": 5
+      }
+    },
+    "census": {
+      "missing_kinds": [],
+      "stable_captures": 570,
+      "concurrent_captures": 2,
+      "reported_invariant_failures": 0,
+      "selected": {
+        "snapshot": {
+          "peak_live": 1,
+          "final_live": 1,
+          "created": 10,
+          "destroyed": 9,
+          "retired_peak": 0
+        },
+        "health_supervisor": {
+          "peak_live": 1,
+          "final_live": 0,
+          "created": 1,
+          "destroyed": 1
+        },
+        "discovery_supervisor": {
+          "peak_live": 1,
+          "final_live": 0,
+          "created": 1,
+          "destroyed": 1
+        },
+        "proxy_pool_family": {
+          "peak_live": 4,
+          "final_live": 0,
+          "created": 38,
+          "destroyed": 38,
+          "retired_peak": 1,
+          "max_retired_age_ms": 1116
+        },
+        "health_pool_family": {
+          "peak_live": 2,
+          "final_live": 2,
+          "created": 21,
+          "destroyed": 19
+        },
+        "upstream_tcp_connection": {
+          "peak_live": 5,
+          "final_live": 2,
+          "created": 476,
+          "destroyed": 474
+        },
+        "upstream_tls_connection": {
+          "peak_live": 5,
+          "final_live": 2,
+          "created": 476,
+          "destroyed": 474
+        },
+        "upstream_task": {
+          "peak_live": 18,
+          "final_live": 6,
+          "created": 116874,
+          "destroyed": 116868
+        },
+        "upstream_upload_task": {
+          "peak_live": 4,
+          "final_live": 0,
+          "created": 24274,
+          "destroyed": 24274
+        },
+        "response_body": {
+          "peak_live": 3,
+          "final_live": 0,
+          "created": 111274,
+          "destroyed": 111274
+        },
+        "tunnel": {
+          "peak_live": 1,
+          "final_live": 0,
+          "created": 436,
+          "destroyed": 436
+        }
+      }
+    },
+    "qualification": "FAIL: three unexpected healthy wire failures. TLS graceful-close and positive steady RSS/PSS attribution remain INCONCLUSIVE. No leak or allocator-retention conclusion."
+  },
+  "churn": {
+    "artifact_id": 11301848009,
+    "archive_sha256": "b74cca2b7ac8baa2bb160ba5c5adddc3b2f002110101586e44ec7b62837a3a1b",
+    "manifest_files": 36,
+    "manifest_mismatches": [],
+    "independent_replay_equal_original": true,
+    "original_result": "FAIL",
+    "boot_id": "90a5e515-fdeb-4ada-8873-63c9db535886",
+    "roles": [
+      [
+        "gateway",
+        6111,
+        31358
+      ],
+      [
+        "controller",
+        6091,
+        31353
+      ],
+      [
+        "dns",
+        6105,
+        31357
+      ],
+      [
+        "upstream",
+        6099,
+        31357
+      ],
+      [
+        "sampler",
+        6119,
+        31367
+      ]
+    ],
+    "phase_closed_seconds": {
+      "warmup": 30.082237948,
+      "steady": null,
+      "recovery": null,
+      "quiet": null,
+      "post_drain": null
+    },
+    "steady_partial_observed_until_fatal_seconds": 106.314702935,
+    "counters": {
+      "offered": 69828,
+      "received": 69828,
+      "connection_attempts": 224,
+      "admitted_http": 69698,
+      "admitted_upgrade": 130,
+      "abandoned": 0
+    },
+    "retirements": {
+      "started": 53,
+      "terminal": 53,
+      "pending": 0,
+      "raw_driver_counter_errors": []
+    },
+    "fatal_errors": [
+      "qualification failed after collecting started work: [\"resource.control_not_triggered:positive_aaaa_counter\"]"
+    ],
+    "failed_precondition": {
+      "scope": "SRV supervisor round does not increment top-level AAAA-plan metric",
+      "complete_probe_id": "control-7-38",
+      "physical_peer": "[::1]:45563",
+      "status": 200,
+      "body_bytes": 32768,
+      "eof": true,
+      "fixture_aaaa_reply_delta": 3,
+      "top_level_aaaa_plan_metric": 0,
+      "oracle_coverage_not_granted": true
+    },
+    "original_coverage": {
+      "old_held_grpc_and_upgrade": 1,
+      "srv_weight_change": 4,
+      "active_health_failure": 1,
+      "active_health_recovery": 2,
+      "header_deadline_counter": 2,
+      "signed_activate": 1,
+      "total_deadline_counter": 1,
+      "dns_nxdomain": 3,
+      "dns_all_withdraw": 11,
+      "positive_aaaa_answers": 3
+    },
+    "closed_fault_windows": [
+      "response_header_timeout-2",
+      "post_head_error-3",
+      "deadline_timeout-4",
+      "dns-nxdomain-5",
+      "dns-withdraw-6"
+    ],
+    "curves": {
+      "warmup": {
+        "rss_kib": [
+          20940,
+          27432,
+          26808
+        ],
+        "pss_kib": [
+          23641,
+          24434,
+          24434
+        ],
+        "private_dirty_kib": [
+          23536,
+          24320,
+          24320
+        ],
+        "fd": [
+          18,
+          33,
+          26
+        ],
+        "os_samples": 30,
+        "smaps_samples": 2
+      },
+      "steady_partial": {
+        "rss_kib": [
+          27268,
+          30976,
+          29320
+        ],
+        "pss_kib": [
+          24702,
+          27614,
+          27614
+        ],
+        "private_dirty_kib": [
+          9576,
+          12488,
+          12488
+        ],
+        "fd": [
+          33,
+          35,
+          31
+        ],
+        "rss_slope_kib_per_second": 25.361302378188416,
+        "os_samples": 106,
+        "smaps_samples": 10
+      }
+    },
+    "census": {
+      "missing_kinds": [],
+      "stable_captures": 138,
+      "concurrent_captures": 0,
+      "reported_invariant_failures": 0,
+      "selected": {
+        "snapshot": {
+          "peak_live": 1,
+          "final_live": 1,
+          "created": 12,
+          "destroyed": 11
+        },
+        "health_supervisor": {
+          "peak_live": 1,
+          "final_live": 1,
+          "created": 1,
+          "destroyed": 0
+        },
+        "discovery_supervisor": {
+          "peak_live": 1,
+          "final_live": 1,
+          "created": 1,
+          "destroyed": 0
+        },
+        "proxy_pool_family": {
+          "peak_live": 4,
+          "final_live": 2,
+          "created": 16,
+          "destroyed": 14,
+          "retired_peak": 2,
+          "max_retired_age_ms": 1119
+        },
+        "health_pool_family": {
+          "peak_live": 2,
+          "final_live": 1,
+          "created": 8,
+          "destroyed": 7
+        },
+        "upstream_tcp_connection": {
+          "peak_live": 5,
+          "final_live": 2,
+          "created": 150,
+          "destroyed": 148
+        },
+        "upstream_tls_connection": {
+          "peak_live": 5,
+          "final_live": 2,
+          "created": 150,
+          "destroyed": 148
+        },
+        "upstream_task": {
+          "peak_live": 22,
+          "final_live": 6,
+          "created": 31855,
+          "destroyed": 31849
+        },
+        "upstream_upload_task": {
+          "peak_live": 4,
+          "final_live": 0,
+          "created": 6125,
+          "destroyed": 6125
+        },
+        "response_body": {
+          "peak_live": 2,
+          "final_live": 0,
+          "created": 69856,
+          "destroyed": 69856
+        },
+        "tunnel": {
+          "peak_live": 1,
+          "final_live": 0,
+          "created": 126,
+          "destroyed": 126
+        }
+      }
+    },
+    "qualification": "FAIL: incomplete campaign due measurement scope mismatch; no Recovery/Running Quiet proof and no memory qualification. Original sealed evidence is unchanged."
+  },
+  "artifact_retention_days": 30,
+  "replay_command": "python3 tools/qualification/verify_resource_lifecycle.py <original campaign directory>"
+}

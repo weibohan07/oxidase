@@ -22,8 +22,8 @@ use super::resource_campaign::{FaultInterval, Faults, resource_source};
 use super::resource_evidence::JsonLines;
 use super::resource_identity::monotonic_ns;
 use super::{
-    FixtureCommand, FixtureProcess, ResourceArguments, ResourceCampaign, SoakError, fail, io_error,
-    json_error,
+    FixtureCommand, FixtureProcess, HEALTHY_DNS_TTL_SECONDS, ResourceArguments, ResourceCampaign,
+    SoakError, fail, io_error, json_error,
 };
 
 pub(super) struct ControlPlan<'a> {
@@ -44,8 +44,50 @@ const STATE_DEADLINE: Duration = Duration::from_secs(6);
 // 8 s logical deadline + 500 ms ejection + at most 1 s fixture refresh, rounded up.
 const SETTLING: Duration = Duration::from_secs(10);
 const RECOVERY_NS: u64 = 12_000_000_000;
+// A validation witness, not a replacement for any production request timeout.
+// All before/probe/after operations must finish inside this fixed window.
+const SRV_AAAA_WITNESS_NS: u64 = 30_000_000_000;
+const SRV_POSITIVE_METRIC: &str =
+    "oxidase_discovery_queries_total{cluster=\"upstream\",family=\"srv\",result=\"positive\"}";
 const MAX_PROBE_FILE: u64 = 64 * 1024 * 1024;
 const MAX_PROBE_ROW: usize = 64 * 1024;
+const TOTAL_TIMEOUT_METRIC: &str = "oxidase_upstream_timeouts_total{phase=\"total\"}";
+const HEADER_TIMEOUT_METRIC: &str = "oxidase_upstream_timeouts_total{phase=\"response_header\"}";
+
+fn timeout_control_observed(
+    scenario: &str,
+    raw: &Value,
+    before_metrics: &str,
+    after_metrics: &str,
+) -> Result<bool, SoakError> {
+    let counter = timeout_metric(scenario)?;
+    Ok(full_safe_timeout_response(raw)
+        && metric(after_metrics, counter)? > metric(before_metrics, counter)?)
+}
+
+fn timeout_metric(scenario: &str) -> Result<&'static str, SoakError> {
+    match scenario {
+        "deadline_timeout" => Ok(TOTAL_TIMEOUT_METRIC),
+        "response_header_timeout" => Ok(HEADER_TIMEOUT_METRIC),
+        _ => Err(fail("resource.control_timeout_scenario_invalid")),
+    }
+}
+
+fn full_safe_timeout_response(raw: &Value) -> bool {
+    raw["status"] == 504
+        && raw["eof"] == true
+        && raw["body_bytes"] == 15
+        && raw["body_sha256"] == "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547"
+        && raw["content_type"] == "text/plain; charset=utf-8"
+        && raw["error_code"].is_null()
+        && raw["error_stage"].is_null()
+        && raw["h2_reason"].is_null()
+        && raw["h2_error_kind"].is_null()
+        && raw["diagnostics"].as_array().is_some_and(Vec::is_empty)
+        && raw["trailers"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+}
 
 struct Driver(Option<tokio::task::JoinHandle<Result<(), hyper::Error>>>);
 impl Driver {
@@ -174,10 +216,18 @@ async fn metrics(root: &Path) -> Result<String, SoakError> {
 }
 
 fn upstream_cluster(value: &Value) -> Result<&Value, SoakError> {
-    value["clusters"]
+    let mut matching = value["clusters"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["cluster"] == "upstream"))
-        .ok_or_else(|| fail("resource.control_cluster_unavailable"))
+        .ok_or_else(|| fail("resource.control_cluster_unavailable"))?
+        .iter()
+        .filter(|row| row["cluster"] == "upstream");
+    let cluster = matching
+        .next()
+        .ok_or_else(|| fail("resource.control_cluster_unavailable"))?;
+    if matching.next().is_some() {
+        return Err(fail("resource.control_cluster_duplicate"));
+    }
+    Ok(cluster)
 }
 fn endpoint_counter(value: &Value, name: &str) -> Result<u64, SoakError> {
     upstream_cluster(value)?["endpoints"]
@@ -438,10 +488,12 @@ struct ProbeSpec<'a> {
     grpc: bool,
     h2: bool,
     window: Option<&'a str>,
+    deadline_ns: Option<u64>,
 }
 struct Probe {
     id: String,
     raw: Value,
+    end_ns: u64,
 }
 struct Scene<'a> {
     round: usize,
@@ -487,7 +539,10 @@ async fn probe(
     if let Some(address) = upstream.ready.ipv6 {
         targets.push(("ipv6".into(), address));
     }
-    let result = tokio::time::timeout(CONTROL_WIRE_DEADLINE, async {
+    let wire_deadline = spec.deadline_ns.map_or(CONTROL_WIRE_DEADLINE, |deadline| {
+        CONTROL_WIRE_DEADLINE.min(Duration::from_nanos(deadline.saturating_sub(start)))
+    });
+    let result = tokio::time::timeout(wire_deadline, async {
         let connected =
             ResourceDataClient::connect(plan.gateway_address, config, spec.h2, targets).await?;
         client = Some(connected);
@@ -538,13 +593,19 @@ async fn probe(
     {
         return Err(fail("resource.control_probe_driver_exit"));
     }
-    Ok(Probe { id, raw })
+    Ok(Probe {
+        id,
+        raw,
+        end_ns: end,
+    })
 }
 
 fn full_response(raw: &Value, payload: usize, grpc: bool, peer: Option<SocketAddr>) -> bool {
     if raw["status"] != 200
         || raw["eof"] != true
         || !raw["error_code"].is_null()
+        || !raw["h2_reason"].is_null()
+        || !raw["h2_error_kind"].is_null()
         || raw["diagnostics"]
             .as_array()
             .is_none_or(|values| !values.is_empty())
@@ -603,7 +664,76 @@ async fn full_peer(
     let deadline = monotonic_ns()?
         .checked_add(RECOVERY_NS)
         .ok_or_else(|| fail("resource.control_clock_overflow"))?;
-    for _ in 0..8 {
+    let mut witnesses = full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &[peer],
+            scenario,
+            deadline_ns: deadline,
+        },
+    )
+    .await?;
+    Ok(witnesses.remove(0).1)
+}
+
+struct PeerRecovery<'a> {
+    peers: &'a [SocketAddr],
+    scenario: &'a str,
+    deadline_ns: u64,
+}
+
+// A successful B response must not disappear while a later probe looks for A.
+// This collector keeps physical, fully verified witnesses under one original
+// recovery deadline; it never changes runtime endpoint selection or retries.
+struct FreshPeerWitnesses {
+    pending: Vec<SocketAddr>,
+    completed: Vec<(SocketAddr, Probe)>,
+    deadline_ns: u64,
+}
+impl FreshPeerWitnesses {
+    fn new(peers: &[SocketAddr], deadline_ns: u64) -> Self {
+        Self {
+            pending: peers.to_vec(),
+            completed: Vec::new(),
+            deadline_ns,
+        }
+    }
+    fn record(&mut self, seen: Probe, payload: usize) -> Result<(), SoakError> {
+        if seen.end_ns > self.deadline_ns {
+            return Err(fail("resource.control_peer_recovery_deadline"));
+        }
+        if !full_response(&seen.raw, payload, false, None) {
+            return Err(fail("resource.control_bad_full_response"));
+        }
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|peer| full_response(&seen.raw, payload, false, Some(*peer)))
+        {
+            let peer = self.pending.remove(index);
+            self.completed.push((peer, seen));
+        }
+        Ok(())
+    }
+}
+
+async fn full_peers(
+    plan: &ControlPlan<'_>,
+    upstream: &FixtureProcess,
+    round: usize,
+    sequence: &mut u64,
+    journal: &mut ProbeJournal,
+    recovery: PeerRecovery<'_>,
+) -> Result<Vec<(SocketAddr, Probe)>, SoakError> {
+    let mut witnesses = FreshPeerWitnesses::new(recovery.peers, recovery.deadline_ns);
+    for _ in 0..64 {
+        if monotonic_ns()? >= recovery.deadline_ns {
+            break;
+        }
         let seen = probe(
             plan,
             upstream,
@@ -611,23 +741,23 @@ async fn full_peer(
             sequence,
             journal,
             ProbeSpec {
-                scenario,
+                scenario: recovery.scenario,
                 grpc: false,
                 h2: true,
                 window: None,
+                deadline_ns: Some(recovery.deadline_ns),
             },
         )
         .await?;
-        if full_response(&seen.raw, plan.args.payload_size, false, Some(peer)) {
-            return Ok(seen);
-        }
-        if monotonic_ns()? > deadline {
-            break;
+        witnesses.record(seen, plan.args.payload_size)?;
+        if witnesses.pending.is_empty() {
+            return Ok(witnesses.completed);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(fail(format!(
-        "resource.control_peer_recovery_unproven:{scenario}"
+        "resource.control_peer_recovery_unproven:{}",
+        recovery.scenario
     )))
 }
 
@@ -776,7 +906,15 @@ async fn weights(
     events: &mut JsonLines,
 ) -> Result<(), SoakError> {
     let equal_before = dns.recorded_command(FixtureCommand::Status).await?;
-    dns_change(plan, dns, "weights_equal", 1, round, events).await?;
+    dns_change(
+        plan,
+        dns,
+        "weights_equal",
+        HEALTHY_DNS_TTL_SECONDS,
+        round,
+        events,
+    )
+    .await?;
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     let (before, equal_after) = loop {
         let before = clusters(plan.root).await?;
@@ -792,7 +930,7 @@ async fn weights(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    dns_change(plan, dns, "weights", 1, round, events).await?;
+    dns_change(plan, dns, "weights", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let after = clusters(plan.root).await?;
@@ -834,16 +972,44 @@ fn srv_weights(document: &Value, a: u16, b: u16) -> Result<bool, SoakError> {
         .is_some_and(|targets| {
             targets.len() == 2
                 && targets.iter().any(|row| {
-                    row["target"] == "a.discovery.test"
+                    row["target"] == "a.discovery.test."
                         && row["weight"] == a
                         && row["priority"] == 0
                 })
                 && targets.iter().any(|row| {
-                    row["target"] == "b.discovery.test"
+                    row["target"] == "b.discovery.test."
                         && row["weight"] == b
                         && row["priority"] == 0
                 })
         }))
+}
+
+fn srv_aaaa_refresh(
+    before_clusters: &Value,
+    after_clusters: &Value,
+    before_metrics: &str,
+    after_metrics: &str,
+    before_fixture: &Value,
+    after_fixture: &Value,
+) -> Result<bool, SoakError> {
+    let before = &upstream_cluster(before_clusters)?["discovery"];
+    let after = &upstream_cluster(after_clusters)?["discovery"];
+    // The configured supervisor resolves SRV. Its internal target AAAA query is
+    // proved by the real fixture, never by inventing a top-level AAAA metric.
+    Ok(before["name"] == "_https._tcp.api.discovery.test."
+        && after["name"] == before["name"]
+        && before["generation"]
+            .as_u64()
+            .zip(after["generation"].as_u64())
+            .is_some_and(|(before, after)| after > before)
+        && after["resolution"] == "fresh"
+        && after["eligible_endpoints"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        && metric(after_metrics, SRV_POSITIVE_METRIC)?
+            > metric(before_metrics, SRV_POSITIVE_METRIC)?
+        && counter(after_fixture, "positive_aaaa_answers")?
+            > counter(before_fixture, "positive_aaaa_answers")?)
 }
 
 fn allowed_data_failures(mode: &str, target: &str) -> Value {
@@ -988,22 +1154,42 @@ async fn data_fault(
                     grpc: scenario != "deadline_timeout",
                     h2: true,
                     window: Some(&window.id),
+                    deadline_ns: None,
                 },
             )
             .await?;
+            let witness_metrics = if scenario != "post_head_error"
+                && full_safe_timeout_response(&seen.raw)
+            {
+                Some(metrics(plan.root).await?)
+            } else {
+                None
+            };
             let observed = if scenario == "post_head_error" {
                 seen.raw["status"] == 200
                     && seen.raw["error_stage"] == "response_body"
                     && seen.raw["error_code"] == "body_error"
                     && seen.raw["fault_case_id"] == round as u64
+            } else if let Some(after) = &witness_metrics {
+                timeout_control_observed(scenario, &seen.raw, &before_metrics, after)?
             } else {
-                seen.raw["status"] == 504
+                false
             };
             if observed {
+                let cause_scope = if let Some(after) = &witness_metrics {
+                    let counter = timeout_metric(scenario)?;
+                    json!({"kind":"physical_fault_window","window_id":window.id,
+                        "counter":counter,"before":metric(&before_metrics,counter)?,"after":metric(after,counter)?,
+                        "probe_attribution":false,
+                        "note":"counter delta belongs to the same physical fault window; concurrent requests prevent assigning it to this probe"})
+                } else {
+                    Value::Null
+                };
                 coverage(
                     events,
                     scenario,
-                    json!({"source":"control_probe","operation_id":seen.id,"window_id":window.id}),
+                    json!({"source":"control_probe","operation_id":seen.id,"window_id":window.id,
+                        "cause_scope":cause_scope,"before_metrics":before_metrics,"witness_metrics":witness_metrics}),
                 )?;
                 return Ok::<_, SoakError>(());
             }
@@ -1056,18 +1242,24 @@ async fn data_fault(
             &after_metrics,
         )?;
     }
-    for peer in peers {
-        let peer = peer.parse().map_err(io_error)?;
-        let recovered = full_peer(
-            plan,
-            upstream,
-            round,
-            sequence,
-            journal,
-            peer,
-            "fault_recovery",
-        )
-        .await?;
+    let peers = peers
+        .iter()
+        .map(|peer| peer.parse().map_err(io_error))
+        .collect::<Result<Vec<SocketAddr>, _>>()?;
+    for (peer, recovered) in full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &peers,
+            scenario: "fault_recovery",
+            deadline_ns: end + RECOVERY_NS,
+        },
+    )
+    .await?
+    {
         coverage(
             events,
             "fault_recovery",
@@ -1075,6 +1267,15 @@ async fn data_fault(
         )?;
     }
     Ok(())
+}
+
+fn dns_fault_recipe(mode: &str) -> Result<(&'static str, u32, &'static str), SoakError> {
+    match mode {
+        "nxdomain" => Ok(("nxdomain_answers", 1, "dns_nxdomain")),
+        "withdraw" => Ok(("withdraw_answers", 1, "dns_all_withdraw")),
+        "ttl0" => Ok(("ttl_zero_answers", 0, "dns_ttl_zero")),
+        _ => Err(fail("resource.control_unknown_dns_fault")),
+    }
 }
 
 async fn dns_window(
@@ -1089,14 +1290,10 @@ async fn dns_window(
     let Scene { round, name: mode } = scene;
     healthy(upstream, false).await?;
     let before = dns.recorded_command(FixtureCommand::Status).await?;
-    let field = if mode == "nxdomain" {
-        "nxdomain_answers"
-    } else {
-        "withdraw_answers"
-    };
+    let (field, ttl, behavior) = dns_fault_recipe(mode)?;
     let mut window = Window::begin(plan.faults, format!("dns-{mode}-{round}"))?;
     let result = async {
-        dns_change(plan, dns, mode, 1, round, events).await?;
+        dns_change(plan, dns, mode, ttl, round, events).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let seen = probe(
             plan,
@@ -1109,6 +1306,7 @@ async fn dns_window(
                 grpc: false,
                 h2: true,
                 window: Some(&window.id),
+                deadline_ns: None,
             },
         )
         .await?;
@@ -1123,30 +1321,33 @@ async fn dns_window(
     }
     .await;
     let after = dns.recorded_command(FixtureCommand::Status).await?;
-    dns_change(plan, dns, "weights", 1, round, events).await?;
+    dns_change(plan, dns, "weights", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
     tokio::time::sleep(SETTLING).await;
     let end = window.close()?;
     events.write(json!({"kind":"fault_window","t_ns":monotonic_ns()?,"id":window.id,"start_ns":window.start,"end_ns":end,"recovery_deadline_ns":end+RECOVERY_NS,"recovery_peers":[upstream.ready.address.to_string(),upstream.ready.alternate.ok_or_else(||fail("resource.control_fixture_b_missing"))?.to_string()],"target":"upstream","lanes":["churn","cancel"],"allowed":[{"status":503}],"trigger":{"source":"fixture_counter","name":field,"before":counter(&before,field)?,"after":counter(&after,field)?},"fixture_before":before,"fixture_after":after}))?;
-    fixture_coverage(
-        events,
-        if mode == "nxdomain" {
-            "dns_nxdomain"
-        } else {
-            "dns_all_withdraw"
-        },
-        field,
-        &before,
-        &after,
-    )?;
+    fixture_coverage(events, behavior, field, &before, &after)?;
     result?;
-    for peer in [
+    let peers = [
         upstream.ready.address,
         upstream
             .ready
             .alternate
             .ok_or_else(|| fail("resource.control_fixture_b_missing"))?,
-    ] {
-        let seen = full_peer(plan, upstream, round, sequence, journal, peer, "dns_readd").await?;
+    ];
+    for (peer, seen) in full_peers(
+        plan,
+        upstream,
+        round,
+        sequence,
+        journal,
+        PeerRecovery {
+            peers: &peers,
+            scenario: "dns_readd",
+            deadline_ns: end + RECOVERY_NS,
+        },
+    )
+    .await?
+    {
         coverage(
             events,
             "dns_readd",
@@ -1191,7 +1392,7 @@ async fn control_round_inner(
             &plan,
             dns,
             modes[(round.wrapping_add(plan.args.seed as usize)) % modes.len()],
-            1,
+            HEALTHY_DNS_TTL_SECONDS,
             round,
             events,
         )
@@ -1302,9 +1503,11 @@ async fn control_round_inner(
             .await?
         }
         7 => {
+            let witness_start = monotonic_ns()?;
             let before = metrics(plan.root).await?;
             let fixture_before = dns.recorded_command(FixtureCommand::Status).await?;
-            dns_change(&plan, dns, "v6", 1, round, events).await?;
+            let before_clusters = clusters(plan.root).await?;
+            dns_change(&plan, dns, "v6", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let peer = upstream
                 .ready
@@ -1322,6 +1525,23 @@ async fn control_round_inner(
             .await?;
             let after = metrics(plan.root).await?;
             let fixture_after = dns.recorded_command(FixtureCommand::Status).await?;
+            let after_clusters = clusters(plan.root).await?;
+            let witness_end = monotonic_ns()?;
+            let witness_deadline = witness_start
+                .checked_add(SRV_AAAA_WITNESS_NS)
+                .ok_or_else(|| fail("resource.control_aaaa_witness_clock"))?;
+            if witness_end > witness_deadline
+                || !srv_aaaa_refresh(
+                    &before_clusters,
+                    &after_clusters,
+                    &before,
+                    &after,
+                    &fixture_before,
+                    &fixture_after,
+                )?
+            {
+                return Err(fail("resource.control_srv_aaaa_refresh_unproven"));
+            }
             fixture_coverage(
                 events,
                 "positive_aaaa_answers",
@@ -1331,29 +1551,45 @@ async fn control_round_inner(
             )?;
             metric_coverage(
                 events,
-                "positive_aaaa_counter",
-                "oxidase_discovery_queries_total{cluster=\"upstream\",family=\"aaaa\",result=\"positive\"}",
+                "positive_srv_round_counter",
+                SRV_POSITIVE_METRIC,
                 &before,
                 &after,
             )?;
             coverage(
                 events,
                 "positive_aaaa",
-                json!({"source":"control_probe","operation_id":seen.id,"expected_peer":peer.to_string(),"before_metrics":before,"after_metrics":after,"before_raw":fixture_before,"after_raw":fixture_after}),
+                json!({"source":"control_probe","operation_id":seen.id,"expected_peer":peer.to_string(),"observation_window":{"start_ns":witness_start,"end_ns":witness_end,"deadline_ns":witness_deadline},"before_metrics":before,"after_metrics":after,"before_raw":fixture_before,"after_raw":fixture_after,"before_clusters":before_clusters,"after_clusters":after_clusters}),
             )?;
         }
         8 => weights(&plan, dns, round, events).await?,
         9 => {
-            let before = dns.recorded_command(FixtureCommand::Status).await?;
-            dns_change(&plan, dns, "ttl0", 0, round, events).await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let after = dns.recorded_command(FixtureCommand::Status).await?;
-            fixture_coverage(events, "dns_ttl_zero", "ttl_zero_answers", &before, &after)?;
+            dns_window(
+                &plan,
+                dns,
+                upstream,
+                Scene {
+                    round,
+                    name: "ttl0",
+                },
+                sequence,
+                &mut journal,
+                events,
+            )
+            .await?;
         }
         10 => {
-            dns_change(&plan, dns, "b", 1, round, events).await?;
+            dns_change(&plan, dns, "b", HEALTHY_DNS_TTL_SECONDS, round, events).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            dns_change(&plan, dns, "weights", 1, round, events).await?;
+            dns_change(
+                &plan,
+                dns,
+                "weights",
+                HEALTHY_DNS_TTL_SECONDS,
+                round,
+                events,
+            )
+            .await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             let seen = full_peer(
                 &plan,
@@ -1389,6 +1625,7 @@ async fn control_round_inner(
                             grpc: false,
                             h2: false,
                             window: None,
+                            deadline_ns: None,
                         },
                     )
                     .await?;
@@ -1429,6 +1666,262 @@ async fn control_round_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn literal_control_35_safe_504() -> Value {
+        // Exact safe response facts in formal C run 37209014444's
+        // control-35-108. It completed in 5.003 s, not the total 8 s.
+        json!({"status":504,"eof":true,"body_bytes":15,
+            "body_sha256":"d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+            "content_type":"text/plain; charset=utf-8","trailers":{},"diagnostics":[],
+            "error_code":null,"error_stage":null,"h2_reason":null,"h2_error_kind":null})
+    }
+
+    #[test]
+    fn literal_header_timeout_504_does_not_prove_total_deadline() {
+        let before = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let after = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 66\n");
+        assert!(
+            !timeout_control_observed(
+                "deadline_timeout",
+                &literal_control_35_safe_504(),
+                &before,
+                &after
+            )
+            .expect("both real scoped counters available"),
+            "actual header-only 504 is not total-timeout evidence"
+        );
+        assert!(
+            timeout_control_observed(
+                "response_header_timeout",
+                &literal_control_35_safe_504(),
+                &before,
+                &after
+            )
+            .expect("the actual header counter did increase")
+        );
+    }
+
+    #[test]
+    fn timeout_witness_needs_full_safe_wire_and_the_corresponding_real_delta() {
+        let before = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let after = format!("{TOTAL_TIMEOUT_METRIC} 10\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let raw = literal_control_35_safe_504();
+        assert!(
+            timeout_control_observed("deadline_timeout", &raw, &before, &after)
+                .expect("real total delta")
+        );
+        assert!(
+            !timeout_control_observed("response_header_timeout", &raw, &before, &after)
+                .expect("no header delta")
+        );
+        assert!(
+            !timeout_control_observed("deadline_timeout", &raw, &before, &before)
+                .expect("unchanged is not unavailable")
+        );
+        assert!(
+            timeout_control_observed("deadline_timeout", &raw, &before, "").is_err(),
+            "missing is not fabricated zero"
+        );
+        assert!(timeout_control_observed("unknown", &raw, &before, &after).is_err());
+        let body_digest: String = Sha256::digest(b"Gateway Timeout")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            raw["body_sha256"], body_digest,
+            "the literal is an independent safe-body digest"
+        );
+        assert_eq!(CONTROL_WIRE_DEADLINE, Duration::from_secs(9));
+        for (field, invalid) in [
+            ("status", json!(503)),
+            ("eof", json!(false)),
+            ("body_bytes", json!(14)),
+            ("body_sha256", json!("00")),
+            ("content_type", json!("application/grpc")),
+            ("error_code", json!("transport_error")),
+            ("error_stage", json!("response_body")),
+            ("h2_reason", json!("enhance_your_calm")),
+            ("h2_error_kind", json!("goaway")),
+            ("diagnostics", json!(["bad_wire"])),
+            ("trailers", json!({"grpc-status":"0"})),
+            ("diagnostics", Value::Null),
+            ("trailers", Value::Null),
+        ] {
+            let mut bad = raw.clone();
+            bad[field] = invalid;
+            assert!(
+                !timeout_control_observed("deadline_timeout", &bad, &before, &after)
+                    .expect("invalid wire cannot witness a delta"),
+                "{field}"
+            );
+        }
+    }
+    fn peer_probe(peer: SocketAddr, end_ns: u64, id: &str) -> Probe {
+        let digest = Sha256::digest(b"xx")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Probe {
+            id: id.into(),
+            end_ns,
+            raw: json!({"status":200,"eof":true,"error_code":null,"diagnostics":[],
+                "content_type":"application/octet-stream","authority":"gateway.example.test",
+                "server_name":"gateway.example.test","path":"/base/resource/payload?b=2&a=1&a=3",
+                "upstream_peer":peer.to_string(),"body_bytes":2,"body_sha256":digest,"trailers":{}}),
+        }
+    }
+    #[test]
+    fn recovery_keeps_b_before_a_and_does_not_restart_deadline_per_peer() {
+        let a = "127.0.0.1:1200".parse().expect("A");
+        let b = "127.0.0.1:1201".parse().expect("B");
+        let mut witnesses = FreshPeerWitnesses::new(&[a, b], 100);
+        witnesses
+            .record(peer_probe(b, 70, "B-first"), 2)
+            .expect("full B");
+        witnesses
+            .record(peer_probe(b, 80, "B-duplicate"), 2)
+            .expect("duplicate cannot replace first");
+        witnesses
+            .record(peer_probe(a, 100, "A-last"), 2)
+            .expect("exact common deadline");
+        assert!(witnesses.pending.is_empty());
+        assert_eq!(witnesses.completed.len(), 2);
+        assert_eq!(witnesses.completed[0].1.id, "B-first");
+        assert_eq!(witnesses.completed[1].1.id, "A-last");
+        let mut late = FreshPeerWitnesses::new(&[a, b], 100);
+        late.record(peer_probe(b, 90, "B"), 2).expect("B");
+        assert!(late.record(peer_probe(a, 101, "late-A"), 2).is_err());
+        assert_eq!(late.pending, vec![a]);
+    }
+    #[test]
+    fn recovery_needs_actual_peer_and_full_wire_not_an_admin_health_label() {
+        let a = "127.0.0.1:1200".parse().expect("A");
+        let other = "127.0.0.1:1202".parse().expect("other");
+        let mut witnesses = FreshPeerWitnesses::new(&[a], 100);
+        witnesses
+            .record(peer_probe(other, 10, "wrong-peer"), 2)
+            .expect("valid but not a witness");
+        assert_eq!(witnesses.pending, vec![a]);
+        for (field, wrong) in [
+            ("status", json!(503)),
+            ("body_bytes", json!(1)),
+            ("body_sha256", json!("00")),
+            ("eof", json!(false)),
+            ("error_code", json!("transport_error")),
+            ("diagnostics", json!(["bad_wire"])),
+        ] {
+            let mut probe = peer_probe(a, 20, "bad");
+            probe.raw[field] = wrong;
+            assert!(witnesses.record(probe, 2).is_err(), "{field}");
+            assert_eq!(witnesses.pending, vec![a]);
+        }
+    }
+    #[test]
+    fn ttl_zero_uses_the_same_finite_recovery_contract_as_withdrawal() {
+        assert_eq!(
+            dns_fault_recipe("ttl0").expect("explicit zero lease"),
+            ("ttl_zero_answers", 0, "dns_ttl_zero")
+        );
+        assert_eq!(
+            dns_fault_recipe("withdraw").expect("withdrawal"),
+            ("withdraw_answers", 1, "dns_all_withdraw")
+        );
+        assert!(
+            dns_fault_recipe("positive").is_err(),
+            "healthy traffic cannot invent a fault window"
+        );
+    }
+    #[test]
+    fn srv_target_aaaa_witness_requires_real_refresh_and_exact_metric_scope() {
+        let before = json!({"clusters":[{"cluster":"upstream","discovery":{"name":"_https._tcp.api.discovery.test.","generation":4,"resolution":"fresh","eligible_endpoints":2}}]});
+        let duplicate =
+            json!({"clusters":[before["clusters"][0].clone(),before["clusters"][0].clone()]});
+        assert!(upstream_cluster(&duplicate).is_err());
+        let mut after = before.clone();
+        after["clusters"][0]["discovery"]["generation"] = 5.into();
+        let before_metric = format!(
+            "{SRV_POSITIVE_METRIC} 10\noxidase_discovery_queries_total{{cluster=\"upstream\",family=\"aaaa\",result=\"positive\"}} 0\n"
+        );
+        let after_metric = before_metric.replace(" 10\n", " 11\n");
+        let first = json!({"positive_aaaa_answers":0});
+        let last = json!({"positive_aaaa_answers":3});
+        assert!(
+            srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("actual SRV target AAAA")
+        );
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &before_metric,
+                &first,
+                &last
+            )
+            .expect("no supervisor refresh")
+        );
+        assert!(
+            !srv_aaaa_refresh(&before, &after, &before_metric, &after_metric, &last, &last)
+                .expect("no actual AAAA answer")
+        );
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &before,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("no membership generation")
+        );
+        after["clusters"][0]["discovery"]["name"] = "other.discovery.test.".into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("wrong declared origin")
+        );
+        after["clusters"][0]["discovery"]["name"] = "_https._tcp.api.discovery.test.".into();
+        after["clusters"][0]["discovery"]["resolution"] = "stale".into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("stale data")
+        );
+        after["clusters"][0]["discovery"]["resolution"] = "fresh".into();
+        after["clusters"][0]["discovery"]["eligible_endpoints"] = 0.into();
+        assert!(
+            !srv_aaaa_refresh(
+                &before,
+                &after,
+                &before_metric,
+                &after_metric,
+                &first,
+                &last
+            )
+            .expect("no usable endpoint")
+        );
+    }
+
     fn control_journal(directory: &Path) -> Arc<std::sync::Mutex<ProbeJournal>> {
         Arc::new(std::sync::Mutex::new(
             ProbeJournal::named(
@@ -1550,11 +2043,17 @@ mod tests {
     }
     #[test]
     fn srv_weight_oracle_rejects_priority_or_identity_changes() {
-        let mut raw = json!({"clusters":[{"cluster":"upstream","discovery":{"srv_targets":[{"target":"a.discovery.test","priority":0,"weight":1},{"target":"b.discovery.test","priority":0,"weight":1}]}}]});
+        // Literal canonical target representation observed in the actual Linux
+        // Admin artifact, not an unqualified-name fixture invented by this
+        // oracle. DNS target identity/priority must remain exact.
+        let mut raw = json!({"clusters":[{"cluster":"upstream","discovery":{"srv_targets":[{"target":"a.discovery.test.","priority":0,"weight":1},{"target":"b.discovery.test.","priority":0,"weight":1}]}}]});
         assert!(srv_weights(&raw, 1, 1).expect("equal weights"));
         assert!(!srv_weights(&raw, 3, 1).expect("not weighted"));
         raw["clusters"][0]["discovery"]["srv_targets"][0]["weight"] = 3.into();
         assert!(srv_weights(&raw, 3, 1).expect("weighted"));
+        raw["clusters"][0]["discovery"]["srv_targets"][0]["target"] = "a.discovery.test".into();
+        assert!(!srv_weights(&raw, 3, 1).expect("unqualified metadata is not canonical"));
+        raw["clusters"][0]["discovery"]["srv_targets"][0]["target"] = "a.discovery.test.".into();
         raw["clusters"][0]["discovery"]["srv_targets"][1]["priority"] = 1.into();
         assert!(!srv_weights(&raw, 3, 1).expect("changed priority"));
         raw["clusters"][0]["discovery"]["srv_targets"][1]["priority"] = 0.into();
