@@ -379,8 +379,20 @@ impl Client {
             .body(body)
             .expect("valid request");
         let response = match &mut self.sender {
-            Sender::Http1(sender) => sender.send_request(request).await,
-            Sender::H2(sender) => sender.send_request(request).await,
+            Sender::Http1(sender) => {
+                sender
+                    .ready()
+                    .await
+                    .expect("same HTTP/1 dispatcher becomes ready");
+                sender.send_request(request).await
+            }
+            Sender::H2(sender) => {
+                sender
+                    .ready()
+                    .await
+                    .expect("same H2 dispatcher becomes ready");
+                sender.send_request(request).await
+            }
         };
         response.expect("gateway produces a response head")
     }
@@ -771,6 +783,99 @@ async fn response_body_idle_failure_preserves_sent_200_and_releases_permits() {
             .expect("body-idle timeout closes stream")
             .is_err()
     );
+    drop(client);
+    permits_released(&gateway.cluster).await;
+    gateway.stop().await;
+    upstream.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reused_http1_test_client_waits_for_dispatcher_before_its_single_send() {
+    let release = Arc::new(Semaphore::new(0));
+    let upstream = Upstream::start(
+        "127.0.0.1:0",
+        Protocol::Http1,
+        Behavior::HeldResponse(Arc::clone(&release)),
+    )
+    .await;
+    let gateway = Gateway::start(
+        Protocol::Http1,
+        &[url(&upstream)],
+        "        pre_response_total: 2s\n        response_body_idle: 5s\n",
+        "",
+    )
+    .await;
+    let mut client = gateway.client().await;
+    let first = client
+        .request(Method::GET, "/first", ChannelBody::empty())
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first = first.into_body();
+    let frame = first.frame().await.expect("prefix frame").expect("DATA");
+    assert_eq!(frame.data_ref().expect("first DATA"), "prefix");
+    let Sender::Http1(sender) = &client.sender else {
+        panic!("one HTTP/1 sender");
+    };
+    assert!(!sender.is_ready(), "held response keeps dispatcher busy");
+    let (polled, first_poll) = oneshot::channel();
+    let second = tokio::spawn(async move {
+        let response = {
+            let request = client.request(Method::GET, "/second", ChannelBody::empty());
+            tokio::pin!(request);
+            let mut polled = Some(polled);
+            std::future::poll_fn(|context| {
+                let progress = request.as_mut().poll(context);
+                if let Some(polled) = polled.take() {
+                    polled
+                        .send(progress.is_pending())
+                        .expect("first-poll observer remains alive");
+                }
+                progress
+            })
+            .await
+        };
+        (client, response)
+    });
+    // Observe the request future's actual first poll, not a scheduling delay.
+    // The wire gate is still closed, so this must be Pending, never cancelled.
+    let pending = tokio::time::timeout(Duration::from_secs(3), first_poll)
+        .await
+        .expect("request task actually polled")
+        .expect("single-send request did not panic before readiness");
+    assert!(
+        pending,
+        "second single-send must await readiness rather than be cancelled"
+    );
+    assert_eq!(upstream.heads.load(Ordering::Relaxed), 1);
+    assert_eq!(upstream.connections.load(Ordering::Relaxed), 1);
+    release.add_permits(1);
+    let first = first.collect().await.expect("first actual EOF");
+    assert!(first.trailers().is_none(), "fixture emits no trailers");
+    assert!(
+        first.to_bytes().is_empty(),
+        "first body was exactly the already-verified prefix"
+    );
+    let (mut client, response) = tokio::time::timeout(Duration::from_secs(3), second)
+        .await
+        .expect("original pending operation completes after release")
+        .expect("single-send task joined");
+    assert_eq!(response.status(), StatusCode::OK);
+    release.add_permits(1);
+    assert_eq!(complete(response, StatusCode::OK).await, "prefix");
+    assert_eq!(upstream.heads.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        upstream.connections.load(Ordering::Relaxed),
+        1,
+        "no retry or new connection substitutes for dispatcher readiness"
+    );
+    client.task.abort();
+    match tokio::time::timeout(Duration::from_secs(3), &mut client.task)
+        .await
+        .expect("actual downstream driver exit acknowledged")
+    {
+        Ok(()) => {}
+        Err(error) => assert!(error.is_cancelled(), "driver panicked: {error}"),
+    }
     drop(client);
     permits_released(&gateway.cluster).await;
     gateway.stop().await;
