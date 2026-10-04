@@ -370,6 +370,7 @@ def tool_inventory(prefix):
     result["linked_dependencies"] = {
         str(file.relative_to(prefix)): text_command(["ldd", str(file)])
         for file in (binaries[1], binaries[2], binaries[4])}
+    result["linked_files"] = linked_file_evidence(result["linked_dependencies"])
     result["packages"] = []
     for package in PACKAGES:
         entry = {"package": package, "version": None, "copyright_sha256": None,
@@ -385,6 +386,64 @@ def tool_inventory(prefix):
         except (OSError, ValueError, Unavailable):
             entry["error"] = "primary package copyright/version unavailable"
         result["packages"].append(entry)
+    return result
+
+
+def linked_file_evidence(dependencies):
+    paths = set()
+    for text in dependencies.values():
+        for line in text.splitlines():
+            match = re.fullmatch(r"\s*(?:\S+\s+=>\s*)?(/\S+)\s+\(0x[0-9a-fA-F]+\)\s*", line)
+            if match:
+                paths.add(match[1])
+            elif not re.fullmatch(r"\s*linux-vdso\.so\.\d+\s+\(0x[0-9a-fA-F]+\)\s*", line):
+                raise Unavailable("unexpected/unresolved linked dependency record")
+    if not paths or len(paths) > 64:
+        raise Unavailable("linked dependency file capacity/identity unavailable")
+    result = []
+    for original in sorted(paths):
+        file = Path(original).resolve(strict=True)
+        entry = {"ldd_path": original, "canonical_path": str(file), "sha256": sha256(file),
+                 "bytes": file.stat().st_size, "package": None, "package_version": None,
+                 "copyright_sha256": None, "license_fields": None}
+        try:
+            ownership = text_command(["dpkg-query", "-S", original])
+            owners = [row.partition(": ")[0] for row in ownership.splitlines()
+                      if row.partition(": ")[2] == original]
+            if len(owners) != 1 or not re.fullmatch(r"[a-z0-9.+-]+(?::[a-z0-9-]+)?", owners[0]):
+                raise Unavailable("unambiguous library package owner unavailable")
+            package = owners[0]
+            entry["package"] = package
+            entry["package_version"] = text_command(["dpkg-query", "-W", "-f=${Version}", package])
+            copyright_file = Path("/usr/share/doc") / package.split(":")[0] / "copyright"
+            entry["copyright_sha256"] = sha256(copyright_file, 1024 * 1024)
+            entry["license_fields"] = sorted(set(re.findall(r"^License: (.+)$", copyright_file.read_text(), re.M)))
+        except (OSError, ValueError, Unavailable):
+            entry["license_error"] = "primary linked-library package copyright/version unavailable"
+        result.append(entry)
+    return result
+
+
+def stable_profiler_inventory(inventory):
+    """Ignore only ldd's mapped addresses; keep raw reports, paths and hashes."""
+    if not isinstance(inventory, dict) or not isinstance(inventory.get("linked_dependencies"), dict):
+        raise Unavailable("profiler inventory dependency schema unavailable")
+    if any(not isinstance(name, str) or not isinstance(text, str)
+           for name, text in inventory["linked_dependencies"].items()):
+        raise Unavailable("profiler inventory dependency fields invalid")
+    result = dict(inventory)
+    pattern = re.compile(r"^[ \t]*(?:linux-vdso\.so\.\d+|/\S+|\S+[ \t]+=>[ \t]+/\S+)"
+                         r"[ \t]+\((?P<address>0x[0-9a-fA-F]+)\)[ \t]*$")
+    def stable(text):
+        lines = []
+        for line in text.splitlines(keepends=True):
+            match = pattern.match(line.rstrip("\r\n"))
+            if match:
+                start, end = match.span("address")
+                line = line[:start] + "<mapped-address>" + line[end:]
+            lines.append(line)
+        return "".join(lines)
+    result["linked_dependencies"] = {name: stable(text) for name, text in inventory["linked_dependencies"].items()}
     return result
 
 
@@ -684,8 +743,10 @@ def run(args):
         report["gateway_binary"] = {"sha256": sha256(binary), "bytes": binary.stat().st_size}
         report["profiler"] = tool_inventory(args.tool_prefix.resolve())
         preflight = json.loads((args.output / "tool-preflight.json").read_text())
+        if not isinstance(preflight, dict):
+            raise Unavailable("profiler preparation record must be an object")
         if (preflight.get("result") != "AVAILABLE" or preflight.get("archive_sha256") != ARCHIVE_SHA256
-                or preflight.get("inventory") != report["profiler"]):
+                or stable_profiler_inventory(preflight.get("inventory", {})) != stable_profiler_inventory(report["profiler"])):
             raise Unavailable("installed profiler does not match this experiment's pinned preparation record")
         report["ptrace"] = {"scope": None, "cap_eff": None, "attach_attempted": False}
         try:

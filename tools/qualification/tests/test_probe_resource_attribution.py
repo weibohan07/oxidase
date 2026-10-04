@@ -1,6 +1,7 @@
 """Offline regression corpus; fake fixture results are not profiler campaigns."""
 
 import argparse
+import copy
 import gzip
 import hashlib
 import importlib.util
@@ -50,7 +51,7 @@ class Boundaries(unittest.TestCase):
             root = Path(temporary)
             binary = root / "gateway"
             binary.write_bytes(b"known binary fixture, not an executed profiler")
-            inventory = {"version": "heaptrack 1.5.0", "binaries": []}
+            inventory = {"version": "heaptrack 1.5.0", "binaries": [], "linked_dependencies": {}}
             (root / "tool-preflight.json").write_text(json.dumps({
                 "result": "AVAILABLE", "archive_sha256": PROBE.ARCHIVE_SHA256, "inventory": inventory}))
             def process(argv, **_kwargs):
@@ -163,6 +164,49 @@ class Boundaries(unittest.TestCase):
             self.assertEqual((row["offered"], row["completed"], row["failed"]), (1, 0, 1), delayed)
             if delayed == "eof":
                 self.assertIn(1.0, timeouts)
+
+    def test_inventory_ignores_only_mapped_aslr_addresses_not_identity_changes(self):
+        old = {"version": "heaptrack 1.5.0", "binaries": [{"path": "bin/heaptrack", "sha256": "abc", "bytes": 12}],
+               "packages": [{"name": "library", "version": "1.0", "copyright_sha256": "known"}],
+               "linked_files": [{"ldd_path": "/lib/library-0x123.so", "canonical_path": "/usr/lib/library-0x123.so",
+                                 "sha256": "library-one", "bytes": 17}],
+               "linked_dependencies": {"bin/heaptrack": "linux-vdso.so.1 (0x123)\n"
+                   "\tlibrary-0x123.so => /lib/library-0x123.so (0x456)\n\t/lib/loader.so (0x789)\n"}}
+        new = copy.deepcopy(old)
+        new["linked_dependencies"]["bin/heaptrack"] = old["linked_dependencies"]["bin/heaptrack"].replace(
+            "(0x123)", "(0x987)").replace("(0x456)", "(0xabc)").replace("(0x789)", "(0xdef)")
+        self.assertNotEqual(old, new)
+        self.assertEqual(PROBE.stable_profiler_inventory(old), PROBE.stable_profiler_inventory(new))
+        self.assertIn("library-0x123.so", PROBE.stable_profiler_inventory(new)["linked_dependencies"]["bin/heaptrack"])
+        for mutate in (
+                lambda value: value["linked_files"][0].update(sha256="different-library-bytes"),
+                lambda value: value["binaries"][0].update(sha256="different-tool-bytes"),
+                lambda value: value["packages"][0].update(version="2.0"),
+                lambda value: value["linked_dependencies"].update({"bin/heaptrack":
+                    value["linked_dependencies"]["bin/heaptrack"].replace("library-0x123.so", "library-0x999.so")})):
+            mismatch = copy.deepcopy(new)
+            mutate(mismatch)
+            self.assertNotEqual(PROBE.stable_profiler_inventory(old), PROBE.stable_profiler_inventory(mismatch))
+
+    def test_linked_library_is_hashed_by_actual_canonical_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "library-0x123.so"
+            alias = root / "library.so"
+            binary.write_bytes(b"actual runtime library bytes")
+            alias.symlink_to(binary)
+            ldd = {"profiler": f"\tlibrary.so => {alias} (0x123)\n"}
+            with patch.object(PROBE, "text_command", side_effect=PROBE.Unavailable("no synthetic package claim")):
+                before = PROBE.linked_file_evidence(ldd)
+                binary.write_bytes(b"changed runtime library bytes")
+                after = PROBE.linked_file_evidence(ldd)
+            self.assertEqual(before[0]["canonical_path"], str(binary.resolve()))
+            self.assertNotEqual(before[0]["sha256"], after[0]["sha256"])
+            self.assertEqual(before[0]["bytes"], len(b"actual runtime library bytes"))
+            self.assertIsNone(before[0]["license_fields"])
+            self.assertIn("license_error", before[0])
+            with self.assertRaises(PROBE.Unavailable):
+                PROBE.linked_file_evidence({"profiler": "missing.so => not found\n"})
 
     def test_keep_alive_sender_retires_before_operation_1001_without_retry(self):
         payload = b"exact fixture bytes"
