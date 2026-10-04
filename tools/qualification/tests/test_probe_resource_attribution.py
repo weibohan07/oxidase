@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import socket
+import threading
 from pathlib import Path
 import tarfile
 import tempfile
@@ -149,6 +151,8 @@ class Boundaries(unittest.TestCase):
                 status = 200
                 will_close = False
                 reads = 0
+                def isclosed(self):
+                    return False
                 def read(self, _size):
                     self.reads += 1
                     if self.reads == 1:
@@ -244,6 +248,8 @@ class Boundaries(unittest.TestCase):
             def getheader(self, name):
                 return {"Content-Type": "application/octet-stream", "Content-Length": str(len(payload)),
                         "Transfer-Encoding": None, "Trailer": None}[name]
+            def isclosed(self):
+                return False
         class Connection:
             def __init__(self, *_args, **_kwargs):
                 self.count = 0
@@ -273,6 +279,48 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(row["failed"], 0)
         self.assertEqual([connection.count for connection in connections], [1000, 1])
         self.assertTrue(all(connection.closed for connection in connections))
+
+    def test_actual_connection_close_at_1000_validates_full_body_before_retiring(self):
+        payload = b"entire public test fixture, not a captured heap/body dump"
+        seen, connections = [0], []
+        class Handler(PROBE.http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(5)
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.on_connection = 0
+                connections.append(self)
+            def do_GET(self):
+                self.on_connection += 1
+                seen[0] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                if self.on_connection == 1000:
+                    self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+            def log_message(self, *_args):
+                pass
+        server = PROBE.http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # Actual thread/socket exit is joined; no daemon hides leftover I/O.
+        server.daemon_threads = False
+        controller = threading.Thread(target=server.serve_forever)
+        controller.start()
+        PROBE.STOP.clear()
+        try:
+            with patch.object(PROBE, "now", side_effect=lambda: 2_000_000_000 if seen[0] >= 1001 else 0):
+                receipt = PROBE.load(server.server_address, payload, 1, 1)
+        finally:
+            server.shutdown()
+            controller.join(timeout=3)
+            server.server_close()
+        self.assertFalse(controller.is_alive())
+        row = receipt["workers"][0]
+        self.assertEqual((row["offered"], row["completed"], row["failed"]), (1001, 1001, 0))
+        self.assertEqual([handler.on_connection for handler in connections], [1000, 1])
+        self.assertEqual(row["connections"], {"started": 2, "connected": 2, "failed": 0, "closed": 2})
 
     def test_proc_stat_comm_spaces_parentheses_and_start_identity(self):
         rest = ["S", "20"] + ["0"] * 17 + ["123456"]

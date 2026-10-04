@@ -592,12 +592,12 @@ def load(address, payload, duration, concurrency):
                 started = now()
                 deadline = started + 5_000_000_000
                 response_socket = None
-                def remaining():
+                def remaining(update_socket=True):
                     interval = (deadline - now()) / 1e9
                     if interval <= 0:
                         raise Unavailable("absolute full response deadline exceeded")
                     socket = client.sock if client is not None and client.sock is not None else response_socket
-                    if socket is not None:
+                    if update_socket and socket is not None:
                         socket.settimeout(interval)
                     return interval
                 path = "/proxy" if (offered + index) % 2 else "/asset.bin"
@@ -617,12 +617,15 @@ def load(address, payload, duration, concurrency):
                     remaining()
                     response_socket = client.sock
                     response = client.getresponse()
-                    remaining()
+                    remaining(False)
                     digest, count = hashlib.sha256(), 0
                     while True:
+                        if response.isclosed():
+                            remaining(False)
+                            break
                         remaining()
                         data = response.read(65536)
-                        remaining()
+                        remaining(False)
                         if not data:
                             break
                         count += len(data)
