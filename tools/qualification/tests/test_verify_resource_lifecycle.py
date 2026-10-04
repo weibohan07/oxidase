@@ -655,6 +655,50 @@ class VerifierCorpusTests(unittest.TestCase):
                 self.assertEqual(report["result"], "FAIL")
                 self.assertIn("RL_INVALID_EVIDENCE", codes(report))
 
+    def test_diagnostic_code_counts_survive_repeated_tls_detail_truncation(self):
+        analyzer = VERIFIER.Analyzer("synthetic-not-read")
+        for _ in range(201):
+            analyzer.finding("RL_GRACEFUL_TLS_CLOSE", "fixed TLS notice", "INCONCLUSIVE")
+        analyzer.finding("RL_CAPACITY_UNPROVEN", "fixed capacity criterion", "INCONCLUSIVE")
+        analyzer.finding("RL_MEMORY_ATTRIBUTION", "fixed memory criterion", "INCONCLUSIVE")
+        report = analyzer.report()
+        self.assertEqual(report["result"], "INCONCLUSIVE")
+        self.assertEqual(len(report["findings"]), 200)
+        self.assertTrue(report["findings_truncated"])
+        self.assertEqual(report["finding_counts"], {"INCONCLUSIVE": 203})
+        self.assertEqual(report["finding_code_counts"], {
+            "RL_CAPACITY_UNPROVEN": {"INCONCLUSIVE": 1},
+            "RL_GRACEFUL_TLS_CLOSE": {"INCONCLUSIVE": 201},
+            "RL_MEMORY_ATTRIBUTION": {"INCONCLUSIVE": 1}})
+        self.assertFalse(report["finding_code_counts_truncated"])
+        self.assertEqual(report["finding_code_counts_omitted"], 0)
+        self.assertEqual(report, analyzer.report())
+        # A real late FAIL still changes the verdict, even with no detail slot.
+        analyzer.finding("RL_CONTENT", "fixed content error")
+        failed = analyzer.report()
+        self.assertEqual(failed["result"], "FAIL")
+        self.assertEqual(len(failed["findings"]), 200)
+        self.assertEqual(failed["finding_code_counts"]["RL_CONTENT"], {"FAIL": 1})
+        self.assertEqual(failed["finding_counts"], {"INCONCLUSIVE": 203, "FAIL": 1})
+
+    def test_diagnostic_code_counts_distinct_bound_never_changes_severity_verdict(self):
+        analyzer = VERIFIER.Analyzer("synthetic-not-read")
+        for index in range(VERIFIER.MAX_FINDING_CODES):
+            analyzer.finding(f"RL_TEST_{index:03}", "synthetic fixed notice", "INCONCLUSIVE")
+        analyzer.finding("RL_TEST_000", "known code still counts", "INCONCLUSIVE")
+        analyzer.finding("RL_EXTRA_TEST_CODE", "omitted detail-code counter", "FAIL")
+        analyzer.finding("RL_EXTRA_TEST_CODE", "omitted detail-code counter", "FAIL")
+        report = analyzer.report()
+        self.assertEqual(report["result"], "FAIL")
+        self.assertEqual(len(report["finding_code_counts"]), 128)
+        self.assertEqual(report["finding_code_counts"]["RL_TEST_000"], {"INCONCLUSIVE": 2})
+        self.assertNotIn("RL_EXTRA_TEST_CODE", report["finding_code_counts"])
+        self.assertTrue(report["finding_code_counts_truncated"])
+        self.assertEqual(report["finding_code_counts_omitted"], 2)
+        self.assertEqual(report["finding_counts"], {"INCONCLUSIVE": 129, "FAIL": 2})
+        self.assertEqual(list(report["finding_code_counts"]), sorted(report["finding_code_counts"]))
+        self.assertEqual(report, analyzer.report())
+
 
 if __name__ == "__main__":
     unittest.main()

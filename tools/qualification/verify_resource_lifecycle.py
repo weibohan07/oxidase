@@ -30,6 +30,7 @@ MAX_ROWS = 5_000_000
 MAX_ERRORS = 100_000
 MAX_PROBES = 50_000
 MAX_FINDINGS = 200
+MAX_FINDING_CODES = 128
 ROLES = ("gateway", "controller", "dns", "upstream", "sampler")
 HEX256 = re.compile(r"^[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -164,6 +165,8 @@ class Analyzer:
         self.inputs = Inputs(directory)
         self.findings = []
         self.finding_count = Counter()
+        self.finding_code_counts = {}
+        self.finding_code_counts_omitted = 0
         self.phases = []
         self.windows = {}
         self.drain_windows = []
@@ -214,6 +217,14 @@ class Analyzer:
 
     def finding(self, code, message, result="FAIL", **context):
         self.finding_count[result] += 1
+        # Codes are fixed internal diagnostics, never raw request/error labels.
+        # Count before detail truncation so repeated tunnel notices cannot hide
+        # later capacity/memory criteria. The defensive distinct-code bound
+        # changes visibility only, never severity totals or the final verdict.
+        if code in self.finding_code_counts or len(self.finding_code_counts) < MAX_FINDING_CODES:
+            self.finding_code_counts.setdefault(code, Counter())[result] += 1
+        else:
+            self.finding_code_counts_omitted += 1
         if len(self.findings) < MAX_FINDINGS:
             row = {"code": code, "result": result, "message": message}
             if context:
@@ -1883,6 +1894,10 @@ class Analyzer:
                              "source_set_sha256": self.receipt.get("source_set_sha256")},
                 "findings": self.findings, "finding_counts": dict(self.finding_count),
                 "findings_truncated": sum(self.finding_count.values()) > len(self.findings),
+                "finding_code_counts": {code: dict(sorted(counts.items()))
+                                        for code, counts in sorted(self.finding_code_counts.items())},
+                "finding_code_counts_truncated": self.finding_code_counts_omitted > 0,
+                "finding_code_counts_omitted": self.finding_code_counts_omitted,
                 "counts": dict(self.counts), "verified_wire_responses": self.verified_wire_responses,
                 "coverage": dict(self.coverage), "actual_publications": self.publications,
                 "quiescent_resource_captures": self.stable_captures,
