@@ -25,6 +25,12 @@ Actual external heaptrack collection/parsing succeeded only for a separate
 60-second debug-enabled H1 experiment, not normal H/C attribution. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
+Final implementation C repeat (`37211766238`, `c0db6cd`) remains FAIL: five
+unwindowed worker 504s, one missing cancellation ACK and a normal IPv6 control
+504. All 62870 offered operations were received; recovery/Quiet were not entered.
+No production fix is asserted without attribution. 7A has not fully passed;
+Access Log, OpenTelemetry, packaging and version/release work remain out of scope.
+
 ## Baseline
 
 - phase-six delivery: 6A–6D, protected PRs #16–#19; exact delivery receipts are

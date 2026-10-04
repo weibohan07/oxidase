@@ -56,12 +56,12 @@ This is local macOS validation, not a Linux campaign or new Hosted check.
 | RL-04 | observation owns no resources, pure reads and bounded scalar detail | PASS_IMPLEMENTATION: 5000 generations, disabled/missing series and authenticated pure reads |
 | RL-05 | old issued streams pin resources, new leases honor retirement | PASS_IMPLEMENTATION: real old TLS/H2 stream/Asset publication and cancellation; campaign pending |
 | RL-06 | no-scrape Running retirement, 0/low/high scrape controls | PASS_IMPLEMENTATION; three complete Linux Respond controls, positive drift INCONCLUSIVE and no-scrape Running lifecycle unavailable |
-| RL-07 | healthy and fault lanes fully validate DATA/trailers with all operations classified | PASS_IMPLEMENTATION for conservation/oracle; original actual H/C failures remain FAIL, final repeat pending |
-| RL-08 | bounded fault windows and real recovery deadlines, AAAA/timeout/post-head failure | PASS_IMPLEMENTATION: adversarial oracle and real fixture corpus; complete C qualification pending |
+| RL-07 | healthy and fault lanes fully validate DATA/trailers with all operations classified | PASS_IMPLEMENTATION; full H wire/conservation verified, final C has 5 unwindowed 504s + missing cancel ACK and remains FAIL |
+| RL-08 | bounded fault windows and real recovery deadlines, AAAA/timeout/post-head failure | PASS_IMPLEMENTATION: strict oracle and regression-backed repairs; final normal IPv6 control 504 remains FAIL, no whole C qualification |
 | RL-09 | warm / steady / recovery-running / quiet-running / post-drain measurements | formal H completed all minima with actual Running reclamation; original INCONCLUSIVE, all C attempts so far stopped early |
 | RL-10 | independent verifier rejects missing data, false healthy, leak and lost results | PASS_IMPLEMENTATION: negative corpus and actual Hosted artifact rejections; never promotes controller claim to PASS |
 | RL-11 | exact implementation/tool/binary/PID identity and untruncated raw evidence | PASS_IMPLEMENTATION; sealed formal H and original C/provider/per-file/frozen-replay indices, earlier truncated C remains FAIL |
-| RL-12 | evidence-driven attribution, necessary regression-backed fixes and Linux repeat | INCONCLUSIVE: multiple preserved failures and regression-backed tool repairs; no proven production-retention defect |
+| RL-12 | evidence-driven attribution, necessary regression-backed fixes and Linux repeat | INCONCLUSIVE: real native allocation capture, multiple preserved Linux repeats and regression-backed tool repairs; no proven production-retention defect or full memory attribution |
 | RL-13 | final-head and independent main CI for all three PRs | PR #20 and #21 PASS; PR #22 Draft, final delivery pending |
 
 ## 7A.1 implemented boundaries and development executions
@@ -132,6 +132,15 @@ zero after drain. Required checks must rerun on the repaired head.
 Implementation, bounded runtime qualification and memory attribution are separate
 conclusions. Missing required data or unclosed attribution cannot become PASS
 because code, an interface, a workflow, or a green build exists.
+
+The final implementation repeat is recorded in the
+[attribution ledger](resource-retention-attribution.md#final-implementation-repeat-and-delivery-boundary).
+It preserves final C `37211766238` FAIL, not a tool-generated success: all 62870
+operations were conserved, but normal IPv6/worker 504s and a missing ACK remain.
+Its recovery/Quiet never started. Full H met time minima and had no unexpected
+outcome, but still has TLS-close, structural-capacity and resident-attribution
+INCONCLUSIVE criteria. **7A 尚未完整通过** even if all three implementation PRs
+are normally merged with independently green required/main checks.
 
 ## 7A.2 original Hosted failures (not qualification results)
 

@@ -1,0 +1,1162 @@
+{
+  "schema_version": "oxidase.resource-evidence-index/v1",
+  "scope": "Final implementation formal C campaign stopped early; genuine FAIL. Evidence preservation and bounded diagnosis only, not completed 7A qualification.",
+  "run": {
+    "id": 37211766238,
+    "url": "https://github.com/weibohan07/oxidase/actions/runs/37211766238",
+    "event": "workflow_dispatch",
+    "head_commit": "c0db6cde862b3101ed3939e5c7dfa1d68fe6a891",
+    "job_id": 111464219594,
+    "job_result": "failure",
+    "job_duration_seconds": 369,
+    "allocation_job_result": "skipped"
+  },
+  "artifact": {
+    "id": 11306813903,
+    "name": "resource-7a-churn-c0db6cde862b3101ed3939e5c7dfa1d68fe6a891-37211766238",
+    "bytes": 1412778,
+    "provider_sha256": "24dd32f3aa3ae5c2d5fb78a69820f2127db805ba18f7a0b30d852c1c71251c91",
+    "download_sha256": "24dd32f3aa3ae5c2d5fb78a69820f2127db805ba18f7a0b30d852c1c71251c91",
+    "local_zip": "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/artifact-11306813903.zip",
+    "local_original_directory": "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/original",
+    "manifest_sha256": "fdf57f385a1e0f10e1ee79edeadfcc6c3fa48a85268414be4f8195750a4b8255",
+    "manifest_entries": [
+      {
+        "path": "analysis.json",
+        "bytes": 1768,
+        "sha256": "9e8050b6d4916a10b1125ff46e5880113da0c737275cf864f243803613703883",
+        "actual_bytes": 1768,
+        "actual_sha256": "9e8050b6d4916a10b1125ff46e5880113da0c737275cf864f243803613703883",
+        "verified": true
+      },
+      {
+        "path": "build-record.json",
+        "bytes": 27878,
+        "sha256": "aedfed5a17aa2faa91f4a8d090537cb4fd898aca776178daed941afe401b5d81",
+        "actual_bytes": 27878,
+        "actual_sha256": "aedfed5a17aa2faa91f4a8d090537cb4fd898aca776178daed941afe401b5d81",
+        "verified": true
+      },
+      {
+        "path": "campaign/buckets.jsonl",
+        "bytes": 2904453,
+        "sha256": "6ba283030ecb86d5ec11d08525b55439cdaefca9883b49906317edc298856a99",
+        "actual_bytes": 2904453,
+        "actual_sha256": "6ba283030ecb86d5ec11d08525b55439cdaefca9883b49906317edc298856a99",
+        "verified": true
+      },
+      {
+        "path": "campaign/client-retirements.jsonl",
+        "bytes": 43924,
+        "sha256": "17d47a3d33f4e76e5b6fdfb0710c3c83d7a79ceeda9f8ec3427c34357675e4aa",
+        "actual_bytes": 43924,
+        "actual_sha256": "17d47a3d33f4e76e5b6fdfb0710c3c83d7a79ceeda9f8ec3427c34357675e4aa",
+        "verified": true
+      },
+      {
+        "path": "campaign/compact-fault-results.jsonl",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "actual_bytes": 0,
+        "actual_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "verified": true
+      },
+      {
+        "path": "campaign/control-operations.jsonl",
+        "bytes": 6141,
+        "sha256": "8223e26233df3f398300b64cf9f21f197f199f9dd3436a1bc8e4cfe3d7f58063",
+        "actual_bytes": 6141,
+        "actual_sha256": "8223e26233df3f398300b64cf9f21f197f199f9dd3436a1bc8e4cfe3d7f58063",
+        "verified": true
+      },
+      {
+        "path": "campaign/control-probes.jsonl",
+        "bytes": 1727,
+        "sha256": "2a609397abe4f54e730db1d5c812ad8cab65594f664e0880d3d0bd11b503a6f3",
+        "actual_bytes": 1727,
+        "actual_sha256": "2a609397abe4f54e730db1d5c812ad8cab65594f664e0880d3d0bd11b503a6f3",
+        "verified": true
+      },
+      {
+        "path": "campaign/dns.stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "actual_bytes": 0,
+        "actual_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "verified": true
+      },
+      {
+        "path": "campaign/errors.jsonl",
+        "bytes": 551147,
+        "sha256": "84327cea7ce013dd4d5cdc5176405d41c8f2a0874e1dc6a16d8927b1f8d4733a",
+        "actual_bytes": 551147,
+        "actual_sha256": "84327cea7ce013dd4d5cdc5176405d41c8f2a0874e1dc6a16d8927b1f8d4733a",
+        "verified": true
+      },
+      {
+        "path": "campaign/events.jsonl",
+        "bytes": 30478,
+        "sha256": "0eb5f4461af7793b91e74ef0a74a7daf3c89cbcacb3b6446674e00de86a27cbf",
+        "actual_bytes": 30478,
+        "actual_sha256": "0eb5f4461af7793b91e74ef0a74a7daf3c89cbcacb3b6446674e00de86a27cbf",
+        "verified": true
+      },
+      {
+        "path": "campaign/gateway.stderr.log",
+        "bytes": 2764,
+        "sha256": "bd5bf1ded89e24c77b18925b9ef9e6c434b16429264a419af3c513ae15cbdd00",
+        "actual_bytes": 2764,
+        "actual_sha256": "bd5bf1ded89e24c77b18925b9ef9e6c434b16429264a419af3c513ae15cbdd00",
+        "verified": true
+      },
+      {
+        "path": "campaign/gateway.stdout.log",
+        "bytes": 79,
+        "sha256": "3b5e7fc515d2ea7ee51275e0087bb01003d058678e42451e029ba08ef74fe550",
+        "actual_bytes": 79,
+        "actual_sha256": "3b5e7fc515d2ea7ee51275e0087bb01003d058678e42451e029ba08ef74fe550",
+        "verified": true
+      },
+      {
+        "path": "campaign/identity.json",
+        "bytes": 2851,
+        "sha256": "42b099ab32a81c61519317178e22d603afd1d8dd41abdd7c9d8b4e1802a2a468",
+        "actual_bytes": 2851,
+        "actual_sha256": "42b099ab32a81c61519317178e22d603afd1d8dd41abdd7c9d8b4e1802a2a468",
+        "verified": true
+      },
+      {
+        "path": "campaign/prelude-operations.json",
+        "bytes": 14833,
+        "sha256": "e8d16904fea826c96b564f6e7d65cfaa40b7e9323ace008c3e884f760026b6c8",
+        "actual_bytes": 14833,
+        "actual_sha256": "e8d16904fea826c96b564f6e7d65cfaa40b7e9323ace008c3e884f760026b6c8",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0001.json",
+        "bytes": 322,
+        "sha256": "f6a5c396ab543e1273e9283a23832bafd9ea2b61fa0e40323fb45f434d0cd45e",
+        "actual_bytes": 322,
+        "actual_sha256": "f6a5c396ab543e1273e9283a23832bafd9ea2b61fa0e40323fb45f434d0cd45e",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0002.json",
+        "bytes": 338,
+        "sha256": "4926cbb8764c5acd56eaf0ba881f0f6412e286b6ab7b95cf8b62d3b4f236fef7",
+        "actual_bytes": 338,
+        "actual_sha256": "4926cbb8764c5acd56eaf0ba881f0f6412e286b6ab7b95cf8b62d3b4f236fef7",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0003.json",
+        "bytes": 881,
+        "sha256": "a85135962c5bfa58199a4268f9e3f7f4b8ba0596d9e22ee3e203342378280bb6",
+        "actual_bytes": 881,
+        "actual_sha256": "a85135962c5bfa58199a4268f9e3f7f4b8ba0596d9e22ee3e203342378280bb6",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0004.json",
+        "bytes": 1177,
+        "sha256": "f5a88671246170f137af6e6ffbc89d8081c1fed83d1b379dca2a10195359c179",
+        "actual_bytes": 1177,
+        "actual_sha256": "f5a88671246170f137af6e6ffbc89d8081c1fed83d1b379dca2a10195359c179",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0005.json",
+        "bytes": 1180,
+        "sha256": "ec09b1260ccc03b7d4cb040141012029a9d30a5ee6e59c3c53b8633f588f20a0",
+        "actual_bytes": 1180,
+        "actual_sha256": "ec09b1260ccc03b7d4cb040141012029a9d30a5ee6e59c3c53b8633f588f20a0",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0006.json",
+        "bytes": 322,
+        "sha256": "e7a73374b45c5d532bf5abf176af98e2ca0c5277d70cac078f8c63e3df96aa2a",
+        "actual_bytes": 322,
+        "actual_sha256": "e7a73374b45c5d532bf5abf176af98e2ca0c5277d70cac078f8c63e3df96aa2a",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0007.json",
+        "bytes": 338,
+        "sha256": "61cdb56909bbc47262ca34d00f343c17e93dfedfd676f151c87ef9e7b1be32cd",
+        "actual_bytes": 338,
+        "actual_sha256": "61cdb56909bbc47262ca34d00f343c17e93dfedfd676f151c87ef9e7b1be32cd",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0008.json",
+        "bytes": 881,
+        "sha256": "5212b46496fc59ee3457e12eaf1cff8961af8f954d1b01b085197fdf26f94398",
+        "actual_bytes": 881,
+        "actual_sha256": "5212b46496fc59ee3457e12eaf1cff8961af8f954d1b01b085197fdf26f94398",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0009.json",
+        "bytes": 1177,
+        "sha256": "4cd13e8cc68007fb0c6b5a511b46b03077c1a4317339fc0f8492e3dd2cb2cfe3",
+        "actual_bytes": 1177,
+        "actual_sha256": "4cd13e8cc68007fb0c6b5a511b46b03077c1a4317339fc0f8492e3dd2cb2cfe3",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0010.json",
+        "bytes": 1180,
+        "sha256": "c98413b70ff1c5c17c210a82da6d014933d40ab11c0f8f601f84f15a3fa5c37a",
+        "actual_bytes": 1180,
+        "actual_sha256": "c98413b70ff1c5c17c210a82da6d014933d40ab11c0f8f601f84f15a3fa5c37a",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0011.json",
+        "bytes": 1246,
+        "sha256": "af2ef32d64d7ce566b72dd2621f80cd30a4f0290f248245a325326a796adadac",
+        "actual_bytes": 1246,
+        "actual_sha256": "af2ef32d64d7ce566b72dd2621f80cd30a4f0290f248245a325326a796adadac",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0012.json",
+        "bytes": 1246,
+        "sha256": "263a955ab4e9100a06f6a71868adc61f9d497010fd270b1a4cccef5be5348bf8",
+        "actual_bytes": 1246,
+        "actual_sha256": "263a955ab4e9100a06f6a71868adc61f9d497010fd270b1a4cccef5be5348bf8",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0013.json",
+        "bytes": 645,
+        "sha256": "3bb38f89af86dd0596ea3cba479ba9d9a054a2fc79599f073f7cfb471ebeedfe",
+        "actual_bytes": 645,
+        "actual_sha256": "3bb38f89af86dd0596ea3cba479ba9d9a054a2fc79599f073f7cfb471ebeedfe",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0014.json",
+        "bytes": 1246,
+        "sha256": "b9a7c4574947c149fb8e074fdc403836c974f1aa078dcf0832c1cbc54ec82ba5",
+        "actual_bytes": 1246,
+        "actual_sha256": "b9a7c4574947c149fb8e074fdc403836c974f1aa078dcf0832c1cbc54ec82ba5",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt.json",
+        "bytes": 66774,
+        "sha256": "9deb3b2a29dd1016a9e1565e241668b497c015775be03f662df653de567c9c28",
+        "actual_bytes": 66774,
+        "actual_sha256": "9deb3b2a29dd1016a9e1565e241668b497c015775be03f662df653de567c9c28",
+        "verified": true
+      },
+      {
+        "path": "campaign/sampler.stderr.log",
+        "bytes": 486,
+        "sha256": "ab4dd845cdda088a341151332d58021483e3a9d6b315a75b69e9cd3340475504",
+        "actual_bytes": 486,
+        "actual_sha256": "ab4dd845cdda088a341151332d58021483e3a9d6b315a75b69e9cd3340475504",
+        "verified": true
+      },
+      {
+        "path": "campaign/samples.jsonl",
+        "bytes": 13530309,
+        "sha256": "a0d7c727f8ade43f51df87024e52d14311f21fd5440c48d0011998cfaa59e850",
+        "actual_bytes": 13530309,
+        "actual_sha256": "a0d7c727f8ade43f51df87024e52d14311f21fd5440c48d0011998cfaa59e850",
+        "verified": true
+      },
+      {
+        "path": "campaign/seed-config.yaml",
+        "bytes": 2906,
+        "sha256": "5e929baa776c9698cc9c830c2e7402abcd0a1c0e702c15692488c142818d538a",
+        "actual_bytes": 2906,
+        "actual_sha256": "5e929baa776c9698cc9c830c2e7402abcd0a1c0e702c15692488c142818d538a",
+        "verified": true
+      },
+      {
+        "path": "campaign/upstream.stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "actual_bytes": 0,
+        "actual_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "verified": true
+      },
+      {
+        "path": "command.json",
+        "bytes": 690,
+        "sha256": "78879559ef54e97a2484aea845d234937dc6f5eacf8a2f26e74c405d999b2736",
+        "actual_bytes": 690,
+        "actual_sha256": "78879559ef54e97a2484aea845d234937dc6f5eacf8a2f26e74c405d999b2736",
+        "verified": true
+      },
+      {
+        "path": "controller.log",
+        "bytes": 150,
+        "sha256": "aab2a735e4650f6415b6cfe43edab53a87c576a1080c6d760174d46df33d4d5f",
+        "actual_bytes": 150,
+        "actual_sha256": "aab2a735e4650f6415b6cfe43edab53a87c576a1080c6d760174d46df33d4d5f",
+        "verified": true
+      },
+      {
+        "path": "workflow.json",
+        "bytes": 1459,
+        "sha256": "c6ac6477ecea48b8d6aca384b075a443b201f8e477615172f2c0f45d8862adc9",
+        "actual_bytes": 1459,
+        "actual_sha256": "c6ac6477ecea48b8d6aca384b075a443b201f8e477615172f2c0f45d8862adc9",
+        "verified": true
+      }
+    ],
+    "manifest_verified": 36,
+    "manifest_total": 36,
+    "raw_job_log": "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/job-111464219594-raw.log",
+    "raw_job_log_sha256": "0280ecff50daa560fd33426b9ec4a5125aa7d000172699b8683f43ac5983d0d0"
+  },
+  "frozen_replay": {
+    "source_commit": "c0db6cde862b3101ed3939e5c7dfa1d68fe6a891",
+    "analyzer_repository_path": "tools/qualification/verify_resource_lifecycle.py",
+    "local_analyzer": "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/frozen-c0db6cd-analyzer.py",
+    "analyzer_sha256": "9de0d99e9142bbee55f19830068f2acce4e7227ca0bb75b6d72b8f5f890b9b05",
+    "command": [
+      "python3",
+      "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/frozen-c0db6cd-analyzer.py",
+      "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/original/campaign",
+      "--output",
+      "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/replay.json"
+    ],
+    "exit_code": 1,
+    "result": "FAIL",
+    "original_analysis_sha256": "9e8050b6d4916a10b1125ff46e5880113da0c737275cf864f243803613703883",
+    "replay_sha256": "9e8050b6d4916a10b1125ff46e5880113da0c737275cf864f243803613703883",
+    "bit_identical": true,
+    "findings": [
+      {
+        "code": "RL_INCOMPLETE",
+        "result": "FAIL",
+        "message": "run did not finish with complete untruncated evidence"
+      },
+      {
+        "code": "RL_FATAL",
+        "result": "FAIL",
+        "message": "receipt contains fatal collection/worker/process errors"
+      },
+      {
+        "code": "RL_GRACEFUL_TLS_CLOSE",
+        "result": "INCONCLUSIVE",
+        "message": "full tunnel exchange ended with observed peer closure without TLS close_notify"
+      },
+      {
+        "code": "RL_FATAL",
+        "result": "FAIL",
+        "message": "fatal raw event",
+        "context": {
+          "error": null
+        }
+      },
+      {
+        "code": "RL_INVALID_EVIDENCE",
+        "result": "FAIL",
+        "message": "exactly five ordered phases and an end event are required"
+      }
+    ]
+  },
+  "parameters": {
+    "actual_worker_count": 10,
+    "admitted_worker_count": 10,
+    "campaign": "C",
+    "concurrency": 8,
+    "connection_request_budget": 1000,
+    "durations_ns": {
+      "post_drain": 300000000000,
+      "quiet": 300000000000,
+      "recovery": 900000000000,
+      "steady": 3600000000000,
+      "warmup": 180000000000
+    },
+    "formal": true,
+    "isolation": "churn",
+    "max_sample_gap_ns": 4000000000,
+    "normal_dns_ttl_seconds": 5,
+    "operation_interval_ns": 0,
+    "payload_bytes": 32768,
+    "sample_interval_ns": 1000000000,
+    "scrape_interval_ns": 1000000000,
+    "seed": 700218,
+    "traffic_required": true,
+    "upload_bytes": 1048576
+  },
+  "source_identity": {
+    "implementation_commit": "c0db6cde862b3101ed3939e5c7dfa1d68fe6a891",
+    "tool_commit": "c0db6cde862b3101ed3939e5c7dfa1d68fe6a891",
+    "source_set_sha256": "55b22a36f77c28f5477836a0ca94cca1010fd4c89a8b6ef14d7c0c190e3d3e17",
+    "git_dirty": false
+  },
+  "actual_phases": {
+    "warmup": {
+      "start_ns": 199597629805,
+      "end_ns": 379721313868,
+      "seconds": 180.123684063
+    },
+    "steady_before_fatal": {
+      "start_ns": 379721313868,
+      "end_ns": 392857472818,
+      "seconds": 13.13615895
+    },
+    "recovery": {
+      "result": "NOT REACHED",
+      "seconds": null
+    },
+    "quiet": {
+      "result": "NOT REACHED",
+      "seconds": null
+    },
+    "post_drain": {
+      "result": "NOT REACHED",
+      "seconds": null
+    },
+    "ordered_end_event": false
+  },
+  "collection": {
+    "controller_result": "fail",
+    "complete": false,
+    "artifact_truncated": false,
+    "fatal_errors": [
+      "qualification failed after collecting started work: [\"resource.control_bad_full_response\"]"
+    ],
+    "final_counts": {
+      "abandoned_operations": [],
+      "admitted_http_operations": 62690,
+      "admitted_upgrade_operations": 180,
+      "client_retirements_received": 60,
+      "client_retirements_started": 60,
+      "compact_503_operations": 0,
+      "compact_503_rows": 0,
+      "connection_attempts": 249,
+      "non_complete": 357,
+      "offered": 62870,
+      "received_operations": 62870,
+      "workers": [
+        {
+          "admitted_http_operations": 22629,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 23,
+          "last_operation_seq": 22629,
+          "offered": 22629,
+          "received_operations": 22629,
+          "worker_id": 0
+        },
+        {
+          "admitted_http_operations": 4056,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 5,
+          "last_operation_seq": 4056,
+          "offered": 4056,
+          "received_operations": 4056,
+          "worker_id": 1
+        },
+        {
+          "admitted_http_operations": 2145,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 3,
+          "last_operation_seq": 2145,
+          "offered": 2145,
+          "received_operations": 2145,
+          "worker_id": 2
+        },
+        {
+          "admitted_http_operations": 2693,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 3,
+          "last_operation_seq": 2693,
+          "offered": 2693,
+          "received_operations": 2693,
+          "worker_id": 3
+        },
+        {
+          "admitted_http_operations": 22011,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 23,
+          "last_operation_seq": 22011,
+          "offered": 22011,
+          "received_operations": 22011,
+          "worker_id": 4
+        },
+        {
+          "admitted_http_operations": 4064,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 5,
+          "last_operation_seq": 4064,
+          "offered": 4064,
+          "received_operations": 4064,
+          "worker_id": 5
+        },
+        {
+          "admitted_http_operations": 2146,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 3,
+          "last_operation_seq": 2146,
+          "offered": 2146,
+          "received_operations": 2146,
+          "worker_id": 6
+        },
+        {
+          "admitted_http_operations": 2774,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 3,
+          "last_operation_seq": 2774,
+          "offered": 2774,
+          "received_operations": 2774,
+          "worker_id": 7
+        },
+        {
+          "admitted_http_operations": 172,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 1,
+          "last_operation_seq": 172,
+          "offered": 172,
+          "received_operations": 172,
+          "worker_id": 8
+        },
+        {
+          "admitted_http_operations": 0,
+          "admitted_upgrade_operations": 180,
+          "connection_attempts": 180,
+          "last_operation_seq": 180,
+          "offered": 180,
+          "received_operations": 180,
+          "worker_id": 9
+        }
+      ]
+    },
+    "prelude_counts": {
+      "abandoned": 0,
+      "by_role": {
+        "cancel": {
+          "abandoned": 0,
+          "classified": 1,
+          "offered": 1
+        },
+        "control": {
+          "abandoned": 0,
+          "classified": 1,
+          "offered": 1
+        },
+        "held": {
+          "abandoned": 0,
+          "classified": 1,
+          "offered": 1
+        },
+        "probe": {
+          "abandoned": 0,
+          "classified": 9,
+          "offered": 9
+        },
+        "upgrade": {
+          "abandoned": 0,
+          "classified": 1,
+          "offered": 1
+        }
+      },
+      "classified": 13,
+      "offered": 13,
+      "scope": "prelude_data_plane_and_connection_prepare",
+      "violations": []
+    },
+    "independent_journal_checks": {
+      "bucket_rows": 1856,
+      "bucket_offered_sum": 62870,
+      "bucket_received_sum": 62870,
+      "bucket_outcome_count_sum": 62870,
+      "control_probe_ids": 1,
+      "control_probe_unpaired": 0,
+      "control_io_ids": 9,
+      "control_io_unpaired": 0,
+      "retirement_ids": 60,
+      "retirement_unpaired": 0,
+      "retirement_missing_join_ack": 0
+    },
+    "non_complete_note": "357 non_complete is 180 intentional Upgrade closes + 172 cancellation terminals + 5 full safe 504, not 357 unexpected transport failures."
+  },
+  "supplemental_wire_check": {
+    "scope": "Supplementary frozen wire oracle only, not a replacement full-phase analyzer result",
+    "checked_rows": 1765,
+    "derived_counts": {
+      "completed_success": 62513,
+      "upgrade_completed": 180
+    },
+    "operation_level_cancel_and_504": {
+      "intentional_cancelled": 171,
+      "unexpected_http_response": 6
+    },
+    "not_in_aggregate_success_check": {
+      "504": 5,
+      "cancelled": 172
+    },
+    "findings_by_code": {
+      "RL_GRACEFUL_TLS_CLOSE": {
+        "INCONCLUSIVE": 180
+      },
+      "RL_UNEXPECTED_RESPONSE": {
+        "FAIL": 6
+      }
+    },
+    "actual_full_ipv6_responses": 22,
+    "local_script": "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/supplementary-wire-check.py",
+    "script_sha256": "325d768dfcf31c054f02c2d233b5ac90a71915fd1cc61965915ce9b30c710fcb",
+    "command": [
+      "python3",
+      "/private/tmp/oxidase-7a-c0db6cd-final-c.vn2lvE/supplementary-wire-check.py"
+    ],
+    "exit_code": 0,
+    "scope_note": "Calls frozen Analyzer.wire on complete 200/101 aggregated rows and individual cancellation/504 terminals. It does not add missing phases or supersede the full analyzer FAIL. unexpected_http_response includes the status-200 ACK mismatch because of the existing classifier name."
+  },
+  "control_failure": {
+    "code": "resource.control_bad_full_response",
+    "scenario": "positive_aaaa",
+    "window_id": null,
+    "raw_started_and_terminal": [
+      {
+        "kind": "started",
+        "operation_id": "control-1-15",
+        "phase": "steady",
+        "protocol": "h2",
+        "recipe": "download",
+        "request": {
+          "grpc": false,
+          "path": "/resource/payload?b=2&a=1&a=3",
+          "payload_bytes": 32768,
+          "upload_bytes": 0
+        },
+        "scenario": "positive_aaaa",
+        "schema_version": "oxidase.resource-control-probe/v1",
+        "start_ns": 381736936375,
+        "target": "upstream",
+        "window_id": null,
+        "writer_seq": 1
+      },
+      {
+        "admitted": true,
+        "connection_attempts": 1,
+        "driver_exit": {
+          "abort_requested": false,
+          "code": null,
+          "exit_ns": 386738767300,
+          "join_acknowledged": true,
+          "result": "completed"
+        },
+        "end_ns": 386738770324,
+        "head_ns": 386738700089,
+        "kind": "terminal",
+        "operation_id": "control-1-15",
+        "phase": "steady",
+        "protocol": "h2",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": true,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 386738718997,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 386738700089,
+          "operation_id": "control-1-15",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 381737609597,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        },
+        "recipe": "download",
+        "scenario": "positive_aaaa",
+        "schema_version": "oxidase.resource-control-probe/v1",
+        "start_ns": 381736936375,
+        "target": "upstream",
+        "window_id": null,
+        "writer_seq": 2
+      }
+    ],
+    "interpretation": "The probe received complete safe 504, not expected 200 payload/metadata. The full_response predicate correctly failed. No injected-fault allowance exists here and this is not the previous first-504 timeout-witness bug.",
+    "cause": "INCONCLUSIVE: wire, coarse timeout counters and logs do not prove why the otherwise normal positive AAAA request timed out."
+  },
+  "worker_failures": {
+    "safe_504_outside_fault_window": [
+      {
+        "worker_id": 7,
+        "operation_seq": 2774,
+        "start_ns": 380697208581,
+        "head_ns": 388699131230,
+        "end_ns": 388699156408,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "upload",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": false,
+          "connection_epoch": 3,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 388699143058,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 388699131230,
+          "operation_id": "7:2774",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 380697210394,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        }
+      },
+      {
+        "worker_id": 1,
+        "operation_seq": 4056,
+        "start_ns": 385687170932,
+        "head_ns": 390688510905,
+        "end_ns": 390688545346,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "download",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": false,
+          "connection_epoch": 5,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 390688526197,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 390688510905,
+          "operation_id": "1:4056",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 385687171973,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        }
+      },
+      {
+        "worker_id": 2,
+        "operation_seq": 2145,
+        "start_ns": 385686251640,
+        "head_ns": 390688511746,
+        "end_ns": 390688548892,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "grpc",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": false,
+          "connection_epoch": 3,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 390688525016,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 390688511746,
+          "operation_id": "2:2145",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 385686254635,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        }
+      },
+      {
+        "worker_id": 6,
+        "operation_seq": 2146,
+        "start_ns": 385687171318,
+        "head_ns": 390688531726,
+        "end_ns": 390688551215,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "grpc",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": false,
+          "connection_epoch": 3,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 390688538867,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 390688531726,
+          "operation_id": "6:2146",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 385687237717,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 2693,
+        "start_ns": 384855285528,
+        "head_ns": 392856698180,
+        "end_ns": 392856730549,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "upload",
+        "raw": {
+          "admitted": true,
+          "authority": null,
+          "body_bytes": 15,
+          "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+          "cancelled": false,
+          "connection_attempted": false,
+          "connection_epoch": 3,
+          "content_type": "text/plain; charset=utf-8",
+          "data_observed": true,
+          "diagnostics": [],
+          "echo_iterations": 0,
+          "ended_ns": 392856712281,
+          "eof": true,
+          "error_code": null,
+          "error_stage": null,
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 392856698180,
+          "operation_id": "3:2693",
+          "path": null,
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": null,
+          "started_ns": 384855286440,
+          "status": 504,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": null,
+            "body_sha256": null,
+            "eof": null,
+            "fixture_ack": false
+          },
+          "upstream_name": null,
+          "upstream_peer": null
+        }
+      }
+    ],
+    "cancellation_ack_missing": [
+      {
+        "admitted": true,
+        "connection_attempts": 0,
+        "end_ns": 388688539589,
+        "head_ns": 385646258103,
+        "lane": "cancel",
+        "operation_seq": 172,
+        "phase": "steady",
+        "protocol": "h2",
+        "raw": {
+          "admitted": true,
+          "authority": "gateway.example.test",
+          "body_bytes": 1024,
+          "body_sha256": "49abd65bbf7f7e40c7055093ed2e3fd75f2f602f2c5fcf955c213e3135eb03f7",
+          "cancelled": true,
+          "connection_attempted": false,
+          "connection_epoch": 1,
+          "content_type": "application/octet-stream",
+          "data_observed": true,
+          "diagnostics": [],
+          "driver_exit": {
+            "abort_requested": false,
+            "code": null,
+            "exit_ns": 388688535073,
+            "join_acknowledged": true,
+            "result": "completed"
+          },
+          "echo_iterations": 0,
+          "ended_ns": 385687084733,
+          "eof": false,
+          "error": "fixture body drop acknowledgement deadline",
+          "error_code": "cancellation_ack_missing",
+          "error_stage": "fixture_ack",
+          "fault_case_id": null,
+          "fixture_cancel_ack": false,
+          "h2_error_kind": null,
+          "h2_reason": null,
+          "head_ns": 385646258103,
+          "operation_id": "8:172",
+          "path": "/base/resource/cancel?b=2&a=1&a=3",
+          "protocol": "h2",
+          "request_head_sent": false,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "sender_ready": true,
+          "server_name": "gateway.example.test",
+          "started_ns": 381314830930,
+          "status": 200,
+          "trailers": {},
+          "tunnel_client_shutdown": false,
+          "tunnel_close_result": null,
+          "upgrade": false,
+          "upgrade_headers": {},
+          "upload": {
+            "body_bytes": 0,
+            "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "eof": true,
+            "fixture_ack": true
+          },
+          "upstream_name": "ipv6",
+          "upstream_peer": "[::1]:38417"
+        },
+        "recipe": "cancel",
+        "start_ns": 381314823049,
+        "target": "upstream",
+        "window_id": null,
+        "worker_id": 8,
+        "writer_seq": 352
+      }
+    ],
+    "cause_note": "Five safe 504 and one cancellation ACK failure are not waived. No late operation-bound 8:172 Drop receipt was preserved; the actual DATA, peer, local driver join and expired ACK wait do not prove upstream body destruction.",
+    "typed_h2_head_transport_failures": 0,
+    "typed_h2_note": "No such errors were observed in this short run; this does not close earlier formal C H2 failures."
+  },
+  "ipv6_and_publication": {
+    "fixture_peers": {
+      "a": "127.0.0.1:38417",
+      "b": "127.0.0.2:38417",
+      "ipv6": "[::1]:38417"
+    },
+    "actual_full_ipv6_responses": 22,
+    "partial_cancel_peer": "[::1]:38417",
+    "partial_cancel_data_bytes": 1024,
+    "positive_aaaa_control_probe_result": "FAIL",
+    "runtime_etag_before_and_after": "\"runtime-558b24e08a261e0f1ab8252fdd16f4534fd13e86404f76e584e375d61f32815c-4\"",
+    "boundary_note": "Complete IPv6 worker responses and physical IPv6 DATA are actual positives, but do not excuse the failed dedicated IPv6 control. DNS refresh does not constitute publication."
+  },
+  "coarse_timeout_evidence": {
+    "counter_scope": "global upstream phase counters, not attributable to an individual logical probe",
+    "admin_samples": [
+      {
+        "t_ns": 387596769903,
+        "response_header": 1,
+        "total_deadline": 0
+      },
+      {
+        "t_ns": 389596528338,
+        "response_header": 1,
+        "total_deadline": 1
+      },
+      {
+        "t_ns": 391597146835,
+        "response_header": 4,
+        "total_deadline": 1
+      }
+    ],
+    "gateway_log_observations": {
+      "response_header_5s_timeout_events": 4,
+      "total_deadline_expired_events": 2
+    },
+    "cause_note": "Timeout classifications occurred while actual IPv6 target remained fresh/eligible/healthy in Admin observations. Health probe success does not prove business-stream completion, scheduling cause or absence of fixture/socket pressure."
+  },
+  "sampling": {
+    "actual_samples": [
+      {
+        "source": "admin",
+        "phase": "bootstrap",
+        "count": 2,
+        "first_ns": 199595118069,
+        "last_ns": 199596947576
+      },
+      {
+        "source": "admin",
+        "phase": "steady",
+        "count": 14,
+        "first_ns": 380596349618,
+        "last_ns": 392858226024
+      },
+      {
+        "source": "admin",
+        "phase": "warmup",
+        "count": 179,
+        "first_ns": 201596767705,
+        "last_ns": 379597392668
+      },
+      {
+        "source": "os",
+        "phase": "bootstrap",
+        "count": 1,
+        "first_ns": 199595101895,
+        "last_ns": 199595953463
+      },
+      {
+        "source": "os",
+        "phase": "steady",
+        "count": 13,
+        "first_ns": 380596383714,
+        "last_ns": 392597285834
+      },
+      {
+        "source": "os",
+        "phase": "warmup",
+        "count": 180,
+        "first_ns": 200597130856,
+        "last_ns": 379597046207
+      }
+    ],
+    "recovery_window_result": "INCONCLUSIVE: not reached",
+    "quiet_reclamation_result": "INCONCLUSIVE: not reached",
+    "post_drain_result": "NOT RUN",
+    "memory_attribution_result": "INCONCLUSIVE: incomplete campaign; no Running/Quiet slope or ownership closure is claimed.",
+    "resource_reclamation_result": "INCONCLUSIVE: no normal Running recovery or quiet sampling window. Registry/task/counter values are not synthesized."
+  },
+  "limits": [
+    "Original requested 60-minute Steady was not completed; campaign terminated after 13.136 seconds Steady.",
+    "No Recovery, Quiet, PostDrain or ordered end event exists.",
+    "No blanket whitelist, fault-window expansion, extra request retry or production-policy change was made.",
+    "Full analyzer remains FAIL; supplemental complete wire evidence cannot convert the qualification result to PASS.",
+    "Upgrade full echo was observed but graceful TLS close_notify remained INCONCLUSIVE.",
+    "No allocator explanation or production resource leak conclusion is established by this run."
+  ]
+}
+

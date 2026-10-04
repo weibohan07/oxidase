@@ -293,3 +293,50 @@ Controlled tests now capture actual REFUSED_STREAM, perform 512 empty and
 and obtain eight operation-bound upstream Drop ACKs while the original H2
 connection remains open. They did not reproduce those campaign anomalies and
 do not close the original failure or its scheduling/propagation attribution.
+
+### Final implementation repeat and delivery boundary
+
+Final implementation `c0db6cde862b3101ed3939e5c7dfa1d68fe6a891` ran C
+`37211766238`, seed 700218, with the original formal 180/3600/900/300/300-second
+recipe and unchanged concurrency/payload/fault rules. It actually stopped after
+180.124 seconds warmup and 13.136 seconds steady, not after a completed hour.
+[The final original index](artifacts/resource-7a-c0db6cd-hosted-failure.json)
+retains artifact `11306813903`, all 36 verified files and exact frozen replay.
+
+All 62870 offered operations were received. Independent supplementary wire-only
+replay verified 62513 complete ordinary responses, 180 complete Upgrade echoes
+and 171 acknowledged cancellations. It separately retained **five unwindowed
+worker 504s**, one missing cancellation ACK, and the failed normal IPv6 control
+probe. That probe received a complete safe 504 after 5.001 seconds; correctness
+of the safe error body is not correctness of the healthy operation. It must not
+be excused as a named fault or attributed to a controller mistake. Twenty-two
+other complete IPv6 replies do not cancel that failure. No claimed counter
+zero, private-library cause, shortened deadline, enlarged limit or new failure
+allowance closes it. Running recovery/Quiet never began and remain unavailable.
+
+The total/header witness now requires full safe response bytes/EOF plus a real
+delta in the corresponding phase counter. It retains the original eight new
+probes and nine-second per-probe budget; it does not retry business operations.
+Counter attribution is explicitly the same physical fault window, **not** that
+specific probe. Header-only 504 cannot prove total timeout. That repair cannot
+explain the final normal IPv6 failure, which occurred before that scenario.
+
+Hosted implementation run `37208987135` at `3822a49` also had an independent
+Stable failure in the existing IPv6 pool-reuse test: its test sender called
+`send_request` while the dispatcher was not ready. The original log is retained;
+a real gated first-poll regression fails the old helper and passes an explicit
+`ready().await` on the same sender. All body/query/authority/pool assertions
+remain intact, with one send and actual driver join, no retry/reconnection.
+Final implementation `c0db6cd` passed all nine local gates and four required
+Hosted checks (`37211727753`). That green build does not relabel any campaign.
+
+The final 61-second local ASan `discovery_runtime` campaign at `c0db6cd`, seed
+600401, executed 4012 inputs, added 511 corpus units and ended with 487 files:
+no crash/timeout/OOM. Peak 507 MiB belongs to the **fuzzer**, not the gateway.
+Source and both lockfiles were unchanged. All 14 example commands passed.
+
+**7A has not fully passed.** Implementation/evidence delivery is allowed to
+retain FAIL/INCONCLUSIVE; it is not a production-readiness claim. Still-open
+work is exact-load IPv6 timeout attribution, H2 GOAWAY/cancellation propagation,
+normal TLS/H2 retained-allocation attribution and the 21 unproven structural
+capacities. No speculative production retention change was made in PR #22.
