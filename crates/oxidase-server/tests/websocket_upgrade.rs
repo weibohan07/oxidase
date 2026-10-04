@@ -564,6 +564,54 @@ async fn tls_http1_upgrade_forwards_upstream_bytes_and_upstream_close() {
 }
 
 #[tokio::test]
+async fn tls_client_first_close_receives_close_notify_after_complete_tunnel_echo() {
+    let upstream = spawn_upgrade_upstream(UpstreamMode::Echo).await;
+    let identity = identity(&["gateway.example.test"]);
+    let gateway = tls_proxy_gateway(upstream.address, &identity, "http1").await;
+    let mut client = connect_tls(
+        gateway.address,
+        "gateway.example.test",
+        client_config(&identity, &[b"http/1.1"]),
+    )
+    .await;
+    perform_upgrade(&mut client).await;
+    client
+        .write_all(CLIENT_FRAME)
+        .await
+        .expect("full tunnel frame");
+    let mut echoed = vec![0; CLIENT_FRAME.len()];
+    client.read_exact(&mut echoed).await.expect("complete echo");
+    assert_eq!(echoed, CLIENT_FRAME);
+
+    // The client only closes its write half. A clean gateway close must be a
+    // received TLS close_notify, not a tolerated socket EOF/reset after Drop.
+    client.shutdown().await.expect("client sends close_notify");
+    let mut after = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.read(&mut after))
+            .await
+            .expect("gateway close arrives within the existing fixture bound")
+            .expect("gateway sends TLS close_notify after the opposite copy is cancelled"),
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(2), upstream.peer_closed.notified())
+        .await
+        .expect("upstream observes its own write-half close");
+    upstream.finish().await;
+    let metrics = wait_for_metric(
+        gateway.admin,
+        "oxidase_tunnel_terminations_total{listener=\"public\",reason=\"downstream_closed\"} 1",
+    )
+    .await;
+    assert!(metrics.contains("oxidase_active_tunnels{listener=\"public\"} 0"));
+    gateway
+        .running
+        .shutdown()
+        .await
+        .expect("gateway shuts down");
+}
+
+#[tokio::test]
 async fn reload_keeps_the_old_tunnel_until_retired_listener_drain_timeout() {
     let upstream = spawn_upgrade_upstream(UpstreamMode::Echo).await;
     let gateway = plain_proxy_gateway(upstream.address).await;

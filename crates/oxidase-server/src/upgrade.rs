@@ -243,7 +243,10 @@ impl TunnelPlan {
     /// then pumps bytes in both directions without spawning a detached task.
     ///
     /// Completion, EOF, or error in either direction cancels the other copy
-    /// future. The pinned snapshot is retained until this method returns.
+    /// future. Clean EOF finishes both transport write-half shutdowns without
+    /// awaiting the cancelled reader; non-EOF errors keep their first cause.
+    /// The pinned snapshot is retained until this method returns or its owning
+    /// connection task is cancelled by the existing listener drain.
     pub(crate) async fn run(self) -> Result<TunnelReport, TunnelEstablishmentError> {
         let Self {
             token: _,
@@ -576,7 +579,7 @@ where
     let (mut downstream_read, mut downstream_write) = tokio::io::split(downstream);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
-    let termination = {
+    let mut termination = {
         let downstream_to_upstream = copy_direction(
             &mut downstream_read,
             &mut upstream_write,
@@ -598,6 +601,26 @@ where
             }
         }
     };
+
+    // A clean first copy already shut down its writer. Cancellation drops the
+    // other copy, but Drop does not send rustls close_notify. Finish only that
+    // missing write-half shutdown; repeating the completed shutdown is not
+    // required by AsyncWrite and can invent an unrelated BrokenPipe. Readers
+    // stay cancelled, and the existing listener drain can still cancel this
+    // future while a shutdown flush is pending. Keep a non-EOF first error.
+    match termination {
+        TunnelTermination::DownstreamClosed => {
+            if let Err(error) = downstream_write.shutdown().await {
+                termination = TunnelTermination::DownstreamWriteError(error.kind());
+            }
+        }
+        TunnelTermination::UpstreamClosed => {
+            if let Err(error) = upstream_write.shutdown().await {
+                termination = TunnelTermination::UpstreamWriteError(error.kind());
+            }
+        }
+        _ => {}
+    }
 
     TunnelReport {
         downstream_to_upstream_bytes: downstream_to_upstream_bytes.load(Ordering::Relaxed),
@@ -925,6 +948,473 @@ mod tests {
         assert_eq!(report.downstream_to_upstream_bytes, 4);
         assert_eq!(report.upstream_to_downstream_bytes, 4);
         assert_eq!(report.termination, TunnelTermination::DownstreamClosed);
+    }
+
+    fn tunnel_tls_test_configs() -> (
+        std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+        std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+    ) {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::crypto::ring::default_provider;
+        use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+        // Ephemeral publicly generated test-only identity, never deployed.
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["tunnel.example.test".into()])
+                .expect("test TLS identity");
+        let provider = Arc::new(default_provider());
+        let server = Arc::new(
+            ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("safe TLS versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+                )
+                .expect("test TLS key"),
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).expect("test trust");
+        let client = Arc::new(
+            ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("safe TLS versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn first_eof_sends_close_notify_on_both_tls_hops() {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let (client, server) = tunnel_tls_test_configs();
+        for downstream_first in [true, false] {
+            let (client_io, downstream_io) = duplex(4096);
+            let (upstream_io, fixture_io) = duplex(4096);
+            let name = ServerName::try_from("tunnel.example.test").expect("test name");
+            let (client_tls, downstream_tls, upstream_tls, fixture_tls) = tokio::join!(
+                TlsConnector::from(Arc::clone(&client)).connect(name.clone(), client_io),
+                TlsAcceptor::from(Arc::clone(&server)).accept(downstream_io),
+                TlsConnector::from(Arc::clone(&client)).connect(name, upstream_io),
+                TlsAcceptor::from(Arc::clone(&server)).accept(fixture_io),
+            );
+            let mut client_tls = client_tls.expect("downstream TLS");
+            let mut fixture_tls = fixture_tls.expect("upstream TLS");
+            let client_flow = async {
+                client_tls.write_all(b"round-trip").await.expect("request");
+                let mut reply = [0; 10];
+                client_tls.read_exact(&mut reply).await.expect("full echo");
+                assert_eq!(&reply, b"round-trip");
+                if downstream_first {
+                    client_tls.shutdown().await.expect("client close_notify");
+                }
+                let mut after = [0; 1];
+                assert_eq!(
+                    client_tls
+                        .read(&mut after)
+                        .await
+                        .expect("gateway close_notify"),
+                    0
+                );
+                // A clean gateway write-half close is proved by this TLS EOF.
+                // The peer need not send another alert after the gateway's IO
+                // has already been dropped by the first-EOF tunnel contract.
+            };
+            let upstream_flow = async {
+                let mut request = [0; 10];
+                fixture_tls
+                    .read_exact(&mut request)
+                    .await
+                    .expect("full request");
+                assert_eq!(&request, b"round-trip");
+                fixture_tls.write_all(&request).await.expect("full echo");
+                if !downstream_first {
+                    fixture_tls.shutdown().await.expect("fixture close_notify");
+                }
+                let mut after = [0; 1];
+                assert_eq!(
+                    fixture_tls
+                        .read(&mut after)
+                        .await
+                        .expect("gateway close_notify"),
+                    0
+                );
+            };
+            let (report, (), ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    run_tunnel_io(
+                        downstream_tls.expect("gateway TLS"),
+                        upstream_tls.expect("proxy TLS")
+                    ),
+                    client_flow,
+                    upstream_flow,
+                )
+            })
+            .await
+            .expect("both hop shutdowns finish without awaiting peer's read loop");
+            assert_eq!(report.downstream_to_upstream_bytes, 10);
+            assert_eq!(report.upstream_to_downstream_bytes, 10);
+            assert_eq!(
+                report.termination,
+                if downstream_first {
+                    TunnelTermination::DownstreamClosed
+                } else {
+                    TunnelTermination::UpstreamClosed
+                }
+            );
+        }
+    }
+
+    /// TLS needs poll_shutdown on both owned writers. Drop is not close_notify.
+    #[tokio::test]
+    async fn first_eof_closes_both_transport_write_halves() {
+        struct ShutdownObserved {
+            io: tokio::io::DuplexStream,
+            shutdowns: std::sync::Arc<AtomicU64>,
+        }
+        impl tokio::io::AsyncRead for ShutdownObserved {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().io).poll_read(context, buffer)
+            }
+        }
+        impl AsyncWrite for ShutdownObserved {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.get_mut().io).poll_write(context, bytes)
+            }
+            fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().io).poll_flush(context)
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                // A transport may reject a repeated shutdown. The clean first
+                // copy must not be shut down again during opposite-half cleanup.
+                if this.shutdowns.load(Ordering::Relaxed) != 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "fixture second shutdown rejected",
+                    )));
+                }
+                let result = Pin::new(&mut this.io).poll_shutdown(context);
+                if result.is_ready() {
+                    this.shutdowns.fetch_add(1, Ordering::Relaxed);
+                }
+                result
+            }
+        }
+
+        for downstream_first in [true, false] {
+            let (mut client, gateway_downstream) = duplex(256);
+            let (gateway_upstream, mut upstream) = duplex(256);
+            let downstream_shutdowns = std::sync::Arc::new(AtomicU64::new(0));
+            let upstream_shutdowns = std::sync::Arc::new(AtomicU64::new(0));
+            // Both readers stay alive. Only the selected peer half-closes;
+            // cancelling the other copy future must not forget its writer.
+            if downstream_first {
+                client.shutdown().await.expect("client write EOF");
+            } else {
+                upstream.shutdown().await.expect("upstream write EOF");
+            }
+            let report = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_tunnel_io(
+                    ShutdownObserved {
+                        io: gateway_downstream,
+                        shutdowns: std::sync::Arc::clone(&downstream_shutdowns),
+                    },
+                    ShutdownObserved {
+                        io: gateway_upstream,
+                        shutdowns: std::sync::Arc::clone(&upstream_shutdowns),
+                    },
+                ),
+            )
+            .await
+            .expect("first EOF does not wait for peer read completion");
+            assert_eq!(
+                report.termination,
+                if downstream_first {
+                    TunnelTermination::DownstreamClosed
+                } else {
+                    TunnelTermination::UpstreamClosed
+                }
+            );
+            assert_eq!(downstream_shutdowns.load(Ordering::Relaxed), 1);
+            assert_eq!(upstream_shutdowns.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_tls_shutdown_does_not_prove_a_complete_tunnel_message() {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let (client, server) = tunnel_tls_test_configs();
+        let (client_io, downstream_io) = duplex(4096);
+        let (upstream_io, fixture_io) = duplex(4096);
+        let name = ServerName::try_from("tunnel.example.test").expect("test name");
+        let (client_tls, downstream_tls, upstream_tls, fixture_tls) = tokio::join!(
+            TlsConnector::from(Arc::clone(&client)).connect(name.clone(), client_io),
+            TlsAcceptor::from(Arc::clone(&server)).accept(downstream_io),
+            TlsConnector::from(client).connect(name, upstream_io),
+            TlsAcceptor::from(server).accept(fixture_io),
+        );
+        let mut client_tls = client_tls.expect("downstream TLS");
+        let mut fixture_tls = fixture_tls.expect("upstream TLS");
+        let client_flow = async {
+            client_tls.write_all(b"round-trip").await.expect("request");
+            let mut reply = [0; 10];
+            let error = client_tls
+                .read_exact(&mut reply)
+                .await
+                .expect_err("three-byte prefix cannot satisfy a ten-byte application message");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(&reply[..3], b"rou");
+            let mut after = [0; 1];
+            assert_eq!(
+                client_tls.read(&mut after).await.expect("TLS close_notify"),
+                0
+            );
+        };
+        let upstream_flow = async {
+            let mut request = [0; 10];
+            fixture_tls
+                .read_exact(&mut request)
+                .await
+                .expect("full request");
+            assert_eq!(&request, b"round-trip");
+            fixture_tls.write_all(b"rou").await.expect("truncated echo");
+            fixture_tls.shutdown().await.expect("fixture close_notify");
+            let mut after = [0; 1];
+            assert_eq!(
+                fixture_tls
+                    .read(&mut after)
+                    .await
+                    .expect("gateway close_notify"),
+                0
+            );
+        };
+        let (report, (), ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                run_tunnel_io(
+                    downstream_tls.expect("gateway TLS"),
+                    upstream_tls.expect("proxy TLS")
+                ),
+                client_flow,
+                upstream_flow,
+            )
+        })
+        .await
+        .expect("transport shutdown cannot turn truncation into application success");
+        assert_eq!(report.termination, TunnelTermination::UpstreamClosed);
+        assert_eq!(report.downstream_to_upstream_bytes, 10);
+        assert_eq!(report.upstream_to_downstream_bytes, 3);
+    }
+
+    struct IoDropReceipt(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for IoDropReceipt {
+        fn drop(&mut self) {
+            if let Some(receipt) = self.0.take() {
+                let _ = receipt.send(());
+            }
+        }
+    }
+
+    struct ShutdownGatedIo {
+        io: tokio::io::DuplexStream,
+        read_error: Option<io::ErrorKind>,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        // Last field acknowledges actual transport-field destruction, not a
+        // request to abort or the beginning of this owner's Drop.
+        _drop_receipt: IoDropReceipt,
+    }
+
+    impl tokio::io::AsyncRead for ShutdownGatedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(kind) = this.read_error.take() {
+                return Poll::Ready(Err(io::Error::new(kind, "fixture first read failed")));
+            }
+            Pin::new(&mut this.io).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for ShutdownGatedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().io).poll_write(context, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(entered) = this.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = &mut this.release {
+                match std::future::Future::poll(Pin::new(release), context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => this.release = None,
+                }
+            }
+            Pin::new(&mut this.io).poll_shutdown(context)
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_opposite_shutdown_finishes_or_is_cancelled_with_actual_io_drop() {
+        for downstream_first in [true, false] {
+            for cancel in [false, true] {
+                let (mut client, downstream) = duplex(256);
+                let (upstream, mut fixture) = duplex(256);
+                let (entered, observed) = tokio::sync::oneshot::channel();
+                let (release, allowed) = tokio::sync::oneshot::channel();
+                let (down_drop, down_dropped) = tokio::sync::oneshot::channel();
+                let (up_drop, up_dropped) = tokio::sync::oneshot::channel();
+                if downstream_first {
+                    client.shutdown().await.expect("client write EOF");
+                } else {
+                    fixture.shutdown().await.expect("fixture write EOF");
+                }
+                let (gated_io, plain_io, gated_drop, plain_drop) = if downstream_first {
+                    (downstream, upstream, down_drop, up_drop)
+                } else {
+                    (upstream, downstream, up_drop, down_drop)
+                };
+                let gated = ShutdownGatedIo {
+                    io: gated_io,
+                    read_error: None,
+                    entered: Some(entered),
+                    release: Some(allowed),
+                    _drop_receipt: IoDropReceipt(Some(gated_drop)),
+                };
+                let plain = ShutdownGatedIo {
+                    io: plain_io,
+                    read_error: None,
+                    entered: None,
+                    release: None,
+                    _drop_receipt: IoDropReceipt(Some(plain_drop)),
+                };
+                let task = if downstream_first {
+                    tokio::spawn(run_tunnel_io(gated, plain))
+                } else {
+                    tokio::spawn(run_tunnel_io(plain, gated))
+                };
+                tokio::time::timeout(Duration::from_secs(1), observed)
+                    .await
+                    .expect("opposite shutdown is actually polled")
+                    .expect("shutdown entry receipt");
+                assert!(
+                    !task.is_finished(),
+                    "a Pending close flush must not be ignored"
+                );
+                if cancel {
+                    // Listener drain cancels this same owned future. It need
+                    // not release a peer gate or spawn detached close work.
+                    task.abort();
+                    let error = tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("drain cancellation finishes")
+                        .expect_err("owned tunnel task was cancelled");
+                    assert!(error.is_cancelled());
+                } else {
+                    release.send(()).expect("release close flush");
+                    let report = tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("close flush completes")
+                        .expect("tunnel joins");
+                    assert_eq!(
+                        report.termination,
+                        if downstream_first {
+                            TunnelTermination::DownstreamClosed
+                        } else {
+                            TunnelTermination::UpstreamClosed
+                        }
+                    );
+                }
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    down_dropped.await.expect("downstream IO destroyed");
+                    up_dropped.await.expect("upstream IO destroyed");
+                })
+                .await
+                .expect("both transports actually released without scrape or peer progress");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_eof_failure_keeps_its_first_cause_without_waiting_for_shutdown() {
+        let (mut client, downstream) = duplex(256);
+        let (upstream, mut fixture) = duplex(256);
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (_release, allowed) = tokio::sync::oneshot::channel();
+        let (dropped, destroyed) = tokio::sync::oneshot::channel();
+        let report = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_tunnel_io(
+                ShutdownGatedIo {
+                    io: downstream,
+                    read_error: Some(io::ErrorKind::ConnectionReset),
+                    entered: Some(entered),
+                    release: Some(allowed),
+                    _drop_receipt: IoDropReceipt(Some(dropped)),
+                },
+                upstream,
+            ),
+        )
+        .await
+        .expect("first read error does not wait for a close flush");
+        assert_eq!(
+            report.termination,
+            TunnelTermination::DownstreamReadError(io::ErrorKind::ConnectionReset)
+        );
+        assert_eq!(report.downstream_to_upstream_bytes, 0);
+        assert_eq!(report.upstream_to_downstream_bytes, 0);
+        assert!(
+            observed.await.is_err(),
+            "no shutdown poll follows a non-EOF error"
+        );
+        destroyed.await.expect("failed downstream IO destroyed");
+        let mut after = [0; 1];
+        assert_eq!(
+            client.read(&mut after).await.expect("client sees release"),
+            0
+        );
+        assert_eq!(
+            fixture
+                .read(&mut after)
+                .await
+                .expect("fixture sees release"),
+            0
+        );
     }
 
     #[tokio::test]
