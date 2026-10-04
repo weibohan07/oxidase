@@ -119,7 +119,7 @@ class Inputs:
             raise EvidenceError(f"evidence file exceeds size limit: {name}")
         return path
 
-    def rows(self, name):
+    def rows(self, name, maximum=MAX_FILE_BYTES):
         path = self.path(name)
         opener = gzip.open if path.suffix == ".gz" else open
         total = 0
@@ -129,7 +129,7 @@ class Inputs:
                 if not line:
                     break
                 total += len(line)
-                if len(line) > MAX_LINE_BYTES or total > MAX_FILE_BYTES or index > MAX_ROWS:
+                if len(line) > MAX_LINE_BYTES or total > maximum or index > MAX_ROWS:
                     raise EvidenceError(f"uncompressed evidence limit exceeded: {name}")
                 if not line.endswith(b"\n"):
                     raise EvidenceError(f"truncated/non-terminated row: {name}:{index}")
@@ -170,7 +170,13 @@ class Analyzer:
         self.coverage = Counter()
         self.errors = {}
         self.errors_by_worker = defaultdict(dict)
+        self.error_order = defaultdict(list)
+        self.error_cursors = defaultdict(int)
         self.consumed_errors = set()
+        self.compact_by_worker = defaultdict(list)
+        self.compact_cursors = defaultdict(int)
+        self.compact_rows = 0
+        self.consumed_compact = set()
         self.counts = Counter()
         self.workers = defaultdict(Counter)
         self.last_operation = defaultdict(int)
@@ -544,8 +550,73 @@ class Analyzer:
             if head is not None and not start <= integer(head, "head_ns") <= end:
                 raise EvidenceError("response head timestamp outside operation interval")
             required(row, "raw")
+            ordered = self.error_order[key[0]]
+            if ordered and key[1] <= ordered[-1][0][1]:
+                raise EvidenceError("individual error operation order moved backwards")
             self.errors[key] = row
             self.errors_by_worker[key[0]][key[1]] = row
+            ordered.append((key, row))
+
+    def load_compact_faults(self):
+        """Bounded range encoding, never a new allowance for any wire result."""
+        storage = self.receipt.get("fault_result_storage")
+        present = self.optional_file("compact-fault-results.jsonl")
+        if storage is None:
+            if present:
+                raise EvidenceError("compact fault file has no declared storage schema")
+            return
+        if storage != "contiguous_safe_503_v1":
+            raise EvidenceError("unknown compact fault storage schema")
+        # Even a run with no compactable terminal must contain this empty file.
+        self.inputs.path("compact-fault-results.jsonl")
+        for index, row in self.inputs.rows("compact-fault-results.jsonl", 64 << 20):
+            if row.get("schema_version") != "oxidase.resource-compact-fault/v1":
+                raise EvidenceError("unknown compact fault row schema")
+            if integer(required(row, "writer_seq"), "compact writer_seq", 1) != index or index > MAX_ERRORS:
+                raise EvidenceError("compact writer sequence missing, duplicated or excessive")
+            worker = integer(required(row, "worker_id"), "compact worker_id")
+            first = integer(required(row, "first_operation_seq"), "compact first sequence", 1)
+            last = integer(required(row, "last_operation_seq"), "compact last sequence", 1)
+            count = integer(required(row, "count"), "compact count", 1)
+            if last < first or count != last - first + 1:
+                raise EvidenceError("compact range count differs from contiguous operation range")
+            previous = self.compact_by_worker[worker]
+            if previous and first <= previous[-1]["last_operation_seq"]:
+                raise EvidenceError("compact worker ranges overlap or move backwards")
+            start, last_start, end, min_head, max_head = (
+                integer(required(row, key), f"compact {key}") for key in
+                ("first_start_ns", "last_start_ns", "last_end_ns", "min_head_ns", "max_head_ns"))
+            if (not start <= last_start <= end or not start <= min_head <= max_head <= end or
+                    last_start > max_head or (count == 1 and (start != last_start or min_head != max_head)) or
+                    (previous and start < previous[-1]["last_end_ns"])):
+                raise EvidenceError("compact operation timing/response-head extrema are impossible")
+            phase, lane, protocol = (required(row, key) for key in ("phase", "lane", "protocol"))
+            self.check_phase(phase, start, end, f"compact range {worker}:{first}-{last}")
+            window_id = required(row, "window_id")
+            window = self.windows.get(window_id) if isinstance(window_id, str) else None
+            raw = required(row, "raw")
+            attempts = integer(required(row, "connection_attempts"), "compact per-operation connections")
+            if (phase != "steady" or lane != "churn" or protocol not in ("http1", "h2") or
+                    row.get("target") != "upstream" or row.get("admitted") is not True or attempts not in (0, 1) or
+                    not window or window["target"] != row["target"] or lane not in window["lanes"] or
+                    not window["start_ns"] <= min_head <= max_head <= window["end_ns"] or
+                    not any(choice.get("status") == 503 for choice in window["allowed"])):
+                self.finding("RL_COMPACT_SCOPE", "compact range is outside exact finite churn/status/target/head window")
+            if (not isinstance(raw, dict) or raw.get("status") != 503 or raw.get("eof") is not True or
+                    raw.get("admitted") is not True or raw.get("connection_attempted") is not bool(attempts) or
+                    raw.get("cancelled") is not False or raw.get("upgrade") is not False or
+                    raw.get("diagnostics") != [] or raw.get("error_stage", "missing") is not None or
+                    raw.get("error_code", "missing") is not None or
+                    any(key in raw for key in ("operation_id", "started_ns", "head_ns", "ended_ns"))):
+                raise EvidenceError("compact row is not a complete, identical safe-503 raw terminal")
+            integer(required(raw, "connection_epoch"), "compact actual connection epoch", 1)
+            if (raw.get("trailers") != {} or raw.get("data_observed") is not True or
+                    any(raw.get(key) is not None for key in
+                        ("upstream_peer", "upstream_name", "authority", "server_name", "path"))):
+                self.finding("RL_COMPACT_CONTENT", "compact safe gateway response has inconsistent metadata/trailers")
+            required(row, "recipe")
+            previous.append(row)
+            self.compact_rows += 1
 
     def optional_file(self, name):
         return (self.inputs.directory / name).is_file() or (self.inputs.directory / (name + ".gz")).is_file()
@@ -1337,15 +1408,43 @@ class Analyzer:
                 self.finding("RL_RESULT_CONSERVATION", "offered operation range does not equal received terminals")
             if offered > MAX_ROWS:
                 raise EvidenceError("bucket exceeds bounded operation capacity")
-            error_rows = [((worker, operation), self.errors_by_worker[worker][operation])
-                          for operation in range(first, last + 1) if operation in self.errors_by_worker[worker]]
+            error_rows = []
+            ordered_errors = self.error_order[worker]
+            cursor = self.error_cursors[worker]
+            while cursor < len(ordered_errors) and ordered_errors[cursor][0][1] <= last:
+                key, item = ordered_errors[cursor]
+                if key[1] < first:
+                    self.finding("RL_ABANDONED_RESULT", "individual error is outside its worker bucket")
+                error_rows.append((key, item))
+                cursor += 1
+            self.error_cursors[worker] = cursor
             anomaly_hist = Counter()
             for key, item in error_rows:
                 self.consumed_errors.add(key)
                 if not start <= item["start_ns"] <= item["end_ns"] <= end:
                     self.finding("RL_BUCKET_INTERVAL", "operation evidence lies outside its bucket interval", worker_id=worker)
                 anomaly_hist[self.fingerprint(item)] += 1
+            compact_rows = []
+            ranges = self.compact_by_worker[worker]
+            cursor = self.compact_cursors[worker]
+            while cursor < len(ranges) and ranges[cursor]["first_operation_seq"] <= last:
+                item = ranges[cursor]
+                left, right = item["first_operation_seq"], item["last_operation_seq"]
+                self.consumed_compact.add(item["writer_seq"])
+                if not first <= left <= right <= last:
+                    self.finding("RL_COMPACT_BUCKET", "compact range is orphaned or crosses a worker bucket boundary")
+                if not start <= item["first_start_ns"] <= item["last_start_ns"] <= item["last_end_ns"] <= end:
+                    self.finding("RL_COMPACT_BUCKET", "compact timing lies outside its one worker bucket")
+                if any(left <= key[1] <= right for key, _ in error_rows):
+                    self.finding("RL_COMPACT_OVERLAP", "compact range double-counts an individual error terminal")
+                compact_rows.append(item)
+                anomaly_hist[self.fingerprint(item)] += item["count"]
+                self.counts["compact_503_rows"] += 1
+                self.counts["compact_503_operations"] += item["count"]
+                cursor += 1
+            self.compact_cursors[worker] = cursor
             total = attempts = admitted = upgrades = 0
+            bucket_histogram = Counter()
             for outcome in required(row, "outcomes"):
                 count = integer(required(outcome, "count"), "outcome count", 1)
                 total += count
@@ -1377,18 +1476,41 @@ class Analyzer:
                         raise EvidenceError("histogram operation timing lies outside bucket")
                     self.check_phase(outcome["phase"], last_start, last_end, "histogram end")
                 fingerprint = self.fingerprint(outcome)
+                bucket_histogram[fingerprint] += count
                 matching_errors = [item for _, item in error_rows if self.fingerprint(item) == fingerprint]
+                matching_compact = [item for item in compact_rows if self.fingerprint(item) == fingerprint]
+                if matching_compact:
+                    starts = [item["start_ns"] for item in matching_errors] + [item["first_start_ns"] for item in matching_compact]
+                    last_starts = [item["start_ns"] for item in matching_errors] + [item["last_start_ns"] for item in matching_compact]
+                    ends = [item["end_ns"] for item in matching_errors] + [item["last_end_ns"] for item in matching_compact]
+                    measured = (min(starts), max(last_starts), max(ends))
+                    declared = tuple(outcome.get(key) for key in ("first_start_ns", "last_start_ns", "last_end_ns"))
+                    if declared != measured:
+                        self.finding("RL_COMPACT_BUCKET", "compact/full terminal extrema differ from exact matching histogram timestamps")
                 nonnormal = (raw.get("cancelled") or raw.get("error_stage") or raw.get("error_code") or
                              not raw.get("admitted") or raw.get("eof") is not True or
                              raw.get("status") != self.receipt.get("recipes", {}).get(outcome.get("recipe"), {}).get("status"))
                 if nonnormal and anomaly_hist[fingerprint] != count:
                     self.finding("RL_MISSING_RESULT", "anomaly histogram does not match all individual terminal receipts")
-                if matching_errors:
-                    if len(matching_errors) != count:
+                if matching_errors or matching_compact:
+                    if len(matching_errors) + sum(item["count"] for item in matching_compact) != count:
                         self.finding("RL_RESULT_CONSERVATION", "individual terminal evidence count differs from histogram")
                     for error in matching_errors:
                         derived = self.wire(outcome, error)
                         self.counts[derived] += 1
+                    for compact in matching_compact:
+                        # The actual extrema bound every recorded head. Check
+                        # both with the same independent wire oracle; never
+                        # materialize the operation IDs represented by a range.
+                        derived = None
+                        for head in (compact["min_head_ns"], compact["max_head_ns"]):
+                            evidence = {**compact, "start_ns": compact["first_start_ns"],
+                                        "end_ns": compact["last_end_ns"], "head_ns": head}
+                            current_derived = self.wire(outcome, evidence)
+                            if current_derived != "expected_injected_failure":
+                                self.finding("RL_COMPACT_SCOPE", "compact encoding cannot independently prove every terminal expected")
+                            derived = current_derived
+                        self.counts[derived] += compact["count"]
                 else:
                     derived = self.wire(outcome)
                     self.counts[derived] += count
@@ -1400,13 +1522,23 @@ class Analyzer:
                     self.verified_wire_responses += count
                 if outcome["phase"] in ("quiet", "post_drain"):
                     self.finding("RL_QUIET_ADMISSION", "business admission continued after quiet Running began")
+            for item in compact_rows:
+                fingerprint = self.fingerprint(item)
+                if anomaly_hist[fingerprint] != bucket_histogram[fingerprint]:
+                    self.finding("RL_COMPACT_MATCH", "compact range has no exact complete matching raw histogram")
             if total != offered or attempts != row["connection_attempts"] or admitted != row["admitted_http_operations"] or upgrades != row.get("admitted_upgrade_operations", 0):
                 self.finding("RL_RESULT_CONSERVATION", "raw histogram does not conserve offered/connect/admitted/terminal counts")
             self.bucket_boundaries[worker].append((first, last, start, end, epoch_at_first))
         self.retirement_boundaries()
         if set(self.errors) != self.consumed_errors:
             self.finding("RL_ABANDONED_RESULT", "operation-level errors are not covered by a worker bucket")
+        if len(self.consumed_compact) != self.compact_rows:
+            self.finding("RL_ABANDONED_RESULT", "compact fault range is not covered by exactly one worker bucket")
         final = required(self.receipt, "final_counts")
+        if self.receipt.get("fault_result_storage") is not None:
+            for key in ("compact_503_rows", "compact_503_operations"):
+                if self.counts[key] != integer(required(final, key), f"final {key}"):
+                    self.finding("RL_RESULT_CONSERVATION", "compact final storage counts differ from raw ranges", counter=key)
         for key in COUNT_KEYS + OPTIONAL_COUNT_KEYS:
             if self.counts[key] != integer(final.get(key, 0) if key in OPTIONAL_COUNT_KEYS else required(final, key), f"final {key}"):
                 self.finding("RL_RESULT_CONSERVATION", "final independently started count differs from raw received", counter=key)
@@ -1762,6 +1894,7 @@ class Analyzer:
             self.load_controls()
             self.load_retirements()
             self.load_errors()
+            self.load_compact_faults()
             self.load_probes()
             self.operations()
             self.samples()

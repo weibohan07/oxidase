@@ -3,7 +3,9 @@
 The independent analyzer reads `receipt.json`, `identity.json`, `events.jsonl`,
 `buckets.jsonl`, `errors.jsonl`, and `samples.jsonl`, plus the applicable
 `prelude-operations.json`, `control-probes.jsonl`, and
-`control-operations.jsonl` journals (a `.gz` suffix is also supported).
+`control-operations.jsonl` journals (a `.gz` suffix is also supported). The
+declared bounded fault representation additionally requires
+`compact-fault-results.jsonl`, including when it is empty.
 All timestamps are integer Linux `CLOCK_MONOTONIC` nanoseconds, not
 wall clock or an index. Files retain capture order. Unknown optional fields are
 allowed; missing required evidence is never filled with zero.
@@ -88,6 +90,50 @@ Stop halts admission, not collection. Upgrade handshakes use the separate
 `raw.admitted=true,raw.upgrade=true`; they are not ordinary HTTP response
 successes. `parameters.actual_worker_count` includes the separate low-frequency
 cancel/Upgrade workers; `concurrency` remains the number of normal workers.
+
+### Bounded contiguous safe-503 representation
+
+New receipts may explicitly declare
+`fault_result_storage: contiguous_safe_503_v1`. Old receipts without that marker
+retain the individual `errors.jsonl` contract; an undeclared compact file or an
+unknown marker is rejected. This is an encoding change, not an expected-fault
+verdict. Every Started and Terminal is still consumed by the producer. The
+producer and independent analyzer retain their bounded file/row limits; a full
+file fails collection instead of dropping evidence.
+
+Only consecutive, identical, fully received safe gateway 503 responses in the
+same worker/connection epoch and finite `churn`/`steady` window are compactable.
+Healthy or unwindowed failures, transport/post-head errors, cancellation and
+Upgrade still require individual rows. Each compact row has:
+
+```text
+schema_version: oxidase.resource-compact-fault/v1
+writer_seq, worker_id, first_operation_seq, last_operation_seq, count
+first_start_ns, last_start_ns, last_end_ns, min_head_ns, max_head_ns
+phase, lane, protocol, recipe, target, window_id
+connection_attempts, admitted, raw
+```
+
+`count` equals the inclusive consecutive sequence range length.
+`connection_attempts` is the same per-operation count, not the range total.
+`raw` is exactly the corresponding bucket's normalized wire object, without
+`operation_id`, `started_ns`, `head_ns`, or `ended_ns`; `connection_epoch` remains
+mandatory. Error stage/code are explicit nulls, diagnostics are empty, and
+cancelled/upgrade are false. Safe gateway metadata has no claimed upstream
+peer/name, authority, SNI or path, no trailers, and the complete independently
+checked `Service Unavailable` DATA bytes, SHA-256, Content-Type and EOF.
+
+The actual minimum/maximum response-head clocks must both fall inside the same
+declared finite target/lane/status window. First/last starts and last end must
+lie inside exactly one worker bucket. A context/epoch/bucket/retirement change,
+normal terminal or EOF flushes the pending range. Per-worker ranges retain raw
+capture order, cannot overlap individual error IDs or each other, and cannot
+cross bucket boundaries. Range counts must exactly match their bucket anomaly
+fingerprints and the final `compact_503_rows` / `compact_503_operations` storage
+counts. The independent analyzer checks ranges directly without expanding all
+represented operation IDs in memory; missing, orphaned, overlapping, corrupted
+or out-of-window ranges fail. No archive from a previous failed campaign is
+rewritten into this representation.
 Isolation modes without traffic explicitly set `traffic_required=false` and
 `actual_worker_count=0`. Control and probe lanes retain separate counters.
 

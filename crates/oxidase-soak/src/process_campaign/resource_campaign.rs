@@ -445,6 +445,7 @@ pub(super) async fn run(args: ResourceArguments) -> Result<(), SoakError> {
     }
     receipt["parameters"]["connection_request_budget"] = RESOURCE_REQUESTS_PER_CONNECTION.into();
     receipt["parameters"]["normal_dns_ttl_seconds"] = HEALTHY_DNS_TTL_SECONDS.into();
+    receipt["fault_result_storage"] = "contiguous_safe_503_v1".into();
     persist_receipt(&args.output, &receipt)?;
     let result = run_inner(&args, &mut receipt).await;
     receipt["complete"] = result.is_ok().into();

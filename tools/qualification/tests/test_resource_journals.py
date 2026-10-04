@@ -127,6 +127,53 @@ def positive_aaaa_corpus():
     return data
 
 
+def compact_fault_corpus(count=3):
+    """New bounded encoding for the same independently checked safe 503s."""
+    data = fault_corpus()
+    for bucket in data["buckets.jsonl"]:
+        for outcome in bucket["outcomes"]:
+            outcome["target"] = "upstream"
+    window = next(row for row in data["events.jsonl"] if row["kind"] == "fault_window")
+    window.update(target="upstream", lanes=["churn"])
+    bucket = data["buckets.jsonl"][2]
+    outcome = bucket["outcomes"][0]
+    outcome.update(lane="churn", count=count)
+    raw = outcome["raw"]
+    raw.update(error_stage=None, error_code=None, cancelled=False, upgrade=False,
+               diagnostics=[], data_observed=True, connection_epoch=1,
+               upstream_peer=None, upstream_name=None, authority=None, server_name=None,
+               path=None, trailers={})
+    start, end = bucket["bucket_start_ns"], bucket["bucket_end_ns"]
+    last_start = start if count == 1 else start + 10
+    minimum, maximum = start + 1, (start + 1 if count == 1 else start + 11)
+    outcome.update(first_start_ns=start, last_start_ns=last_start, last_end_ns=end)
+    compact = {"schema_version": "oxidase.resource-compact-fault/v1", "writer_seq": 1,
+               "worker_id": bucket["worker_id"], "first_operation_seq": 2,
+               "last_operation_seq": count + 1, "count": count, "first_start_ns": start,
+               "last_start_ns": last_start, "last_end_ns": end,
+               "min_head_ns": minimum, "max_head_ns": maximum,
+               "phase": "steady", "lane": "churn", "protocol": outcome["protocol"],
+               "recipe": outcome["recipe"], "target": "upstream", "window_id": outcome["window_id"],
+               "connection_attempts": 0, "admitted": True, "raw": copy.deepcopy(raw)}
+    data["compact-fault-results.jsonl"] = [compact]
+    data["errors.jsonl"] = []
+    bucket.update(last_operation_seq=count + 1, offered=count,
+                  admitted_http_operations=count, received_operations=count)
+    for later in data["buckets.jsonl"][3:]:
+        if later["worker_id"] == bucket["worker_id"]:
+            later["first_operation_seq"] += count - 1
+            later["last_operation_seq"] += count - 1
+    receipt = data["receipt.json"]
+    receipt["fault_result_storage"] = "contiguous_safe_503_v1"
+    final = receipt["final_counts"]
+    final.update(compact_503_rows=1, compact_503_operations=count)
+    for key in ("offered", "received_operations", "admitted_http_operations"):
+        final[key] += count - 1
+        final["workers"][0][key] += count - 1
+    final["workers"][0]["last_operation_seq"] += count - 1
+    return data
+
+
 def prelude_corpus():
     data = retained_corpus()
     proof = data["events.jsonl"][1]["evidence"]["raw"]
@@ -173,6 +220,134 @@ class IndependentJournalTests(unittest.TestCase):
                 self.assertEqual(report["counts"]["control_operations.offered"], 1)
                 self.assertEqual(report["counts"]["control_operations.completed"], 1)
                 self.assertEqual(report["counts"]["offered"], 6)
+
+    def test_compact_safe_503_uses_same_independent_wire_and_conserves_range(self):
+        data = compact_fault_corpus()
+        report = self.verify(data)
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["expected_injected_failure"], 3)
+        self.assertEqual(report["counts"]["compact_503_rows"], 1)
+        self.assertEqual(report["counts"]["compact_503_operations"], 3)
+        self.assertEqual(report["counts"]["offered"], 8)
+        self.assertEqual(report, self.verify(copy.deepcopy(data)))
+
+    def test_compact_large_range_is_not_expanded_to_individual_ids(self):
+        report = self.verify(compact_fault_corpus(5_000_000))
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["counts"]["expected_injected_failure"], 5_000_000)
+        self.assertEqual(report["counts"]["compact_503_rows"], 1)
+
+    def test_compact_marker_requires_empty_file_and_rejects_unknown_version(self):
+        data = corpus()
+        data["receipt.json"]["fault_result_storage"] = "contiguous_safe_503_v1"
+        data["receipt.json"]["final_counts"].update(compact_503_rows=0, compact_503_operations=0)
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data["compact-fault-results.jsonl"] = []
+        self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
+        data["receipt.json"]["fault_result_storage"] = "unknown"
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data["receipt.json"].pop("fault_result_storage")
+        self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_compact_missing_range_count_orphan_overlap_and_double_count(self):
+        for change, code in (("missing", "RL_MISSING_RESULT"), ("count", "RL_INVALID_EVIDENCE"),
+                             ("orphan", "RL_ABANDONED_RESULT"), ("overlap", "RL_INVALID_EVIDENCE"),
+                             ("double", "RL_COMPACT_OVERLAP")):
+            with self.subTest(change=change):
+                data = compact_fault_corpus()
+                row = data["compact-fault-results.jsonl"][0]
+                if change == "missing":
+                    data["compact-fault-results.jsonl"].clear()
+                elif change == "count":
+                    row["count"] += 1
+                elif change == "orphan":
+                    row["worker_id"] = 99
+                elif change == "overlap":
+                    duplicate = copy.deepcopy(row)
+                    duplicate["writer_seq"] = 2
+                    data["compact-fault-results.jsonl"].append(duplicate)
+                else:
+                    data["errors.jsonl"] = [{**copy.deepcopy(row), "operation_seq": row["first_operation_seq"],
+                        "start_ns": row["first_start_ns"], "end_ns": row["last_end_ns"], "head_ns": row["min_head_ns"]}]
+                self.fail(data, code)
+
+    def test_compact_never_crosses_bucket_or_retirement_boundary(self):
+        data = compact_fault_corpus()
+        row = data["compact-fault-results.jsonl"][0]
+        row["last_operation_seq"] += 1
+        row["count"] += 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+        data = compact_fault_corpus()
+        row = data["compact-fault-results.jsonl"][0]
+        row["last_end_ns"] = data["buckets.jsonl"][2]["bucket_end_ns"] + 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+        data = compact_fault_corpus()
+        data["buckets.jsonl"][2]["outcomes"][0]["first_start_ns"] += 1
+        self.fail(data, "RL_COMPACT_BUCKET")
+
+    def test_compact_extrema_cannot_escape_window_or_fabricate_order(self):
+        for field in ("min_head_ns", "max_head_ns", "last_start_ns"):
+            data = compact_fault_corpus()
+            row = data["compact-fault-results.jsonl"][0]
+            row[field] = row["last_end_ns"] + 1
+            self.fail(data, "RL_INVALID_EVIDENCE")
+        data = compact_fault_corpus()
+        window = next(row for row in data["events.jsonl"] if row["kind"] == "fault_window")
+        window["end_ns"] = data["compact-fault-results.jsonl"][0]["max_head_ns"] - 1
+        self.fail(data, "RL_COMPACT_SCOPE")
+        data = compact_fault_corpus(1)
+        data["compact-fault-results.jsonl"][0]["max_head_ns"] += 1
+        self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_compact_healthy_wrong_phase_lane_target_window_or_epoch_is_not_whitelisted(self):
+        for field, value in (("lane", "healthy"), ("phase", "warmup"), ("target", "other"),
+                             ("window_id", "missing")):
+            with self.subTest(field=field):
+                data = compact_fault_corpus()
+                data["compact-fault-results.jsonl"][0][field] = value
+                self.fail(data, "RL_COMPACT_SCOPE")
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["raw"]["connection_epoch"] = 2
+        self.fail(data, "RL_MISSING_RESULT")
+        data = compact_fault_corpus()
+        for row in (data["buckets.jsonl"][2]["outcomes"][0], data["compact-fault-results.jsonl"][0]):
+            row["lane"] = "healthy"
+        self.fail(data, "RL_COMPACT_SCOPE")
+
+    def test_compact_bad_safe_body_and_metadata_are_not_excused_by_window(self):
+        for key, value, code in (("body_sha256", "0" * 64, "RL_CONTENT"),
+                                 ("content_type", "application/grpc", "RL_CONTENT"),
+                                 ("trailers", {"grpc-status": "0"}, "RL_COMPACT_CONTENT"),
+                                 ("authority", "forged", "RL_COMPACT_CONTENT"),
+                                 ("eof", False, "RL_INVALID_EVIDENCE"),
+                                 ("cancelled", True, "RL_INVALID_EVIDENCE"),
+                                 ("error_stage", "response_body", "RL_INVALID_EVIDENCE")):
+            with self.subTest(key=key):
+                data = compact_fault_corpus()
+                for row in (data["buckets.jsonl"][2]["outcomes"][0], data["compact-fault-results.jsonl"][0]):
+                    row["raw"][key] = value
+                self.fail(data, code)
+
+    def test_compact_writer_counter_and_uncompressed_gap_cannot_be_forged(self):
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["writer_seq"] = 2
+        self.fail(data, "RL_INVALID_EVIDENCE")
+        data = compact_fault_corpus()
+        data["receipt.json"]["final_counts"]["compact_503_operations"] = 2
+        self.fail(data, "RL_RESULT_CONSERVATION")
+        data = compact_fault_corpus()
+        data["compact-fault-results.jsonl"][0]["first_operation_seq"] += 1
+        data["compact-fault-results.jsonl"][0]["count"] -= 1
+        self.fail(data, "RL_MISSING_RESULT")
+        data = compact_fault_corpus()
+        # A range cannot hide beside a normal-success histogram just because
+        # its IDs are inside a valid worker bucket and storage totals match.
+        raw = data["buckets.jsonl"][2]["outcomes"][0]["raw"]
+        recipe = data["receipt.json"]["recipes"]["download"]
+        raw.update(status=200, body_bytes=17, body_sha256=hashlib.sha256(b"x" * 17).hexdigest(),
+                   content_type=None, upstream_peer=recipe["allowed_peers"][0], upstream_name="a",
+                   authority=recipe["authority"], server_name=recipe["server_name"], path=recipe["path"])
+        self.fail(data, "RL_COMPACT_MATCH")
 
     def test_control_missing_duplicate_and_changed_terminal_identity(self):
         for change in ("missing", "duplicate", "time"):
