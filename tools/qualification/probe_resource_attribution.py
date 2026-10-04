@@ -876,8 +876,12 @@ def run(args):
         if report["gateway_binary_verified_at_running_end"] != gateway_identity:
             raise Unavailable("gateway binary/process identity changed during capture")
         settle_sampler(sampler, sampled_stop, capture, report, require=True)
-        safe_signal(gateway_identity, signal.SIGTERM)
-        report["cleanup"]["gateway_term_requested_ns"] = now()
+        # Existing CLI shutdown is tokio::signal::ctrl_c(), not SIGTERM. This
+        # experiment uses that advertised signal; it does not change runtime
+        # signal policy or relabel failure-path forced termination as graceful.
+        safe_signal(gateway_identity, signal.SIGINT)
+        report["cleanup"]["gateway_shutdown_signal"] = "SIGINT"
+        report["cleanup"]["gateway_shutdown_requested_ns"] = now()
         profiler.wait(timeout=20)
         if gateway:
             gateway.wait(timeout=5)

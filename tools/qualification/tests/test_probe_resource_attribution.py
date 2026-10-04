@@ -41,7 +41,7 @@ class Boundaries(unittest.TestCase):
                     with self.assertRaisesRegex(PROBE.Unavailable, "readiness deadline"):
                         PROBE.listen_address(log, process, 100)
 
-    def sampler_failure_experiment(self, *, stuck=False, late=False):
+    def sampler_failure_experiment(self, *, stuck=False, late=False, signal_receipts=None):
         class OwnedProcess:
             pid = 424242
             returncode = None
@@ -95,11 +95,21 @@ class Boundaries(unittest.TestCase):
                     patch.object(PROBE, "collector_mapping", return_value={"verified": "synthetic"}), \
                     patch.object(PROBE, "listen_address", return_value=("127.0.0.1", 12345)), \
                     patch.object(PROBE, "sample_process", return_value={"rss_kib": 1}), \
-                    patch.object(PROBE, "safe_signal"), \
+                    patch.object(PROBE, "safe_signal") as signals, \
                     patch.object(PROBE, "load", return_value={"workers": [{"completed": 1, "failed": 0}]}), \
                     patch.object(PROBE, "guarded_command", side_effect=parse):
                 code = PROBE.run(args)
+                if signal_receipts is not None:
+                    signal_receipts.extend(call.args[1] for call in signals.call_args_list)
             return code, json.loads((root / "attribution.json").read_text())
+
+    def test_normal_shutdown_uses_existing_cli_ctrl_c_signal_not_sigterm(self):
+        signals = []
+        code, report = self.sampler_failure_experiment(signal_receipts=signals)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["cleanup"]["gateway_shutdown_signal"], "SIGINT")
+        self.assertEqual(signals[0], PROBE.signal.SIGINT)
+        self.assertEqual(report["cleanup"]["collector_exit"], 0)
 
     def test_late_sampler_failure_cannot_be_captured(self):
         code, report = self.sampler_failure_experiment(late=True)
