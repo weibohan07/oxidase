@@ -589,6 +589,30 @@ Access Log, OpenTelemetry, packaging and version/release work remain out of scop
   `docs/verification/discovery-acceptance.md` and the protected PR delivery records.
   This bounded alpha qualification is not a production-readiness claim.
 
+## 7A-R remediation under verification
+
+- A real TLS/H2 early-503 segmented-upload counterexample reaches the locked
+  h2 internal-reset guard before the existing 1000-request retirement boundary.
+  The candidate retains only a never-claimed ingress payload until streaming
+  disposal reaches EOS, with fixed byte/absolute-time bounds; response head and
+  DATA remain immediate. Ordinary Proxy payload ownership, H1, trusted Upgrade,
+  retry deadlines and the h2 reset guards are unchanged. The unchanged1000-upload
+  regression passes on stable and MSRV. A real zero-window/PING test confirms
+  bounded actual input destruction and a healthy sibling's complete body/trailers;
+  new Linux qualification remains a separate gate.
+- Clean first-EOF tunnel termination now shuts down the remaining TLS write half
+  exactly once. Real two-hop TLS and complete/incomplete application-message
+  regressions pass. This does not reinterpret old unclean-EOF notices as proof of
+  successful closure.
+- Cancellation evidence separates actual operation-bound upstream Drop from the
+  ACK-query connection's cleanup/join. Late ACK, cleanup failure and unjoined
+  drivers still fail. Historical normal IPv6 504 and missing ACK remain unresolved;
+  two unchanged focused original-C Linux runs do not reproduce them.
+- All21 frozen resource capacity gaps and matched TLS/H2 retained-allocation
+  attribution remain open pending actual admission/retirement fixes and proof.
+  No new formal H/C pass or 7A-R completion is claimed; the preservation, old
+  counterexamples and exact boundaries are in `verification/7ar-failure-closure.md`.
+
 ## Not implemented
 
 - gRPC-Web, OXT inheritance, and a portable executable snapshot of live process
