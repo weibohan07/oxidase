@@ -420,7 +420,7 @@ pub(super) async fn run(args: ResourceArguments) -> Result<(), SoakError> {
     }
     let mut receipt = json!({"schema_version":"oxidase.resource-qualification/v1","implementation_commit":source["commit"],"tool_commit":source["commit"],"source_set_sha256":source["source_set_sha256"],"source_files":source["source_files"],"git_dirty":source["dirty"],"build_record":build,"complete":false,"artifact_truncated":false,"controller_result":"running",
         "parameters":{"campaign":match args.campaign{ResourceCampaign::Healthy=>"H",ResourceCampaign::Churn=>"C",_=>"I"},"isolation":args.campaign,"seed":args.seed,"concurrency":args.concurrency,"payload_bytes":args.payload_size,"upload_bytes":args.upload_size,"formal":args.formal,"sample_interval_ns":args.sample_interval_ms*1_000_000,"max_sample_gap_ns":args.sample_interval_ms*4_000_000,"scrape_interval_ns":args.scrape_interval_ms*1_000_000,"durations_ns":{"warmup":args.warm_up.as_nanos()as u64,"steady":args.duration.as_nanos()as u64,"recovery":args.recovery_running.as_nanos()as u64,"quiet":args.quiet_running.as_nanos()as u64,"post_drain":args.post_drain.as_nanos()as u64}},
-        "bounds":bounds(args.concurrency),"required_gauges":["oxidase_active_requests","oxidase_active_connections","oxidase_http2_active_streams","oxidase_active_tunnels"],"coverage_required":[],"fatal_errors":[]});
+        "bounds":bounds(args.concurrency),"required_gauges":["oxidase_active_requests","oxidase_active_connections{listener=\"qualification\",protocol=\"http1\"}","oxidase_active_connections{listener=\"qualification\",protocol=\"h2\"}","oxidase_http2_active_streams{listener=\"qualification\"}","oxidase_active_tunnels{listener=\"qualification\"}"],"coverage_required":[],"fatal_errors":[]});
     if matches!(
         args.campaign,
         ResourceCampaign::Healthy | ResourceCampaign::Churn
@@ -435,6 +435,12 @@ pub(super) async fn run(args: ResourceArguments) -> Result<(), SoakError> {
             "upgrade",
             "old_held_grpc_and_upgrade"
         ]);
+    } else {
+        // Isolations intentionally omit particular protocols or all business
+        // traffic. Their on-demand listener series may never be instantiated;
+        // that is unavailable, not a fabricated zero. Raw series/census remain
+        // recorded, and an I run cannot grant formal H/C qualification.
+        receipt["required_gauges"] = json!(["oxidase_active_requests"]);
     }
     persist_receipt(&args.output, &receipt)?;
     let result = run_inner(&args, &mut receipt).await;
@@ -551,6 +557,15 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     )
     .map_err(io_error)?;
     let mut dns = FixtureProcess::spawn("dns", &root, &args.output).await?;
+    // Establish the old-flow fixture policy before the actual runtime can query
+    // DNS/cache membership. Changing `both` to `a` after publication does not
+    // prove convergence and can let weighted RR open the supposed old-A tunnel
+    // on B. The client and independent oracle still validate the actual peer.
+    dns.command(FixtureCommand::Dns {
+        mode: initial_dns_mode(args.campaign).into(),
+        ttl: 1,
+    })
+    .await?;
     receipt["parameters"]["operation_interval_ns"] =
         (args.operation_interval_ms * 1_000_000).into();
     let source = resource_source(&root, dns.ready.address, &upstream, args.campaign, 0);
@@ -1294,6 +1309,17 @@ async fn read_runtime(root: &Path) -> Result<Value, SoakError> {
     serde_json::from_slice(&client::admin_read(root, "/api/v1/runtime").await?).map_err(json_error)
 }
 
+fn initial_dns_mode(campaign: ResourceCampaign) -> &'static str {
+    if matches!(
+        campaign,
+        ResourceCampaign::Healthy | ResourceCampaign::Churn
+    ) {
+        "a"
+    } else {
+        "both"
+    }
+}
+
 async fn wait_for_pacing(delay: Duration, stop: &tokio::sync::watch::Receiver<bool>) {
     if delay.is_zero() || *stop.borrow() {
         return;
@@ -1308,6 +1334,13 @@ async fn wait_for_pacing(delay: Duration, stop: &tokio::sync::watch::Receiver<bo
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn retained_flow_setup_is_single_a_before_any_runtime_resolution() {
+        assert_eq!(initial_dns_mode(ResourceCampaign::Healthy), "a");
+        assert_eq!(initial_dns_mode(ResourceCampaign::Churn), "a");
+        assert_eq!(initial_dns_mode(ResourceCampaign::StaticProxy), "both");
+    }
 
     #[tokio::test]
     async fn pacing_does_not_delay_stop_or_leave_an_active_operation() {

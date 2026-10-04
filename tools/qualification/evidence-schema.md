@@ -27,6 +27,16 @@ allowed; missing required evidence is never filled with zero.
   An observed kind without a structural capacity/exit budget makes that formal
   criterion `INCONCLUSIVE`; bounds for ten kinds cannot qualify all 31 kinds.
 - `required_gauges: [name]`, `coverage_required: [name]`, and `recipes` below.
+  Gauge names are exact raw series, not unlabelled aggregate aliases. The fixed
+  H/C fixture requires `oxidase_active_requests`, both
+  `oxidase_active_connections{listener="qualification",protocol="http1|h2"}`
+  series separately, `oxidase_http2_active_streams{listener="qualification"}`,
+  and `oxidase_active_tunnels{listener="qualification"}`. The `http1|h2` notation
+  here denotes two literal declarations, not a regex selector. Missing series,
+  a wrong listener/protocol, duplicate series or a non-finite value cannot be
+  replaced with a zero. Formal H/C cannot delete these declarations to bypass
+  the fixed fixture requirement. Bootstrap observations do not grant measured
+  Running coverage or fabricate a metric before it is registered.
 - `final_counts: {offered,connection_attempts,admitted_http_operations,
   received_operations,workers:[{worker_id,offered,connection_attempts,
   admitted_http_operations,received_operations,last_operation_seq}]}`.

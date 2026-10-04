@@ -43,6 +43,13 @@ RESOURCE_KINDS = frozenset((
     "proxy_pool_family", "health_pool_family", "upstream_tcp_connection", "upstream_tls_connection",
     "upstream_connect_attempt", "upstream_tls_handshake", "warm_socket_slot", "warm_expiry_task", "upstream_task",
     "upstream_upload_task", "dispatch_retirement_task", "response_body", "tunnel"))
+FIXTURE_GAUGES = (
+    "oxidase_active_requests",
+    'oxidase_active_connections{listener="qualification",protocol="http1"}',
+    'oxidase_active_connections{listener="qualification",protocol="h2"}',
+    'oxidase_http2_active_streams{listener="qualification"}',
+    'oxidase_active_tunnels{listener="qualification"}',
+)
 
 
 class EvidenceError(Exception):
@@ -188,6 +195,7 @@ class Analyzer:
         self.probes = {}
         self.retained_proofs = []
         self.unbounded_kinds = set()
+        self.required_gauges = []
         self.first_metric = {}
         self.last_metric = {}
         self.actual_ipv6_responses = 0
@@ -409,6 +417,18 @@ class Analyzer:
             raise EvidenceError("campaign must be H, C or I")
         if campaign == "H" and self.windows:
             self.finding("RL_HEALTHY_FAULT", "healthy campaign includes injected unavailability")
+        gauges = required(self.receipt, "required_gauges")
+        if (not isinstance(gauges, list) or any(not isinstance(name, str) or not name for name in gauges) or
+                len(set(gauges)) != len(gauges)):
+            raise EvidenceError("required gauges must be unique exact series names")
+        self.required_gauges = list(gauges)
+        if campaign in ("H", "C") and (params.get("formal") or not self.receipt.get("synthetic")):
+            missing = set(FIXTURE_GAUGES) - set(gauges)
+            if missing:
+                self.finding("RL_REQUIRED_GAUGE_CONTRACT", "H/C receipt omitted mandatory fixed-fixture raw series", series=sorted(missing))
+            # Even a damaged declaration cannot suppress measured missing-series
+            # evidence. Keep labels exact; never aggregate or invent a zero.
+            self.required_gauges.extend(name for name in FIXTURE_GAUGES if name not in gauges)
         if campaign in ("H", "C"):
             payload = integer(required(params, "payload_bytes"), "planned payload_bytes", 1)
             for name, recipe in required(self.receipt, "recipes").items():
@@ -1426,7 +1446,7 @@ class Analyzer:
                 for name, value in metrics.items():
                     self.first_metric.setdefault(name, value)
                     self.last_metric[name] = value
-                for name in required(self.receipt, "required_gauges"):
+                for name in self.required_gauges:
                     if name not in metrics:
                         self.finding("RL_MISSING_GAUGE", "mandatory raw metric unavailable", metric=name)
                     else:

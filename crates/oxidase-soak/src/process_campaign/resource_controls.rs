@@ -1459,7 +1459,7 @@ mod tests {
         for (index, row) in rows.iter().enumerate() {
             assert_eq!(row["writer_seq"], index as u64 + 1);
         }
-        for pair in rows.chunks_exact(2) {
+        for pair in rows.as_chunks::<2>().0 {
             assert_eq!(pair[0]["kind"], "started");
             assert_eq!(pair[1]["kind"], "terminal");
             assert_eq!(pair[0]["operation_id"], pair[1]["operation_id"]);

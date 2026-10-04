@@ -57,6 +57,22 @@ def probe_corpus():
     return data
 
 
+def labelled_metrics_corpus():
+    data = corpus()
+    data["receipt.json"]["required_gauges"] = list(VERIFIER.FIXTURE_GAUGES)
+    # Raw renderer shape, including different real protocol values: this is not
+    # a normalized sum and neither protocol can cover the other protocol.
+    raw = ('oxidase_active_requests 2\n'
+           'oxidase_active_connections{listener="qualification",protocol="http1"} 1\n'
+           'oxidase_active_connections{listener="qualification",protocol="h2"} 2\n'
+           'oxidase_http2_active_streams{listener="qualification"} 3\n'
+           'oxidase_active_tunnels{listener="qualification"} 1\n')
+    for row in data["samples.jsonl"]:
+        if row["source"] == "admin":
+            row["metrics"] = raw
+    return data
+
+
 def prelude_corpus():
     data = retained_corpus()
     proof = data["events.jsonl"][1]["evidence"]["raw"]
@@ -289,6 +305,67 @@ class IndependentJournalTests(unittest.TestCase):
         report = self.verify(data)
         self.assertIn("RL_CAPACITY_UNPROVEN", codes(report))
         self.assertNotEqual(report["result"], "PASS_BOUNDED_QUALIFICATION")
+
+    def test_real_renderer_labelled_series_are_not_replaced_by_global_zeros(self):
+        report = self.verify(labelled_metrics_corpus())
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        curves = report["curves"]["steady"]
+        self.assertEqual(curves[VERIFIER.FIXTURE_GAUGES[1]]["final"], 1)
+        self.assertEqual(curves[VERIFIER.FIXTURE_GAUGES[2]]["final"], 2)
+        self.assertNotIn("oxidase_active_connections", curves)
+
+    def test_removing_any_exact_gauge_cannot_be_filled_or_covered_by_other_labels(self):
+        for series in VERIFIER.FIXTURE_GAUGES:
+            with self.subTest(series=series):
+                data = labelled_metrics_corpus()
+                measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin" and row["phase"] == "steady")
+                measured["metrics"] = "".join(line + "\n" for line in measured["metrics"].splitlines() if not line.startswith(series + " "))
+                self.fail(data, "RL_MISSING_GAUGE")
+
+    def test_wrong_protocol_or_listener_does_not_satisfy_fixed_gauge(self):
+        for old, new in (('protocol="http1"', 'protocol="http2"'),
+                         ('listener="qualification"', 'listener="other"')):
+            with self.subTest(new=new):
+                data = labelled_metrics_corpus()
+                measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin" and row["phase"] == "steady")
+                measured["metrics"] = measured["metrics"].replace(old, new)
+                self.fail(data, "RL_MISSING_GAUGE")
+
+    def test_duplicate_and_nonfinite_labelled_metrics_are_invalid_raw_evidence(self):
+        for change in ("duplicate", "NaN"):
+            data = labelled_metrics_corpus()
+            measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin")
+            line = VERIFIER.FIXTURE_GAUGES[2] + " 2\n"
+            if change == "duplicate":
+                measured["metrics"] += line
+            else:
+                measured["metrics"] = measured["metrics"].replace(line, VERIFIER.FIXTURE_GAUGES[2] + " NaN\n")
+            self.fail(data, "RL_INVALID_EVIDENCE")
+
+    def test_formal_receipt_cannot_delete_fixed_gauge_declaration(self):
+        data = labelled_metrics_corpus()
+        data["receipt.json"]["parameters"]["formal"] = True
+        data["receipt.json"]["required_gauges"] = []
+        report = self.fail(data, "RL_REQUIRED_GAUGE_CONTRACT")
+        self.assertNotIn("RL_MISSING_GAUGE", codes(report))
+        for row in data["samples.jsonl"]:
+            if row["source"] == "admin":
+                row["metrics"] = ""
+        self.fail(data, "RL_MISSING_GAUGE")
+
+    def test_bootstrap_missing_series_is_retained_but_cannot_replace_running_capture(self):
+        data = labelled_metrics_corpus()
+        early = copy.deepcopy(next(row for row in data["samples.jsonl"] if row["source"] == "admin"))
+        early.update(phase="bootstrap", planned_ns=9 * NS, start_ns=9 * NS, end_ns=9 * NS + 1000, metrics="")
+        data["samples.jsonl"].insert(0, early)
+        for index, row in enumerate(data["samples.jsonl"], 1):
+            row["writer_seq"] = index
+        report = self.verify(data)
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["prelude_samples"], 1)
+        measured = next(row for row in data["samples.jsonl"] if row["source"] == "admin" and row["phase"] == "warmup")
+        measured["metrics"] = ""
+        self.fail(data, "RL_MISSING_GAUGE")
 
 
 if __name__ == "__main__":

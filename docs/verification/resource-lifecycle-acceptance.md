@@ -148,3 +148,34 @@ debug startup budget does not extend production deadlines or measured phases.
 
 Artifacts expire after the workflow retention period; replay uses the original
 archive bytes plus checksum, not new tool-generated replacement evidence.
+
+### Next actual Linux oracle rejection
+
+Head `0db05e61bcf1763e62c8f4b2193d3b8eeaca08b4` passed all nine local macOS
+gates without a source change, but Hosted `37195361755` failed. Stable Rust 1.99
+stopped on the new `chunks_exact_to_as_chunks` Clippy lint; its Linux smoke never
+ran. Rust 1.88 completed the real implementation smoke/controller and rejected
+its evidence independently. Artifact `11301305852` archive SHA-256 is
+`3a5e3486d791876ef82ceafae1715463bbb94e3238d959125b5822575497b022`.
+
+The original held gRPC was physically A, but the old Upgrade was physically B:
+initial DNS `both` had been cached before setup switched to `a`. Complete echo
+bytes do not prove an A lease survived A withdrawal. The oracle's rejection is
+correct; setup must fix A **before** Gateway preparation and validate both old
+flows against actual A, without hidden retries or rewriting the old artifact.
+
+All 74 original Admin captures contain the three labelled metric families. The
+receipt incorrectly requested unlabelled keys while the decoder preserved full
+labelsets, causing false missing-gauge findings. The repair requests all five
+actual fixed series (requests, H1/H2 connections, H2 streams, tunnels); missing
+either protocol, wrong listener/label, duplicate series or NaN remains failure.
+No aggregation default or zero replacement is used.
+
+The new startup timestamps actually measured self-executable hashing at
+16.536330851 seconds, with preceding cheap identity validation at 459511 ns.
+This supports the separate debug startup-budget change on this run. It does not
+manufacture missing timestamps for the older `c503ab5` failure or explain RSS.
+Normal workers conserved 543 offered/received operations (536 HTTP admissions,
+7 Upgrade admissions, 12 connection attempts); conservation alone did not grant
+qualification to the invalid retained-flow proof. This is a short implementation
+run, not an hour-scale resource or memory campaign.

@@ -2314,6 +2314,45 @@ async fn echo_upgrade(
     echo_upgrade_capture(socket, None, None, None).await
 }
 
+fn retained_upgrade_uses_fixture_a(raw: &ResourceResponseFacts, fixture_a: SocketAddr) -> bool {
+    raw.status == Some(101)
+        && raw.request_head_sent
+        && raw.upstream_name.as_deref() == Some("a")
+        && raw.upstream_peer.as_deref() == Some(fixture_a.to_string().as_str())
+        && raw.authority.as_deref() == Some("gateway.example.test")
+        && raw.server_name.as_deref() == Some("gateway.example.test")
+        && raw.path.as_deref() == Some("/base/ws")
+}
+
+/// This additional qualification precondition never substitutes the requested
+/// endpoint for the actual response metadata. A wrong peer remains a failed,
+/// fully journalled operation, not a hidden retry or proof of an old A lease.
+async fn verify_captured_retained_upgrade(
+    socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    raw: &mut ResourceResponseFacts,
+    prelude: Option<&mut PreludeGuard>,
+    fixture_a: SocketAddr,
+) -> Result<(), SoakError> {
+    if retained_upgrade_uses_fixture_a(raw, fixture_a) {
+        return Ok(());
+    }
+    resource_error(raw, "response_head", "retained_upgrade_identity_mismatch");
+    raw.tunnel_client_shutdown = matches!(
+        tokio::time::timeout(Duration::from_secs(2), socket.shutdown()).await,
+        Ok(Ok(()))
+    );
+    if !raw.tunnel_client_shutdown {
+        raw.diagnostics
+            .push("retained_upgrade_rejection_shutdown_failed".into());
+    }
+    // shutdown is an action, not an observed peer EOF or complete echo exchange.
+    raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+    if let Some(guard) = prelude {
+        guard.finish(raw, "failed", "identity_mismatch")?;
+    }
+    Err(fail("captured old Upgrade did not use actual fixture A"))
+}
+
 async fn echo_upgrade_capture(
     socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
     mut raw: Option<&mut ResourceResponseFacts>,
@@ -2647,6 +2686,17 @@ async fn retained_stream_proof_inner(
             return Err(fail("initial Upgrade fixture unavailable"));
         }
     };
+    if capture {
+        verify_captured_retained_upgrade(
+            &mut tunnel,
+            upgrade_raw
+                .as_mut()
+                .ok_or_else(|| fail("captured retained Upgrade raw head missing"))?,
+            upgrade_operation.as_mut(),
+            targets[0],
+        )
+        .await?;
+    }
     let mut upgrade_digest = Sha256::new();
     echo_upgrade_capture(
         &mut tunnel,
@@ -3589,6 +3639,134 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_upgrade_requires_actual_a_socket_and_all_logical_metadata() {
+        let fixture_a: SocketAddr = "127.0.0.1:43210".parse().expect("numeric fixture address");
+        let mut raw = ResourceResponseFacts::blank("retained:a".into(), "upgrade");
+        raw.status = Some(101);
+        raw.request_head_sent = true;
+        raw.upstream_name = Some("a".into());
+        raw.upstream_peer = Some(fixture_a.to_string());
+        raw.authority = Some("gateway.example.test".into());
+        raw.server_name = Some("gateway.example.test".into());
+        raw.path = Some("/base/ws".into());
+        assert!(retained_upgrade_uses_fixture_a(&raw, fixture_a));
+        for field in ["name", "peer", "authority", "sni", "path", "missing"] {
+            let mut invalid = raw.clone();
+            match field {
+                "name" => invalid.upstream_name = Some("b".into()),
+                "peer" => invalid.upstream_peer = Some("127.0.0.2:43210".into()),
+                "authority" => invalid.authority = Some("other.example.test".into()),
+                "sni" => invalid.server_name = Some("other.example.test".into()),
+                "path" => invalid.path = Some("/base/ws?unexpected=1".into()),
+                "missing" => invalid.upstream_peer = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !retained_upgrade_uses_fixture_a(&invalid, fixture_a),
+                "{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_retained_upgrade_rejects_real_wrong_peer_without_hidden_retry() {
+        use rustls::pki_types::pem::PemObject as _;
+        let identity = identity().expect("test-only identity");
+        let client = client_config(&[&identity], &[b"http/1.1"]).expect("verified fixture client");
+        let key =
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+                .expect("test-only key");
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![identity.certificate_der.clone()], key)
+        .expect("matching test certificate");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let fixture_a = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("distinct physical fixture A");
+        let expected_a = fixture_a.local_addr().expect("actual A socket");
+        let fixture_b = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("distinct physical fixture B");
+        let actual_b = fixture_b.local_addr().expect("actual B socket");
+        let task = tokio::spawn(async move {
+            let (socket, _) = fixture_b.accept().await.expect("one actual connection");
+            assert_eq!(socket.local_addr().expect("accepted socket"), actual_b);
+            let mut socket = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                .accept(socket)
+                .await
+                .expect("verified TLS handshake");
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.expect("real request head"));
+                assert!(head.len() <= 16384);
+            }
+            assert!(head.starts_with(b"GET /ws HTTP/1.1\r\n"));
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nX-Fixture-Upstream: b\r\nX-Fixture-Peer: {actual_b}\r\nX-Fixture-Authority: gateway.example.test\r\nX-Fixture-Sni: gateway.example.test\r\nX-Fixture-Path: /base/ws\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("real 101 head");
+            let mut byte = [0];
+            assert_eq!(
+                socket.read(&mut byte).await.expect("actual client closure"),
+                0
+            );
+            socket
+                .shutdown()
+                .await
+                .expect("actual fixture TLS shutdown");
+        });
+        let recorder = Arc::new(Mutex::new(PreludeRecorder::default()));
+        let mut guard = PreludeGuard::begin(&recorder, "upgrade", "upgrade")
+            .expect("operation identity before network");
+        let (socket, raw) = open_upgrade_capture(actual_b, client, true, Some(&guard))
+            .await
+            .expect("real captured B handshake");
+        let mut socket = socket.expect("actual 101 tunnel");
+        let mut raw = raw.expect("actual response metadata");
+        assert_eq!(
+            raw.upstream_peer.as_deref(),
+            Some(actual_b.to_string().as_str())
+        );
+        assert!(
+            verify_captured_retained_upgrade(&mut socket, &mut raw, Some(&mut guard), expected_a)
+                .await
+                .is_err()
+        );
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("fixture acknowledged closure")
+            .expect("fixture did not panic");
+        drop(guard);
+        let evidence = recorder.lock().expect("journal").evidence().expect("facts");
+        assert_eq!(evidence["prelude_counts"]["offered"], 1);
+        assert_eq!(evidence["prelude_counts"]["classified"], 1);
+        assert_eq!(evidence["prelude_counts"]["abandoned"], 0);
+        let operation = &evidence["prelude_operations"][0];
+        assert_eq!(operation["terminal"], "failed");
+        assert_eq!(operation["cause"], "identity_mismatch");
+        assert_eq!(operation["raw"]["upstream_name"], "b");
+        assert_eq!(operation["raw"]["upstream_peer"], actual_b.to_string());
+        assert_eq!(
+            operation["raw"]["error_code"],
+            "retained_upgrade_identity_mismatch"
+        );
+        assert_eq!(operation["raw"]["status"], 101);
+        assert_eq!(operation["raw"]["body_bytes"], 0);
+        assert_eq!(operation["raw"]["eof"], false);
+        assert_eq!(operation["raw"]["tunnel_client_shutdown"], true);
+        assert!(operation["raw"]["tunnel_close_result"].is_null());
+    }
 
     #[test]
     fn explicit_local_response_accepts_null_metadata_without_weakening_proxy_peer_checks() {
