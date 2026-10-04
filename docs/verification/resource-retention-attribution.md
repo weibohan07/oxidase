@@ -189,3 +189,60 @@ old A held/Upgrade proof, and Running-only reclamation before drain. Missing
 capacities or allocation attribution remain INCONCLUSIVE even after a green PR.
 The phase-six `ca0ffc9` UNKNOWN and old positive RSS drift are not retrospectively
 explained by new counters or repaired validation tools.
+
+### Actual allocation capture, not a normal-release verdict
+
+[The allocation-attempt index](artifacts/resource-7a-allocation-attempts.json)
+preserves five actual attempts plus a failed checkout caused by a mistyped
+source SHA (NOT RUN). The earlier failures were stable-library identity
+comparison incorrectly including ASLR addresses, readiness matching the wrong
+protocol text, accessing the closed fd after the 1000th complete reply, and
+using SIGTERM where the existing CLI's normal shutdown accepts SIGINT. Each
+repair has a bounded regression; no production allocator, retirement interval,
+pool policy or signal contract was changed.
+
+Run `37206022587`, exact source `5fda7f7545bb082df7c57e21d30c5945b97abd51`,
+actually collected and parsed heaptrack 1.5.0 stacks. The separate debug-enabled
+release H1 Proxy/Asset fixture ran 60.035 seconds, four clients, 1-MiB public
+payloads: 9910 offered/full replies, zero errors, 12 actual connections all
+joined. Gateway PID/start/binary identity was rechecked at the end; 118 actual
+Running samples are distinct from the profiler interpreter's samples.
+
+Gateway RSS first/peak/last was 34320/44192/44192 KiB; PSS
+30374/40246/40246; Private_Dirty 29732/37116/24744; FD 20/26/23.
+An additional stopped-load but still Running final capture was
+41184/37238/21736 KiB RSS/PSS/Private_Dirty, FD 18. The external interpreter's
+RSS was 260924/272048/272048 KiB, not gateway residency. Collector injection
+also changes the gateway, so this is not an unprofiled counterfactual.
+
+The native parser printed 3004406 allocations, peak heap `7.49M`, peak RSS
+`45.25M`, and unfreed-at-end `195.64K` in its original units. Actual Oxidase
+Rust symbols/source lines occur alongside Bytes/Hyper I/O, connection-state,
+upstream-handshake and runtime/tracing stacks. Non-merged peak stack groups
+are not additive retained-byte totals; unfreed-at-exit is not a leak verdict,
+and Rust v0 symbols were not fully demangled. This narrows one isolated H1
+case but does **not** assign normal TLS/H2 H/C resident drift to a category.
+Those retained-allocation/allocator hypotheses remain INCONCLUSIVE.
+
+### Retry witness stopping point
+
+Formal C repeat `37205968672`, exact `60ca74f`, seed 700216, conserved all
+111955 offered/terminal operations and all 100 explicit retirement pairs,
+but stopped at `resource.control_retry_not_triggered` after 89.638 seconds
+of steady. Its 180.095-second warmup cannot count toward 60-minute steady.
+[The original checked index](artifacts/resource-7a-60ca74f-hosted-failure.json)
+contains provider hashes, all 37 verified files and identical frozen replay.
+The resource fixture dispatch bypassed the legacy branch implementing
+`retry_a`: all 16 control probes returned 200 without that trigger. This proves
+a fixture wiring defect, not a production retry failure.
+
+It also retains nineteen H2 upload transport failures in status-only DNS
+windows and one actual cancellation whose fixture Drop was only observed
+3.118 seconds after client cancellation, following connection retirement.
+None is accepted inside the original three-second ACK deadline. The source
+predates typed H2-reason capture, so those causes cannot be reconstructed.
+Controlled tests now capture actual REFUSED_STREAM, perform 512 empty and
+512 1-MiB uploads with complete safe 503s on the same TLS/H2 connections,
+and obtain eight operation-bound upstream Drop ACKs while the original H2
+connection remains open. They did not reproduce those campaign anomalies and
+do not close the original failure or its scheduling/propagation attribution.

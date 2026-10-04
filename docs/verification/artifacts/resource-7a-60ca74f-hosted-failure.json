@@ -1,0 +1,1142 @@
+{
+  "schema_version": "oxidase.resource-evidence-index/v1",
+  "scope": "Original failed Linux C campaign; not final head qualification or PR required checks",
+  "run": {
+    "id": 37205968672,
+    "url": "https://github.com/weibohan07/oxidase/actions/runs/37205968672",
+    "event": "workflow_dispatch",
+    "head_commit": "60ca74f5613b1a73e1410e738a1579411d83c470",
+    "job_id": 111447099841,
+    "job_name": "Running resources (churn)",
+    "job_result": "failure",
+    "allocation_job_result": "skipped"
+  },
+  "artifact": {
+    "id": 11305245107,
+    "name": "resource-7a-churn-60ca74f5613b1a73e1410e738a1579411d83c470-37205968672",
+    "bytes": 2353563,
+    "provider_sha256": "342ee75bdf0d889df2e0d77839dccef465f6208d84cce52f87efea788578cdf7",
+    "download_sha256": "342ee75bdf0d889df2e0d77839dccef465f6208d84cce52f87efea788578cdf7",
+    "local_original_directory": "/private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/original",
+    "local_zip": "/private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/artifact-11305245107.zip",
+    "manifest_sha256": "373f594dc6893311941dc4cbbac59e494627ec0a348c5377c066b0f2c0c0d39c",
+    "manifest_entries": [
+      {
+        "path": "analysis.json",
+        "bytes": 1754,
+        "sha256": "62f367985609ada3fba8dbbed20458a993e7ff6c2a960828419b189f1a7798c8",
+        "actual_bytes": 1754,
+        "actual_sha256": "62f367985609ada3fba8dbbed20458a993e7ff6c2a960828419b189f1a7798c8",
+        "verified": true
+      },
+      {
+        "path": "build-record.json",
+        "bytes": 27878,
+        "sha256": "7eea02b0906bc48bba1041cd00163fdc9507965cf8bdb16bf8cb4647d5a8d146",
+        "actual_bytes": 27878,
+        "actual_sha256": "7eea02b0906bc48bba1041cd00163fdc9507965cf8bdb16bf8cb4647d5a8d146",
+        "verified": true
+      },
+      {
+        "path": "campaign/buckets.jsonl",
+        "bytes": 4607225,
+        "sha256": "1cc105de339c53633bd1d6655ebb05770215d40f2ae398974349bfde50ba0edf",
+        "actual_bytes": 4607225,
+        "actual_sha256": "1cc105de339c53633bd1d6655ebb05770215d40f2ae398974349bfde50ba0edf",
+        "verified": true
+      },
+      {
+        "path": "campaign/client-retirements.jsonl",
+        "bytes": 73296,
+        "sha256": "a3ab8c08b79c5e34af68a6136359c14af5435d8aa2fc6d32376f240220e9d26e",
+        "actual_bytes": 73296,
+        "actual_sha256": "a3ab8c08b79c5e34af68a6136359c14af5435d8aa2fc6d32376f240220e9d26e",
+        "verified": true
+      },
+      {
+        "path": "campaign/compact-fault-results.jsonl",
+        "bytes": 439109,
+        "sha256": "5c87110a807277f5dcd2be8c320e065358489ec97ffd2d79319e9c5cc9b35bc4",
+        "actual_bytes": 439109,
+        "actual_sha256": "5c87110a807277f5dcd2be8c320e065358489ec97ffd2d79319e9c5cc9b35bc4",
+        "verified": true
+      },
+      {
+        "path": "campaign/control-operations.jsonl",
+        "bytes": 311410,
+        "sha256": "200069d22814008339f4f1a2a76db76c61c372eabbcac0a6b063709079358629",
+        "actual_bytes": 311410,
+        "actual_sha256": "200069d22814008339f4f1a2a76db76c61c372eabbcac0a6b063709079358629",
+        "verified": true
+      },
+      {
+        "path": "campaign/control-probes.jsonl",
+        "bytes": 61658,
+        "sha256": "ea79fdd1f5f9391f54f07129999d2d43d4271c50bff0fa66ed609f366fcfb773",
+        "actual_bytes": 61658,
+        "actual_sha256": "ea79fdd1f5f9391f54f07129999d2d43d4271c50bff0fa66ed609f366fcfb773",
+        "verified": true
+      },
+      {
+        "path": "campaign/dns.stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "actual_bytes": 0,
+        "actual_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "verified": true
+      },
+      {
+        "path": "campaign/errors.jsonl",
+        "bytes": 782446,
+        "sha256": "39a5325e283773146c66d3cf2bd9f5282efffcd70c2f131d2fb960c4309c0664",
+        "actual_bytes": 782446,
+        "actual_sha256": "39a5325e283773146c66d3cf2bd9f5282efffcd70c2f131d2fb960c4309c0664",
+        "verified": true
+      },
+      {
+        "path": "campaign/events.jsonl",
+        "bytes": 280325,
+        "sha256": "3f59561e7a4dc85dac69ef9ad96337860caad33ed757ac7c4e05355a3f0ccbef",
+        "actual_bytes": 280325,
+        "actual_sha256": "3f59561e7a4dc85dac69ef9ad96337860caad33ed757ac7c4e05355a3f0ccbef",
+        "verified": true
+      },
+      {
+        "path": "campaign/gateway.stderr.log",
+        "bytes": 16376901,
+        "sha256": "c08cc8490921ac9088a4500b96ee3477e6b3d82fac2f0f72b64b01ee0959c7fd",
+        "actual_bytes": 16376901,
+        "actual_sha256": "c08cc8490921ac9088a4500b96ee3477e6b3d82fac2f0f72b64b01ee0959c7fd",
+        "verified": true
+      },
+      {
+        "path": "campaign/gateway.stdout.log",
+        "bytes": 79,
+        "sha256": "1b9c90630b79e24df8976975c3034694af60cca7e803589e1203c263ae922934",
+        "actual_bytes": 79,
+        "actual_sha256": "1b9c90630b79e24df8976975c3034694af60cca7e803589e1203c263ae922934",
+        "verified": true
+      },
+      {
+        "path": "campaign/identity.json",
+        "bytes": 2846,
+        "sha256": "e660810d8f0f839dd6cb5644a4fc23712937e27d8251dc02d20b030b3e9f2244",
+        "actual_bytes": 2846,
+        "actual_sha256": "e660810d8f0f839dd6cb5644a4fc23712937e27d8251dc02d20b030b3e9f2244",
+        "verified": true
+      },
+      {
+        "path": "campaign/prelude-operations.json",
+        "bytes": 14339,
+        "sha256": "44e454dc72d0bcba29dc280dc6edc3fa34cfcf372a5845f2e71e783b06c2094a",
+        "actual_bytes": 14339,
+        "actual_sha256": "44e454dc72d0bcba29dc280dc6edc3fa34cfcf372a5845f2e71e783b06c2094a",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0001.json",
+        "bytes": 322,
+        "sha256": "aa0ed0d553806344ab06343f32386a4f47a2ce741e0c098a56b89aef08503d86",
+        "actual_bytes": 322,
+        "actual_sha256": "aa0ed0d553806344ab06343f32386a4f47a2ce741e0c098a56b89aef08503d86",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0002.json",
+        "bytes": 338,
+        "sha256": "443940ddeb7c4418d217f82a2fb3a379599631214425be06c66972e6b533d4e3",
+        "actual_bytes": 338,
+        "actual_sha256": "443940ddeb7c4418d217f82a2fb3a379599631214425be06c66972e6b533d4e3",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0003.json",
+        "bytes": 881,
+        "sha256": "a10aa17365d747c9d7e717ecdac93223a2adcda415d3dcb4654a11e9f455211c",
+        "actual_bytes": 881,
+        "actual_sha256": "a10aa17365d747c9d7e717ecdac93223a2adcda415d3dcb4654a11e9f455211c",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0004.json",
+        "bytes": 1177,
+        "sha256": "58bd7248fba0e4b98610e6c59418109b1e9a8354ca28db1233517ab956775b29",
+        "actual_bytes": 1177,
+        "actual_sha256": "58bd7248fba0e4b98610e6c59418109b1e9a8354ca28db1233517ab956775b29",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0005.json",
+        "bytes": 1180,
+        "sha256": "eab3f5e3de0b4eaef1ff4b65c1df5b53a70cf9c566cfb32c1e328e8fb17c3dab",
+        "actual_bytes": 1180,
+        "actual_sha256": "eab3f5e3de0b4eaef1ff4b65c1df5b53a70cf9c566cfb32c1e328e8fb17c3dab",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0006.json",
+        "bytes": 322,
+        "sha256": "afc863d2fab6fe8da05dc3fc5188a47277973b970e29c9aefb6bc7c46bf89a6b",
+        "actual_bytes": 322,
+        "actual_sha256": "afc863d2fab6fe8da05dc3fc5188a47277973b970e29c9aefb6bc7c46bf89a6b",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0007.json",
+        "bytes": 338,
+        "sha256": "d0a09278cfda6a161d6c5c95871bb57a4618b2c33e25790bd097882cac513b0c",
+        "actual_bytes": 338,
+        "actual_sha256": "d0a09278cfda6a161d6c5c95871bb57a4618b2c33e25790bd097882cac513b0c",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0008.json",
+        "bytes": 881,
+        "sha256": "1bcdc3550f05bdf7965818ec5c85a960a8a267c6dba7b9275bea5a363555d5bf",
+        "actual_bytes": 881,
+        "actual_sha256": "1bcdc3550f05bdf7965818ec5c85a960a8a267c6dba7b9275bea5a363555d5bf",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0009.json",
+        "bytes": 1177,
+        "sha256": "0cb6cf1ceaca42600fb8494dcf8a68506ea4405a1af22725c8d40eafdf6f279d",
+        "actual_bytes": 1177,
+        "actual_sha256": "0cb6cf1ceaca42600fb8494dcf8a68506ea4405a1af22725c8d40eafdf6f279d",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0010.json",
+        "bytes": 1180,
+        "sha256": "b38fbd53212497b04c80c64dcc4ea35b28fedd98525c49054bbdfb887b745840",
+        "actual_bytes": 1180,
+        "actual_sha256": "b38fbd53212497b04c80c64dcc4ea35b28fedd98525c49054bbdfb887b745840",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0011.json",
+        "bytes": 1246,
+        "sha256": "0fb440ac13bafcaefcc89cf9444011ffcad34778862590276e40a4419261b132",
+        "actual_bytes": 1246,
+        "actual_sha256": "0fb440ac13bafcaefcc89cf9444011ffcad34778862590276e40a4419261b132",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0012.json",
+        "bytes": 1246,
+        "sha256": "037eca3ca972f2549f2f7e4b84331bbf52448e4d76d19186e052d3dcfb773e80",
+        "actual_bytes": 1246,
+        "actual_sha256": "037eca3ca972f2549f2f7e4b84331bbf52448e4d76d19186e052d3dcfb773e80",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0013.json",
+        "bytes": 645,
+        "sha256": "216f8b764e7bb11ed147c01e31d489713391560a635c301a4b06d917ba6430f9",
+        "actual_bytes": 645,
+        "actual_sha256": "216f8b764e7bb11ed147c01e31d489713391560a635c301a4b06d917ba6430f9",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0014.json",
+        "bytes": 1246,
+        "sha256": "085b5c28ea4bda730b8d9fd8b4a4098c0f812415f56e82a69fc7bf25f6860662",
+        "actual_bytes": 1246,
+        "actual_sha256": "085b5c28ea4bda730b8d9fd8b4a4098c0f812415f56e82a69fc7bf25f6860662",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt-0025.json",
+        "bytes": 1249,
+        "sha256": "c5977b875c372d8ca7ae27eaa2d1f185216a258b3fe68570e3d9b7cd5f8d6aec",
+        "actual_bytes": 1249,
+        "actual_sha256": "c5977b875c372d8ca7ae27eaa2d1f185216a258b3fe68570e3d9b7cd5f8d6aec",
+        "verified": true
+      },
+      {
+        "path": "campaign/receipt.json",
+        "bytes": 66801,
+        "sha256": "64b8ab52bc5d1bde14d944a53c53aefee3b1e5b73702439a5be3f907a5f33ea0",
+        "actual_bytes": 66801,
+        "actual_sha256": "64b8ab52bc5d1bde14d944a53c53aefee3b1e5b73702439a5be3f907a5f33ea0",
+        "verified": true
+      },
+      {
+        "path": "campaign/sampler.stderr.log",
+        "bytes": 486,
+        "sha256": "e19bc711613e406a4d3d21a4c97c5e48402e8d9908eb0369d3089f0e60008b5a",
+        "actual_bytes": 486,
+        "actual_sha256": "e19bc711613e406a4d3d21a4c97c5e48402e8d9908eb0369d3089f0e60008b5a",
+        "verified": true
+      },
+      {
+        "path": "campaign/samples.jsonl",
+        "bytes": 18824031,
+        "sha256": "38e943d7493ee1cc0be6127e6e0b0bcfcf8f1419ed0412d328e8c18ff781ab67",
+        "actual_bytes": 18824031,
+        "actual_sha256": "38e943d7493ee1cc0be6127e6e0b0bcfcf8f1419ed0412d328e8c18ff781ab67",
+        "verified": true
+      },
+      {
+        "path": "campaign/seed-config.yaml",
+        "bytes": 2906,
+        "sha256": "c01bbf0042977791780450605f5042e7ed3b80038b076cbbfba2c81398455f2e",
+        "actual_bytes": 2906,
+        "actual_sha256": "c01bbf0042977791780450605f5042e7ed3b80038b076cbbfba2c81398455f2e",
+        "verified": true
+      },
+      {
+        "path": "campaign/upstream.stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "actual_bytes": 0,
+        "actual_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "verified": true
+      },
+      {
+        "path": "command.json",
+        "bytes": 690,
+        "sha256": "15dc818fc4a1df938474ff486169048348846d5d78e456afedf3033bdec01947",
+        "actual_bytes": 690,
+        "actual_sha256": "15dc818fc4a1df938474ff486169048348846d5d78e456afedf3033bdec01947",
+        "verified": true
+      },
+      {
+        "path": "controller.log",
+        "bytes": 152,
+        "sha256": "8fd569dbfbe3ad6d7d6f02f93698f840817e16e0233985ba0e3fd5811697f610",
+        "actual_bytes": 152,
+        "actual_sha256": "8fd569dbfbe3ad6d7d6f02f93698f840817e16e0233985ba0e3fd5811697f610",
+        "verified": true
+      },
+      {
+        "path": "workflow.json",
+        "bytes": 1459,
+        "sha256": "9fc53b0d2d2b0cf18ef6490ba1b8e4e4be94e9e2fa4ab3f64df9d81ad8ec1bc5",
+        "actual_bytes": 1459,
+        "actual_sha256": "9fc53b0d2d2b0cf18ef6490ba1b8e4e4be94e9e2fa4ab3f64df9d81ad8ec1bc5",
+        "verified": true
+      }
+    ]
+  },
+  "job_log": {
+    "local_path": "/private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/job-111447099841-raw.log",
+    "sha256": "2d3a56b8763578bb76bd7329714e5922e2a0bc09673d3150c63f3febbd105e26"
+  },
+  "frozen_replay": {
+    "analyzer_commit": "60ca74f5613b1a73e1410e738a1579411d83c470",
+    "analyzer_sha256": "1c5321e65523d3713a5833826be049eb237c529c9bd385f3fa800d5a85d0b0be",
+    "command": "python3 /private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/frozen-60ca74f-analyzer.py /private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/original/campaign --output /private/tmp/oxidase-7a-60ca74f-failure.vjSwW0/replay.json",
+    "exit_code": 1,
+    "bit_identical_to_original": true,
+    "original_and_replay_sha256": "62f367985609ada3fba8dbbed20458a993e7ff6c2a960828419b189f1a7798c8",
+    "analysis": {
+      "schema_version": "oxidase.resource-analysis/v1",
+      "result": "FAIL",
+      "findings": [
+        {
+          "code": "RL_INCOMPLETE",
+          "result": "FAIL",
+          "message": "run did not finish with complete untruncated evidence"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "receipt contains fatal collection/worker/process errors"
+        },
+        {
+          "code": "RL_GRACEFUL_TLS_CLOSE",
+          "result": "INCONCLUSIVE",
+          "message": "full tunnel exchange ended with observed peer closure without TLS close_notify"
+        },
+        {
+          "code": "RL_FATAL",
+          "result": "FAIL",
+          "message": "fatal raw event",
+          "context": {
+            "error": null
+          }
+        },
+        {
+          "code": "RL_INVALID_EVIDENCE",
+          "result": "FAIL",
+          "message": "exactly five ordered phases and an end event are required"
+        }
+      ],
+      "finding_counts": {
+        "FAIL": 4,
+        "INCONCLUSIVE": 1
+      },
+      "counts": {}
+    }
+  },
+  "receipt": {
+    "complete": false,
+    "artifact_truncated": false,
+    "controller_result": "fail",
+    "fatal_errors": [
+      "qualification failed after collecting started work: [\"resource.control_retry_not_triggered\"]"
+    ],
+    "parameters": {
+      "actual_worker_count": 10,
+      "admitted_worker_count": 10,
+      "campaign": "C",
+      "concurrency": 8,
+      "connection_request_budget": 1000,
+      "durations_ns": {
+        "post_drain": 300000000000,
+        "quiet": 300000000000,
+        "recovery": 900000000000,
+        "steady": 3600000000000,
+        "warmup": 180000000000
+      },
+      "formal": true,
+      "isolation": "churn",
+      "max_sample_gap_ns": 4000000000,
+      "normal_dns_ttl_seconds": 5,
+      "operation_interval_ns": 0,
+      "payload_bytes": 32768,
+      "sample_interval_ns": 1000000000,
+      "scrape_interval_ns": 1000000000,
+      "seed": 700216,
+      "traffic_required": true,
+      "upload_bytes": 1048576
+    },
+    "final_counts": {
+      "abandoned_operations": [],
+      "admitted_http_operations": 111696,
+      "admitted_upgrade_operations": 259,
+      "client_retirements_received": 100,
+      "client_retirements_started": 100,
+      "compact_503_operations": 38752,
+      "compact_503_rows": 353,
+      "connection_attempts": 388,
+      "non_complete": 39275,
+      "offered": 111955,
+      "received_operations": 111955,
+      "workers": [
+        {
+          "admitted_http_operations": 31451,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 32,
+          "last_operation_seq": 31451,
+          "offered": 31451,
+          "received_operations": 31451,
+          "worker_id": 0
+        },
+        {
+          "admitted_http_operations": 10834,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 11,
+          "last_operation_seq": 10834,
+          "offered": 10834,
+          "received_operations": 10834,
+          "worker_id": 1
+        },
+        {
+          "admitted_http_operations": 3095,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 4,
+          "last_operation_seq": 3095,
+          "offered": 3095,
+          "received_operations": 3095,
+          "worker_id": 2
+        },
+        {
+          "admitted_http_operations": 6173,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 12,
+          "last_operation_seq": 6173,
+          "offered": 6173,
+          "received_operations": 6173,
+          "worker_id": 3
+        },
+        {
+          "admitted_http_operations": 31250,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 32,
+          "last_operation_seq": 31250,
+          "offered": 31250,
+          "received_operations": 31250,
+          "worker_id": 4
+        },
+        {
+          "admitted_http_operations": 18758,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 19,
+          "last_operation_seq": 18758,
+          "offered": 18758,
+          "received_operations": 18758,
+          "worker_id": 5
+        },
+        {
+          "admitted_http_operations": 3102,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 4,
+          "last_operation_seq": 3102,
+          "offered": 3102,
+          "received_operations": 3102,
+          "worker_id": 6
+        },
+        {
+          "admitted_http_operations": 6788,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 13,
+          "last_operation_seq": 6788,
+          "offered": 6788,
+          "received_operations": 6788,
+          "worker_id": 7
+        },
+        {
+          "admitted_http_operations": 245,
+          "admitted_upgrade_operations": 0,
+          "connection_attempts": 2,
+          "last_operation_seq": 245,
+          "offered": 245,
+          "received_operations": 245,
+          "worker_id": 8
+        },
+        {
+          "admitted_http_operations": 0,
+          "admitted_upgrade_operations": 259,
+          "connection_attempts": 259,
+          "last_operation_seq": 259,
+          "offered": 259,
+          "received_operations": 259,
+          "worker_id": 9
+        }
+      ]
+    }
+  },
+  "actual_stop": {
+    "code": "resource.control_retry_not_triggered",
+    "fatal_event_ns": 517369400514,
+    "warmup_start_ns": 247636157886,
+    "steady_start_ns": 427731426836,
+    "warmup_seconds": 180.09526895,
+    "steady_until_fatal_seconds": 89.637973678,
+    "phases_not_reached": [
+      "recovery",
+      "quiet",
+      "post_drain"
+    ],
+    "end_event_recorded": false,
+    "source_confirmed_fixture_contract": "At frozen head, serve_route sends /base/resource/* directly to serve_resource; retry_a status injection exists only in legacy serve. All 16 retry probes use /base/resource/payload and therefore cannot trigger retryable_status_replies. This is not proof of a production retry defect."
+  },
+  "raw_error_review": {
+    "error_rows_with_nonnull_code": 20,
+    "h2_upload_response_head_transport_failures": 19,
+    "h2_failure_windows": {
+      "dns-nxdomain-1": 9,
+      "dns-withdraw-2": 2,
+      "dns-ttl0-5": 8
+    },
+    "h2_failures_without_window": 0,
+    "window_allowance": "Only complete status 503 was allowed; these transport failures are not waived.",
+    "h2_typed_reason": "UNAVAILABLE: h2_reason and h2_error_kind fields did not yet exist in this frozen source. No reset/GOAWAY cause is inferred.",
+    "cancel_ack": {
+      "operation_id": "8:180",
+      "window_id": null,
+      "upstream": "b",
+      "physical_peer": "127.0.0.2:36063",
+      "response_head_ns": 445796794515,
+      "first_data_and_client_body_drop_return_ns": 445837232107,
+      "body_bytes": 1024,
+      "bounded_ack_result": "missing",
+      "client_driver_exit_ns": 448838221241,
+      "actual_upstream_body_drop_ns": 448955663056,
+      "upstream_drop_receipt_observed_at_ns": 457097443591,
+      "upstream_drop_delay_after_client_body_return_ns": 3118430949,
+      "upstream_drop_after_client_driver_exit_ns": 117441815,
+      "cause": "INCONCLUSIVE: exact propagation/fixture-query/scheduling stage is not present in this original evidence. The actual late Drop is preserved and does not satisfy the original 3-second ACK deadline."
+    },
+    "rows": [
+      {
+        "worker_id": 3,
+        "operation_seq": 2940,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 428397317669,
+        "end_ns": 428398644220,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 3,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 428398641445,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 2985,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 428448325704,
+        "end_ns": 428451240773,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 3,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 428451237648,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 3230,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 428945822359,
+        "end_ns": 428946429329,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 4,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 428946425101,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 3293,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 429028741487,
+        "end_ns": 429031940425,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 4,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 429031936949,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 3536,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 429534702675,
+        "end_ns": 429536837601,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 5,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 429536833964,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 3604,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 429631619537,
+        "end_ns": 429632428554,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 5,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 429632425348,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 3857,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 430165789568,
+        "end_ns": 430166895938,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 6,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 430166892222,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 3915,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 430233337620,
+        "end_ns": 430234777352,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 6,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 430234774346,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 4175,
+        "phase": "steady",
+        "window_id": "dns-nxdomain-1",
+        "recipe": "upload",
+        "start_ns": 430755946905,
+        "end_ns": 430757696261,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 7,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 430757692845,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 8,
+        "operation_seq": 180,
+        "phase": "steady",
+        "window_id": null,
+        "recipe": "cancel",
+        "start_ns": 443034478418,
+        "end_ns": 448838225158,
+        "raw": {
+          "error_code": "cancellation_ack_missing",
+          "error_stage": "fixture_ack",
+          "connection_epoch": 1,
+          "sender_ready": true,
+          "sender_closed_on_error": null,
+          "sender_error_category": null,
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": null,
+            "exit_ns": 448838221241,
+            "join_acknowledged": true,
+            "result": "completed"
+          },
+          "status": 200,
+          "body_bytes": 1024,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 4308,
+        "phase": "steady",
+        "window_id": "dns-withdraw-2",
+        "recipe": "upload",
+        "start_ns": 459853232078,
+        "end_ns": 459855660303,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 7,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 459855657308,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 4616,
+        "phase": "steady",
+        "window_id": "dns-withdraw-2",
+        "recipe": "upload",
+        "start_ns": 460162938681,
+        "end_ns": 460163766112,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 8,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 460163763507,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 5369,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 489981315208,
+        "end_ns": 489982444144,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 9,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 489982440166,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 4891,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 490188385342,
+        "end_ns": 490189633086,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 8,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 490189630121,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 5670,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 490570329055,
+        "end_ns": 490571626832,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 10,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 490571622504,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 5196,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 490812472370,
+        "end_ns": 490812499290,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 9,
+          "sender_ready": false,
+          "sender_closed_on_error": true,
+          "sender_error_category": "closed",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 490812494981,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 5989,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 491174558678,
+        "end_ns": 491178476294,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 11,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 491178471195,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 5502,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 491406099777,
+        "end_ns": 491406772773,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 10,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 491406769166,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 7,
+        "operation_seq": 6315,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 491768909843,
+        "end_ns": 491771247868,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 12,
+          "sender_ready": true,
+          "sender_closed_on_error": false,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 491771006538,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      },
+      {
+        "worker_id": 3,
+        "operation_seq": 5781,
+        "phase": "steady",
+        "window_id": "dns-ttl0-5",
+        "recipe": "upload",
+        "start_ns": 491923823820,
+        "end_ns": 491924223875,
+        "raw": {
+          "error_code": "transport_error",
+          "error_stage": "response_head",
+          "connection_epoch": 11,
+          "sender_ready": true,
+          "sender_closed_on_error": true,
+          "sender_error_category": "transport",
+          "h2_reason_field_present": false,
+          "h2_error_kind_field_present": false,
+          "driver_exit": {
+            "abort_requested": false,
+            "code": "http2_driver_error",
+            "exit_ns": 491924220609,
+            "join_acknowledged": true,
+            "result": "error"
+          },
+          "status": null,
+          "body_bytes": 0,
+          "eof": false
+        }
+      }
+    ]
+  },
+  "qualification": "FAIL. Started workload ledgers were collected, but no full 60-minute steady or Running recovery/quiet/drain campaign was completed. No retained-allocation attribution or leak-free claim is made.",
+  "notes": [
+    "Original ZIP and extracted files were not rewritten.",
+    "Replay aborts after invalid/incomplete phase evidence; raw error review is a separate read-only inspection, not a forged continuation of that analyzer.",
+    "These original failures must not be replaced with later control-test PASS or final-head results."
+  ]
+}
