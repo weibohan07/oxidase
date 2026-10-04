@@ -658,12 +658,21 @@ type ResourceFixtureBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std
 #[cfg(test)]
 pub(super) struct ResourceTestFixture {
     pub(super) address: std::net::SocketAddr,
+    state: Arc<UpstreamState>,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(test)]
 impl ResourceTestFixture {
+    pub(super) fn set_retry_a(&self, enabled: bool) {
+        self.state.retry_a.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(super) fn retryable_status_replies(&self) -> u64 {
+        self.state.retries.load(Ordering::Relaxed)
+    }
+
     pub(super) async fn stop(self) {
         let _ = self.stop.send(());
         self.task.await.expect("all real fixture tasks joined");
@@ -673,6 +682,14 @@ impl ResourceTestFixture {
 #[cfg(test)]
 pub(super) async fn resource_test_fixture(
     identity: &crate::common::TestIdentity,
+) -> ResourceTestFixture {
+    resource_test_fixture_named(identity, "a").await
+}
+
+#[cfg(test)]
+pub(super) async fn resource_test_fixture_named(
+    identity: &crate::common::TestIdentity,
+    id: &'static str,
 ) -> ResourceTestFixture {
     let key = PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
         .expect("ephemeral test-only key");
@@ -692,7 +709,9 @@ pub(super) async fn resource_test_fixture(
     let address = listener.local_addr().expect("actual upstream socket");
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let state = Arc::new(UpstreamState::default());
+    let serving = Arc::clone(&state);
     let task = tokio::spawn(async move {
+        let state = serving;
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -708,7 +727,7 @@ pub(super) async fn resource_test_fixture(
                         let socket = TlsAcceptor::from(tls).accept(socket).await.expect("verified TLS");
                         let sni = socket.get_ref().1.server_name().unwrap_or("").to_owned();
                         let h2 = socket.get_ref().1.alpn_protocol() == Some(b"h2");
-                        let service = service_fn(move |request| serve_route(request, "a", address, sni.clone(), Arc::clone(&state)));
+                        let service = service_fn(move |request| serve_route(request, id, address, sni.clone(), Arc::clone(&state)));
                         if h2 {
                             let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket), service).await;
                         } else {
@@ -727,6 +746,7 @@ pub(super) async fn resource_test_fixture(
     });
     ResourceTestFixture {
         address,
+        state,
         stop,
         task,
     }
@@ -827,7 +847,7 @@ async fn serve_resource(
     if operation_id.is_empty() || payload_size == 0 {
         return resource_empty_response(StatusCode::BAD_REQUEST);
     }
-    state.requests.fetch_add(1, Ordering::Relaxed);
+    let attempt = state.requests.fetch_add(1, Ordering::Relaxed);
     let uploaded = match tokio::time::timeout(
         Duration::from_secs(10),
         verify_resource_upload(request.body_mut(), grpc, upload_size),
@@ -846,6 +866,33 @@ async fn serve_resource(
     state
         .resource_upload_bytes
         .fetch_add(uploaded.0, Ordering::Release);
+    // The qualification switch must exercise real, pre-head retry behavior
+    // for ordinary zero-body GETs, not affect upload/gRPC/cancellation lanes.
+    // Keep the legacy fixture's endpoint/method/cadence and actual counter.
+    if request.uri().path() == "/base/resource/payload"
+        && uploaded.0 == 0
+        && !grpc
+        && retryable_reply(&state, id, request.method(), attempt)
+    {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header("x-fixture-upstream", id)
+            .header("x-fixture-peer", target.to_string())
+            .header("x-fixture-authority", authority)
+            .header("x-fixture-path", path)
+            .header("x-fixture-sni", sni)
+            .header("x-resource-operation-id", operation_id)
+            .header("x-resource-upload-bytes", uploaded.0)
+            .header("x-resource-upload-sha256", uploaded.1)
+            .header("x-resource-upload-eof", "true")
+            .body(
+                Full::new(Bytes::from_static(b"retryable"))
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .expect("bounded actual retry response");
+    }
     let configured = state
         .resource_fault
         .lock()
@@ -2135,6 +2182,145 @@ mod tests {
         assert_eq!(state.retries.load(Ordering::Relaxed), 0);
         assert!(retryable_reply(&state, "a", &http::Method::GET, 3));
         assert_eq!(state.retries.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_retry_switch_emits_actual_503_only_for_zero_body_payload_gets() {
+        let identity = crate::common::identity().expect("ephemeral test identity");
+        let config =
+            crate::common::client_config(&[&identity], &[b"h2"]).expect("verified H2 client");
+        let fixture = resource_test_fixture(&identity).await;
+        fixture.set_retry_a(true);
+        let tcp = tokio::net::TcpStream::connect(fixture.address)
+            .await
+            .expect("actual socket");
+        let name =
+            rustls::pki_types::ServerName::try_from("gateway.example.test").expect("test SNI");
+        let tls = tokio_rustls::TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .expect("verified TLS");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .expect("real H2");
+        let driver = tokio::spawn(connection);
+        let mut replies = Vec::new();
+        for (sequence, method, path, upload, grpc) in [
+            (0, http::Method::GET, "payload", 0, false),
+            (1, http::Method::GET, "payload", 0, false),
+            (2, http::Method::GET, "payload", 0, false),
+            (3, http::Method::POST, "upload", 1024, false),
+            (4, http::Method::POST, "grpc", 0, true),
+            (5, http::Method::GET, "payload", 1024, false),
+            (6, http::Method::GET, "payload", 1024, false),
+            (7, http::Method::GET, "payload", 0, false),
+            (8, http::Method::GET, "payload", 0, false),
+            (9, http::Method::GET, "cancel", 0, false),
+        ] {
+            let mut bytes = Vec::new();
+            if grpc {
+                bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
+            }
+            bytes.extend(std::iter::repeat_n(b'u', upload));
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("https://gateway.example.test/base/resource/{path}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    if grpc {
+                        "application/grpc"
+                    } else {
+                        "application/octet-stream"
+                    },
+                )
+                .header(
+                    "x-resource-operation-id",
+                    format!("retry-fixture:{sequence}"),
+                )
+                .header("x-resource-upload-length", upload)
+                .header("x-resource-response-length", 4096)
+                .body(Full::new(Bytes::from(bytes)))
+                .expect("bounded request");
+            sender.ready().await.expect("one actual admission");
+            let response = sender
+                .send_request(request)
+                .await
+                .expect("actual fixture reply");
+            let status = response.status();
+            let headers = response.headers().clone();
+            let mut body = response.into_body();
+            let mut received = Vec::new();
+            let mut trailers = HeaderMap::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.expect("actual wire frame");
+                if let Some(bytes) = frame.data_ref() {
+                    assert!(received.len() + bytes.len() <= 8192);
+                    received.extend_from_slice(bytes);
+                    if path == "cancel" && !bytes.is_empty() {
+                        break;
+                    }
+                }
+                if let Some(values) = frame.trailers_ref() {
+                    trailers = values.clone();
+                }
+            }
+            drop(body);
+            if path == "cancel" {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let dropped = fixture
+                            .state
+                            .resource_cancellations
+                            .lock()
+                            .expect("bounded ACK ring")
+                            .iter()
+                            .any(|receipt| {
+                                receipt.operation_id == "retry-fixture:9"
+                                    && receipt.body_bytes == 1024
+                            });
+                        if dropped {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("actual cancellation Drop remains available when retry is enabled");
+            }
+            replies.push((status, headers, received, trailers));
+        }
+        let count = fixture.retryable_status_replies();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("actual driver exit")
+            .expect("driver did not panic")
+            .expect("normal transport end");
+        fixture.stop().await;
+        assert_eq!(count, 1, "actual resource A retry switch must not be inert");
+        for (sequence, (status, headers, bytes, trailers)) in replies.iter().enumerate() {
+            assert_eq!(headers["x-fixture-upstream"], "a");
+            assert_eq!(headers["x-fixture-authority"], "gateway.example.test");
+            assert_eq!(headers["x-fixture-sni"], "gateway.example.test");
+            assert_eq!(status.as_u16(), if sequence == 0 { 503 } else { 200 });
+            if sequence == 0 {
+                assert_eq!(bytes, b"retryable");
+                assert!(trailers.is_empty());
+            } else if sequence == 4 {
+                assert_eq!(&bytes[..5], &[0, 0, 0, 16, 0]);
+                assert_eq!(&bytes[5..], vec![b'x'; 4096]);
+                assert_eq!(trailers["grpc-status"], "0");
+            } else if sequence == 9 {
+                assert_eq!(bytes, &vec![b'x'; 1024]);
+                assert!(trailers.is_empty());
+            } else {
+                assert_eq!(bytes, &vec![b'x'; 4096]);
+                assert!(trailers.is_empty());
+            }
+        }
     }
 
     struct TestBody(VecDeque<Result<Frame<Bytes>, ()>>);

@@ -3780,6 +3780,173 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn resource_retry_fixture_drives_real_gateway_a_to_b_pre_head_retry() {
+        let directory = tempfile::tempdir().expect("isolated test source");
+        let identity = identity().expect("ephemeral TLS identity");
+        write_identity(directory.path(), &identity).expect("test certificate files");
+        let a = super::super::fixture::resource_test_fixture_named(&identity, "a").await;
+        let b = super::super::fixture::resource_test_fixture_named(&identity, "b").await;
+        a.set_retry_a(true);
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  trust_stores:
+    fixture:
+      ca_bundle: gateway.pem
+  clusters:
+    api:
+      protocol: h2
+      endpoints:
+        - name: a
+          url: https://{}/base
+        - name: b
+          url: https://{}/base
+      load_balance:
+        policy: round_robin
+      tls:
+        server_name: gateway.example.test
+        trust:
+          system_roots: false
+          trust_store: fixture
+      retry:
+        max_attempts: 2
+        methods: [GET]
+        statuses: [503]
+        request_body:
+          mode: none
+          max_bytes: 64KiB
+        max_concurrent_retries: 8
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    service:
+      ref: root
+"#,
+            a.address, b.address
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real cluster preparation");
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .with_admin_listener("127.0.0.1:0".parse().expect("ephemeral admin"))
+            .await
+            .expect("test-only read-only admin")
+            .spawn();
+        let mut client = ResourceDataClient::connect(
+            gateway.local_addresses()[0].1,
+            client_config(&[&identity], &[b"h2"]).expect("verified TLS/H2 client"),
+            true,
+            vec![("a".into(), a.address), ("b".into(), b.address)],
+        )
+        .await
+        .expect("actual downstream connection");
+        let raw = client
+            .measure(ResourceRequest {
+                operation_id: "actual-retry:0".into(),
+                path: "/resource/payload?b=2&a=1&a=3".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        let mut metrics_socket =
+            TcpStream::connect(gateway.admin_address().expect("actual admin socket"))
+                .await
+                .expect("metrics connection");
+        metrics_socket
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("actual metrics request");
+        let mut metrics = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            metrics_socket.take(256 * 1024).read_to_end(&mut metrics),
+        )
+        .await
+        .expect("bounded metrics collection")
+        .expect("complete metrics response");
+        let retries_a = a.retryable_status_replies();
+        let retries_b = b.retryable_status_replies();
+        let expected_b = b.address.to_string();
+        gateway
+            .shutdown()
+            .await
+            .expect("all gateway work collected");
+        a.stop().await;
+        b.stop().await;
+        assert_eq!(
+            submitted, 1,
+            "one logical downstream operation, not client retry"
+        );
+        assert_eq!(retries_a, 1, "actual A returned the retryable status");
+        assert_eq!(retries_b, 0);
+        assert_eq!(raw.status, Some(200));
+        assert!(
+            raw.eof && raw.error_code.is_none(),
+            "actual retry wire facts: {raw:?}"
+        );
+        // This exact static-endpoint control intentionally uses B's numeric
+        // origin authority, unlike the resource campaign's logical DNS origin.
+        // Assert it explicitly; do not weaken the ordinary campaign oracle.
+        assert_eq!(raw.diagnostics, ["authority_mismatch"]);
+        assert_eq!(raw.authority.as_deref(), Some(expected_b.as_str()));
+        assert_eq!(raw.server_name.as_deref(), Some("gateway.example.test"));
+        assert!(raw.h2_reason.is_none() && raw.h2_error_kind.is_none());
+        assert_eq!(raw.upstream_name.as_deref(), Some("b"));
+        assert_eq!(raw.upstream_peer.as_deref(), Some(expected_b.as_str()));
+        assert_eq!(
+            raw.path.as_deref(),
+            Some("/base/resource/payload?b=2&a=1&a=3")
+        );
+        assert_eq!(raw.body_bytes, 32768);
+        let digest: String = Sha256::digest(vec![b'x'; 32768])
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(raw.body_sha256, digest);
+        assert_eq!(
+            raw.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert!(raw.trailers.is_empty());
+        assert_eq!(close["result"], "completed");
+        let metrics = String::from_utf8(metrics).expect("fixed Prometheus UTF-8");
+        assert!(
+            metrics.len() < 256 * 1024,
+            "metrics reached real EOF before the collection bound"
+        );
+        assert!(metrics.starts_with("HTTP/1.1 200"));
+        assert!(
+            metrics
+                .lines()
+                .any(|line| line == "oxidase_cluster_retry_attempts_total{cluster=\"api\"} 1"),
+            "actual gateway retry metric: {metrics}"
+        );
+    }
+
+    #[tokio::test]
     async fn resource_h2_cancel_ack_is_actual_upstream_drop_while_connection_remains_open() {
         let directory = tempfile::tempdir().expect("isolated test source");
         let identity = identity().expect("ephemeral TLS identity");

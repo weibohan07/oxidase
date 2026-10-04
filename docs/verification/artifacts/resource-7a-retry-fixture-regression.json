@@ -1,0 +1,84 @@
+{
+  "schema_version": "oxidase.regression-evidence/v1",
+  "scope": "Validation fixture retry switch repair only; no production gateway retry, deadline, discovery or streaming policy change",
+  "prior_hosted_failure": {
+    "run_id": 37205968672,
+    "head_commit": "60ca74f5613b1a73e1410e738a1579411d83c470",
+    "result": "FAIL",
+    "index": "resource-7a-60ca74f-hosted-failure.json"
+  },
+  "red": {
+    "base_commit": "b00f1b0e60bed2041ae1f250f5cba0968e8e272a",
+    "fixture_file_sha256_with_regression_before_fix": "06a97a3dada67def1b924aa5a9ef6c0dbc000f5b082d35c345c1f95c1903f17e",
+    "command": "cargo test -p oxidase-soak --lib resource_retry_switch_emits_actual_503_only_for_zero_body_payload_gets --locked -- --nocapture",
+    "exit_code": 101,
+    "test_seconds": 0.02,
+    "observed_actual_retryable_status_replies": 0,
+    "expected_actual_retryable_status_replies": 1,
+    "started_requests": 5,
+    "all_started_response_bodies_and_driver_collected_before_assertion": true
+  },
+  "repair": "serve_resource now invokes the existing A/GET/every-third retry helper only after validating actual empty upload, for /base/resource/payload and non-gRPC requests. It emits an actual 503 with retryable bytes, complete fixture metadata and the real reply counter. Legacy fixture and health behavior are unchanged.",
+  "green": {
+    "source_state": "local WIP on b00f1b0; not Hosted final-head qualification",
+    "client_sha256": "c93470b072894d3a92f2a0613089e0af23b8b3b5e9c4710ae937b28c6fa79763",
+    "fixture_sha256": "1397306d814c92b78a659b2e22771718eb8a0dcf7996127c031042bd8a987046",
+    "commands": [
+      {
+        "command": "cargo test -p oxidase-soak --lib resource_retry --locked -- --nocapture",
+        "exit_code": 0,
+        "passed": 2,
+        "test_seconds": 0.03
+      },
+      {
+        "command": "cargo +1.88.0 test -p oxidase-soak --lib resource_retry --locked -- --nocapture",
+        "exit_code": 0,
+        "passed": 2,
+        "test_seconds": 0.03
+      },
+      {
+        "command": "cargo clippy -p oxidase-soak --all-targets --all-features --locked -- -D warnings",
+        "exit_code": 0
+      },
+      {
+        "command": "git diff --check -- crates/oxidase-soak/src/process_campaign/client.rs crates/oxidase-soak/src/process_campaign/fixture.rs",
+        "exit_code": 0
+      }
+    ],
+    "fixture_case": {
+      "started_requests": 10,
+      "complete_response_bodies": 9,
+      "planned_cancellations": 1,
+      "actual_retryable_503": 1,
+      "counter": 1,
+      "boundaries": [
+        "zero-body payload GET emits the actual first A retryable status",
+        "GET payload with nonempty actual body does not inject",
+        "POST upload does not inject",
+        "gRPC POST does not inject",
+        "cancel GET at the every-third counter remains DATA then Pending and receives actual operation-bound Drop ACK"
+      ]
+    },
+    "gateway_case": {
+      "downstream_protocol": "TLS/H2",
+      "upstream_protocol": "TLS/H2",
+      "downstream_submitted_requests": 1,
+      "physical_upstream_a_retryable_503": 1,
+      "physical_upstream_b_retryable_503": 0,
+      "final_upstream": "b",
+      "status": 200,
+      "body_bytes": 32768,
+      "body_sha256": "427965f49a857174e308658227325dbd23ff4eccbe399d5ad4817dda3ec79f87",
+      "eof": true,
+      "trailers": {},
+      "gateway_retry_metric": 1,
+      "static_origin_policy": "Actual final authority equals B's numeric static endpoint; TLS SNI is gateway.example.test. The test strictly asserts this static-origin metadata; the campaign's logical DNS authority oracle was not weakened.",
+      "all_started_tasks_and_body_results_collected": true
+    }
+  },
+  "limits": [
+    "This local RED/GREEN fixture proof does not retroactively pass the original failed Hosted C campaign.",
+    "The original missing cancellation ACK and H2 upload transport failures retain their recorded failure and attribution boundaries.",
+    "Same-config repaired Linux C qualification has not been executed by this evidence writer."
+  ]
+}
