@@ -1,0 +1,91 @@
+{
+  "schema_version": "oxidase.regression-evidence/v1",
+  "scope": "Validation-only timeout control witness correction; no production deadlines, retries, DNS, protocol or fault allowance change",
+  "original_hosted_failure": {
+    "run_id": 37209014444,
+    "head_commit": "3822a490276b654b733933b5777ef93291385ba1",
+    "operation_id": "control-35-108",
+    "wire": {
+      "status": 504,
+      "eof": true,
+      "body_bytes": 15,
+      "body_sha256": "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+      "content_type": "text/plain; charset=utf-8",
+      "trailers": {}
+    },
+    "actual_probe_seconds": 5.00298054,
+    "total_timeout_counter": {
+      "before": 9,
+      "after": 9
+    },
+    "response_header_timeout_counter": {
+      "before": 62,
+      "after": 66
+    },
+    "result": "FAIL; a full 504 is not by itself total-timeout attribution"
+  },
+  "red": {
+    "command": "cargo test -p oxidase-soak --lib literal_header_timeout_504_does_not_prove_total_deadline --locked -- --nocapture",
+    "exit_code": 101,
+    "test_seconds": 0,
+    "controls_sha256_before_fix_with_added_regression": "a4118fd26bc17dd8f78faed825d5354b11619c4c2ac22a6065e6fd3309e84545",
+    "old_predicate": "raw status == 504",
+    "observed": true,
+    "expected": false
+  },
+  "green": {
+    "controls_sha256": "684af9fb36c58dc1062401952bcacf992967bc8325189e9f80742328682e0b0f",
+    "new_predicate": "Complete exact safe 504 wire response and actual increment of the corresponding total or response_header phase metric",
+    "original_35_total_witness": false,
+    "original_35_header_witness": true,
+    "boundaries": [
+      "counter unchanged => no witness",
+      "header increment is not total increment",
+      "missing counter => error, not fabricated zero",
+      "partial EOF, incorrect body length/digest/content-type, trailers, error or H2 cause => no witness",
+      "valid full safe 504 plus actual total increment => witness"
+    ],
+    "commands": [
+      {
+        "command": "cargo test -p oxidase-soak --lib process_campaign::resource_controls --locked",
+        "exit_code": 0,
+        "passed": 15,
+        "test_seconds": 0.02
+      },
+      {
+        "command": "cargo +1.88.0 test -p oxidase-soak --lib process_campaign::resource_controls --locked",
+        "exit_code": 0,
+        "passed": 15,
+        "test_seconds": 0.01
+      },
+      {
+        "command": "cargo clippy -p oxidase-soak --all-targets --all-features --locked -- -D warnings",
+        "exit_code": 0
+      },
+      {
+        "command": "git diff --check -- crates/oxidase-soak/src/process_campaign/resource_controls.rs",
+        "exit_code": 0
+      }
+    ]
+  },
+  "scope_contract": {
+    "cause_scope_kind": "physical_fault_window",
+    "probe_attribution": false,
+    "note": "The global fixed phase counter is observed during the same physical fault window. Concurrent requests prevent assigning its delta to the named probe. The independent verifier must still validate the actual before/witness metric delta.",
+    "raw_baseline_and_witness_metrics_preserved": true
+  },
+  "bounds": {
+    "max_new_logical_probes": 8,
+    "per_probe_wire_deadline_seconds": 9,
+    "production_response_header_seconds": 5,
+    "production_pre_response_total_seconds": 8,
+    "request_deadlines_refreshed_by_retry": false,
+    "fault_rules_unchanged": true,
+    "h2_transport_errors_waived": false
+  },
+  "limitations": [
+    "This local literal RED/GREEN guard proof does not retroactively pass the failed C campaign.",
+    "The production deadline wire regressions are independent evidence owned by the root task and are not claimed here as executed by this subtask.",
+    "A repaired formal Linux campaign and its frozen independent replay remain required."
+  ]
+}

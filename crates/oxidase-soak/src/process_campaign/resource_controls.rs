@@ -51,6 +51,43 @@ const SRV_POSITIVE_METRIC: &str =
     "oxidase_discovery_queries_total{cluster=\"upstream\",family=\"srv\",result=\"positive\"}";
 const MAX_PROBE_FILE: u64 = 64 * 1024 * 1024;
 const MAX_PROBE_ROW: usize = 64 * 1024;
+const TOTAL_TIMEOUT_METRIC: &str = "oxidase_upstream_timeouts_total{phase=\"total\"}";
+const HEADER_TIMEOUT_METRIC: &str = "oxidase_upstream_timeouts_total{phase=\"response_header\"}";
+
+fn timeout_control_observed(
+    scenario: &str,
+    raw: &Value,
+    before_metrics: &str,
+    after_metrics: &str,
+) -> Result<bool, SoakError> {
+    let counter = timeout_metric(scenario)?;
+    Ok(full_safe_timeout_response(raw)
+        && metric(after_metrics, counter)? > metric(before_metrics, counter)?)
+}
+
+fn timeout_metric(scenario: &str) -> Result<&'static str, SoakError> {
+    match scenario {
+        "deadline_timeout" => Ok(TOTAL_TIMEOUT_METRIC),
+        "response_header_timeout" => Ok(HEADER_TIMEOUT_METRIC),
+        _ => Err(fail("resource.control_timeout_scenario_invalid")),
+    }
+}
+
+fn full_safe_timeout_response(raw: &Value) -> bool {
+    raw["status"] == 504
+        && raw["eof"] == true
+        && raw["body_bytes"] == 15
+        && raw["body_sha256"] == "d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547"
+        && raw["content_type"] == "text/plain; charset=utf-8"
+        && raw["error_code"].is_null()
+        && raw["error_stage"].is_null()
+        && raw["h2_reason"].is_null()
+        && raw["h2_error_kind"].is_null()
+        && raw["diagnostics"].as_array().is_some_and(Vec::is_empty)
+        && raw["trailers"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+}
 
 struct Driver(Option<tokio::task::JoinHandle<Result<(), hyper::Error>>>);
 impl Driver {
@@ -1121,19 +1158,38 @@ async fn data_fault(
                 },
             )
             .await?;
+            let witness_metrics = if scenario != "post_head_error"
+                && full_safe_timeout_response(&seen.raw)
+            {
+                Some(metrics(plan.root).await?)
+            } else {
+                None
+            };
             let observed = if scenario == "post_head_error" {
                 seen.raw["status"] == 200
                     && seen.raw["error_stage"] == "response_body"
                     && seen.raw["error_code"] == "body_error"
                     && seen.raw["fault_case_id"] == round as u64
+            } else if let Some(after) = &witness_metrics {
+                timeout_control_observed(scenario, &seen.raw, &before_metrics, after)?
             } else {
-                seen.raw["status"] == 504
+                false
             };
             if observed {
+                let cause_scope = if let Some(after) = &witness_metrics {
+                    let counter = timeout_metric(scenario)?;
+                    json!({"kind":"physical_fault_window","window_id":window.id,
+                        "counter":counter,"before":metric(&before_metrics,counter)?,"after":metric(after,counter)?,
+                        "probe_attribution":false,
+                        "note":"counter delta belongs to the same physical fault window; concurrent requests prevent assigning it to this probe"})
+                } else {
+                    Value::Null
+                };
                 coverage(
                     events,
                     scenario,
-                    json!({"source":"control_probe","operation_id":seen.id,"window_id":window.id}),
+                    json!({"source":"control_probe","operation_id":seen.id,"window_id":window.id,
+                        "cause_scope":cause_scope,"before_metrics":before_metrics,"witness_metrics":witness_metrics}),
                 )?;
                 return Ok::<_, SoakError>(());
             }
@@ -1610,6 +1666,96 @@ async fn control_round_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn literal_control_35_safe_504() -> Value {
+        // Exact safe response facts in formal C run 37209014444's
+        // control-35-108. It completed in 5.003 s, not the total 8 s.
+        json!({"status":504,"eof":true,"body_bytes":15,
+            "body_sha256":"d2c6262a999d448de3f6b22fc8785acf126e0e93324f95970029428e58ac1547",
+            "content_type":"text/plain; charset=utf-8","trailers":{},"diagnostics":[],
+            "error_code":null,"error_stage":null,"h2_reason":null,"h2_error_kind":null})
+    }
+
+    #[test]
+    fn literal_header_timeout_504_does_not_prove_total_deadline() {
+        let before = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let after = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 66\n");
+        assert!(
+            !timeout_control_observed(
+                "deadline_timeout",
+                &literal_control_35_safe_504(),
+                &before,
+                &after
+            )
+            .expect("both real scoped counters available"),
+            "actual header-only 504 is not total-timeout evidence"
+        );
+        assert!(
+            timeout_control_observed(
+                "response_header_timeout",
+                &literal_control_35_safe_504(),
+                &before,
+                &after
+            )
+            .expect("the actual header counter did increase")
+        );
+    }
+
+    #[test]
+    fn timeout_witness_needs_full_safe_wire_and_the_corresponding_real_delta() {
+        let before = format!("{TOTAL_TIMEOUT_METRIC} 9\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let after = format!("{TOTAL_TIMEOUT_METRIC} 10\n{HEADER_TIMEOUT_METRIC} 62\n");
+        let raw = literal_control_35_safe_504();
+        assert!(
+            timeout_control_observed("deadline_timeout", &raw, &before, &after)
+                .expect("real total delta")
+        );
+        assert!(
+            !timeout_control_observed("response_header_timeout", &raw, &before, &after)
+                .expect("no header delta")
+        );
+        assert!(
+            !timeout_control_observed("deadline_timeout", &raw, &before, &before)
+                .expect("unchanged is not unavailable")
+        );
+        assert!(
+            timeout_control_observed("deadline_timeout", &raw, &before, "").is_err(),
+            "missing is not fabricated zero"
+        );
+        assert!(timeout_control_observed("unknown", &raw, &before, &after).is_err());
+        let body_digest: String = Sha256::digest(b"Gateway Timeout")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            raw["body_sha256"], body_digest,
+            "the literal is an independent safe-body digest"
+        );
+        assert_eq!(CONTROL_WIRE_DEADLINE, Duration::from_secs(9));
+        for (field, invalid) in [
+            ("status", json!(503)),
+            ("eof", json!(false)),
+            ("body_bytes", json!(14)),
+            ("body_sha256", json!("00")),
+            ("content_type", json!("application/grpc")),
+            ("error_code", json!("transport_error")),
+            ("error_stage", json!("response_body")),
+            ("h2_reason", json!("enhance_your_calm")),
+            ("h2_error_kind", json!("goaway")),
+            ("diagnostics", json!(["bad_wire"])),
+            ("trailers", json!({"grpc-status":"0"})),
+            ("diagnostics", Value::Null),
+            ("trailers", Value::Null),
+        ] {
+            let mut bad = raw.clone();
+            bad[field] = invalid;
+            assert!(
+                !timeout_control_observed("deadline_timeout", &bad, &before, &after)
+                    .expect("invalid wire cannot witness a delta"),
+                "{field}"
+            );
+        }
+    }
     fn peer_probe(peer: SocketAddr, end_ns: u64, id: &str) -> Probe {
         let digest = Sha256::digest(b"xx")
             .iter()
