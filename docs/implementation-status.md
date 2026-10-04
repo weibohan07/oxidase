@@ -2,10 +2,11 @@
 
 Last updated: 2026-10-04
 
-Phase 7A.1 is in progress on `hardening/v0.4-resource-census` from protected
+Phase 7A.1 was delivered through protected PR #20 from
 `495a906`; actual object/task/IO census and pure authenticated read observation
-have development regressions, but final-head/main CI and Linux resource/memory
-qualification are not yet acceptance evidence. See
+passed final-head and merged-main CI. Phase 7A.2 starts from `7bd6d48` to build
+independent Running qualification. Linux resource/memory qualification remains
+unclosed. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
 ## Baseline

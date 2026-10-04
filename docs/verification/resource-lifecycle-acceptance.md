@@ -7,12 +7,19 @@ Bundle `oxidase.bundle/v1`, Admin `oxidase.admin/v1` remain alpha.
 No Access Log, OpenTelemetry, packaging, tag or Release belongs to this task.
 
 The source ownership decision is [ADR 0016](../adr/0016-resource-lifecycle-census.md).
-Draft [PR #20](https://github.com/weibohan07/oxidase/pull/20) records the first
+[PR #20](https://github.com/weibohan07/oxidase/pull/20) records the first
 implementation; it does not qualify memory. Three sequential protected PRs require independent final
 head and merged-main checks. The phase-six positive RSS drift and null observations
 remain historical UNKNOWN; no new experiment retroactively explains them.
 
 ## Baseline
+
+7A.1 final head `e3b34744b88c55eea132c774fa10deba0358b577` passed all nine
+requested local gates and the four required Hosted jobs in run `37186858528`.
+It was normally merged as `7bd6d486d89aeb19e6785d65d15600a7435d6925`.
+The independent main push run `37187599520` also passed all four jobs. Those are
+implementation receipts, not a Linux memory/campaign qualification. 7A.2 starts
+from this merged main and preserves all historical failures.
 
 All nine requested local commands executed on unchanged `495a906` and PASS:
 fmt; locked workspace all-target/all-feature denied-warning Clippy; locked
