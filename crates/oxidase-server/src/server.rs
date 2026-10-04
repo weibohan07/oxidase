@@ -42,8 +42,9 @@ use crate::admin::{
 };
 use crate::admin_audit::{AdminAuditEvent, AdminAuditSink};
 use crate::body::{
-    DownstreamTimeoutSignal, GatewayBody, GatewayBodyPlan,
-    instrument_response_body_with_snapshot_timeout, timeout_request_body,
+    DownstreamTimeoutSignal, GatewayBody, GatewayBodyPlan, UnconsumedH2Body,
+    instrument_response_body_with_snapshot_timeout, retain_unconsumed_h2_body,
+    timeout_request_body,
 };
 use crate::cluster_health::ClusterHealthManager;
 use crate::connection::TrackedExecutor;
@@ -4507,16 +4508,16 @@ async fn handle_request(
     metadata.tls = tls;
     let leaves = HyperLeaves::new(snapshot.clone(), proxy, Arc::clone(&metrics));
     let observer = ProductionObserver::new(&metrics, &config_version, &listener_name, request_id);
+    let incoming = timeout_request_body(body, limits.request_body_idle_timeout);
+    let unconsumed_h2 = (wire_protocol == WireProtocol::Http2
+        && !http_body::Body::is_end_stream(&incoming))
+    .then(UnconsumedH2Body::default);
+    let mut payload = GatewayRequestPayload::new(incoming, pending_upgrade, request_trailer_guard);
+    if let Some(slot) = &unconsumed_h2 {
+        payload = payload.with_unconsumed_h2(slot.clone());
+    }
     let report = Executor::new(&program, &leaves)
-        .execute_observed(
-            RequestFrame::new(metadata),
-            Some(GatewayRequestPayload::new(
-                timeout_request_body(body, limits.request_body_idle_timeout),
-                pending_upgrade,
-                request_trailer_guard,
-            )),
-            &observer,
-        )
+        .execute_observed(RequestFrame::new(metadata), Some(payload), &observer)
         .await;
 
     let (outcome, status, response, tunnel) = match report.outcome {
@@ -4606,6 +4607,11 @@ async fn handle_request(
         "request complete"
     );
     metrics.record_request(outcome, status, started.elapsed());
+    let response = if let Some(slot) = unconsumed_h2 {
+        retain_unconsumed_h2_body(response, slot, limits.request_body_idle_timeout)
+    } else {
+        response
+    };
     Ok(instrument_response_body_with_snapshot_timeout(
         response,
         metrics,

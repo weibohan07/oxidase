@@ -336,7 +336,8 @@ class Analyzer:
                     window["recovery_peers"] = [row["recovery_peer"]]
                 elif "recovery_peers" in row:
                     window["recovery_peers"] = row["recovery_peers"]
-                for key in ("failure_peers", "fault_case_id"):
+                for key in ("failure_peers", "fault_case_id", "fixture_before", "fixture_after",
+                            "timeout_metrics_before", "timeout_metrics_after"):
                     if key in row:
                         window[key] = row[key]
                 if window["id"] in self.windows:
@@ -1005,11 +1006,29 @@ class Analyzer:
             classification = probe.get("derived_classification")
             raw = probe["raw"]
             proven = False
-            if name == "deadline_timeout":
-                # A header delay alone is not the logical total-budget oracle.
-                proven = classification == "expected_injected_failure" and raw.get("status") == 504
+            if name in ("deadline_timeout", "response_header_timeout"):
+                # The wire proves this operation's complete 504; original raw
+                # counters prove only the named physical fault-window phase.
+                # Never borrow another phase/window or claim per-probe causality.
+                phase = "total" if name == "deadline_timeout" else "response_header"
+                proven = (classification == "expected_injected_failure" and raw.get("status") == 504 and
+                          self.timeout_window_proven(reference, probe, phase))
                 if proven:
-                    self.coverage["deadline_timeout_probe"] += 1
+                    self.coverage[name + "_probe"] += 1
+            elif name == "dns_withdraw":
+                window_id = reference.get("window_id")
+                window = self.windows.get(window_id) if isinstance(window_id, str) else None
+                trigger = window.get("trigger", {}) if window else {}
+                field = trigger.get("name")
+                proven = (classification == "expected_injected_failure" and raw.get("status") == 503 and
+                          window is not None and probe.get("window_id") == window_id and
+                          field in ("withdraw_answers", "ttl_zero_answers") and
+                          self.raw_counter_delta({"name": field, "before": trigger.get("before"),
+                                                  "after": trigger.get("after"),
+                                                  "before_raw": window.get("fixture_before"),
+                                                  "after_raw": window.get("fixture_after")}) > 0)
+                if proven:
+                    self.coverage[name] += 1
             elif name == "post_head_error":
                 proven = classification == "expected_injected_failure" and raw.get("status") == 200 and raw.get("error_stage") == "response_body"
             elif name == "positive_aaaa":
@@ -1027,6 +1046,34 @@ class Analyzer:
                     self.coverage[name] += 1
             if not proven:
                 self.finding("RL_TRIGGER", "control probe does not prove its claimed behavior", behavior=name)
+
+    def timeout_window_proven(self, reference, probe, phase):
+        window_id = reference.get("window_id")
+        window = self.windows.get(window_id) if isinstance(window_id, str) else None
+        scope = reference.get("cause_scope")
+        counter = 'oxidase_upstream_timeouts_total{phase="' + phase + '"}'
+        if (window is None or probe.get("window_id") != window_id or not isinstance(scope, dict) or
+                scope.get("kind") != "physical_fault_window" or scope.get("probe_attribution") is not False or
+                scope.get("window_id") != window_id or scope.get("counter") != counter):
+            return False
+        values = []
+        for text in (reference.get("before_metrics"), reference.get("witness_metrics"),
+                     window.get("timeout_metrics_before"), window.get("timeout_metrics_after")):
+            if not isinstance(text, str):
+                return False
+            value = self.metrics(text).get(counter)
+            if value is None or value < 0 or value != int(value):
+                return False
+            values.append(value)
+        before, witness, window_before, window_after = values
+        trigger = window.get("trigger", {})
+        field = "resource_header_delays_started"
+        return (scope.get("before") == before and scope.get("after") == witness and
+                window_before == before < witness <= window_after and trigger.get("name") == field and
+                self.raw_counter_delta({"name": field, "before": trigger.get("before"),
+                                        "after": trigger.get("after"),
+                                        "before_raw": window.get("fixture_before"),
+                                        "after_raw": window.get("fixture_after")}) > 0)
 
     def ipv6_resolution_proven(self, evidence, probe):
         """SRV resolves target AAAA internally: never relabel its round as AAAA."""
@@ -1260,6 +1307,19 @@ class Analyzer:
                     mismatches.append("cancel-receipt")
                 elif error is not None and not error["start_ns"] <= integer(required(ack, "dropped_ns"), "actual cancellation time") <= error["end_ns"]:
                     mismatches.append("cancel-receipt-time")
+                if isinstance(ack, dict) and "ack_observed_ns" in ack:
+                    observed = ack.get("ack_observed_ns")
+                    started = ack.get("ack_wait_started_ns")
+                    deadline = ack.get("ack_deadline_ns")
+                    dropped = ack.get("dropped_ns")
+                    times = (observed, started, deadline, dropped)
+                    if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in times) or
+                            not started <= observed <= deadline or deadline - started > 3 * NS or dropped > observed):
+                        mismatches.append("cancel-ack-deadline")
+                    cleanup = ack.get("ack_connection")
+                    if (not isinstance(cleanup, dict) or cleanup.get("result") != "completed" or
+                            cleanup.get("join_acknowledged") is not True):
+                        mismatches.append("cancel-ack-cleanup")
             elif self.receipt.get("parameters", {}).get("formal"):
                 self.finding("RL_CANCEL_PROOF", "formal cancel lane has only a boolean acknowledgement", "INCONCLUSIVE")
             if mismatches:

@@ -57,6 +57,47 @@ def probe_corpus():
     return data
 
 
+def faulted_probe_corpus(behavior):
+    data = probe_corpus()
+    data["receipt.json"]["parameters"]["campaign"] = "C"
+    window_id = "bounded-probe-fault"
+    status, body = (503, b"Service Unavailable") if behavior == "dns_withdraw" else (504, b"Gateway Timeout")
+    field = "withdraw_answers" if status == 503 else "resource_header_delays_started"
+    window = {"kind": "fault_window", "t_ns": 11 * NS + 50, "id": window_id,
+              "start_ns": 11 * NS + 20, "end_ns": 11 * NS + 50,
+              "recovery_deadline_ns": 13 * NS, "target": "upstream", "lanes": ["churn"],
+              "allowed": [{"status": status}],
+              "trigger": {"source": "fixture_counter", "name": field, "before": 0, "after": 1},
+              "fixture_before": {field: 0}, "fixture_after": {field: 1}}
+    for probe in data["control-probes.jsonl"]:
+        probe["window_id"] = window_id
+    terminal = data["control-probes.jsonl"][1]
+    terminal["raw"].update(status=status, body_bytes=len(body), body_sha256=hashlib.sha256(body).hexdigest(),
+                           content_type="text/plain; charset=utf-8", trailers={},
+                           upstream_peer=None, upstream_name=None)
+    evidence = {"source": "control_probe", "operation_id": terminal["operation_id"], "window_id": window_id}
+    if status == 504:
+        phase = "total" if behavior == "deadline_timeout" else "response_header"
+        counter = 'oxidase_upstream_timeouts_total{phase="' + phase + '"}'
+        evidence.update(before_metrics=counter + " 7\n", witness_metrics=counter + " 8\n",
+                        cause_scope={"kind": "physical_fault_window", "probe_attribution": False,
+                                     "window_id": window_id, "counter": counter, "before": 7, "after": 8})
+        window.update(timeout_metrics_before=counter + " 7\n", timeout_metrics_after=counter + " 8\n")
+    insert_event(data, window)
+    insert_event(data, {"kind": "coverage", "t_ns": 11 * NS + 51, "name": behavior, "evidence": evidence})
+    # Independent full affected-peer recovery, not a producer pass flag.
+    recovery = probe_corpus()["control-probes.jsonl"]
+    for probe in recovery:
+        probe.update(operation_id="control-0-2", writer_seq=probe["writer_seq"] + 2,
+                     start_ns=11 * NS + 60)
+    recovery[1].update(end_ns=11 * NS + 75)
+    recovery[1]["raw"].update(operation_id="control-0-2", started_ns=11 * NS + 60,
+                              head_ns=11 * NS + 65, ended_ns=11 * NS + 70)
+    recovery[1]["driver_exit"]["exit_ns"] = 11 * NS + 74
+    data["control-probes.jsonl"].extend(recovery)
+    return data
+
+
 def labelled_metrics_corpus():
     data = corpus()
     data["receipt.json"]["required_gauges"] = list(VERIFIER.FIXTURE_GAUGES)
@@ -391,6 +432,44 @@ class IndependentJournalTests(unittest.TestCase):
         data = probe_corpus()
         data["control-probes.jsonl"][1]["raw"]["body_sha256"] = "0" * 64
         self.fail(data, "RL_CONTENT")
+
+    def test_existing_dns_withdraw_and_header_probe_contracts_are_implemented(self):
+        for behavior in ("dns_withdraw", "response_header_timeout", "deadline_timeout"):
+            with self.subTest(behavior=behavior):
+                report = self.verify(faulted_probe_corpus(behavior))
+                if report["result"] != "PASS_IMPLEMENTATION":
+                    unittest.TestCase.fail(self, str(report["findings"]))
+
+    def test_fault_probe_cannot_borrow_another_window_or_phase(self):
+        for behavior in ("dns_withdraw", "response_header_timeout", "deadline_timeout"):
+            data = faulted_probe_corpus(behavior)
+            coverage = next(row for row in data["events.jsonl"] if row.get("name") == behavior)
+            coverage["evidence"]["window_id"] = "another-window"
+            self.fail(data, "RL_TRIGGER")
+        for behavior in ("response_header_timeout", "deadline_timeout"):
+            for corruption in ("no_delta", "wrong_phase", "false_attribution", "no_fixture"):
+                with self.subTest(behavior=behavior, corruption=corruption):
+                    data = faulted_probe_corpus(behavior)
+                    reference = next(row for row in data["events.jsonl"] if row.get("name") == behavior)["evidence"]
+                    if corruption == "no_delta":
+                        reference["witness_metrics"] = reference["before_metrics"]
+                    elif corruption == "wrong_phase":
+                        wrong = "response_header" if behavior == "deadline_timeout" else "total"
+                        reference["witness_metrics"] = f'oxidase_upstream_timeouts_total{{phase="{wrong}"}} 8\n'
+                    elif corruption == "false_attribution":
+                        reference["cause_scope"]["probe_attribution"] = True
+                    else:
+                        next(row for row in data["events.jsonl"] if row["kind"] == "fault_window")["fixture_after"] = {"resource_header_delays_started": 0}
+                    self.fail(data, "RL_TRIGGER")
+
+    def test_fault_probe_wrong_body_or_normal_504_still_fails(self):
+        data = faulted_probe_corpus("response_header_timeout")
+        data["control-probes.jsonl"][1]["raw"]["body_sha256"] = "0" * 64
+        self.fail(data, "RL_CONTENT")
+        data = faulted_probe_corpus("response_header_timeout")
+        for probe in data["control-probes.jsonl"]:
+            probe["window_id"] = None
+        self.fail(data, "RL_UNEXPECTED_RESPONSE")
 
     def test_probe_missing_result_connection_failure_and_driver_panic_cannot_disappear(self):
         data = probe_corpus()

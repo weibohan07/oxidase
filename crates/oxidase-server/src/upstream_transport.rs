@@ -1431,6 +1431,304 @@ mod tests {
         .expect("TLS connector")
     }
 
+    /// Isolates the cold TCP/TLS -> one-use warm slot -> shared H2 checkout
+    /// boundary. This is not the mixed cancellation/discovery campaign, nor
+    /// evidence that its previously observed ordinary 504s are fixed.
+    async fn assert_preconnected_h2_cold_and_hot_dispatch(bind: &str) {
+        use crate::proxy_body::ProxyRequestBody;
+        use crate::upstream_timing::{
+            DispatchRetirementBudget, PreResponseBudget, RequestProgress, await_response_head,
+        };
+        use http::{HeaderMap, Method, StatusCode};
+        use hyper_util::client::legacy::connect::capture_connection;
+        use tokio::sync::{Semaphore, oneshot};
+
+        let listener = TcpListener::bind(bind)
+            .await
+            .expect("ephemeral physical target");
+        let address = listener.local_addr().expect("physical address");
+        let census = Arc::new(ResourceCensus::new(true));
+        let (server, tls) = tls_fixture("logical.oxidase.invalid", &[b"h2"]);
+        let begin_h2 = Arc::new(Semaphore::new(0));
+        let server_begin = Arc::clone(&begin_h2);
+        let (tls_ready, tls_accepted) = oneshot::channel();
+        let (stop, mut stopping) = oneshot::channel();
+        let heads = Arc::new(AtomicU64::new(0));
+        let server_heads = Arc::clone(&heads);
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener
+                .accept()
+                .await
+                .expect("the single preconnected TCP");
+            assert_eq!(
+                socket.local_addr().expect("accepted physical peer"),
+                address
+            );
+            let socket = TlsAcceptor::from(server)
+                .accept(socket)
+                .await
+                .expect("verified TLS");
+            assert_eq!(
+                socket.get_ref().1.server_name(),
+                Some("logical.oxidase.invalid")
+            );
+            assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+            tls_ready.send(()).expect("actual TLS accepted");
+            server_begin
+                .acquire()
+                .await
+                .expect("explicit H2 boundary")
+                .forget();
+            let mut connection = h2::server::handshake(socket)
+                .await
+                .expect("actual H2 driver");
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopping => break,
+                    Some(joined) = streams.join_next(), if !streams.is_empty() => {
+                        joined.expect("fixture stream fully verified");
+                    }
+                    accepted = connection.accept() => {
+                        let Some(Ok((request, mut response))) = accepted else { break };
+                        server_heads.fetch_add(1, Ordering::Relaxed);
+                        streams.spawn(async move {
+                            assert_eq!(request.uri().authority().expect("logical authority").as_str(), "logical.oxidase.invalid");
+                            let index: usize = request.uri().path().trim_start_matches("/base/")
+                                .parse().expect("explicit operation index");
+                            let expected = match index % 3 { 0 => 0, 1 => 1024 * 1024, _ => 5 };
+                            let grpc = index % 3 == 2;
+                            assert_eq!(request.headers()[header::CONTENT_TYPE], if grpc { "application/grpc" } else { "application/octet-stream" });
+                            let mut body = request.into_body();
+                            let mut seen = 0;
+                            while let Some(frame) = body.data().await {
+                                let data = frame.expect("intact request DATA");
+                                if grpc {
+                                    assert!(seen + data.len() <= 5);
+                                    assert!(data.iter().all(|byte| *byte == 0));
+                                } else {
+                                    assert!(data.iter().all(|byte| *byte == b'u'));
+                                }
+                                seen += data.len();
+                                body.flow_control().release_capacity(data.len()).expect("actual receive progress");
+                            }
+                            assert_eq!(seen, expected, "every request byte and EOS are required");
+                            assert!(body.trailers().await.expect("request trailers/EOS").is_none());
+                            let mut send = response.send_response(
+                                Response::builder().status(StatusCode::OK)
+                                    .header("x-fixture-peer", address.to_string())
+                                    .header("x-fixture-index", index.to_string())
+                                    .header(header::CONTENT_TYPE, if grpc { "application/grpc" } else { "application/octet-stream" })
+                                    .body(()).expect("bounded response metadata"), false,
+                            ).expect("real response head");
+                            let mut response_bytes = if grpc {
+                                let mut prefix = vec![0];
+                                prefix.extend_from_slice(&32768_u32.to_be_bytes());
+                                prefix
+                            } else { Vec::new() };
+                            response_bytes.extend(std::iter::repeat_n(b'r', 32768));
+                            send.send_data(Bytes::from(response_bytes), false).expect("response DATA");
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("x-fixture-complete", "yes".parse().expect("trailer"));
+                            if grpc {
+                                trailers.insert("grpc-status", "0".parse().expect("grpc trailer"));
+                            }
+                            send.send_trailers(trailers).expect("terminal trailers");
+                        });
+                    }
+                }
+            }
+            while let Some(joined) = streams.join_next().await {
+                joined.expect("all accepted operations joined");
+            }
+        });
+        let logical = origin("https://logical.oxidase.invalid/base");
+        let connector = tls_connector(
+            logical.clone(),
+            DialTarget::new(address).expect("validated fixed address"),
+            ClusterProtocol::H2,
+            tls,
+            Duration::from_secs(1),
+        )
+        .with_census(Arc::clone(&census))
+        .preconnect()
+        .await
+        .expect("cold TCP and TLS within original transport policy");
+        tls_accepted.await.expect("actual handshake barrier");
+        assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 1);
+        let pool = Arc::new(build_upstream_pool::<ProxyRequestBody>(
+            connector,
+            ClusterProtocol::H2,
+            32,
+        ));
+        let retirement = Arc::new(DispatchRetirementBudget::with_census(
+            1024,
+            Arc::clone(&census),
+        ));
+        for round in 0..4 {
+            let mut operations = Vec::new();
+            for lane in 0..8 {
+                let index = round * 8 + lane;
+                let pool = Arc::clone(&pool);
+                let retirement = Arc::clone(&retirement);
+                let logical = logical.clone();
+                let operation = async move {
+                    let initial = match index % 3 {
+                        0 => ProxyRequestBody::empty(),
+                        1 => ProxyRequestBody::Replay {
+                            data: Some(Bytes::from(vec![b'u'; 1024 * 1024])),
+                            trailers: None,
+                        },
+                        _ => ProxyRequestBody::Replay {
+                            data: Some(Bytes::from_static(&[0; 5])),
+                            trailers: None,
+                        },
+                    };
+                    let progress = RequestProgress::new(initial.is_end_stream());
+                    let body =
+                        initial.with_progress(progress.clone(), Some(Duration::from_secs(5)));
+                    let mut request = Request::builder()
+                        .method(if index % 3 == 0 {
+                            Method::GET
+                        } else {
+                            Method::POST
+                        })
+                        .uri(
+                            logical
+                                .request_uri(&format!("/{index}"))
+                                .expect("logical URI"),
+                        )
+                        .header(
+                            header::CONTENT_TYPE,
+                            if index % 3 == 2 {
+                                "application/grpc"
+                            } else {
+                                "application/octet-stream"
+                            },
+                        )
+                        .body(body)
+                        .expect("actual operation");
+                    let mut capture = capture_connection(&mut request);
+                    progress.capture_transport(capture.clone(), true);
+                    let budget = PreResponseBudget::new(Duration::from_secs(8));
+                    let dispatch = retirement
+                        .protect(
+                            pool.request(request),
+                            capture.clone(),
+                            progress.clone(),
+                            Duration::from_secs(7),
+                        )
+                        .expect("cold dispatch admitted");
+                    let response = await_response_head(
+                        dispatch,
+                        capture.clone(),
+                        &progress,
+                        Duration::from_secs(5),
+                        &budget,
+                    )
+                    .await
+                    .expect("original 5s head/8s total budget")
+                    .expect("healthy operation response");
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()["x-fixture-peer"], address.to_string());
+                    assert_eq!(response.headers()["x-fixture-index"], index.to_string());
+                    assert_eq!(
+                        response.headers()[header::CONTENT_TYPE],
+                        if index % 3 == 2 {
+                            "application/grpc"
+                        } else {
+                            "application/octet-stream"
+                        }
+                    );
+                    let connected = capture.wait_for_connection_metadata().await;
+                    let mut extras = http::Extensions::new();
+                    connected
+                        .as_ref()
+                        .expect("actual pool-ready capture")
+                        .get_extras(&mut extras);
+                    assert_eq!(
+                        extras
+                            .get::<HttpInfo>()
+                            .expect("physical connected peer")
+                            .remote_addr(),
+                        address
+                    );
+                    drop(connected);
+                    let mut body = response.into_body();
+                    let mut data = 0;
+                    let mut terminal = None;
+                    while let Some(frame) = body.frame().await {
+                        let frame = frame.expect("no post-head error");
+                        if let Some(bytes) = frame.data_ref() {
+                            let grpc_prefix = [0, 0, 0, 128, 0];
+                            for (offset, byte) in bytes.iter().enumerate() {
+                                let at = data + offset;
+                                let expected = if index % 3 == 2 && at < 5 {
+                                    grpc_prefix[at]
+                                } else {
+                                    b'r'
+                                };
+                                assert_eq!(*byte, expected, "complete framed response bytes");
+                            }
+                            data += bytes.len();
+                        }
+                        if let Ok(trailers) = frame.into_trailers() {
+                            assert!(
+                                terminal.replace(trailers).is_none(),
+                                "one terminal trailer frame"
+                            );
+                        }
+                    }
+                    assert_eq!(data, 32768 + usize::from(index % 3 == 2) * 5);
+                    let trailers = terminal.expect("real final trailers before EOS");
+                    assert_eq!(trailers["x-fixture-complete"], "yes");
+                    assert_eq!(
+                        trailers.get("grpc-status").map(http::HeaderValue::as_bytes),
+                        (index % 3 == 2).then_some(b"0".as_slice())
+                    );
+                };
+                operations.push(Box::pin(operation));
+            }
+            if round == 0 {
+                // Poll every operation once while the actual peer's H2 driver
+                // is gated. This deterministically exercises cold shared
+                // acquisition instead of warming with a synthetic request.
+                for operation in &mut operations {
+                    assert!(futures_util::poll!(operation).is_pending());
+                }
+                assert_eq!(heads.load(Ordering::Relaxed), 0);
+                begin_h2.add_permits(1);
+            }
+            futures_util::future::join_all(operations).await;
+            assert_eq!(heads.load(Ordering::Relaxed), ((round + 1) * 8) as u64);
+            assert_eq!(
+                count(&census, ResourceKind::UpstreamTcpConnection).created,
+                1,
+                "hot rounds reuse the same physical connection"
+            );
+            assert_eq!(count(&census, ResourceKind::WarmSocketSlot).live, 0);
+        }
+        drop(pool);
+        stop.send(())
+            .expect("explicit fixture stop after all terminals");
+        fixture.await.expect("actual H2 fixture joins");
+        tasks_finished(&census, ResourceKind::UpstreamTask).await;
+        tasks_finished(&census, ResourceKind::UpstreamUploadTask).await;
+        tasks_finished(&census, ResourceKind::WarmExpiryTask).await;
+        assert_eq!(count(&census, ResourceKind::UpstreamTcpConnection).live, 0);
+        assert_eq!(census.sample().invariant_failures, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn preconnected_ipv4_h2_cold_checkout_and_hot_uploads_preserve_complete_frames() {
+        assert_preconnected_h2_cold_and_hot_dispatch("127.0.0.1:0").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn preconnected_ipv6_h2_cold_checkout_and_hot_uploads_preserve_complete_frames() {
+        assert_preconnected_h2_cold_and_hot_dispatch("[::1]:0").await;
+    }
+
     #[tokio::test]
     async fn tls_uses_fixed_logical_sni_and_proves_h2_alpn_and_actual_peer() {
         use tokio::io::AsyncReadExt as _;

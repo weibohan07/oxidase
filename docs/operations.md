@@ -355,6 +355,18 @@ H2 response trailers crossing to an accepting HTTP/1 client, explicit failure fo
 undeclared trailers, and an upstream post-head reset remaining a body error rather
 than becoming 502.
 
+An ordinary early H2 response whose Service never claimed the ingress body sends
+its head and DATA immediately, but does not close that stream while an unread
+upload is still arriving. The response body streams and discards that original
+input, validating request trailers, before its own terminal trailers/EOS. It never
+reclaims an upload already handed to Proxy, collects a body, or retries business
+data. The cleanup has a fixed 16MiB cap and an absolute deadline of the smaller of
+30 seconds and the Listener request-body idle setting; DATA cannot renew it.
+Explicit 400/413 rejection remains fail-fast. After the head, limit/error/expiry
+resets only that stream rather than pretending to deliver a complete response.
+The existing H2 stream task owns the absolute deadline even when response flow
+control prevents another body poll; healthy siblings keep their normal lifetime.
+
 HTTP/1 Proxy owns a private Upgrade capability extracted by the connection driver.
 Both the downstream request and upstream 101 response must contain one valid,
 matching Upgrade protocol and `Connection: upgrade`; user Respond/OXR/Transform
@@ -364,6 +376,12 @@ copies bytes bidirectionally without application buffering and keeps the request
 snapshot alive. A retained Listener leaves the tunnel running across reload;
 retirement permits it to run until the normal drain deadline, after which the
 connection task is aborted.
+
+On clean first EOF, each tunnel transport write half is shut down exactly once,
+including the half whose copy future was cancelled. This sends TLS close_notify
+without awaiting the cancelled reader. A shutdown flush is still cancellable by
+the existing Listener drain. A non-EOF error retains its first cause; neither
+clean TLS shutdown nor transport EOF proves a complete application message.
 
 This is generic Upgrade transport and does not inspect WebSocket frames. Focused
 unit tests cover validation, matching 101 responses, partial byte accounting,
