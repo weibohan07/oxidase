@@ -233,6 +233,10 @@ pub(super) struct ResourceResponseFacts {
     pub(super) sender_ready: Option<bool>,
     pub(super) sender_closed_on_error: Option<bool>,
     pub(super) sender_error_category: Option<String>,
+    /// Fixed protocol facts from the actual Hyper error source chain. Absence
+    /// means no H2 cause was available, not an inferred remote reset.
+    pub(super) h2_reason: Option<String>,
+    pub(super) h2_error_kind: Option<String>,
     pub(super) cancelled: bool,
     pub(super) data_observed: bool,
     pub(super) fixture_cancel_ack: bool,
@@ -271,6 +275,8 @@ impl ResourceResponseFacts {
             sender_ready: None,
             sender_closed_on_error: None,
             sender_error_category: None,
+            h2_reason: None,
+            h2_error_kind: None,
             cancelled: false,
             data_observed: false,
             fixture_cancel_ack: false,
@@ -746,9 +752,13 @@ impl ResourceDataClient {
         };
         let mut trailers_seen = false;
         while let Some(frame) = body.frame().await {
-            let Ok(frame) = frame else {
-                resource_error(facts, "response_body", "body_error");
-                return;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    record_h2_error(facts, &error);
+                    resource_error(facts, "response_body", "body_error");
+                    return;
+                }
             };
             if let Some(data) = frame.data_ref() {
                 if trailers_seen {
@@ -803,6 +813,7 @@ impl ResourceDataClient {
     }
 
     fn record_sender_error(&self, facts: &mut ResourceResponseFacts, error: &hyper::Error) {
+        record_h2_error(facts, error);
         facts.sender_closed_on_error = self.sender.as_ref().map(|sender| match sender {
             ResourceSender::H1(sender) => sender.is_closed(),
             ResourceSender::H2(sender) => sender.is_closed(),
@@ -852,6 +863,51 @@ impl ResourceDataClient {
                 facts.diagnostics.push("path_mismatch".into());
             }
         }
+    }
+}
+
+fn record_h2_error(facts: &mut ResourceResponseFacts, error: &hyper::Error) {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    // The trusted library chain is finite, but keep traversal bounded rather
+    // than formatting arbitrary diagnostic strings into operation evidence.
+    for _ in 0..16 {
+        let Some(error) = source else { return };
+        if let Some(error) = error.downcast_ref::<h2::Error>() {
+            facts.h2_error_kind = Some(
+                if error.is_reset() {
+                    "reset"
+                } else if error.is_go_away() {
+                    "goaway"
+                } else if error.is_io() {
+                    "io"
+                } else {
+                    "other"
+                }
+                .into(),
+            );
+            facts.h2_reason = error.reason().map(|reason| {
+                match reason {
+                    h2::Reason::NO_ERROR => "no_error",
+                    h2::Reason::PROTOCOL_ERROR => "protocol_error",
+                    h2::Reason::INTERNAL_ERROR => "internal_error",
+                    h2::Reason::FLOW_CONTROL_ERROR => "flow_control_error",
+                    h2::Reason::SETTINGS_TIMEOUT => "settings_timeout",
+                    h2::Reason::STREAM_CLOSED => "stream_closed",
+                    h2::Reason::FRAME_SIZE_ERROR => "frame_size_error",
+                    h2::Reason::REFUSED_STREAM => "refused_stream",
+                    h2::Reason::CANCEL => "cancel",
+                    h2::Reason::COMPRESSION_ERROR => "compression_error",
+                    h2::Reason::CONNECT_ERROR => "connect_error",
+                    h2::Reason::ENHANCE_YOUR_CALM => "enhance_your_calm",
+                    h2::Reason::INADEQUATE_SECURITY => "inadequate_security",
+                    h2::Reason::HTTP_1_1_REQUIRED => "http_1_1_required",
+                    _ => "unknown",
+                }
+                .into()
+            });
+            return;
+        }
+        source = error.source();
     }
 }
 
@@ -3723,6 +3779,346 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn resource_h2_cancel_ack_is_actual_upstream_drop_while_connection_remains_open() {
+        let directory = tempfile::tempdir().expect("isolated test source");
+        let identity = identity().expect("ephemeral TLS identity");
+        write_identity(directory.path(), &identity).expect("test certificate files");
+        let upstream = super::super::fixture::resource_test_fixture(&identity).await;
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  trust_stores:
+    fixture:
+      ca_bundle: gateway.pem
+  clusters:
+    api:
+      protocol: h2
+      endpoints: ["https://{}/base"]
+      tls:
+        server_name: gateway.example.test
+        trust:
+          system_roots: false
+          trust_store: fixture
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    service:
+      ref: root
+"#,
+            upstream.address
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real TLS/cluster preparation");
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("gateway binds")
+            .spawn();
+        let h2 = client_config(&[&identity], &[b"h2"]).expect("H2 test trust");
+        let ack = client_config(&[&identity], &[b"http/1.1"]).expect("H1 ACK test trust");
+        let mut client = ResourceDataClient::connect(
+            gateway.local_addresses()[0].1,
+            h2,
+            true,
+            vec![("a".into(), upstream.address)],
+        )
+        .await
+        .expect("actual TLS/H2 downstream");
+        let mut operations = Vec::new();
+        for sequence in 0..8 {
+            let operation_id = format!("cancel-proof:{sequence}");
+            let raw = client
+                .measure(ResourceRequest {
+                    operation_id: operation_id.clone(),
+                    path: "/resource/cancel?b=2&a=1&a=3".into(),
+                    grpc: false,
+                    cancel_after_first_data: true,
+                    payload_size: 32768,
+                    upload_bytes: 0,
+                })
+                .await;
+            let receipt =
+                await_fixture_cancel_receipt(upstream.address, Arc::clone(&ack), &operation_id)
+                    .await;
+            operations.push((raw, receipt));
+        }
+        let sibling = client
+            .measure(ResourceRequest {
+                operation_id: "same-connection-normal:8".into(),
+                path: "/resource/payload?b=2&a=1&a=3".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 32768,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let close = client.close_receipt().await;
+        gateway.shutdown().await.expect("real gateway tasks joined");
+        upstream.stop().await;
+        for (raw, receipt) in operations {
+            let receipt =
+                receipt.expect("same H2 connection was still open while actual Drop ACK arrived");
+            assert_eq!(raw.status, Some(200));
+            assert!(raw.cancelled && raw.data_observed && !raw.eof && raw.error_code.is_none());
+            assert_eq!(raw.body_bytes, 1024);
+            assert_eq!(receipt["operation_id"], raw.operation_id);
+            assert_eq!(receipt["body_dropped_after_data"], true);
+            assert_eq!(receipt["body_bytes"], 1024);
+            let dropped = receipt["dropped_ns"]
+                .as_u64()
+                .expect("actual upstream Drop clock");
+            assert!(dropped >= raw.head_ns.expect("real response head"));
+            assert!(dropped <= raw.ended_ns.expect("actual body cancellation") + 3_000_000_000);
+        }
+        assert_eq!(sibling.status, Some(200));
+        assert!(sibling.eof && sibling.error_code.is_none());
+        assert_eq!(sibling.body_bytes, 32768);
+        assert_eq!(
+            submitted, 9,
+            "eight cancellations plus one same-connection operation, no retry"
+        );
+        assert_eq!(close["result"], "completed");
+        assert_eq!(close["join_acknowledged"], true);
+    }
+
+    #[tokio::test]
+    async fn resource_h2_reset_reason_is_from_actual_tls_wire_without_retry() {
+        use rustls::pki_types::pem::PemObject as _;
+        let identity = identity().expect("ephemeral test identity");
+        let config = client_config(&[&identity], &[b"h2"]).expect("verified client");
+        let key =
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+                .expect("test-only private key");
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS defaults")
+        .with_no_client_auth()
+        .with_single_cert(vec![identity.certificate_der], key)
+        .expect("matching key");
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral fixture");
+        let address = listener.local_addr().expect("actual socket");
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("one client");
+            let socket = tokio_rustls::TlsAcceptor::from(Arc::new(server))
+                .accept(socket)
+                .await
+                .expect("verified TLS");
+            let mut connection = h2::server::handshake(socket).await.expect("real H2");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("one submitted operation")
+                .expect("valid request");
+            assert_eq!(request.uri().path(), "/resource/respond");
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            assert!(
+                connection.accept().await.is_none(),
+                "no retry or fixture transport error"
+            );
+        });
+        let mut client = ResourceDataClient::connect_local(address, config, true)
+            .await
+            .expect("real TLS/H2 client");
+        let raw = client
+            .measure(ResourceRequest {
+                operation_id: "wire-reset:1".into(),
+                path: "/resource/respond".into(),
+                grpc: false,
+                cancel_after_first_data: false,
+                payload_size: 1,
+                upload_bytes: 0,
+            })
+            .await;
+        let submitted = client.submitted_requests();
+        let driver = client.close_receipt().await;
+        tokio::time::timeout(Duration::from_secs(2), fixture)
+            .await
+            .expect("all fixture work collected")
+            .expect("fixture did not panic");
+        assert_eq!(raw.status, None);
+        assert_eq!(raw.error_stage.as_deref(), Some("response_head"));
+        assert_eq!(raw.error_code.as_deref(), Some("transport_error"));
+        assert_eq!(raw.h2_reason.as_deref(), Some("refused_stream"));
+        assert_eq!(raw.h2_error_kind.as_deref(), Some("reset"));
+        assert_eq!(submitted, 1, "no retry of refused logical request");
+        assert_eq!(driver["join_acknowledged"], true);
+    }
+
+    #[tokio::test]
+    async fn resource_tls_h2_unavailable_discovery_preserves_complete_503_for_uploads() {
+        let directory = tempfile::tempdir().expect("isolated test-only source");
+        let identity = identity().expect("ephemeral test-only TLS identity");
+        write_identity(directory.path(), &identity).expect("test-only certificate files");
+        // A bound local resolver that deliberately supplies no answers: the
+        // prepared discovery resource has no eligible endpoints throughout.
+        // There is no public DNS or upstream server to influence this control.
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral controlled resolver");
+        let dns_address = dns.local_addr().expect("actual resolver socket");
+        let source = format!(
+            r#"api_version: oxidase.dev/v1alpha1
+kind: gateway
+resources:
+  certificates:
+    ingress:
+      cert_chain: gateway.pem
+      private_key: gateway-key.pem
+  clusters:
+    api:
+      protocol: h2
+      discovery:
+        dns:
+          name: endpoint.example.invalid
+          record: a_aaaa
+          port: 8443
+          origin: https://gateway.example.test:8443/base
+          resolver:
+            nameservers: ["{dns_address}"]
+            query_timeout: 100ms
+          refresh:
+            min_interval: 50ms
+            max_interval: 100ms
+            jitter_percent: 0
+            stale_if_error: 0ms
+          limits:
+            max_endpoints: 2
+            max_targets: 2
+          address_policy:
+            allow_private: true
+            allow_loopback: true
+            allow_link_local: false
+services:
+  root:
+    type: proxy
+    cluster: api
+listeners:
+  - name: secure
+    bind: 127.0.0.1:0
+    protocol: https
+    tls:
+      default_certificate: ingress
+    http:
+      versions: [h2]
+    limits:
+      max_requests_per_connection: 1000
+    service:
+      ref: root
+"#
+        );
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(&path, source).expect("bounded test source");
+        let snapshot = oxidase_runtime::RuntimeSnapshot::prepare(
+            oxidase_config::Compiler::compile_path(&path).expect("real source compiles"),
+        )
+        .expect("real discovery preparation without resolution");
+        let cluster =
+            Arc::clone(&snapshot.resources.clusters[&oxidase_core::ResourceId::new("cluster:api")]);
+        assert!(cluster.endpoints().is_empty());
+        let gateway = oxidase_server::GatewayServer::bind(snapshot)
+            .await
+            .expect("real gateway binds")
+            .spawn();
+        let address = gateway.local_addresses()[0].1;
+        let config = client_config(&[&identity], &[b"h2"]).expect("verified TLS/H2 client");
+        let mut lanes = Vec::new();
+        for upload_bytes in [0, 1024 * 1024] {
+            let mut client = ResourceDataClient::connect(
+                address,
+                Arc::clone(&config),
+                true,
+                vec![(
+                    "unreachable".into(),
+                    "127.0.0.1:8443".parse().expect("fixture peer"),
+                )],
+            )
+            .await
+            .expect("actual downstream TLS/H2 connection");
+            let mut operations = Vec::new();
+            for sequence in 0..512 {
+                let raw = client
+                    .measure(ResourceRequest {
+                        operation_id: format!("unavailable-{upload_bytes}:{sequence}"),
+                        path: "/resource/upload?b=2&a=1&a=3".into(),
+                        grpc: false,
+                        cancel_after_first_data: false,
+                        payload_size: 1,
+                        upload_bytes,
+                    })
+                    .await;
+                let failed = raw.error_code.is_some();
+                operations.push(raw);
+                // No hidden reconnection/retry after a started failure; keep
+                // every actual result and close the same transport explicitly.
+                if failed {
+                    break;
+                }
+            }
+            let submitted = client.submitted_requests();
+            let close = client.close_receipt().await;
+            lanes.push((upload_bytes, operations, submitted, close));
+        }
+        let empty_at_end = cluster.endpoints().is_empty();
+        gateway.shutdown().await.expect("gateway work collected");
+        drop(dns);
+        let expected_digest: String = Sha256::digest(b"Service Unavailable")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(empty_at_end, "control never acquired an eligible endpoint");
+        for (upload_bytes, operations, submitted, close) in lanes {
+            assert_eq!(
+                submitted,
+                operations.len() as u64,
+                "one actual send per operation"
+            );
+            let failures: Vec<_> = operations
+                .iter()
+                .filter(|raw| {
+                    raw.status != Some(503)
+                        || !raw.eof
+                        || raw.body_bytes != 19
+                        || raw.body_sha256 != expected_digest
+                        || raw.content_type.as_deref() != Some("text/plain; charset=utf-8")
+                        || raw.error_code.is_some()
+                        || raw.h2_reason.is_some()
+                        || raw.h2_error_kind.is_some()
+                        || !raw.trailers.is_empty()
+                })
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "upload_bytes={upload_bytes}; actual={failures:?}; driver={close}"
+            );
+            assert_eq!(operations.len(), 512);
+            assert_eq!(close["join_acknowledged"], true);
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn resource_http1_waits_for_occupied_dispatcher_without_retry() {
         let (client_io, server_io) = tokio::io::duplex(1024);
@@ -4535,6 +4931,8 @@ mod tests {
             "sender_ready",
             "sender_closed_on_error",
             "sender_error_category",
+            "h2_reason",
+            "h2_error_kind",
         ] {
             assert!(raw[key].is_null(), "unavailable {key} is not fabricated");
         }

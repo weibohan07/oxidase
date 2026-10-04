@@ -257,6 +257,16 @@ It must identify the offered operation and contain a legal DATA prefix; a bare
 `fixture_cancel_ack:true` cannot qualify a formal cancel lane. The Drop may race
 the client's local timestamp but must remain inside the collected ACK deadline.
 
+Multi-peer recovery uses one shared set of fresh, fully verified physical-peer
+responses, not separate A-then-B searches that discard a previously seen B.
+The original `fault_window.end_ns + 12s` deadline applies to every peer and is
+not refreshed per peer or probe. Each probe is recorded Started/Terminal with
+its actual connection/driver outcome; its wire timeout is at most nine seconds
+and the remaining original window budget. A timeout, bad body, absent peer or
+late driver join cannot establish recovery. The bounded 64-probe cap does not
+replace the time bound. Ordinary business operations are never replayed by
+this validation controller.
+
 Upgrade telemetry distinguishes normal DATA EOF from tunnel shutdown. A planned
 close requires all four (steady) or eight (retained) exact echo responses,
 actual request-head write, explicit client shutdown and observed peer termination.
@@ -276,3 +286,14 @@ Reports use `PASS_IMPLEMENTATION`, `PASS_BOUNDED_QUALIFICATION`, `INCONCLUSIVE`,
 or `FAIL` per criterion. Formal minimum duration is not inferred from the requested
 duration. RSS drift alone neither proves a leak nor proves allocator retention.
 Unattributed persistent growth prevents a whole-run memory qualification pass.
+
+New wire facts may include nullable `h2_reason` and `h2_error_kind`. They are
+obtained by bounded traversal/downcast of the actual Hyper error chain, not
+formatted diagnostics or guesses about the remote endpoint. Kind is only
+`reset`, `goaway`, `io` or `other`; reason is a fixed RFC reason name or
+`unknown`. Missing legacy fields stay unavailable, not reconstructed from a
+coarse transport error. These facts do not change error classification or
+permit a transport failure inside a status-only fault window. Non-null error
+facts contradicting a complete success/safe-503 terminal fail independent
+validation. An actual single-send TLS/H2 REFUSED_STREAM fixture proves the
+reason capture; a non-reproducing test does not explain the original campaign.

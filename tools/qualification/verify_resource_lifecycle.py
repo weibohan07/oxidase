@@ -605,7 +605,8 @@ class Analyzer:
             if (not isinstance(raw, dict) or raw.get("status") != 503 or raw.get("eof") is not True or
                     raw.get("admitted") is not True or raw.get("connection_attempted") is not bool(attempts) or
                     raw.get("cancelled") is not False or raw.get("upgrade") is not False or
-                    raw.get("diagnostics") != [] or raw.get("error_stage", "missing") is not None or
+                    raw.get("diagnostics") != [] or raw.get("h2_reason") is not None or
+                    raw.get("h2_error_kind") is not None or raw.get("error_stage", "missing") is not None or
                     raw.get("error_code", "missing") is not None or
                     any(key in raw for key in ("operation_id", "started_ns", "head_ns", "ended_ns"))):
                 raise EvidenceError("compact row is not a complete, identical safe-503 raw terminal")
@@ -1176,6 +1177,18 @@ class Analyzer:
         raw = required(outcome, "raw")
         if not isinstance(raw, dict):
             raise EvidenceError("raw outcome must be an object")
+        reason, kind = raw.get("h2_reason"), raw.get("h2_error_kind")
+        if (reason not in (None, "no_error", "protocol_error", "internal_error",
+                           "flow_control_error", "settings_timeout", "stream_closed",
+                           "frame_size_error", "refused_stream", "cancel",
+                           "compression_error", "connect_error", "enhance_your_calm",
+                           "inadequate_security", "http_1_1_required", "unknown") or
+                kind not in (None, "reset", "goaway", "io", "other") or
+                reason is not None and kind is None or
+                (reason is not None or kind is not None) and
+                not (raw.get("error_stage") and raw.get("error_code"))):
+            self.finding("RL_H2_ERROR_FACTS", "typed H2 error facts are unknown or contradict a successful wire terminal")
+            return "content_error"
         lane, phase = required(outcome, "lane"), required(outcome, "phase")
         recipe_name = required(outcome, "recipe")
         recipe = required(required(self.receipt, "recipes"), recipe_name)

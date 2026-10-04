@@ -85,6 +85,17 @@ def retained_corpus():
 
 
 class VerifierCorpusTests(unittest.TestCase):
+    def test_typed_h2_error_facts_never_turn_a_reset_into_full_success(self):
+        for fields in ({"h2_reason": "refused_stream", "h2_error_kind": "reset"},
+                       {"h2_reason": "arbitrary diagnostic string", "h2_error_kind": "reset"},
+                       {"h2_reason": "cancel", "h2_error_kind": None},
+                       {"h2_reason": None, "h2_error_kind": "unverified_remote"}):
+            with self.subTest(fields=fields):
+                data = corpus()
+                anomaly(data, **fields)
+                report = self.assert_failure(data, "RL_H2_ERROR_FACTS")
+                self.assertLess(report["counts"].get("completed_success", 0), 6)
+
     def verify(self, data=None):
         with tempfile.TemporaryDirectory(prefix="oxidase-analyzer-test-") as directory:
             write_corpus(Path(directory), data)

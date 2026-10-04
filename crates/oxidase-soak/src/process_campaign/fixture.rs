@@ -653,6 +653,85 @@ impl Drop for ResourceStreamBody {
 
 type ResourceFixtureBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
+/// The exact process fixture route/body/ACK implementation, exposed only to
+/// bounded real-gateway regression tests. Shutdown joins every accepted task.
+#[cfg(test)]
+pub(super) struct ResourceTestFixture {
+    pub(super) address: std::net::SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl ResourceTestFixture {
+    pub(super) async fn stop(self) {
+        let _ = self.stop.send(());
+        self.task.await.expect("all real fixture tasks joined");
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn resource_test_fixture(
+    identity: &crate::common::TestIdentity,
+) -> ResourceTestFixture {
+    let key = PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+        .expect("ephemeral test-only key");
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("TLS defaults")
+    .with_no_client_auth()
+    .with_single_cert(vec![identity.certificate_der.clone()], key)
+    .expect("matching identity");
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls = Arc::new(tls);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral upstream");
+    let address = listener.local_addr().expect("actual upstream socket");
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let state = Arc::new(UpstreamState::default());
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    result.expect("fixture connection did not panic");
+                }
+                accepted = listener.accept() => {
+                    let (socket, _) = accepted.expect("actual client");
+                    let tls = Arc::clone(&tls);
+                    let state = Arc::clone(&state);
+                    connections.spawn(async move {
+                        let socket = TlsAcceptor::from(tls).accept(socket).await.expect("verified TLS");
+                        let sni = socket.get_ref().1.server_name().unwrap_or("").to_owned();
+                        let h2 = socket.get_ref().1.alpn_protocol() == Some(b"h2");
+                        let service = service_fn(move |request| serve_route(request, "a", address, sni.clone(), Arc::clone(&state)));
+                        if h2 {
+                            let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket), service).await;
+                        } else {
+                            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).await;
+                        }
+                    });
+                }
+            }
+        }
+        connections.abort_all();
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "fixture task panicked: {error}");
+            }
+        }
+    });
+    ResourceTestFixture {
+        address,
+        stop,
+        task,
+    }
+}
+
 async fn serve_route(
     request: Request<Incoming>,
     id: &'static str,

@@ -567,6 +567,8 @@ fn full_response(raw: &Value, payload: usize, grpc: bool, peer: Option<SocketAdd
     if raw["status"] != 200
         || raw["eof"] != true
         || !raw["error_code"].is_null()
+        || !raw["h2_reason"].is_null()
+        || !raw["h2_error_kind"].is_null()
         || raw["diagnostics"]
             .as_array()
             .is_none_or(|values| !values.is_empty())
