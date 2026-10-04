@@ -916,6 +916,11 @@ fn worker<T: Send + 'static>(
 }
 
 pub(super) async fn run_sampler(args: ResourceSamplerArguments) -> Result<(), SoakError> {
+    let validation_started_ns = monotonic_ns()?;
+    eprintln!(
+        "{}",
+        json!({"event":"sampler_startup_progress","schema_version":"oxidase.resource-sampler/v1","stage":"validation_started","t_ns":validation_started_ns})
+    );
     if !(100..=60000).contains(&args.interval_ms)
         || args.admin_interval_ms > 60000
         || (args.admin_interval_ms > 0 && args.admin_interval_ms < 100)
@@ -976,11 +981,21 @@ pub(super) async fn run_sampler(args: ResourceSamplerArguments) -> Result<(), So
         .find(|process| process.role == ProcessRole::Gateway)
         .expect("role checked")
         .clone();
+    let capture_started_ns = monotonic_ns()?;
+    eprintln!(
+        "{}",
+        json!({"event":"sampler_startup_progress","schema_version":"oxidase.resource-sampler/v1","stage":"self_identity_capture_started","t_ns":capture_started_ns,"validation_duration_ns":capture_started_ns.checked_sub(validation_started_ns)})
+    );
     let own = resource_identity::capture(
         ProcessRole::Sampler,
         std::process::id(),
         &std::env::current_exe().map_err(|_| fail("resource.sampler_executable"))?,
     )?;
+    let capture_completed_ns = monotonic_ns()?;
+    eprintln!(
+        "{}",
+        json!({"event":"sampler_startup_progress","schema_version":"oxidase.resource-sampler/v1","stage":"self_identity_capture_completed","t_ns":capture_completed_ns,"capture_duration_ns":capture_completed_ns.checked_sub(capture_started_ns)})
+    );
     processes.push(own.clone());
     let boot_ns = monotonic_ns()?;
     let phase = Arc::new(Mutex::new(PhaseState {

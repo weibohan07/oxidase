@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
@@ -236,6 +238,7 @@ pub(super) struct ResourceResponseFacts {
     pub(super) fault_case_id: Option<u64>,
     pub(super) upgrade_headers: BTreeMap<String, String>,
     pub(super) tunnel_client_shutdown: bool,
+    pub(super) tunnel_close_result: Option<String>,
     pub(super) echo_iterations: u8,
     /// Actual complete Upgrade request-head write, not merely a built request.
     pub(super) request_head_sent: bool,
@@ -270,6 +273,7 @@ impl ResourceResponseFacts {
             fault_case_id: None,
             upgrade_headers: BTreeMap::new(),
             tunnel_client_shutdown: false,
+            tunnel_close_result: None,
             echo_iterations: 0,
             request_head_sent: false,
         }
@@ -351,6 +355,7 @@ pub(super) struct ResourceDataClient {
     driver: Option<tokio::task::JoinHandle<Result<(), String>>>,
     h2: bool,
     targets: Vec<(String, SocketAddr)>,
+    local_response: bool,
 }
 
 impl Drop for ResourceDataClient {
@@ -368,8 +373,31 @@ impl ResourceDataClient {
         h2: bool,
         targets: Vec<(String, SocketAddr)>,
     ) -> Result<Self, SoakError> {
-        if targets.len() > 3 {
-            return Err(fail("resource peer table must contain at most 3 entries"));
+        Self::connect_inner(address, config, h2, targets, false).await
+    }
+
+    pub(super) async fn connect_local(
+        address: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+        h2: bool,
+    ) -> Result<Self, SoakError> {
+        Self::connect_inner(address, config, h2, Vec::new(), true).await
+    }
+
+    async fn connect_inner(
+        address: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+        h2: bool,
+        targets: Vec<(String, SocketAddr)>,
+        local_response: bool,
+    ) -> Result<Self, SoakError> {
+        if (!local_response && targets.is_empty())
+            || targets.len() > 3
+            || (local_response && !targets.is_empty())
+        {
+            return Err(fail(
+                "Proxy requires 1..=3 peers; local response mode is explicit",
+            ));
         }
         let tcp = TcpStream::connect(address).await.map_err(io_error)?;
         let name = rustls::pki_types::ServerName::try_from("gateway.example.test".to_owned())
@@ -412,6 +440,7 @@ impl ResourceDataClient {
             driver: Some(driver),
             h2,
             targets,
+            local_response,
         })
     }
 
@@ -646,25 +675,9 @@ impl ResourceDataClient {
         facts.upload.fixture_ack = facts.upload.body_bytes.is_some()
             && facts.upload.body_sha256.is_some()
             && facts.upload.eof == Some(true);
-        if facts.status == Some(200) && !self.targets.is_empty() {
-            if !self.targets.iter().any(|(name, peer)| {
-                facts.upstream_name.as_deref() == Some(name.as_str())
-                    && facts.upstream_peer.as_deref() == Some(peer.to_string().as_str())
-            }) {
-                facts.diagnostics.push("physical_peer_mismatch".into());
-            }
-            if facts.authority.as_deref() != Some("gateway.example.test") {
-                facts.diagnostics.push("authority_mismatch".into());
-            }
-            if facts.server_name.as_deref() != Some("gateway.example.test") {
-                facts.diagnostics.push("sni_mismatch".into());
-            }
-            if facts.path.as_deref() != Some(format!("/base{}", request.path).as_str()) {
-                facts.diagnostics.push("path_mismatch".into());
-            }
-        }
+        self.check_peer_metadata(facts, &request.path);
         let mut body = response.into_body();
-        let cap = if facts.status == Some(200) {
+        let cap = if facts.status == Some(200) && !self.local_response {
             (request.payload_size + if request.grpc { 5 } else { 0 }) as u64
         } else {
             64 * 1024
@@ -725,6 +738,37 @@ impl ResourceDataClient {
             }
         }
         facts.eof = true;
+    }
+
+    fn check_peer_metadata(&self, facts: &mut ResourceResponseFacts, path: &str) {
+        if facts.status == Some(200) && self.local_response {
+            if facts.upstream_peer.is_some()
+                || facts.upstream_name.is_some()
+                || facts.authority.is_some()
+                || facts.server_name.is_some()
+                || facts.path.is_some()
+            {
+                facts
+                    .diagnostics
+                    .push("unexpected_upstream_metadata_for_local_response".into());
+            }
+        } else if facts.status == Some(200) {
+            if !self.targets.iter().any(|(name, peer)| {
+                facts.upstream_name.as_deref() == Some(name.as_str())
+                    && facts.upstream_peer.as_deref() == Some(peer.to_string().as_str())
+            }) {
+                facts.diagnostics.push("physical_peer_mismatch".into());
+            }
+            if facts.authority.as_deref() != Some("gateway.example.test") {
+                facts.diagnostics.push("authority_mismatch".into());
+            }
+            if facts.server_name.as_deref() != Some("gateway.example.test") {
+                facts.diagnostics.push("sni_mismatch".into());
+            }
+            if facts.path.as_deref() != Some(format!("/base{path}").as_str()) {
+                facts.diagnostics.push("path_mismatch".into());
+            }
+        }
     }
 }
 
@@ -791,8 +835,10 @@ fn resource_head_facts<B>(
     facts
 }
 
-/// `eof` is an actual peer EOF after four verified exchanges and client shutdown,
-/// not an inference from the successful half-close or resource registry counts.
+/// `eof` is an actual clean peer EOF, not an inference from half-close or
+/// registry counts. An exact TLS UnexpectedEof after all verified echoes and
+/// planned client shutdown is recorded separately; graceful TLS closure remains
+/// unproven, while the later resource census can independently check reclamation.
 pub(super) async fn measure_resource_upgrade(
     address: SocketAddr,
     h1_config: Arc<rustls::ClientConfig>,
@@ -859,16 +905,15 @@ pub(super) async fn measure_resource_upgrade(
                 facts.echo_iterations += 1;
             }
             stage = "tunnel_close";
-            socket.shutdown().await.map_err(io_error)?;
-            facts.tunnel_client_shutdown = true;
-            let mut tail = [0u8;1];
-            if socket.read(&mut tail).await.map_err(io_error)? != 0 { return Err(fail("Upgrade trailing data after completed exchange")); }
-            facts.eof = true;
+            observe_tunnel_close(&mut socket,&mut facts,4).await?;
             Ok(())
         }).await {
             Ok(Ok(())) => {},
             Ok(Err(_)) => resource_error(&mut facts, stage, "transport_or_protocol_error"),
-            Err(_) => resource_error(&mut facts, stage, "client_operation_timeout"),
+            Err(_) => {
+                if stage=="tunnel_close" {facts.tunnel_close_result=Some("timeout".into());}
+                resource_error(&mut facts, stage, "client_operation_timeout");
+            },
         }
     }
     facts.body_sha256 = digest
@@ -881,6 +926,48 @@ pub(super) async fn measure_resource_upgrade(
         Err(_) => resource_error(&mut facts, "clock", "monotonic_unavailable"),
     }
     facts
+}
+
+/// The existing gateway cancels the opposite copy on first EOF. A peer TCP
+/// close without TLS close-notify after the complete, explicitly closed echo
+/// operation is recorded as that exact boundary, never as a clean TLS EOF.
+async fn observe_tunnel_close<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    raw: &mut ResourceResponseFacts,
+    expected_echoes: u8,
+) -> Result<(), SoakError> {
+    if raw.status != Some(101)
+        || raw.echo_iterations != expected_echoes
+        || raw.body_bytes != u64::from(expected_echoes) * 20
+    {
+        return Err(fail("tunnel close cannot precede complete echo exchange"));
+    }
+    if socket.shutdown().await.is_err() {
+        raw.tunnel_close_result = Some("error".into());
+        return Err(fail("tunnel client shutdown failed"));
+    }
+    raw.tunnel_client_shutdown = true;
+    let mut tail = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(3), socket.read(&mut tail)).await {
+        Ok(Ok(0)) => {
+            raw.eof = true;
+            raw.tunnel_close_result = Some("clean_eof".into());
+            Ok(())
+        }
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            raw.eof = false;
+            raw.tunnel_close_result = Some("peer_closed_without_close_notify".into());
+            Ok(())
+        }
+        Ok(Ok(_)) | Ok(Err(_)) => {
+            raw.tunnel_close_result = Some("error".into());
+            Err(fail("tunnel close transport error or trailing data"))
+        }
+        Err(_) => {
+            raw.tunnel_close_result = Some("timeout".into());
+            Err(fail("tunnel peer close deadline"))
+        }
+    }
 }
 
 fn parse_listener(line: &str) -> Option<SocketAddr> {
@@ -1272,6 +1359,178 @@ pub(super) struct DataClient {
     payload_size: usize,
     capture_raw: bool,
     last_raw: Option<ResourceResponseFacts>,
+    prelude: Option<Arc<Mutex<PreludeRecorder>>>,
+}
+
+/// Only the additive prelude uses this bounded scalar evidence journal. It has
+/// no reference to a gateway resource, socket, body or future.
+#[derive(Default)]
+struct PreludeRecorder {
+    operations: Vec<PreludeOperation>,
+    violations: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct PreludeOperation {
+    operation_id: String,
+    role: &'static str,
+    terminal: Option<&'static str>,
+    cause: Option<&'static str>,
+    raw: ResourceResponseFacts,
+    acknowledgement: Option<Value>,
+}
+
+struct PreludeGuard {
+    recorder: Arc<Mutex<PreludeRecorder>>,
+    index: usize,
+    operation_id: String,
+    started_ns: u64,
+    finished: bool,
+}
+
+impl PreludeGuard {
+    fn begin(
+        recorder: &Arc<Mutex<PreludeRecorder>>,
+        role: &'static str,
+        protocol: &str,
+    ) -> Result<Self, SoakError> {
+        let started_ns = super::resource_identity::monotonic_ns()?;
+        let mut journal = recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if journal.operations.len() >= 4096 {
+            return Err(fail("prelude operation evidence capacity exhausted"));
+        }
+        let index = journal.operations.len();
+        let operation_id = format!("prelude:{}", index + 1);
+        let mut raw = ResourceResponseFacts::blank(operation_id.clone(), protocol);
+        raw.started_ns = Some(started_ns);
+        journal.operations.push(PreludeOperation {
+            operation_id: operation_id.clone(),
+            role,
+            terminal: None,
+            cause: None,
+            raw,
+            acknowledgement: None,
+        });
+        Ok(Self {
+            recorder: Arc::clone(recorder),
+            index,
+            operation_id,
+            started_ns,
+            finished: false,
+        })
+    }
+
+    fn update(&self, raw: &ResourceResponseFacts) -> Result<(), SoakError> {
+        let mut journal = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if raw.operation_id != self.operation_id
+            || journal.operations[self.index].terminal.is_some()
+        {
+            journal
+                .violations
+                .push("duplicate_terminal_or_identity_mismatch");
+            return Err(fail("prelude raw identity/terminal mismatch"));
+        }
+        journal.operations[self.index].raw = raw.clone();
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        raw: &ResourceResponseFacts,
+        terminal: &'static str,
+        cause: &'static str,
+    ) -> Result<(), SoakError> {
+        self.update(raw)?;
+        let mut journal = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        journal.operations[self.index].terminal = Some(terminal);
+        journal.operations[self.index].cause = Some(cause);
+        self.finished = true;
+        Ok(())
+    }
+
+    fn fail(&mut self, stage: &str, code: &str) -> Result<(), SoakError> {
+        let mut raw = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operations[self.index]
+            .raw
+            .clone();
+        resource_error(&mut raw, stage, code);
+        raw.ended_ns = super::resource_identity::monotonic_ns().ok();
+        self.finish(&raw, "failed", "operation_error")
+    }
+}
+
+impl Drop for PreludeGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut journal = self
+                .recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let operation = &mut journal.operations[self.index];
+            resource_error(&mut operation.raw, "collection", "prelude_abandoned");
+            operation.raw.ended_ns = super::resource_identity::monotonic_ns().ok();
+            operation.terminal = Some("abandoned");
+            operation.cause = Some("future_dropped_before_terminal");
+        }
+    }
+}
+
+impl PreludeRecorder {
+    fn acknowledge_cancel(&mut self, operation_id: &str, receipt: Value) -> Result<(), SoakError> {
+        let operation = self
+            .operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id && operation.role == "cancel")
+            .ok_or_else(|| fail("prelude cancellation operation missing"))?;
+        if operation.terminal != Some("cancelled_after_data")
+            || receipt["operation_id"] != operation_id
+            || receipt["body_dropped_after_data"] != true
+            || receipt["body_bytes"]
+                .as_u64()
+                .is_none_or(|bytes| bytes < operation.raw.body_bytes || bytes == 0)
+            || receipt["dropped_ns"].as_u64().is_none()
+        {
+            return Err(fail("prelude cancellation receipt invalid"));
+        }
+        if operation.acknowledgement.is_some() {
+            self.violations.push("duplicate_cancel_ack");
+            return Err(fail("prelude duplicate cancellation receipt"));
+        }
+        operation.raw.fixture_cancel_ack = true;
+        operation.acknowledgement = Some(receipt);
+        Ok(())
+    }
+
+    fn evidence(&self) -> Result<Value, SoakError> {
+        let mut by_role = BTreeMap::<&str, Value>::new();
+        for operation in &self.operations {
+            let counts = by_role
+                .entry(operation.role)
+                .or_insert_with(|| json!({"offered":0,"classified":0,"abandoned":0}));
+            for (name, increment) in [
+                ("offered", true),
+                ("classified", operation.terminal.is_some()),
+                ("abandoned", operation.terminal == Some("abandoned")),
+            ] {
+                counts[name] =
+                    json!(counts[name].as_u64().expect("fixed count") + u64::from(increment));
+            }
+        }
+        Ok(
+            json!({"prelude_counts":{"scope":"prelude_data_plane_and_connection_prepare","offered":self.operations.len(),"classified":self.operations.iter().filter(|op|op.terminal.is_some()).count(),"abandoned":self.operations.iter().filter(|op|op.terminal==Some("abandoned")).count(),"by_role":by_role,"violations":self.violations},"prelude_operations":serde_json::to_value(&self.operations).map_err(json_error)?}),
+        )
+    }
 }
 struct PayloadValidator {
     grpc: bool,
@@ -1341,6 +1600,65 @@ struct HeldGrpc {
     body: hyper::body::Incoming,
     validator: PayloadValidator,
     raw: Option<ResourceResponseFacts>,
+    prelude: Option<PreludeGuard>,
+}
+
+async fn capture_bounded_prelude_body<B: Body<Data = Bytes> + Unpin>(
+    mut body: B,
+    raw: &mut ResourceResponseFacts,
+    prelude: Option<&PreludeGuard>,
+) -> Result<u64, SoakError> {
+    let mut digest = Sha256::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| fail("prelude rejection body error"))?;
+        if let Some(data) = frame.data_ref() {
+            raw.body_bytes = raw
+                .body_bytes
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| fail("prelude rejection byte count overflow"))?;
+            digest.update(data);
+            raw.data_observed |= !data.is_empty();
+            raw.body_sha256 = digest
+                .clone()
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if let Some(guard) = prelude {
+                guard.update(raw)?;
+            }
+            if raw.body_bytes > 64 * 1024 {
+                return Err(fail("prelude rejection body exceeds bound"));
+            }
+        }
+        if let Some(trailers) = frame.trailers_ref() {
+            if trailers.len() > 16 {
+                return Err(fail("prelude rejection trailers exceed bound"));
+            }
+            for (name, value) in trailers {
+                let value = value.to_str().map_err(io_error)?;
+                if value.len() > 1024
+                    || raw
+                        .trailers
+                        .insert(name.to_string(), value.to_owned())
+                        .is_some()
+                {
+                    return Err(fail("prelude rejection trailer value/duplicate"));
+                }
+            }
+        }
+        if let Some(guard) = prelude {
+            guard.update(raw)?;
+        }
+    }
+    raw.body_sha256 = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    raw.eof = true;
+    raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+    Ok(raw.body_bytes)
 }
 impl Drop for DataClient {
     fn drop(&mut self) {
@@ -1381,6 +1699,7 @@ impl DataClient {
                 payload_size,
                 capture_raw: false,
                 last_raw: None,
+                prelude: None,
             })
         } else {
             let (sender, connection) = http1::handshake(TokioIo::new(tls))
@@ -1399,6 +1718,7 @@ impl DataClient {
                 payload_size,
                 capture_raw: false,
                 last_raw: None,
+                prelude: None,
             })
         }
     }
@@ -1426,7 +1746,73 @@ impl DataClient {
         cancel: bool,
         expected_upstream: Option<&str>,
     ) -> Result<(u16, u64, bool), SoakError> {
-        let started = if self.capture_raw {
+        let mut prelude = self
+            .prelude
+            .as_ref()
+            .map(|recorder| {
+                PreludeGuard::begin(
+                    recorder,
+                    if cancel { "cancel" } else { "probe" },
+                    if self.h2 { "h2" } else { "http1" },
+                )
+            })
+            .transpose()?;
+        self.last_raw = None;
+        let result = if self.capture_raw {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                self.request_inner(grpc, cancel, expected_upstream, prelude.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Some(guard) = &mut prelude {
+                        guard.fail("request", "prelude_deadline")?;
+                    }
+                    return Err(fail("bounded prelude request deadline"));
+                }
+            }
+        } else {
+            self.request_inner(grpc, cancel, expected_upstream, None)
+                .await
+        };
+        if let Some(guard) = &mut prelude {
+            if result.is_ok() {
+                let raw = self
+                    .last_raw
+                    .as_ref()
+                    .ok_or_else(|| fail("prelude complete request raw missing"))?;
+                guard.finish(
+                    raw,
+                    if raw.cancelled {
+                        "cancelled_after_data"
+                    } else {
+                        "response_complete"
+                    },
+                    if raw.cancelled {
+                        "explicit_cancel"
+                    } else {
+                        "response_eof"
+                    },
+                )?;
+            } else {
+                guard.fail("request", "prelude_operation_error")?;
+            }
+        }
+        result
+    }
+
+    async fn request_inner(
+        &mut self,
+        grpc: bool,
+        cancel: bool,
+        expected_upstream: Option<&str>,
+        prelude: Option<&PreludeGuard>,
+    ) -> Result<(u16, u64, bool), SoakError> {
+        let started = if let Some(guard) = prelude {
+            Some(guard.started_ns)
+        } else if self.capture_raw {
             Some(super::resource_identity::monotonic_ns()?)
         } else {
             None
@@ -1454,6 +1840,9 @@ impl DataClient {
                 .header(header::CONTENT_TYPE, "application/grpc")
                 .header(header::TE, "trailers");
         }
+        if let Some(guard) = prelude {
+            builder = builder.header("x-resource-operation-id", &guard.operation_id);
+        }
         let request = builder
             .body(Full::new(if grpc {
                 Bytes::from_static(&[0, 0, 0, 0, 2, b'h', b'i'])
@@ -1470,12 +1859,21 @@ impl DataClient {
         let mut raw = self.capture_raw.then(|| {
             resource_head_facts(
                 &response,
-                "retained:request",
+                prelude.map_or("retained:request", |guard| guard.operation_id.as_str()),
                 if self.h2 { "h2" } else { "http1" },
                 started,
             )
         });
+        if let (Some(guard), Some(raw)) = (prelude, raw.as_ref()) {
+            guard.update(raw)?;
+        }
         if status != 200 {
+            if let Some(raw) = &mut raw {
+                let bytes =
+                    capture_bounded_prelude_body(response.into_body(), raw, prelude).await?;
+                self.last_raw = Some(raw.clone());
+                return Ok((status, bytes, false));
+            }
             self.last_raw = raw;
             return Ok((status, 0, false));
         }
@@ -1532,10 +1930,28 @@ impl DataClient {
             validator.capture();
         }
         let mut trailer = false;
+        let mut observed_digest = self.capture_raw.then(Sha256::new);
         let mut body = response.into_body();
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(io_error)?;
             if let Some(data) = frame.data_ref() {
+                if let (Some(raw), Some(digest)) = (&mut raw, &mut observed_digest) {
+                    digest.update(data);
+                    raw.body_bytes = raw
+                        .body_bytes
+                        .checked_add(data.len() as u64)
+                        .ok_or_else(|| fail("prelude byte count overflow"))?;
+                    raw.data_observed |= !data.is_empty();
+                    raw.body_sha256 = digest
+                        .clone()
+                        .finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    if let Some(guard) = prelude {
+                        guard.update(raw)?;
+                    }
+                }
                 validator.push(data)?;
                 bytes = bytes.saturating_add(data.len() as u64);
                 if cancel {
@@ -1559,6 +1975,9 @@ impl DataClient {
                             value.to_str().map_err(io_error)?.to_owned(),
                         );
                     }
+                    if let Some(guard) = prelude {
+                        guard.update(raw)?;
+                    }
                 }
                 trailer = trailers.get("grpc-status").is_some_and(|v| v == "0")
                     && trailers.get("grpc-message").is_some_and(|v| v == "ok");
@@ -1580,7 +1999,63 @@ impl DataClient {
     }
 
     async fn hold_grpc(&mut self) -> Result<Option<HeldGrpc>, SoakError> {
-        let started = if self.capture_raw {
+        let mut prelude = self
+            .prelude
+            .as_ref()
+            .map(|recorder| PreludeGuard::begin(recorder, "held", "h2"))
+            .transpose()?;
+        self.last_raw = None;
+        let result = if self.capture_raw {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                self.hold_grpc_inner(prelude.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Some(guard) = &mut prelude {
+                        guard.fail("request", "prelude_deadline")?;
+                    }
+                    return Err(fail("bounded initial held prelude deadline"));
+                }
+            }
+        } else {
+            self.hold_grpc_inner(None).await
+        };
+        match result {
+            Ok(Some(mut held)) => {
+                held.prelude = prelude;
+                Ok(Some(held))
+            }
+            Ok(None) => {
+                if let Some(guard) = &mut prelude {
+                    guard.finish(
+                        self.last_raw
+                            .as_ref()
+                            .ok_or_else(|| fail("held rejection raw missing"))?,
+                        "response_complete",
+                        "response_eof",
+                    )?;
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(guard) = &mut prelude {
+                    guard.fail("request", "prelude_operation_error")?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn hold_grpc_inner(
+        &mut self,
+        prelude: Option<&PreludeGuard>,
+    ) -> Result<Option<HeldGrpc>, SoakError> {
+        let started = if let Some(guard) = prelude {
+            Some(guard.started_ns)
+        } else if self.capture_raw {
             Some(super::resource_identity::monotonic_ns()?)
         } else {
             None
@@ -1588,14 +2063,44 @@ impl DataClient {
         let Sender::H2(sender) = &mut self.sender else {
             return Err(fail("held gRPC proof requires negotiated H2"));
         };
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(http::Method::POST)
             .uri("https://gateway.example.test/hold?b=2&a=1&a=3")
             .header(header::CONTENT_TYPE, "application/grpc")
-            .header(header::TE, "trailers")
+            .header(header::TE, "trailers");
+        if let Some(guard) = prelude {
+            builder = builder.header("x-resource-operation-id", &guard.operation_id);
+        }
+        let request = builder
             .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 2, b'h', b'i'])))
             .map_err(io_error)?;
         let response = sender.send_request(request).await.map_err(io_error)?;
+        let mut raw = self.capture_raw.then(|| {
+            resource_head_facts(
+                &response,
+                prelude.map_or("retained:held-grpc", |guard| guard.operation_id.as_str()),
+                "h2",
+                started,
+            )
+        });
+        if let (Some(guard), Some(raw)) = (prelude, raw.as_ref()) {
+            guard.update(raw)?;
+        }
+        if response.status() != http::StatusCode::OK && self.capture_raw {
+            let status = response.status();
+            capture_bounded_prelude_body(
+                response.into_body(),
+                raw.as_mut().expect("capture enabled"),
+                prelude,
+            )
+            .await?;
+            self.last_raw = raw;
+            return if status == http::StatusCode::SERVICE_UNAVAILABLE {
+                Ok(None)
+            } else {
+                Err(fail("initial held response unexpectedly rejected"))
+            };
+        }
         if response.status() == http::StatusCode::SERVICE_UNAVAILABLE {
             return Ok(None);
         }
@@ -1622,9 +2127,6 @@ impl DataClient {
                 "initial held gRPC stream did not use actual fixture A",
             ));
         }
-        let raw = self
-            .capture_raw
-            .then(|| resource_head_facts(&response, "retained:held-grpc", "h2", started));
         let mut body = response.into_body();
         let first = body
             .frame()
@@ -1639,10 +2141,19 @@ impl DataClient {
             validator.capture();
         }
         validator.push(first.data_ref().expect("validated first DATA"))?;
+        if let Some(raw) = &mut raw {
+            raw.body_bytes = validator.seen as u64;
+            raw.body_sha256 = validator.digest().expect("capture enabled");
+            raw.data_observed = raw.body_bytes > 0;
+            if let Some(guard) = prelude {
+                guard.update(raw)?;
+            }
+        }
         Ok(Some(HeldGrpc {
             body,
             validator,
             raw,
+            prelude: None,
         }))
     }
 }
@@ -1651,7 +2162,7 @@ async fn open_upgrade(
     address: SocketAddr,
     config: Arc<rustls::ClientConfig>,
 ) -> Result<Option<tokio_rustls::client::TlsStream<TcpStream>>, SoakError> {
-    open_upgrade_capture(address, config, false)
+    open_upgrade_capture(address, config, false, None)
         .await
         .map(|value| value.0)
 }
@@ -1660,6 +2171,7 @@ async fn open_upgrade_capture(
     address: SocketAddr,
     config: Arc<rustls::ClientConfig>,
     capture: bool,
+    prelude: Option<&PreludeGuard>,
 ) -> Result<
     (
         Option<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -1667,7 +2179,9 @@ async fn open_upgrade_capture(
     ),
     SoakError,
 > {
-    let started = if capture {
+    let started = if let Some(guard) = prelude {
+        Some(guard.started_ns)
+    } else if capture {
         Some(super::resource_identity::monotonic_ns()?)
     } else {
         None
@@ -1680,6 +2194,12 @@ async fn open_upgrade_capture(
         .await
         .map_err(io_error)?;
     socket.write_all(b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.map_err(io_error)?;
+    if let Some(guard) = prelude {
+        let mut raw = ResourceResponseFacts::blank(guard.operation_id.clone(), "upgrade");
+        raw.started_ns = Some(guard.started_ns);
+        raw.request_head_sent = true;
+        guard.update(&raw)?;
+    }
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         let byte = socket.read_u8().await.map_err(io_error)?;
@@ -1688,19 +2208,32 @@ async fn open_upgrade_capture(
             return Err(fail("Upgrade header limit"));
         }
     }
-    if head.starts_with(b"HTTP/1.1 503") {
+    if !capture && head.starts_with(b"HTTP/1.1 503") {
         return Ok((None, None));
     }
-    if !head.starts_with(b"HTTP/1.1 101") {
+    if !capture && !head.starts_with(b"HTTP/1.1 101") {
         return Err(fail("trusted Proxy Upgrade handshake failed"));
     }
-    let raw = if capture {
-        let mut facts = ResourceResponseFacts::blank("retained:upgrade".into(), "upgrade");
+    let mut raw = if capture {
+        let mut facts = ResourceResponseFacts::blank(
+            prelude
+                .map_or("retained:upgrade", |guard| guard.operation_id.as_str())
+                .into(),
+            "upgrade",
+        );
         facts.started_ns = started;
         facts.head_ns = Some(super::resource_identity::monotonic_ns()?);
-        facts.status = Some(101);
         facts.request_head_sent = true;
         let text = std::str::from_utf8(&head).map_err(io_error)?;
+        facts.status = text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_once(' '))
+            .and_then(|(code, _)| code.parse().ok());
+        if facts.status.is_none() {
+            return Err(fail("captured Upgrade status invalid"));
+        }
         for line in text.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
             let (name, value) = line
                 .split_once(':')
@@ -1718,39 +2251,120 @@ async fn open_upgrade_capture(
         facts.authority = facts.upgrade_headers.get("x-fixture-authority").cloned();
         facts.server_name = facts.upgrade_headers.get("x-fixture-sni").cloned();
         facts.path = facts.upgrade_headers.get("x-fixture-path").cloned();
+        if let Some(guard) = prelude {
+            guard.update(&facts)?;
+        }
         Some(facts)
     } else {
         None
     };
+    if let Some(raw) = &mut raw
+        && raw.status != Some(101)
+    {
+        let length = raw
+            .upgrade_headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value <= 64 * 1024)
+            .ok_or_else(|| fail("captured Upgrade rejection framing unavailable"))?;
+        if raw.upgrade_headers.contains_key("transfer-encoding") {
+            return Err(fail("captured Upgrade rejection ambiguous framing"));
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 1024];
+        while raw.body_bytes < (length as u64) {
+            let size = socket
+                .read(&mut buffer[..(length - raw.body_bytes as usize).min(1024)])
+                .await
+                .map_err(io_error)?;
+            if size == 0 {
+                return Err(fail("captured Upgrade rejection truncated"));
+            }
+            digest.update(&buffer[..size]);
+            raw.body_bytes += size as u64;
+            raw.data_observed = true;
+            raw.body_sha256 = digest
+                .clone()
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if let Some(guard) = prelude {
+                guard.update(raw)?;
+            }
+        }
+        raw.body_sha256 = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        raw.eof = true;
+        raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+        if let Some(guard) = prelude {
+            guard.update(raw)?;
+        }
+        return Ok((None, Some(raw.clone())));
+    }
     Ok((Some(socket), raw))
 }
 
 async fn echo_upgrade(
     socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
 ) -> Result<(), SoakError> {
-    echo_upgrade_capture(socket, None, None).await
+    echo_upgrade_capture(socket, None, None, None).await
 }
 
 async fn echo_upgrade_capture(
     socket: &mut tokio_rustls::client::TlsStream<TcpStream>,
     mut raw: Option<&mut ResourceResponseFacts>,
     mut digest: Option<&mut Sha256>,
+    prelude: Option<&PreludeGuard>,
 ) -> Result<(), SoakError> {
     for _ in 0..4 {
         let bytes = b"qualification-tunnel";
         socket.write_all(bytes).await.map_err(io_error)?;
         let mut echoed = vec![0; bytes.len()];
-        socket.read_exact(&mut echoed).await.map_err(io_error)?;
+        if raw.is_some() {
+            let mut received = 0;
+            while received < echoed.len() {
+                let size = socket
+                    .read(&mut echoed[received..])
+                    .await
+                    .map_err(io_error)?;
+                if size == 0 {
+                    return Err(fail("captured Upgrade echo truncated"));
+                }
+                if let Some(digest) = digest.as_deref_mut() {
+                    digest.update(&echoed[received..received + size]);
+                }
+                if let Some(raw) = raw.as_deref_mut() {
+                    raw.body_bytes += size as u64;
+                    raw.data_observed = true;
+                    if let Some(digest) = digest.as_deref() {
+                        raw.body_sha256 = digest
+                            .clone()
+                            .finalize()
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                    }
+                    if let Some(guard) = prelude {
+                        guard.update(raw)?;
+                    }
+                }
+                received += size;
+            }
+        } else {
+            socket.read_exact(&mut echoed).await.map_err(io_error)?;
+        }
         if echoed != bytes {
             return Err(fail("Upgrade bidirectional byte mismatch"));
         }
-        if let Some(digest) = digest.as_mut() {
-            digest.update(&echoed);
-        }
         if let Some(raw) = raw.as_mut() {
-            raw.body_bytes += echoed.len() as u64;
-            raw.data_observed = true;
             raw.echo_iterations += 1;
+            if let Some(guard) = prelude {
+                guard.update(raw)?;
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1848,7 +2462,7 @@ pub(super) async fn retained_stream_proof(
     upstream: &mut FixtureProcess,
     sequence: &mut u64,
 ) -> Result<Value, SoakError> {
-    retained_stream_proof_inner(plan, dns, upstream, sequence, false).await
+    retained_stream_proof_inner(plan, dns, upstream, sequence, false, None).await
 }
 
 pub(super) async fn resource_retained_stream_proof(
@@ -1857,7 +2471,48 @@ pub(super) async fn resource_retained_stream_proof(
     upstream: &mut FixtureProcess,
     sequence: &mut u64,
 ) -> Result<Value, SoakError> {
-    retained_stream_proof_inner(plan, dns, upstream, sequence, true).await
+    let results = plan.results.to_owned();
+    let recorder = Arc::new(Mutex::new(PreludeRecorder::default()));
+    let result = retained_stream_proof_inner(
+        plan,
+        dns,
+        upstream,
+        sequence,
+        true,
+        Some(Arc::clone(&recorder)),
+    )
+    .await;
+    // Preserve all issued operations even when the proof aborts on a body,
+    // metadata, control or collection failure. This is raw evidence, not a PASS.
+    let evidence = recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .evidence()?;
+    let bytes=serde_json::to_vec(&json!({"schema_version":"oxidase.resource-prelude/v1","result":if result.is_ok(){"collected"}else{"failed"},"evidence":evidence})).map_err(json_error)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(fail("prelude artifact capacity exhausted"));
+    }
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(results.join("prelude-operations.json"))
+            .map_err(io_error)?;
+        file.write_all(&bytes).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+    }
+    let mut result = result?;
+    result["prelude_counts"] = evidence["prelude_counts"].clone();
+    result["prelude_operations"] = evidence["prelude_operations"].clone();
+    if evidence["prelude_counts"]["abandoned"] != 0
+        || evidence["prelude_counts"]["violations"]
+            .as_array()
+            .is_none_or(|violations| !violations.is_empty())
+    {
+        return Err(fail("prelude has missing/duplicate terminal evidence"));
+    }
+    Ok(result)
 }
 
 async fn retained_stream_proof_inner(
@@ -1866,6 +2521,7 @@ async fn retained_stream_proof_inner(
     upstream: &mut FixtureProcess,
     sequence: &mut u64,
     capture: bool,
+    recorder: Option<Arc<Mutex<PreludeRecorder>>>,
 ) -> Result<Value, SoakError> {
     let RetainedProofPlan {
         gateway,
@@ -1885,11 +2541,50 @@ async fn retained_stream_proof_inner(
             .alternate
             .ok_or_else(|| fail("fixture B missing"))?,
     ];
-    let mut client = DataClient::connect(gateway_address, h2, true, targets, payload_size).await?;
+    let mut prepare = recorder
+        .as_ref()
+        .map(|journal| PreludeGuard::begin(journal, "control", "h2"))
+        .transpose()?;
+    let connected = if capture {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            DataClient::connect(gateway_address, h2, true, targets, payload_size),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(fail("bounded prelude connection deadline")),
+        }
+    } else {
+        DataClient::connect(gateway_address, h2, true, targets, payload_size).await
+    };
+    if let Some(guard) = &mut prepare {
+        if connected.is_ok() {
+            let mut raw = ResourceResponseFacts::blank(guard.operation_id.clone(), "h2");
+            raw.started_ns = Some(guard.started_ns);
+            raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+            guard.finish(&raw, "prepared", "connection_ready")?;
+        } else {
+            guard.fail("connection", "prelude_connection_failure")?;
+        }
+    }
+    let mut client = connected?;
     client.capture_raw = capture;
+    client.prelude = recorder.clone();
+    let initialization_start_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut held = loop {
-        if let Some(body) = client.hold_grpc().await? {
+        let response = client.hold_grpc().await?;
+        if capture && Instant::now() > deadline {
+            return Err(fail(
+                "initial held operation exceeded declared initialization window",
+            ));
+        }
+        if let Some(body) = response {
             break body;
         }
         if Instant::now() >= deadline {
@@ -1897,17 +2592,85 @@ async fn retained_stream_proof_inner(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    let (tunnel, mut upgrade_raw) = open_upgrade_capture(gateway_address, h1, capture).await?;
-    let mut tunnel = tunnel.ok_or_else(|| fail("initial Upgrade fixture unavailable"))?;
+    let initialization_end_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
+    let mut upgrade_operation = recorder
+        .as_ref()
+        .map(|journal| PreludeGuard::begin(journal, "upgrade", "upgrade"))
+        .transpose()?;
+    let opened = if capture {
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            open_upgrade_capture(
+                gateway_address,
+                Arc::clone(&h1),
+                capture,
+                upgrade_operation.as_ref(),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(guard) = &mut upgrade_operation {
+                    guard.fail("upgrade", "prelude_deadline")?;
+                }
+                return Err(fail("bounded prelude Upgrade deadline"));
+            }
+        }
+    } else {
+        open_upgrade_capture(gateway_address, Arc::clone(&h1), capture, None).await
+    };
+    let (tunnel, mut upgrade_raw) = match opened {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(guard) = &mut upgrade_operation {
+                guard.fail("upgrade", "prelude_operation_error")?;
+            }
+            return Err(error);
+        }
+    };
+    if let (Some(guard), Some(raw)) = (&upgrade_operation, &mut upgrade_raw) {
+        raw.operation_id = guard.operation_id.clone();
+        raw.started_ns = Some(guard.started_ns);
+        guard.update(raw)?;
+    }
+    let mut tunnel = match tunnel {
+        Some(tunnel) => tunnel,
+        None => {
+            if let (Some(guard), Some(raw)) = (&mut upgrade_operation, upgrade_raw.as_ref()) {
+                guard.finish(raw, "response_complete", "response_eof")?;
+            }
+            return Err(fail("initial Upgrade fixture unavailable"));
+        }
+    };
     let mut upgrade_digest = Sha256::new();
     echo_upgrade_capture(
         &mut tunnel,
         upgrade_raw.as_mut(),
         capture.then_some(&mut upgrade_digest),
+        upgrade_operation.as_ref(),
     )
     .await?;
+    if let (Some(guard), Some(raw)) = (&upgrade_operation, &mut upgrade_raw) {
+        raw.body_sha256 = upgrade_digest
+            .clone()
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        guard.update(raw)?;
+    }
     let before: Value =
         serde_json::from_slice(&admin_read(root, "/api/v1/runtime").await?).map_err(json_error)?;
+    let withdrawal_start_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
     dns.command(FixtureCommand::Dns {
         mode: "b".into(),
         ttl: 1,
@@ -1920,6 +2683,11 @@ async fn retained_stream_proof_inner(
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let (status, _, _) = client.request(true, false, None).await?;
+        if capture && Instant::now() > deadline {
+            return Err(fail(
+                "DNS withdrawal probe exceeded declared availability window",
+            ));
+        }
         if status == 200 && client.last_upstream == Some("b") {
             break;
         }
@@ -1928,6 +2696,11 @@ async fn retained_stream_proof_inner(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let withdrawal_end_ns = if capture {
+        Some(super::resource_identity::monotonic_ns()?)
+    } else {
+        None
+    };
     let mut successful_new_b_streams = 0;
     let mut new_b_streams_raw = Vec::new();
     for _ in 0..8 {
@@ -1937,11 +2710,10 @@ async fn retained_stream_proof_inner(
         let response = client.request(true, false, Some("b")).await?;
         validate_completed_new_b_stream(response, payload_size)?;
         if capture {
-            let mut raw = client
+            let raw = client
                 .last_raw
                 .clone()
                 .ok_or_else(|| fail("new B raw response missing"))?;
-            raw.operation_id = format!("retained:new-b-{successful_new_b_streams}");
             new_b_streams_raw.push(raw);
         }
         successful_new_b_streams += 1;
@@ -1966,6 +2738,7 @@ async fn retained_stream_proof_inner(
         ));
     }
     let cancelled_response = client.request(true, true, Some("b")).await?;
+    let cancelled_operation = client.last_raw.as_ref().map(|raw| raw.operation_id.clone());
     if cancelled_response.0 != 200 || !cancelled_response.2 {
         return Err(fail(
             "explicit cancellation did not receive its partial 200 DATA",
@@ -1992,6 +2765,16 @@ async fn retained_stream_proof_inner(
     };
     let after_dns: Value =
         serde_json::from_slice(&admin_read(root, "/api/v1/runtime").await?).map_err(json_error)?;
+    if let Some(journal) = &recorder {
+        let operation_id = cancelled_operation
+            .as_deref()
+            .ok_or_else(|| fail("prelude cancellation raw missing"))?;
+        let ack = await_fixture_cancel_receipt(targets[1], Arc::clone(&h1), operation_id).await?;
+        journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acknowledge_cancel(operation_id, ack)?;
+    }
     if before != after_dns {
         return Err(fail("DNS changed immutable published runtime metadata"));
     }
@@ -2021,27 +2804,49 @@ async fn retained_stream_proof_inner(
         &mut tunnel,
         upgrade_raw.as_mut(),
         capture.then_some(&mut upgrade_digest),
+        upgrade_operation.as_ref(),
     )
     .await?;
-    tunnel.shutdown().await.map_err(io_error)?;
+    if let (Some(guard), Some(raw)) = (&upgrade_operation, &mut upgrade_raw) {
+        raw.body_sha256 = upgrade_digest
+            .clone()
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        guard.update(raw)?;
+    }
     if let Some(raw) = &mut upgrade_raw {
         raw.body_sha256 = upgrade_digest
             .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        raw.eof = true;
-        raw.tunnel_client_shutdown = true;
-        let mut tail = [0u8; 1];
-        if tokio::time::timeout(Duration::from_secs(3), tunnel.read(&mut tail))
-            .await
-            .map_err(|_| fail("captured retained tunnel peer EOF deadline"))?
-            .map_err(io_error)?
-            != 0
-        {
-            return Err(fail("captured retained tunnel trailing data"));
+        if let Err(error) = observe_tunnel_close(&mut tunnel, raw, 8).await {
+            if let Some(guard) = &mut upgrade_operation {
+                guard.update(raw)?;
+                guard.fail("tunnel_close", "prelude_tunnel_close_error")?;
+            }
+            return Err(error);
         }
         raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+        if let Some(guard) = &mut upgrade_operation {
+            guard.finish(
+                raw,
+                if raw.eof {
+                    "response_complete"
+                } else {
+                    "tunnel_cancelled"
+                },
+                if raw.eof {
+                    "peer_eof"
+                } else {
+                    "planned_client_close_peer_abort"
+                },
+            )?;
+        }
+    } else {
+        tunnel.shutdown().await.map_err(io_error)?;
     }
     upstream.command(FixtureCommand::Release).await?;
     let mut status_trailer = false;
@@ -2049,6 +2854,13 @@ async fn retained_stream_proof_inner(
         let frame = frame.map_err(io_error)?;
         if let Some(data) = frame.data_ref() {
             held.validator.push(data)?;
+            if let Some(raw) = &mut held.raw {
+                raw.body_bytes = held.validator.seen as u64;
+                raw.body_sha256 = held.validator.digest().expect("captured held validator");
+                if let Some(guard) = &held.prelude {
+                    guard.update(raw)?;
+                }
+            }
         }
         if let Some(trailers) = frame.trailers_ref() {
             if let Some(raw) = &mut held.raw {
@@ -2057,6 +2869,9 @@ async fn retained_stream_proof_inner(
                         name.to_string(),
                         value.to_str().map_err(io_error)?.to_owned(),
                     );
+                }
+                if let Some(guard) = &held.prelude {
+                    guard.update(raw)?;
                 }
             }
             status_trailer |= trailers.get("grpc-status").is_some_and(|v| v == "0")
@@ -2075,6 +2890,9 @@ async fn retained_stream_proof_inner(
         raw.data_observed = raw.body_bytes > 0;
         raw.eof = true;
         raw.ended_ns = Some(super::resource_identity::monotonic_ns()?);
+        if let Some(guard) = &mut held.prelude {
+            guard.finish(raw, "response_complete", "response_eof")?;
+        }
     }
     if upstream.command(FixtureCommand::Status).await?["body_drops"] != normal_drops + 1 {
         return Err(fail(
@@ -2115,6 +2933,8 @@ async fn retained_stream_proof_inner(
         result["upgrade_raw"] = serde_json::to_value(upgrade_raw).map_err(json_error)?;
         result["publication_window"] =
             json!({"before_ns":publication_before_ns,"after_ns":publication_after_ns});
+        result["initialization_window"] = json!({"start_ns":initialization_start_ns,"end_ns":initialization_end_ns,"deadline_ns":initialization_start_ns.map(|start|start+8_000_000_000),"roles":["held"],"allowed_statuses":[503]});
+        result["withdrawal_window"] = json!({"start_ns":withdrawal_start_ns,"end_ns":withdrawal_end_ns,"deadline_ns":withdrawal_start_ns.map(|start|start+10_000_000_000),"roles":["probe"],"allowed_statuses":[503]});
     }
     Ok(result)
 }
@@ -2770,6 +3590,344 @@ async fn run_inner(args: &ProcessArguments) -> Result<(), SoakError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_local_response_accepts_null_metadata_without_weakening_proxy_peer_checks() {
+        let local = ResourceDataClient {
+            sender: None,
+            driver: None,
+            h2: true,
+            targets: Vec::new(),
+            local_response: true,
+        };
+        let mut facts = ResourceResponseFacts::blank("local".into(), "h2");
+        facts.status = Some(200);
+        local.check_peer_metadata(&mut facts, "/resource/respond");
+        assert!(facts.diagnostics.is_empty());
+        assert!(
+            facts.upstream_peer.is_none()
+                && facts.server_name.is_none()
+                && facts.authority.is_none()
+        );
+        facts.upstream_peer = Some("127.0.0.1:8080".into());
+        local.check_peer_metadata(&mut facts, "/resource/respond");
+        assert!(
+            facts
+                .diagnostics
+                .iter()
+                .any(|code| code == "unexpected_upstream_metadata_for_local_response")
+        );
+        let proxy = ResourceDataClient {
+            sender: None,
+            driver: None,
+            h2: true,
+            targets: vec![("a".into(), "127.0.0.1:8080".parse().expect("numeric peer"))],
+            local_response: false,
+        };
+        let mut missing = ResourceResponseFacts::blank("proxy".into(), "h2");
+        missing.status = Some(200);
+        proxy.check_peer_metadata(&mut missing, "/resource/payload");
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|code| code == "physical_peer_mismatch"),
+            "Proxy never infers local response from absent metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_rejects_empty_peer_table_before_any_network_io() {
+        let identity = identity().expect("test-only identity");
+        let config = client_config(&[&identity], &[b"h2"]).expect("verified client");
+        let result = ResourceDataClient::connect(
+            "127.0.0.1:0".parse().expect("invalid dial port unused"),
+            config,
+            true,
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            result
+                .err()
+                .expect("empty peers must fail")
+                .to_string()
+                .contains("Proxy requires 1..=3")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_local_client_records_actual_response_even_when_proxy_payload_cap_is_smaller()
+    {
+        use rustls::pki_types::pem::PemObject as _;
+        let identity = identity().expect("test-only TLS identity");
+        for h2 in [false, true] {
+            let alpn: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+            let config = client_config(&[&identity], &[alpn]).expect("verified client identity");
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+                identity.private_key_pem.as_bytes(),
+            )
+            .expect("ephemeral key");
+            let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.certificate_der.clone()], key)
+            .expect("matching test identity");
+            server.alpn_protocols = vec![alpn.to_vec()];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral fixture");
+            let address = listener.local_addr().expect("actual fixture socket");
+            let task = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("real client");
+                let socket = tokio_rustls::TlsAcceptor::from(Arc::new(server))
+                    .accept(socket)
+                    .await
+                    .expect("real TLS");
+                let service =
+                    hyper::service::service_fn(|_request: Request<hyper::body::Incoming>| async {
+                        Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                                .body(Full::new(Bytes::from_static(b"resource-respond")))
+                                .expect("local fixture response"),
+                        )
+                    });
+                if h2 {
+                    hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await
+                        .expect("HTTP2 server");
+                } else {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await
+                        .expect("HTTP1 server");
+                }
+            });
+            let mut client = ResourceDataClient::connect_local(address, config, h2)
+                .await
+                .expect("explicit local transport");
+            let raw = client
+                .measure(ResourceRequest {
+                    operation_id: "local-wire".into(),
+                    path: "/resource/respond".into(),
+                    grpc: false,
+                    cancel_after_first_data: false,
+                    payload_size: 1,
+                    upload_bytes: 0,
+                })
+                .await;
+            assert_eq!(raw.status, Some(200));
+            assert!(raw.eof && raw.error_code.is_none() && raw.diagnostics.is_empty());
+            assert_eq!(raw.body_bytes, 16);
+            let expected: String = Sha256::digest(b"resource-respond")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(raw.body_sha256, expected);
+            assert_eq!(
+                raw.content_type.as_deref(),
+                Some("text/plain; charset=utf-8")
+            );
+            assert!(
+                raw.upstream_peer.is_none()
+                    && raw.upstream_name.is_none()
+                    && raw.authority.is_none()
+                    && raw.server_name.is_none()
+                    && raw.path.is_none(),
+                "local response does not fabricate fixture metadata from transport"
+            );
+            client.close().await.expect("actual client driver exit");
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("actual fixture driver exit")
+                .expect("fixture did not panic");
+        }
+    }
+
+    #[test]
+    fn prelude_journal_keeps_all_started_operations_and_detects_lost_or_duplicate_terminals() {
+        let recorder = Arc::new(Mutex::new(PreludeRecorder::default()));
+        let mut completed =
+            PreludeGuard::begin(&recorder, "probe", "h2").expect("first ID before send");
+        let mut raw = ResourceResponseFacts::blank(completed.operation_id.clone(), "h2");
+        raw.started_ns = Some(completed.started_ns);
+        raw.status = Some(503);
+        raw.eof = true;
+        raw.ended_ns = Some(super::super::resource_identity::monotonic_ns().expect("actual clock"));
+        completed
+            .finish(&raw, "response_complete", "response_eof")
+            .expect("one terminal");
+        assert!(
+            completed
+                .finish(&raw, "response_complete", "response_eof")
+                .is_err(),
+            "duplicate cannot overwrite a terminal"
+        );
+        let abandoned = PreludeGuard::begin(&recorder, "held", "h2").expect("second ID");
+        let abandoned_id = abandoned.operation_id.clone();
+        drop(abandoned);
+        let mut failed = PreludeGuard::begin(&recorder, "probe", "h2").expect("third ID");
+        failed
+            .fail("response_head", "prelude_deadline")
+            .expect("explicit failure terminal");
+        let evidence = recorder
+            .lock()
+            .expect("journal")
+            .evidence()
+            .expect("raw evidence");
+        assert_eq!(evidence["prelude_counts"]["offered"], 3);
+        assert_eq!(evidence["prelude_counts"]["classified"], 3);
+        assert_eq!(evidence["prelude_counts"]["abandoned"], 1);
+        assert_eq!(
+            evidence["prelude_counts"]["violations"]
+                .as_array()
+                .expect("violations")
+                .len(),
+            1
+        );
+        let rows = evidence["prelude_operations"]
+            .as_array()
+            .expect("all issued IDs");
+        let ids: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["operation_id"].as_str().expect("unique ID"))
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let abandoned = rows
+            .iter()
+            .find(|row| row["operation_id"] == abandoned_id)
+            .expect("lost future has raw row");
+        assert_eq!(abandoned["terminal"], "abandoned");
+        assert_eq!(abandoned["raw"]["error_code"], "prelude_abandoned");
+        assert!(abandoned["raw"]["status"].is_null());
+        assert_eq!(abandoned["raw"]["eof"], false);
+    }
+
+    #[tokio::test]
+    async fn prelude_non_200_bodies_have_actual_eof_size_hash_and_strict_bound() {
+        let recorder = Arc::new(Mutex::new(PreludeRecorder::default()));
+        let mut operation = PreludeGuard::begin(&recorder, "probe", "h2").expect("offered probe");
+        let mut raw = ResourceResponseFacts::blank(operation.operation_id.clone(), "h2");
+        raw.started_ns = Some(operation.started_ns);
+        raw.status = Some(503);
+        let bytes = b"upstream unavailable";
+        let size = capture_bounded_prelude_body(
+            Full::new(Bytes::from_static(bytes)),
+            &mut raw,
+            Some(&operation),
+        )
+        .await
+        .expect("full safe rejection body");
+        assert_eq!(size, bytes.len() as u64);
+        let expected: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(raw.body_sha256, expected);
+        assert!(raw.eof && raw.data_observed);
+        operation
+            .finish(&raw, "response_complete", "response_eof")
+            .expect("classified rejection, not healthy 200");
+        let mut too_large = ResourceResponseFacts::blank("overflow".into(), "h2");
+        assert!(
+            capture_bounded_prelude_body(
+                Full::new(Bytes::from(vec![b'x'; 64 * 1024 + 1])),
+                &mut too_large,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            too_large.body_bytes,
+            64 * 1024 + 1,
+            "actually observed over-limit bytes are not zero"
+        );
+        assert!(!too_large.eof, "bound failure cannot claim full response");
+    }
+
+    #[tokio::test]
+    async fn tunnel_close_preserves_unclean_eof_and_rejects_other_errors_or_incomplete_echoes() {
+        struct CloseIo(std::io::ErrorKind);
+        impl AsyncRead for CloseIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0 == std::io::ErrorKind::Other {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(std::io::Error::from(self.0)))
+                }
+            }
+        }
+        impl AsyncWrite for CloseIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        for (kind, result, clean, allowed) in [
+            (std::io::ErrorKind::Other, "clean_eof", true, true),
+            (
+                std::io::ErrorKind::UnexpectedEof,
+                "peer_closed_without_close_notify",
+                false,
+                true,
+            ),
+            (std::io::ErrorKind::ConnectionReset, "error", false, false),
+        ] {
+            let mut raw = ResourceResponseFacts::blank("close".into(), "upgrade");
+            raw.status = Some(101);
+            raw.echo_iterations = 4;
+            raw.body_bytes = 80;
+            assert_eq!(
+                observe_tunnel_close(&mut CloseIo(kind), &mut raw, 4)
+                    .await
+                    .is_ok(),
+                allowed
+            );
+            assert_eq!(raw.eof, clean);
+            assert_eq!(raw.tunnel_close_result.as_deref(), Some(result));
+            assert!(raw.tunnel_client_shutdown);
+        }
+        let mut incomplete = ResourceResponseFacts::blank("incomplete".into(), "upgrade");
+        incomplete.status = Some(101);
+        incomplete.echo_iterations = 3;
+        incomplete.body_bytes = 60;
+        assert!(
+            observe_tunnel_close(
+                &mut CloseIo(std::io::ErrorKind::UnexpectedEof),
+                &mut incomplete,
+                4
+            )
+            .await
+            .is_err()
+        );
+        assert!(!incomplete.tunnel_client_shutdown && !incomplete.eof);
+        assert!(incomplete.tunnel_close_result.is_none());
+    }
+
     #[tokio::test]
     async fn resource_uploads_have_exact_wire_size_and_bounded_frames() {
         for grpc in [false, true] {
@@ -2821,6 +3979,7 @@ mod tests {
                 driver: Some(driver),
                 h2: false,
                 targets: Vec::new(),
+                local_response: false,
             };
             let receipt = client.close_receipt().await;
             assert_eq!(receipt["result"], expected);
@@ -2836,6 +3995,7 @@ mod tests {
             driver: None,
             h2: false,
             targets: Vec::new(),
+            local_response: false,
         }
         .close_receipt()
         .await;

@@ -98,6 +98,9 @@ struct DnsCounts {
     nxdomain_answers: AtomicU64,
     nodata_answers: AtomicU64,
     server_failure_answers: AtomicU64,
+    positive_aaaa_answers: AtomicU64,
+    srv_equal_weight_answers: AtomicU64,
+    srv_weighted_answers: AtomicU64,
 }
 
 impl DnsCounts {
@@ -165,9 +168,38 @@ impl DnsCounts {
                 &self.server_failure_answers,
                 message.response_code == ResponseCode::ServFail,
             ),
+            (&self.positive_aaaa_answers,message.answers.iter().any(|record|matches!(&record.data,RData::AAAA(_)))),
         ] {
             if present {
                 counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let rows: Vec<_> = message
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::SRV(data) => Some((
+                    data.target.to_ascii(),
+                    data.priority,
+                    data.weight,
+                    data.port,
+                )),
+                _ => None,
+            })
+            .collect();
+        if rows.len() == 2
+            && rows[0].0 == "a.discovery.test."
+            && rows[1].0 == "b.discovery.test."
+            && rows[0].1 == 0
+            && rows[1].1 == 0
+            && rows[0].3 == rows[1].3
+        {
+            if rows[0].2 == 1 && rows[1].2 == 1 {
+                self.srv_equal_weight_answers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if rows[0].2 == 3 && rows[1].2 == 1 {
+                self.srv_weighted_answers.fetch_add(1, Ordering::Relaxed);
             }
         }
         let mut rows = message.answers.iter().filter_map(|record| {
@@ -202,6 +234,9 @@ impl DnsCounts {
             "nxdomain_answers":self.nxdomain_answers.load(Ordering::Relaxed),
             "nodata_answers":self.nodata_answers.load(Ordering::Relaxed),
             "server_failure_answers":self.server_failure_answers.load(Ordering::Relaxed),
+            "positive_aaaa_answers":self.positive_aaaa_answers.load(Ordering::Relaxed),
+            "srv_equal_weight_answers":self.srv_equal_weight_answers.load(Ordering::Relaxed),
+            "srv_weighted_answers":self.srv_weighted_answers.load(Ordering::Relaxed),
         })
     }
 }
@@ -297,7 +332,10 @@ pub(super) async fn dns(root: PathBuf) -> Result<(), SoakError> {
                     "cname", "withdraw",
                 ];
                 if !allowed.contains(&mode.as_str())
-                    && !matches!(mode.as_str(), "timeout" | "v6" | "both_v6" | "weights")
+                    && !matches!(
+                        mode.as_str(),
+                        "timeout" | "v6" | "both_v6" | "weights" | "weights_equal"
+                    )
                 {
                     return json!({"ok":false});
                 }
@@ -347,6 +385,8 @@ fn dns_answer(query: Message, state: &DnsState, upstream: &Ready, tcp: bool) -> 
                         vec![("a.discovery.test", 0, 1), ("ipv6.discovery.test", 0, 1)]
                     } else if state.mode == "weights" {
                         vec![("a.discovery.test", 0, 3), ("b.discovery.test", 0, 1)]
+                    } else if state.mode == "weights_equal" {
+                        vec![("a.discovery.test", 0, 1), ("b.discovery.test", 0, 1)]
                     } else if state.mode == "b" {
                         vec![("b.discovery.test", 0, 1)]
                     } else if state.mode == "a" {
@@ -482,6 +522,24 @@ struct ResourceCancelReceipt {
     dropped_ns: Option<u64>,
 }
 
+fn record_cancellation(state: &UpstreamState, operation_id: String, body_bytes: u64) {
+    let mut receipts = state
+        .resource_cancellations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if receipts.len() >= 128 {
+        receipts.pop_front();
+        state
+            .resource_cancel_receipt_evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    receipts.push_back(ResourceCancelReceipt {
+        operation_id,
+        body_bytes,
+        dropped_ns: super::resource_identity::monotonic_ns().ok(),
+    });
+}
+
 #[derive(Clone, Default)]
 struct ResourceFault {
     mode: String,
@@ -588,22 +646,7 @@ impl Drop for ResourceStreamBody {
             self.state
                 .resource_cancelled_bodies
                 .fetch_add(1, Ordering::Release);
-            let mut receipts = self
-                .state
-                .resource_cancellations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if receipts.len() >= 128 {
-                receipts.pop_front();
-                self.state
-                    .resource_cancel_receipt_evictions
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            receipts.push_back(ResourceCancelReceipt {
-                operation_id: self.operation_id.clone(),
-                body_bytes: self.sent,
-                dropped_ns: super::resource_identity::monotonic_ns().ok(),
-            });
+            record_cancellation(&self.state, self.operation_id.clone(), self.sent);
         }
     }
 }
@@ -858,6 +901,8 @@ struct StreamBody {
     remaining: usize,
     release_epoch: u64,
     wait: Option<Pin<Box<tokio::time::Sleep>>>,
+    capture_operation_id: Option<String>,
+    sent: u64,
 }
 impl Body for StreamBody {
     type Data = Bytes;
@@ -867,6 +912,7 @@ impl Body for StreamBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
         if let Some(data) = self.data.take() {
+            self.sent += data.len() as u64;
             return Poll::Ready(Some(Ok(Frame::data(data))));
         }
         if self.hold && self.state.release_epoch.load(Ordering::Acquire) == self.release_epoch {
@@ -889,6 +935,7 @@ impl Body for StreamBody {
         if self.remaining > 0 {
             let size = self.remaining.min(1024);
             self.remaining -= size;
+            self.sent += size as u64;
             return Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; size])))));
         }
         if let Some(trailers) = self.trailers.take() {
@@ -906,6 +953,11 @@ impl Drop for StreamBody {
             && self.state.release_epoch.load(Ordering::Acquire) == self.release_epoch
         {
             self.state.cancellations.fetch_add(1, Ordering::Relaxed);
+            if self.sent > 0
+                && let Some(operation_id) = &self.capture_operation_id
+            {
+                record_cancellation(&self.state, operation_id.clone(), self.sent);
+            }
         }
     }
 }
@@ -1140,6 +1192,13 @@ async fn serve(
         state,
         completed: false,
         wait: None,
+        capture_operation_id: request
+            .headers()
+            .get("x-resource-operation-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("prelude:") && value.len() <= 128)
+            .map(str::to_owned),
+        sent: 0,
     }
     .boxed_unsync();
     let mut response = Response::builder()
@@ -1455,6 +1514,47 @@ mod tests {
                 ("b.discovery.test.".into(), 0, 1, 8443)
             ]
         );
+        let equal = srv_rows(&answer("weights_equal", service, RecordType::SRV));
+        let weighted = srv_rows(&answer("weights", service, RecordType::SRV));
+        assert_eq!(
+            equal,
+            vec![
+                ("a.discovery.test.".into(), 0, 1, 8443),
+                ("b.discovery.test.".into(), 0, 1, 8443)
+            ]
+        );
+        assert_eq!(
+            equal
+                .iter()
+                .map(|(target, priority, _, port)| (target, priority, port))
+                .collect::<Vec<_>>(),
+            weighted
+                .iter()
+                .map(|(target, priority, _, port)| (target, priority, port))
+                .collect::<Vec<_>>(),
+            "only weights change, not priority, port or identity"
+        );
+        let counts = DnsCounts::default();
+        assert_eq!(counts.status()["positive_aaaa_answers"], 0);
+        assert_eq!(counts.status()["srv_equal_weight_answers"], 0);
+        assert_eq!(
+            counts.status()["srv_weighted_answers"],
+            0,
+            "preparing answers alone is not coverage"
+        );
+        for (mode, name, kind) in [
+            ("v6", "api.discovery.test.", RecordType::AAAA),
+            ("weights_equal", service, RecordType::SRV),
+            ("weights", service, RecordType::SRV),
+        ] {
+            counts.response_written(
+                &answer(mode, name, kind).to_vec().expect("encoded packet"),
+                false,
+            );
+        }
+        assert_eq!(counts.status()["positive_aaaa_answers"], 1);
+        assert_eq!(counts.status()["srv_equal_weight_answers"], 1);
+        assert_eq!(counts.status()["srv_weighted_answers"], 1);
     }
 
     #[tokio::test]
@@ -2023,6 +2123,8 @@ mod tests {
             remaining: 0,
             release_epoch: 0,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         assert!(body.frame().await.expect("DATA").expect("frame").is_data());
         assert!(
@@ -2044,6 +2146,8 @@ mod tests {
             remaining: 0,
             release_epoch: 0,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         state.release_epoch.fetch_add(1, Ordering::Release);
         assert!(released.frame().await.is_none());
@@ -2058,9 +2162,53 @@ mod tests {
             remaining: 0,
             release_epoch: 1,
             wait: None,
+            capture_operation_id: None,
+            sent: 0,
         };
         drop(cancelled);
         assert_eq!(state.cancellations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_only_legacy_cancel_has_operation_bound_actual_drop_ack() {
+        let state = Arc::new(UpstreamState::default());
+        for polled in [false, true] {
+            let mut body = StreamBody {
+                data: Some(Bytes::from_static(b"data")),
+                trailers: None,
+                hold: true,
+                state: Arc::clone(&state),
+                completed: false,
+                remaining: 0,
+                release_epoch: 0,
+                wait: None,
+                capture_operation_id: Some(if polled { "prelude:2" } else { "prelude:1" }.into()),
+                sent: 0,
+            };
+            if polled {
+                body.frame().await.expect("actual DATA").expect("frame");
+            }
+            drop(body);
+        }
+        assert_eq!(
+            state.cancellations.load(Ordering::Acquire),
+            2,
+            "legacy counter policy remains unchanged"
+        );
+        assert_eq!(
+            state.resource_cancelled_bodies.load(Ordering::Acquire),
+            0,
+            "legacy body is not mislabeled as the new resource lane"
+        );
+        let receipts = state.resource_cancellations.lock().expect("bound receipt");
+        assert_eq!(
+            receipts.len(),
+            1,
+            "no actual DATA means no cancellation qualification ACK"
+        );
+        assert_eq!(receipts[0].operation_id, "prelude:2");
+        assert_eq!(receipts[0].body_bytes, 4);
+        assert!(receipts[0].dropped_ns.is_some());
     }
 
     #[tokio::test]

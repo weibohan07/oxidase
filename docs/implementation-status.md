@@ -4,9 +4,12 @@ Last updated: 2026-10-04
 
 Phase 7A.1 was delivered through protected PR #20 from
 `495a906`; actual object/task/IO census and pure authenticated read observation
-passed final-head and merged-main CI. Phase 7A.2 starts from `7bd6d48` to build
-independent Running qualification. Linux resource/memory qualification remains
-unclosed. See
+passed final-head and merged-main CI. Phase 7A.2 Draft PR #21 starts from
+`7bd6d48`: separate-process healthy/churn/isolated workloads, raw operation
+conservation, Running recovery/quiet windows, independent sampling and an offline
+positive/negative oracle are implemented. Real Linux smoke initially failed;
+those original artifacts are preserved while tool repairs undergo new checks.
+Formal Linux resource/memory qualification and attribution remain unclosed. See
 `docs/verification/resource-lifecycle-acceptance.md`. Version stays unchanged.
 
 ## Baseline

@@ -1,0 +1,39 @@
+{
+  "schema_version": "oxidase.resource-evidence-index/v1",
+  "source": "actual GitHub Actions PR-head run; original archives checksum-verified locally",
+  "pr": 21,
+  "head_commit": "c503ab59606dac3d9081ed7a8f11aa201920b0e7",
+  "checked_out_merge_commit": "9a49ded21a0030aee7dda7eb2ce2b37090f5723f",
+  "run_id": 37191938838,
+  "run_url": "https://github.com/weibohan07/oxidase/actions/runs/37191938838",
+  "result": "FAIL",
+  "artifacts": [
+    {
+      "job": "MSRV 1.88",
+      "job_id": 111405802103,
+      "artifact_id": 11299825079,
+      "archive_sha256": "fabff440a320a02435224ab0e635b0a9be7847c064c1f3088a342e9d3f451a75",
+      "observation": "Prelude Upgrade peer closed without TLS close_notify; no worker qualification",
+      "complete": false,
+      "conclusion": "FAIL_IMPLEMENTATION_SMOKE",
+      "root_cause_boundary": "validation tool demanded clean TLS EOF despite existing first-EOF tunnel cancellation contract; graceful TLS closure itself remains INCONCLUSIVE"
+    },
+    {
+      "job": "Stable workspace",
+      "job_id": 111405802240,
+      "artifact_id": 11298828178,
+      "archive_sha256": "82dfab9e30091a4531831ebfa55758f19e1abdaee43b8ae824c8ca1720ff075e",
+      "observation": "Sampler startup readiness deadline; no measured steady phase",
+      "complete": false,
+      "conclusion": "FAIL_IMPLEMENTATION_SMOKE",
+      "root_cause_boundary": "Exact original startup substage unavailable; debug executable hashing is a hypothesis pending new measured progress timestamps"
+    }
+  ],
+  "retention": "GitHub artifact retention is bounded; this index does not replace raw bytes. Download via gh api repos/weibohan07/oxidase/actions/artifacts/ARTIFACT_ID/zip and verify SHA-256 before replay.",
+  "excluded_claims": [
+    "No hour-scale Linux memory qualification ran",
+    "No zero counts are inferred from missing operation samples",
+    "Later repairs do not relabel either original run as PASS",
+    "These failures do not explain the historical phase-six positive RSS drift"
+  ]
+}

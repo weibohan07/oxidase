@@ -29,7 +29,8 @@ def parameters():
     params = json.loads(os.environ["RESOURCE_PARAMETERS"])
     allowed = {"duration", "warm_up", "recovery_running", "quiet_running", "post_drain",
                "concurrency", "payload_size", "upload_size", "seed", "scrape_interval_ms",
-               "sample_interval_ms", "formal", "profiling", "observation_disabled", "control_interval"}
+               "sample_interval_ms", "formal", "profiling", "observation_disabled", "control_interval",
+               "operation_interval_ms"}
     if not isinstance(params, dict) or set(params) - allowed:
         raise ValueError("unknown qualification parameter")
     if params.get("profiling", False):
@@ -43,6 +44,21 @@ def parameters():
                 raise ValueError(f"invalid bounded duration: {key}")
         elif not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{key} must be a nonnegative integer")
+    # The 150 minute job budget includes release compilation, immutable binary
+    # hashing, prelude, bounded in-flight collection, and evidence upload. Fail
+    # before building rather than let the runner kill a plausible final receipt.
+    defaults = {"duration": "60m", "warm_up": "3m", "recovery_running": "15m",
+                "quiet_running": "5m", "post_drain": "5m"}
+    phases = []
+    for key, default in defaults.items():
+        text = params.get(key, default)
+        match = re.fullmatch(r"([0-9]+)(ms|s|m)", text)
+        seconds = int(match[1]) * {"ms": 0.001, "s": 1, "m": 60}[match[2]]
+        if not 0 < seconds <= 7200:
+            raise ValueError(f"phase outside controller bounds: {key}")
+        phases.append(seconds)
+    if sum(phases) > 120 * 60:
+        raise ValueError("phase total exceeds 120 minutes; reserve 30 minutes for build/startup/collection/upload")
     return params
 
 
@@ -52,9 +68,14 @@ def preflight(output):
         raise ValueError("source_ref must be the exact checked-out commit")
     if capture(["git", "status", "--porcelain=v1"]):
         raise ValueError("qualification source must be clean")
-    if os.environ["RESOURCE_CAMPAIGN"] not in {"healthy", "churn"}:
-        raise ValueError("unknown H/C campaign")
+    campaign = os.environ["RESOURCE_CAMPAIGN"]
+    if campaign not in {"healthy", "churn", "respond", "static-proxy", "dns-only", "publish-only",
+                        "health-only", "dns-background-only", "h2-only", "h2-cancel",
+                        "grpc-only", "upgrade-only", "scrape-only"}:
+        raise ValueError("unknown H/C/I campaign")
     params = parameters()
+    if campaign not in {"healthy", "churn"} and params.get("formal", False):
+        raise ValueError("isolation experiment cannot claim formal H/C qualification")
     output.mkdir(parents=True, exist_ok=False)
     record = {"schema_version": "oxidase.resource-workflow/v1", "source_commit": source,
               "parameters": params, "campaign": os.environ["RESOURCE_CAMPAIGN"],

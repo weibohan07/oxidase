@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::client::{self, GatewayProcess, ResourceDataClient, ResourceRequest};
+use super::resource_controls::{ControlPlan, control_round};
 use super::resource_evidence::{self, JsonLines, OperationEvent};
 use super::resource_identity::{self, ProcessRole, monotonic_ns};
 use super::{
@@ -26,12 +27,12 @@ use crate::common::{client_config, identity, write_identity};
 const PHASES: [&str; 5] = ["warmup", "steady", "recovery", "quiet", "post_drain"];
 
 #[derive(Clone)]
-struct FaultInterval {
-    id: String,
-    start: u64,
-    end: Option<u64>,
+pub(super) struct FaultInterval {
+    pub(super) id: String,
+    pub(super) start: u64,
+    pub(super) end: Option<u64>,
 }
-type Faults = Arc<Mutex<Vec<FaultInterval>>>;
+pub(super) type Faults = Arc<Mutex<Vec<FaultInterval>>>;
 
 #[derive(Default)]
 struct LoadAdmission {
@@ -198,6 +199,7 @@ pub(super) fn build_record(gateway: &Path, output: &Path) -> Result<(), SoakErro
     let value = json!({"schema_version":"oxidase.resource-build/v1","source":identity,
         "gateway_sha256":file_digest(gateway)?,"tool_sha256":file_digest(&executable)?,
         "build_claim":"identity recorded after caller's documented build; no independent compile attestation",
+        "profile":if cfg!(debug_assertions){"debug"}else{"release"},
         "rustc":std::process::Command::new("rustc").arg("-Vv").output().map_err(io_error).and_then(|r|String::from_utf8(r.stdout).map_err(io_error))?});
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -254,7 +256,16 @@ impl Sampler {
                 .ok_or_else(|| fail("sampler output absent"))?,
         )
         .lines();
-        let line = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+        // Debug executables on CI are large. Identity verification deliberately
+        // full-hashes the running executable, before measured workload phases.
+        // A distinct debug-only startup allowance is not a production timeout
+        // change or a relaxation of the resource retirement budget.
+        let startup_budget = if cfg!(debug_assertions) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(15)
+        };
+        let line = tokio::time::timeout(startup_budget, output.next_line())
             .await
             .map_err(|_| fail("sampler readiness deadline"))?
             .map_err(io_error)?
@@ -337,6 +348,7 @@ fn validate(args: &ResourceArguments) -> Result<(), SoakError> {
         || args.payload_size == 0
         || args.payload_size > 16 * 1024 * 1024
         || args.upload_size > 16 * 1024 * 1024
+        || args.operation_interval_ms > 60000
         || args.sample_interval_ms < 100
         || args.sample_interval_ms > 60000
         || args.scrape_interval_ms > 60000
@@ -466,7 +478,15 @@ fn bounds(concurrency: usize) -> Value {
         ("response_body", concurrency + 8, 0),
         ("tunnel", concurrency + 4, 0),
     ] {
-        bounds.insert(kind.into(),json!({"live_max":max,"quiet_live_max":quiet,"post_drain_live_max":quiet,"retired_exit_budget_ms":120000,"exiting_exit_budget_ms":120000}));
+        let pool = matches!(kind, "proxy_pool_family" | "health_pool_family");
+        // hyper-util 0.1.20 checks age >90 s on a 90 s sweep. A 120 s
+        // observation deadline is therefore not its idle-retirement contract.
+        // Reserve the two sweeps plus this fixture's 10 s body/8 s head bounds
+        // and measurement/control scheduling. This is an experiment deadline,
+        // not a promised hard wall-clock guarantee of a private library driver.
+        let retire_ms = if pool { 210000 } else { 120000 };
+        bounds.insert(kind.into(),json!({"live_max":max,"quiet_live_max":quiet,"post_drain_live_max":quiet,"retired_exit_budget_ms":retire_ms,"exiting_exit_budget_ms":120000,
+            "basis":if pool{"registry <=1024; active clone families additionally held by bounded fixture work; private idle sweeps are not exact timer guarantees"}else{"fixed fixture concurrency/owners; not a global deployment capacity guarantee"}}));
     }
     Value::Object(bounds)
 }
@@ -492,8 +512,11 @@ fn recipes(
         recipes.insert(name.into(), recipe);
     }
     recipes.insert("upgrade".into(),json!({"status":101,"body":{"kind":"utf8","text":"qualification-tunnel".repeat(4)},"trailers":{},"allowed_peers":peers.iter().map(|(_,address)|address.to_string()).collect::<Vec<_>>(),"authority":"gateway.example.test","server_name":"gateway.example.test","path":"/base/ws"}));
-    if matches!(campaign, ResourceCampaign::Respond) {
-        recipes.insert("respond".into(),json!({"status":200,"content_type":"text/plain; charset=utf-8","body":{"kind":"utf8","text":"resource-respond"},"trailers":{},"allowed_peers":[null]}));
+    if matches!(
+        campaign,
+        ResourceCampaign::Respond | ResourceCampaign::ScrapeOnly
+    ) {
+        recipes.insert("respond".into(),json!({"status":200,"content_type":"text/plain; charset=utf-8","body":{"kind":"utf8","text":"resource-respond"},"trailers":{},"allowed_peers":[null],"upstream_expected":false}));
     }
     Value::Object(recipes)
 }
@@ -528,6 +551,8 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     )
     .map_err(io_error)?;
     let mut dns = FixtureProcess::spawn("dns", &root, &args.output).await?;
+    receipt["parameters"]["operation_interval_ns"] =
+        (args.operation_interval_ms * 1_000_000).into();
     let source = resource_source(&root, dns.ready.address, &upstream, args.campaign, 0);
     std::fs::write(root.join("gateway.yaml"), &source).map_err(io_error)?;
     std::fs::write(
@@ -577,6 +602,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     let h1 = client_config(&[&certificate], &[b"http/1.1"])?;
     let h2 = client_config(&[&certificate], &[b"h2"])?;
     let mut command_sequence = 0;
+    let preparation:Result<(String,String),SoakError>=async {
     let a = client::bundle(
         &args.gateway,
         &root,
@@ -631,7 +657,33 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
         )
         .await?;
         events.write(json!({"kind":"coverage","t_ns":monotonic_ns()?,"name":"old_held_grpc_and_upgrade","evidence":{"source":"wire","successful_new_b_streams":retained["successful_new_b_streams"],"raw":retained}}))?;
+        receipt["prelude_counts"]=retained["prelude_counts"].clone();
     }
+    Ok((a,b))
+    }.await;
+    let (a, b) = match preparation {
+        Ok(result) => result,
+        Err(error) => {
+            events.write(json!({"kind":"fatal","t_ns":monotonic_ns()?,"message":error.to_string(),"stage":"prelude"}))?;
+            events.flush()?;
+            // No worker operation was admitted yet, but the independently
+            // started sampler/probes still get a bounded durable close.
+            let results = [
+                sampler.stop().await,
+                gateway.stop().await,
+                dns.stop().await,
+                upstream.stop().await,
+            ];
+            receipt["cleanup_errors"] = json!(
+                results
+                    .into_iter()
+                    .filter_map(Result::err)
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+            );
+            return Err(error);
+        }
+    };
     dns.command(FixtureCommand::Dns {
         mode: "both".into(),
         ttl: 1,
@@ -676,19 +728,25 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     let mut workers = tokio::task::JoinSet::new();
     let load_enabled = !matches!(
         args.campaign,
-        ResourceCampaign::BackgroundOnly | ResourceCampaign::ScrapeOnly
+        ResourceCampaign::BackgroundOnly
+            | ResourceCampaign::HealthOnly
+            | ResourceCampaign::DnsBackgroundOnly
+            | ResourceCampaign::ScrapeOnly
     );
     receipt["parameters"]["traffic_required"] = load_enabled.into();
-    let extra_lanes = matches!(
+    let extra_cancel = matches!(
         args.campaign,
         ResourceCampaign::Healthy
             | ResourceCampaign::Churn
             | ResourceCampaign::DnsOnly
             | ResourceCampaign::PublishOnly
             | ResourceCampaign::StaticProxy
+            | ResourceCampaign::H2Cancel
     );
+    let extra_upgrade = extra_cancel && !matches!(args.campaign, ResourceCampaign::H2Cancel);
+    let extra_workers = usize::from(extra_cancel) + usize::from(extra_upgrade);
     receipt["parameters"]["admitted_worker_count"] = if load_enabled {
-        args.concurrency + if extra_lanes { 2 } else { 0 }
+        args.concurrency + extra_workers
     } else {
         0
     }
@@ -696,21 +754,27 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     receipt["parameters"]["actual_worker_count"] =
         receipt["parameters"]["admitted_worker_count"].clone();
     if load_enabled {
-        for worker in 0..args.concurrency + if extra_lanes { 2 } else { 0 } {
+        for worker in 0..args.concurrency + extra_workers {
             let send = send.clone();
             let stopped = stopped.clone();
             let phase = Arc::clone(&phase);
             let failed = Arc::clone(&failed);
             let lane = if matches!(args.campaign, ResourceCampaign::UpgradeOnly)
-                || extra_lanes && worker == args.concurrency + 1
+                || extra_upgrade && worker == args.concurrency + 1
             {
                 "upgrade"
-            } else if extra_lanes && worker == args.concurrency {
+            } else if extra_cancel && worker == args.concurrency {
                 "cancel"
             } else {
                 "complete"
             };
-            let config = if lane == "upgrade" || lane != "cancel" && worker.is_multiple_of(4) {
+            let config = if lane == "upgrade"
+                || lane != "cancel"
+                    && worker.is_multiple_of(4)
+                    && !matches!(
+                        args.campaign,
+                        ResourceCampaign::H2Only | ResourceCampaign::H2Cancel
+                    ) {
                 Arc::clone(&h1)
             } else {
                 Arc::clone(&h2)
@@ -734,6 +798,7 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
                     payload,
                     upload,
                     campaign,
+                    operation_interval: Duration::from_millis(args.operation_interval_ms),
                 },
                 send,
                 stopped,
@@ -782,6 +847,9 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
                             a: &a,
                             b: &b,
                             faults: &faults,
+                            gateway_address: gateway.address,
+                            h1: Arc::clone(&h1),
+                            h2: Arc::clone(&h2),
                         },
                         &mut dns,
                         &mut upstream,
@@ -920,17 +988,27 @@ async fn run_inner(args: &ResourceArguments, receipt: &mut Value) -> Result<(), 
     Ok(())
 }
 
-fn resource_source(
+pub(super) fn resource_source(
     root: &Path,
     dns: std::net::SocketAddr,
     upstream: &FixtureProcess,
     campaign: ResourceCampaign,
     generation: u64,
 ) -> String {
-    let source = client::source(
+    resource_source_for_address(root, dns, upstream.ready.address, campaign, generation)
+}
+
+fn resource_source_for_address(
+    root: &Path,
+    dns: std::net::SocketAddr,
+    upstream: std::net::SocketAddr,
+    campaign: ResourceCampaign,
+    generation: u64,
+) -> String {
+    let mut source = client::source(
         root,
         dns,
-        upstream.ready.address.port(),
+        upstream.port(),
         if matches!(campaign, ResourceCampaign::Churn) {
             Campaign::Protocol
         } else {
@@ -942,7 +1020,32 @@ fn resource_source(
         "      health:\n",
         "      load_balance:\n        policy: weighted_round_robin\n      health:\n",
     );
-    if matches!(campaign, ResourceCampaign::Respond) {
+    if matches!(
+        campaign,
+        ResourceCampaign::StaticProxy
+            | ResourceCampaign::PublishOnly
+            | ResourceCampaign::HealthOnly
+    ) {
+        let start = source
+            .find("      discovery:\n")
+            .expect("fixture discovery");
+        let end = source.find("      health:\n").expect("fixture health");
+        source.replace_range(
+            start..end,
+            &format!(
+                "      endpoints:\n        - name: a\n          url: https://{upstream}/base\n"
+            ),
+        );
+    }
+    if matches!(campaign, ResourceCampaign::DnsBackgroundOnly) {
+        let start = source.find("      health:\n").expect("fixture health");
+        let end = source.find("      retry:\n").expect("fixture retry");
+        source.replace_range(start..end, "");
+    }
+    if matches!(
+        campaign,
+        ResourceCampaign::Respond | ResourceCampaign::ScrapeOnly
+    ) {
         let begin = source
             .find("      service:\n        type: proxy")
             .expect("known fixture source");
@@ -950,24 +1053,17 @@ fn resource_source(
             .split_once("listeners:\n")
             .expect("known fixture source")
             .1;
-        format!(
+        let mut local = format!(
             "{}      service:\n        type: respond\n        headers:\n          set:\n            Content-Type: text/plain; charset=utf-8\n        body:\n          text: resource-respond\nlisteners:\n{suffix}",
             &source[..begin]
-        )
-    } else if matches!(
-        campaign,
-        ResourceCampaign::StaticProxy | ResourceCampaign::PublishOnly
-    ) {
-        let start = source
-            .find("      discovery:\n")
-            .expect("fixture discovery");
-        let end = source.find("      health:\n").expect("fixture health");
-        format!(
-            "{}      endpoints:\n        - name: a\n          url: https://{}/base\n{}",
-            &source[..start],
-            upstream.ready.address,
-            &source[end..]
-        )
+        );
+        // Unused resources are still prepared/supervised by the real runtime.
+        // A local-response/scrape isolation must remove the whole Cluster plan,
+        // not merely route business traffic around its DNS and health tasks.
+        let clusters = local.find("  clusters:\n").expect("fixture Cluster");
+        let services = local.find("services:\n").expect("fixture Services");
+        local.replace_range(clusters..services, "");
+        local
     } else {
         source
     }
@@ -983,6 +1079,7 @@ struct WorkerPlan {
     payload: usize,
     upload: usize,
     campaign: ResourceCampaign,
+    operation_interval: Duration,
 }
 
 async fn worker_loop(
@@ -996,7 +1093,13 @@ async fn worker_loop(
 ) -> Result<(), SoakError> {
     let mut sequence = 0u64;
     let mut client = None;
-    let h2 = plan.lane == "cancel" || plan.lane != "upgrade" && !plan.worker.is_multiple_of(4);
+    let h2 = plan.lane == "cancel"
+        || plan.lane != "upgrade"
+            && (!plan.worker.is_multiple_of(4)
+                || matches!(
+                    plan.campaign,
+                    ResourceCampaign::H2Only | ResourceCampaign::H2Cancel
+                ));
     loop {
         if *stop.borrow() || failed.load(Ordering::Acquire) {
             break;
@@ -1018,15 +1121,20 @@ async fn worker_loop(
         let mut connection_error = None;
         if plan.lane != "upgrade" && client.is_none() {
             connection_attempts = 1;
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                ResourceDataClient::connect(
-                    plan.address,
-                    Arc::clone(&plan.config),
-                    h2,
-                    plan.targets.clone(),
-                ),
-            )
+            match tokio::time::timeout(Duration::from_secs(5), async {
+                if matches!(plan.campaign, ResourceCampaign::Respond) {
+                    ResourceDataClient::connect_local(plan.address, Arc::clone(&plan.config), h2)
+                        .await
+                } else {
+                    ResourceDataClient::connect(
+                        plan.address,
+                        Arc::clone(&plan.config),
+                        h2,
+                        plan.targets.clone(),
+                    )
+                    .await
+                }
+            })
             .await
             {
                 Ok(Ok(connected)) => client = Some(connected),
@@ -1085,7 +1193,14 @@ async fn worker_loop(
                 client
                     .measure(ResourceRequest {
                         operation_id: format!("{}:{sequence}", plan.worker),
-                        path: format!("/resource/{recipe}?b=2&a=1&a=3"),
+                        path: format!(
+                            "/resource/{}?b=2&a=1&a=3",
+                            if recipe == "download" {
+                                "payload"
+                            } else {
+                                recipe
+                            }
+                        ),
                         grpc,
                         cancel_after_first_data: cancelled,
                         payload_size: plan.payload,
@@ -1158,9 +1273,16 @@ async fn worker_loop(
         .await
         .map_err(io_error)?;
         drop(guard);
-        if cancelled || upgrade {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let delay = if cancelled || upgrade {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_nanos(
+                started
+                    .saturating_add(plan.operation_interval.as_nanos() as u64)
+                    .saturating_sub(monotonic_ns()?),
+            )
+        };
+        wait_for_pacing(delay, &stop).await;
     }
     if let Some(client) = client {
         client.close().await?;
@@ -1172,150 +1294,140 @@ async fn read_runtime(root: &Path) -> Result<Value, SoakError> {
     serde_json::from_slice(&client::admin_read(root, "/api/v1/runtime").await?).map_err(json_error)
 }
 
-struct ControlPlan<'a> {
-    args: &'a ResourceArguments,
-    root: &'a Path,
-    a: &'a str,
-    b: &'a str,
-    faults: &'a Faults,
+async fn wait_for_pacing(delay: Duration, stop: &tokio::sync::watch::Receiver<bool>) {
+    if delay.is_zero() || *stop.borrow() {
+        return;
+    }
+    let mut stopped = stop.clone();
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {},
+        _ = stopped.changed() => {},
+    }
 }
-async fn control_round(
-    plan: ControlPlan<'_>,
-    dns: &mut FixtureProcess,
-    upstream: &mut FixtureProcess,
-    round: usize,
-    sequence: &mut u64,
-    events: &mut JsonLines,
-) -> Result<(), SoakError> {
-    let ControlPlan {
-        args,
-        root,
-        a,
-        b,
-        faults,
-    } = plan;
-    let before = read_runtime(root).await?;
-    if !matches!(args.campaign, ResourceCampaign::PublishOnly) {
-        let modes = ["both", "reverse", "v6", "both_v6", "a", "b", "both"];
-        let mode = modes[(round.wrapping_add(args.seed as usize)) % modes.len()];
-        let mode = if round.is_multiple_of(9) {
-            "weights"
-        } else {
-            mode
-        };
-        let acknowledged = dns
-            .command(FixtureCommand::Dns {
-                mode: mode.into(),
-                ttl: 1,
-            })
-            .await?;
-        let after = read_runtime(root).await?;
-        events.write(json!({"kind":"control","t_ns":monotonic_ns()?,"action":"dns","request_id":round,"before_runtime":before,"after_runtime":after,"fixture_ack":acknowledged,"mode":mode}))?;
-        if before != after {
-            return Err(fail("DNS observation changed complete PublishedRuntime"));
-        }
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pacing_does_not_delay_stop_or_leave_an_active_operation() {
+        let (signal, stop) = tokio::sync::watch::channel(false);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            entered.send(()).expect("waiter exists");
+            wait_for_pacing(Duration::from_secs(60), &stop).await;
+        });
+        started.await.expect("issued waiter");
+        signal.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("no minute-long delay after stop")
+            .expect("waiter joined");
+        let (_, already_stopped) = tokio::sync::watch::channel(true);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_pacing(Duration::from_secs(60), &already_stopped),
+        )
+        .await
+        .expect("already stopped admission is not paced");
     }
-    if matches!(
-        args.campaign,
-        ResourceCampaign::Churn | ResourceCampaign::PublishOnly
-    ) && round.is_multiple_of(4)
-    {
-        let operation = if round.is_multiple_of(8) {
-            ["rollback", a]
-        } else {
-            ["activate", b]
-        };
-        let mut command = client::ctl(root, &operation);
-        command.splice(
-            1..1,
-            [
-                "--if-match".into(),
-                before["etag"]
-                    .as_str()
-                    .ok_or_else(|| fail("published ETag missing"))?
-                    .into(),
-            ],
-        );
-        let mutation_receipt =
-            client::command_json(&args.gateway, &command, &args.output, sequence).await?;
-        let after = read_runtime(root).await?;
-        events.write(json!({"kind":"control","t_ns":monotonic_ns()?,"action":operation[0],"request_id":round,"before_runtime":before,"after_runtime":after,"mutation_receipt":mutation_receipt}))?;
-    }
-    if matches!(args.campaign, ResourceCampaign::Churn) && round.is_multiple_of(12) {
-        // B stays healthy and eligible. Faults affect A's data path; a finite
-        // separately declared all-withdrawal window is a different experiment.
-        dns.command(FixtureCommand::Dns {
-            mode: "weights".into(),
-            ttl: 1,
-        })
-        .await?;
-        upstream
-            .command(FixtureCommand::Health {
-                healthy_a: true,
-                healthy_b: true,
-                retry_a: false,
-            })
-            .await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let start = monotonic_ns()?;
-        let id = format!("fault-{round}");
-        {
-            let mut windows = faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if windows.len() >= 256 {
-                return Err(fail("named fault window capacity exhausted"));
+
+    #[test]
+    fn isolation_sources_compile_without_hidden_cluster_work() {
+        let directory = tempfile::tempdir().expect("isolated fixture source");
+        let root = directory.path();
+        write_identity(root, &identity().expect("test-only identity")).expect("test material");
+        std::fs::write(
+            root.join("admin.token"),
+            b"test-only-resource-fixture-token\n",
+        )
+        .expect("test-only token");
+        std::fs::write(root.join("signing.key"), [31u8; 32]).expect("test-only key");
+        let key = oxidase_bundle::BundleSigningKey::read_file(root.join("signing.key"))
+            .expect("test-only signing key");
+        std::fs::write(root.join("operator.pub"), key.verification_key().as_bytes())
+            .expect("public test key");
+        let dns = "127.0.0.1:5300".parse().expect("syntax only; no dial");
+        let upstream = "127.0.0.1:8443".parse().expect("syntax only; no dial");
+        for campaign in [
+            ResourceCampaign::Respond,
+            ResourceCampaign::ScrapeOnly,
+            ResourceCampaign::HealthOnly,
+            ResourceCampaign::DnsBackgroundOnly,
+            ResourceCampaign::H2Only,
+            ResourceCampaign::H2Cancel,
+            ResourceCampaign::StaticProxy,
+        ] {
+            let source = resource_source_for_address(root, dns, upstream, campaign, 0);
+            let path = root.join("gateway.yaml");
+            std::fs::write(&path, &source).expect("fixture source");
+            let compiled = oxidase_config::Compiler::compile_path(path)
+                .unwrap_or_else(|error| panic!("{campaign:?} isolation source: {error}"));
+            match campaign {
+                ResourceCampaign::Respond | ResourceCampaign::ScrapeOnly => {
+                    assert!(
+                        compiled.resources.clusters.is_empty(),
+                        "no hidden supervisors"
+                    );
+                }
+                ResourceCampaign::HealthOnly | ResourceCampaign::StaticProxy => {
+                    assert!(!source.contains("      discovery:\n"));
+                    assert!(source.contains("      endpoints:\n"));
+                    assert!(source.contains("      health:\n"));
+                }
+                ResourceCampaign::DnsBackgroundOnly => {
+                    assert!(source.contains("      discovery:\n"));
+                    assert!(!source.contains("      health:\n"));
+                }
+                _ => assert_eq!(compiled.resources.clusters.len(), 1),
             }
-            windows.push(FaultInterval {
-                id: id.clone(),
-                start,
-                end: None,
-            });
         }
-        let mode = if round.is_multiple_of(24) {
-            "header_delay"
-        } else {
-            "mid_body_error"
-        };
-        let counter = if mode == "header_delay" {
-            "resource_header_delays_started"
-        } else {
-            "resource_mid_body_errors_emitted"
-        };
-        let before_status = upstream.command(FixtureCommand::Status).await?;
-        upstream
-            .command(FixtureCommand::ResourceFault {
-                mode: mode.into(),
-                target: "a".into(),
-                delay_ms: 6000,
-                after_bytes: 1024,
-                case_id: round as u64,
-            })
-            .await?;
-        tokio::time::sleep(Duration::from_secs(7)).await;
-        upstream
-            .command(FixtureCommand::ResourceFault {
-                mode: "none".into(),
-                target: "all".into(),
-                delay_ms: 0,
-                after_bytes: 0,
-                case_id: 0,
-            })
-            .await?;
-        // Frozen before measurement: eight-second logical pre-response total
-        // plus 500 ms ejection and one resolver refresh slot. No retrospective
-        // allowance expansion or logical-request deadline refresh.
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let end = monotonic_ns()?;
-        if let Some(window) = faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_mut()
-        {
-            window.end = Some(end);
-        }
-        let after_status = upstream.command(FixtureCommand::Status).await?;
-        events.write(json!({"kind":"fault_window","t_ns":end,"id":id,"start_ns":start,"end_ns":end,"recovery_deadline_ns":end+12_000_000_000u64,"target":"upstream","lanes":["churn","cancel"],"allowed":if mode=="header_delay"{json!([{"status":504},{"status":503}])}else{json!([{"error_stage":"response_body","error_code":"body_error"},{"status":503}])},"trigger":{"source":"fixture_counter","name":counter,"before":before_status[counter],"after":after_status[counter]},"fixture_before":before_status,"fixture_after":after_status}))?;
     }
-    Ok(())
+
+    #[tokio::test]
+    async fn phase_barrier_collects_old_work_before_reopening_admission() {
+        let admission = Arc::new(LoadAdmission::default());
+        let (_, stop) = tokio::sync::watch::channel(false);
+        let failed = AtomicBool::new(false);
+        let old = admission.begin(&stop, &failed).await.expect("old phase");
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let paused = Arc::clone(&admission);
+        let mut transition = tokio::spawn(async move {
+            entered.send(()).expect("observed task entry");
+            paused.pause().await
+        });
+        entering.await.expect("transition scheduled");
+        tokio::task::yield_now().await;
+        assert!(admission.state.lock().expect("state").0);
+        assert_eq!(admission.state.lock().expect("state").1, 1);
+        assert!(
+            !transition.is_finished(),
+            "started work cannot be discarded"
+        );
+        drop(old);
+        tokio::time::timeout(Duration::from_secs(1), &mut transition)
+            .await
+            .expect("actual old guard release")
+            .expect("task")
+            .expect("collected boundary");
+        assert_eq!(admission.state.lock().expect("state").1, 0);
+        admission.resume();
+        let next = admission.begin(&stop, &failed).await.expect("new phase");
+        assert_eq!(admission.state.lock().expect("state").1, 1);
+        drop(next);
+        assert_eq!(admission.state.lock().expect("state").1, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_only_rejects_new_admission_and_preserves_issued_guard() {
+        let admission = Arc::new(LoadAdmission::default());
+        let (signal, stop) = tokio::sync::watch::channel(false);
+        let failed = AtomicBool::new(false);
+        let issued = admission.begin(&stop, &failed).await.expect("issued");
+        signal.send_replace(true);
+        assert!(admission.begin(&stop, &failed).await.is_none());
+        assert_eq!(admission.state.lock().expect("state").1, 1);
+        drop(issued);
+        assert_eq!(admission.state.lock().expect("state").1, 0);
+    }
 }

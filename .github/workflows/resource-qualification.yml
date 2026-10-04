@@ -12,7 +12,7 @@ on:
         default: both
         required: true
         type: choice
-        options: [both, healthy, churn]
+        options: [both, healthy, churn, respond, static-proxy, dns-only, publish-only, health-only, dns-background-only, h2-only, h2-cancel, grpc-only, upgrade-only, scrape-only]
       parameters:
         description: Explicit bounded phase/load/sampling parameters (profiling defaults off)
         required: true

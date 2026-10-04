@@ -87,7 +87,8 @@ async fn healthy_resource_run_preserves_raw_evidence_and_independent_replay() {
         String::from_utf8_lossy(&record.stderr)
     );
     let run = tokio::time::timeout(
-        Duration::from_secs(120),
+        // Full debug executable identity hashing is startup, not workload time.
+        Duration::from_secs(240),
         Command::new(executable)
             .arg("resource-run")
             .arg("--gateway")

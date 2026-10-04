@@ -1,8 +1,10 @@
 # Resource qualification evidence v1 (validation-only)
 
 The independent analyzer reads `receipt.json`, `identity.json`, `events.jsonl`,
-`buckets.jsonl`, `errors.jsonl`, and `samples.jsonl` (a `.gz` suffix is also
-supported). All timestamps are integer Linux `CLOCK_MONOTONIC` nanoseconds, not
+`buckets.jsonl`, `errors.jsonl`, and `samples.jsonl`, plus the applicable
+`prelude-operations.json`, `control-probes.jsonl`, and
+`control-operations.jsonl` journals (a `.gz` suffix is also supported).
+All timestamps are integer Linux `CLOCK_MONOTONIC` nanoseconds, not
 wall clock or an index. Files retain capture order. Unknown optional fields are
 allowed; missing required evidence is never filled with zero.
 
@@ -22,6 +24,8 @@ allowed; missing required evidence is never filled with zero.
 - `bounds: {kind: {live_max,retired_exit_budget_ms,exiting_exit_budget_ms?}}`;
   optional `quiet_live_max` and `post_drain_live_max` apply to those phases.
   Bounds are frozen before a run, not derived from observed peaks.
+  An observed kind without a structural capacity/exit budget makes that formal
+  criterion `INCONCLUSIVE`; bounds for ten kinds cannot qualify all 31 kinds.
 - `required_gauges: [name]`, `coverage_required: [name]`, and `recipes` below.
 - `final_counts: {offered,connection_attempts,admitted_http_operations,
   received_operations,workers:[{worker_id,offered,connection_attempts,
@@ -41,6 +45,13 @@ the entire PublishedRuntime JSON. A `coverage` adds `name,evidence` with an
 actual counter increase, or a wire operation identity. Boolean toggle/pass
 evidence is insufficient. `held_release` records a real flow release. `fatal`
 records panic, timeout, evidence write failure, or abandoned work.
+Windows may add `failure_peers`, `fault_case_id`, and `recovery_peers` to isolate
+the exact fixture/endpoint. Recovery requires a new operation started after
+the window, completed before its deadline, on each affected physical peer.
+An already-running request or a healthy response from B cannot prove A recovered.
+Post-head failure still checks received DATA prefix SHA-256 and metadata; an
+injection cannot excuse corrupt DATA. Expected 503/504 responses must contain
+the complete fixed safe response (`Service Unavailable` / `Gateway Timeout`).
 
 Each one-second worker bucket contains `writer_seq,bucket_start_ns,bucket_end_ns,
 worker_id,first_operation_seq,last_operation_seq,offered,connection_attempts,
@@ -112,6 +123,62 @@ Only a resource capture with unchanged sequence and zero writers at both ends
 permits exact creation/destruction/state conservation checks. This is not a
 globally atomic snapshot. Current legal owners are distinguished from retired
 or exiting objects; Running does not require all resource gauges to be zero.
+
+For Respond-only isolation, a recipe explicitly sets `upstream_expected:false`;
+it is allowed only in campaign I, with absent upstream metadata. H/C retain
+strict physical endpoint/SNI/authority/path checks.
+
+`control-probes.jsonl` uses `oxidase.resource-control-probe/v1`. Its Started row
+has `writer_seq,operation_id,start_ns,phase,scenario,protocol,recipe,target,
+window_id,request:{path,grpc,payload_bytes,upload_bytes}`. Terminal repeats its
+identity, adds `end_ns,connection_attempts,admitted,raw,driver_exit`, and must
+pair with exactly one Started. Its recipe is independently reconstructed from
+the fixed fixture request, not the reply. Coverage references `operation_id`.
+These probes are classified separately and cannot inflate worker denominators.
+
+`control-operations.jsonl` uses `oxidase.resource-control-operation/v1` and
+records only `control_round` Admin reads, fixture IPC and CLI mutations. Started
+has `writer_seq,operation_id,start_ns,operation,request`; Terminal adds
+`end_ns,classification,raw`. The analyzer recomputes terminal results from
+Admin status/complete EOF/driver join, fixture ACK, or CLI mutation receipt.
+Cancellation without an actual join receipt is failed/unknown evidence, not a
+fabricated zero. An intentional Admin driver abort *after* complete body EOF is
+separately accepted only with actual cancellation/join acknowledgement.
+Mutation acknowledgement alone cannot prove publication: actual revision,
+ETag and origin transitions are independently checked. This scope does not
+claim that bootstrap, sampler startup or every legacy internal action is journaled.
+
+`prelude-operations.json` has `schema_version: oxidase.resource-prelude/v1`,
+advisory `result`, and `evidence:{prelude_counts,prelude_operations}`. Every
+allocated `prelude:N` has `role,terminal,cause,raw,acknowledgement`; counts include
+offered/classified/abandoned and per-role totals. Retained proof wire facts must
+exactly match their operation identities in this full denominator. Raw protocol,
+DATA SHA-256, EOF, trailers and peer metadata are independently checked. Cancel
+ACK failure or any abandoned operation cannot count as completion.
+Initialization 503 is permitted only for `held` within its explicit <=8s window;
+withdrawal 503 only for `probe` within its explicit <=10s window. Both require
+complete safe response content, not just status. No allowance becomes steady H/C.
+
+The cancellation ACK is the fixture's actual Body Drop receipt:
+`{operation_id,body_dropped_after_data,body_bytes,dropped_ns,termination}`.
+It must identify the offered operation and contain a legal DATA prefix; a bare
+`fixture_cancel_ack:true` cannot qualify a formal cancel lane. The Drop may race
+the client's local timestamp but must remain inside the collected ACK deadline.
+
+Upgrade telemetry distinguishes normal DATA EOF from tunnel shutdown. A planned
+close requires all four (steady) or eight (retained) exact echo responses,
+actual request-head write, explicit client shutdown and observed peer termination.
+`tunnel_close_result:peer_closed_without_close_notify` retains `eof:false` and
+an `INCONCLUSIVE` graceful TLS-close criterion. It is not an HTTP body EOF or a
+blanket exception for timeout/reset/corrupt echo; those still fail.
+
+Real non-synthetic captures must retain all 31 census kinds. A finite closed
+`drain_transition` (<=45s) is the only allowance for state changes while the
+sampler hands Quiet over to post-drain; it cannot replace the requested Running
+Quiet duration. Zero-scrape isolation retains first/final facts but has an
+`INCONCLUSIVE` Running lifecycle criterion; OS sampling remains independently
+continuous. Sampling never forward-fills PSS/private-dirty values when smaps is
+not due, and verifies all process identities rather than only the gateway.
 
 Reports use `PASS_IMPLEMENTATION`, `PASS_BOUNDED_QUALIFICATION`, `INCONCLUSIVE`,
 or `FAIL` per criterion. Formal minimum duration is not inferred from the requested

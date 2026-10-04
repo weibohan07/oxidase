@@ -12,6 +12,7 @@ import argparse
 from collections import Counter, defaultdict
 import gzip
 import hashlib
+import ipaddress
 import json
 import math
 from pathlib import Path
@@ -27,6 +28,7 @@ MAX_FILE_BYTES = 1 << 30
 MAX_LINE_BYTES = 2 << 20
 MAX_ROWS = 5_000_000
 MAX_ERRORS = 100_000
+MAX_PROBES = 50_000
 MAX_FINDINGS = 200
 ROLES = ("gateway", "controller", "dns", "upstream", "sampler")
 HEX256 = re.compile(r"^[0-9a-f]{64}$")
@@ -34,6 +36,13 @@ COMMIT = re.compile(r"^[0-9a-f]{40}$")
 COUNT_KEYS = ("offered", "connection_attempts", "admitted_http_operations", "received_operations")
 OPTIONAL_COUNT_KEYS = ("admitted_upgrade_operations",)
 STATES = ("candidate", "current", "live", "scheduled", "running", "waiting", "exiting", "retired")
+RESOURCE_KINDS = frozenset((
+    "snapshot_preparation", "snapshot", "cluster", "cluster_runtime", "endpoint", "endpoint_admission",
+    "discovery_lease", "cluster_permit", "endpoint_permit", "retry_permit", "health_supervisor", "health_probe",
+    "discovery_supervisor", "discovery_round", "dns_query", "dns_failure_memo", "proxy_pool_entry", "health_pool_entry",
+    "proxy_pool_family", "health_pool_family", "upstream_tcp_connection", "upstream_tls_connection",
+    "upstream_connect_attempt", "upstream_tls_handshake", "warm_socket_slot", "warm_expiry_task", "upstream_task",
+    "upstream_upload_task", "dispatch_retirement_task", "response_body", "tunnel"))
 
 
 class EvidenceError(Exception):
@@ -126,14 +135,15 @@ class Inputs:
                     raise EvidenceError(f"{name}:{index}: row must be an object")
                 yield index, row
 
-    def document(self, name):
+    def document(self, name, maximum=MAX_LINE_BYTES):
         path = self.path(name)
         if path.suffix == ".gz":
             with gzip.open(path, "rb") as stream:
-                raw = stream.read(MAX_LINE_BYTES + 1)
+                raw = stream.read(maximum + 1)
         else:
-            raw = path.read_bytes()
-        if len(raw) > MAX_LINE_BYTES:
+            with path.open("rb") as stream:
+                raw = stream.read(maximum + 1)
+        if len(raw) > maximum:
             raise EvidenceError(f"document exceeds size limit: {name}")
         result = parse_json(raw.decode("utf-8"))
         if not isinstance(result, dict):
@@ -174,6 +184,13 @@ class Analyzer:
         self.publications = 0
         self.raw_histogram = Counter()
         self.digest_cache = {}
+        self.probe_references = []
+        self.probes = {}
+        self.retained_proofs = []
+        self.unbounded_kinds = set()
+        self.first_metric = {}
+        self.last_metric = {}
+        self.actual_ipv6_responses = 0
 
     def finding(self, code, message, result="FAIL", **context):
         self.finding_count[result] += 1
@@ -284,6 +301,13 @@ class Analyzer:
             elif kind == "fault_window":
                 window = {key: required(row, key) for key in
                           ("id", "start_ns", "end_ns", "recovery_deadline_ns", "target", "lanes", "allowed", "trigger")}
+                if "recovery_peer" in row:
+                    window["recovery_peers"] = [row["recovery_peer"]]
+                elif "recovery_peers" in row:
+                    window["recovery_peers"] = row["recovery_peers"]
+                for key in ("failure_peers", "fault_case_id"):
+                    if key in row:
+                        window[key] = row[key]
                 if window["id"] in self.windows:
                     raise EvidenceError("duplicate fault window")
                 if not (integer(window["start_ns"], "window start") < integer(window["end_ns"], "window end")
@@ -293,12 +317,47 @@ class Analyzer:
                     self.finding("RL_FAULT_WINDOW", "fault window lacks closed target/lane/outcome evidence", id=window["id"])
                 if not self.counter_trigger(window["trigger"]):
                     self.finding("RL_TRIGGER", "fault command lacks actual trigger counter evidence", id=window["id"])
+                else:
+                    trigger = dict(window["trigger"])
+                    if "fixture_before" in row and "fixture_after" in row:
+                        trigger.setdefault("before_raw", row["fixture_before"])
+                        trigger.setdefault("after_raw", row["fixture_after"])
+                    delta = self.raw_counter_delta(trigger)
+                    if delta is None and not self.receipt.get("synthetic"):
+                        self.finding("RL_TRIGGER", "fault trigger lacks original counter observations", "INCONCLUSIVE", id=window["id"])
+                    elif delta is not None and delta <= 0:
+                        self.finding("RL_TRIGGER", "fault trigger has no independently observed counter increase", id=window["id"])
                 self.windows[window["id"]] = window
             elif kind == "coverage":
                 name = required(row, "name")
                 evidence = required(row, "evidence")
-                if self.counter_trigger(evidence):
-                    self.coverage[name] += evidence["after"] - evidence["before"]
+                if evidence.get("source") == "control_probe":
+                    self.probe_references.append((name, evidence))
+                elif evidence.get("source") == "runtime_publication":
+                    before, after = required(evidence, "before_runtime"), required(evidence, "after_runtime")
+                    action = required(evidence, "action")
+                    expected_digest = evidence.get("digest")
+                    correct_digest = expected_digest is None or after.get("bundle_digest") == expected_digest
+                    if self.publication_proven(before, after, action) and correct_digest:
+                        self.coverage[name] += 1
+                    else:
+                        self.finding("RL_PUBLICATION_EVIDENCE", "coverage has no real authorized publication change", behavior=name)
+                elif evidence.get("source") == "cluster_membership":
+                    if name == "srv_weight_change" and self.weight_change_proven(evidence):
+                        self.coverage[name] += 1
+                    else:
+                        self.finding("RL_MEMBERSHIP_EVIDENCE", "coverage has no precise weight-only member transition", behavior=name)
+                elif self.counter_trigger(evidence):
+                    delta = self.raw_counter_delta(evidence)
+                    if delta is None:
+                        if self.receipt.get("parameters", {}).get("formal"):
+                            self.finding("RL_TRIGGER", "formal counter trigger lacks original before/after observations", "INCONCLUSIVE", behavior=name)
+                        else:
+                            self.coverage[name] += evidence["after"] - evidence["before"]
+                    elif delta > 0:
+                        self.coverage[name] += delta
+                    else:
+                        self.finding("RL_TRIGGER", "raw counter did not actually increase", behavior=name)
                 elif name == "old_held_grpc_and_upgrade" and evidence.get("source") == "wire":
                     self.retained_proof(evidence)
                 else:
@@ -374,10 +433,75 @@ class Analyzer:
     @staticmethod
     def counter_trigger(value):
         return (isinstance(value, dict) and value.get("source") in
-                ("fixture_counter", "metrics_counter", "wire_counter") and
+                ("fixture_counter", "metrics_counter", "cluster_counter", "wire_counter") and
                 isinstance(value.get("before"), int) and not isinstance(value.get("before"), bool) and
                 isinstance(value.get("after"), int) and not isinstance(value.get("after"), bool) and
                 0 <= value["before"] < value["after"])
+
+    def raw_counter_delta(self, evidence):
+        name = evidence.get("name")
+        if not isinstance(name, str):
+            return None
+        if "before_metrics" in evidence and "after_metrics" in evidence:
+            before = self.metrics(evidence["before_metrics"]).get(name)
+            after = self.metrics(evidence["after_metrics"]).get(name)
+        elif "before_raw" in evidence and "after_raw" in evidence:
+            def values(tree):
+                if isinstance(tree, dict):
+                    found = [number(tree[name], f"raw counter {name}")] if name in tree and isinstance(tree[name], (int, float)) else []
+                    for key, value in tree.items():
+                        if key != name:
+                            found.extend(values(value))
+                    return found
+                if isinstance(tree, list):
+                    return [item for value in tree for item in values(value)]
+                return []
+            left, right = values(evidence["before_raw"]), values(evidence["after_raw"])
+            before, after = sum(left) if left else None, sum(right) if right else None
+        else:
+            return None
+        if before is None or after is None:
+            self.finding("RL_TRIGGER", "named raw counter is unavailable")
+            return 0
+        if "before" in evidence and (before != evidence["before"] or after != evidence.get("after")):
+            self.finding("RL_TRIGGER", "declared counter delta contradicts original raw observations")
+            return 0
+        return after - before
+
+    @staticmethod
+    def publication_proven(before, after, action):
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return False
+        if before.get("schema_version") != "oxidase.admin/v1" or after.get("schema_version") != "oxidase.admin/v1":
+            return False
+        old, new = before.get("runtime_revision"), after.get("runtime_revision")
+        if (not isinstance(old, int) or isinstance(old, bool) or not isinstance(new, int) or isinstance(new, bool) or
+                old < 0 or new <= old or not isinstance(before.get("etag"), str) or not isinstance(after.get("etag"), str) or
+                before["etag"] == after["etag"]):
+            return False
+        origin = after.get("origin")
+        kind = origin.get("kind") if isinstance(origin, dict) else None
+        return (action in ("activate", "rollback") and kind == "bundle") or (action == "reload-source" and kind == "source")
+
+    @staticmethod
+    def weight_change_proven(evidence):
+        def targets(value):
+            if not isinstance(value, dict) or not isinstance(value.get("clusters"), list):
+                return None
+            result = {}
+            for cluster in value["clusters"]:
+                discovery = cluster.get("discovery")
+                if not isinstance(discovery, dict):
+                    continue
+                for row in discovery.get("srv_targets", []):
+                    key = (cluster.get("cluster"), row.get("target"), row.get("port"), row.get("priority"))
+                    if key in result or not isinstance(row.get("weight"), int):
+                        return None
+                    result[key] = row["weight"]
+            return result
+        before = targets(evidence.get("before_raw", evidence.get("before")))
+        after = targets(evidence.get("after_raw", evidence.get("after")))
+        return bool(before) and bool(after) and before.keys() == after.keys() and before != after
 
     def load_errors(self):
         for _, row in self.inputs.rows("errors.jsonl"):
@@ -397,9 +521,324 @@ class Analyzer:
             self.errors[key] = row
             self.errors_by_worker[key[0]][key[1]] = row
 
+    def optional_file(self, name):
+        return (self.inputs.directory / name).is_file() or (self.inputs.directory / (name + ".gz")).is_file()
+
+    def load_controls(self):
+        """A separate denominator for control_round Admin/fixture/CLI work."""
+        if not self.optional_file("control-operations.jsonl"):
+            if not self.receipt.get("synthetic") and self.receipt["parameters"].get("campaign") == "C":
+                self.finding("RL_CONTROL_RESULT", "C control rounds lack their independent started/terminal journal")
+            return
+        pending, completed, sequence = {}, set(), 0
+        for _, row in self.inputs.rows("control-operations.jsonl"):
+            if row.get("schema_version") != "oxidase.resource-control-operation/v1":
+                raise EvidenceError("unknown control operation schema")
+            current = integer(required(row, "writer_seq"), "control writer_seq", 1)
+            if current != sequence + 1:
+                raise EvidenceError("control operation writer sequence missing or duplicated")
+            sequence = current
+            operation_id = required(row, "operation_id")
+            if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 128:
+                raise EvidenceError("invalid control operation identity")
+            kind = required(row, "kind")
+            if kind == "started":
+                if operation_id in pending or operation_id in completed or len(pending) + len(completed) >= MAX_PROBES:
+                    raise EvidenceError("duplicate or excessive control operation identity")
+                integer(required(row, "start_ns"), "control start")
+                if row.get("operation") not in ("admin_read", "fixture_ipc", "cli_mutation"):
+                    raise EvidenceError("unknown control operation kind")
+                required(row, "request")
+                pending[operation_id] = row
+                self.counts["control_operations.offered"] += 1
+                continue
+            if kind != "terminal" or operation_id not in pending:
+                raise EvidenceError("control terminal is duplicated or lacks Started")
+            started = pending.pop(operation_id)
+            completed.add(operation_id)
+            start = integer(required(row, "start_ns"), "control terminal start")
+            end = integer(required(row, "end_ns"), "control terminal end")
+            if start != started["start_ns"] or end < start:
+                raise EvidenceError("control terminal changed start identity or moved time backwards")
+            if self.phase_at(start) != "steady" or self.phase_at(end) not in ("steady", "recovery"):
+                self.finding("RL_CONTROL_PHASE", "control round operation escaped its bounded Running phase")
+            raw, request = required(row, "raw"), started["request"]
+            if not isinstance(raw, dict) or not isinstance(request, dict):
+                raise EvidenceError("control request and raw result must be objects")
+            self.counts["control_operations.received"] += 1
+            proven = False
+            operation = started["operation"]
+            if operation == "admin_read":
+                if request.get("path") not in ("/api/v1/runtime", "/api/v1/clusters", "/metrics"):
+                    self.finding("RL_CONTROL_REQUEST", "Admin read is outside the fixed qualification routes")
+                driver = raw.get("driver_exit")
+                joined = isinstance(driver, dict) and driver.get("join_acknowledged") is True
+                cleanup_cancel = joined and driver.get("result") == "cancelled" and driver.get("abort_requested") is True
+                completed_driver = joined and driver.get("result") == "completed"
+                if not (completed_driver or cleanup_cancel):
+                    self.finding("RL_CONTROL_DRIVER", "Admin driver was not actually completed/joined after complete body")
+                if joined and driver.get("exit_ns") is not None and not start <= integer(driver["exit_ns"], "control driver exit") <= end:
+                    raise EvidenceError("Admin driver completion outside operation interval")
+                status = raw.get("status")
+                proven = (isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300 and
+                          raw.get("body_complete") is True and raw.get("error") is None and
+                          (completed_driver or cleanup_cancel))
+                integer(required(raw, "body_bytes"), "control body bytes")
+            elif operation == "fixture_ipc":
+                if request.get("role") not in ("dns", "upstream") or not isinstance(request.get("command"), dict):
+                    self.finding("RL_CONTROL_REQUEST", "fixture IPC target/command has no fixed identity")
+                ack = raw.get("fixture_ack")
+                proven = isinstance(ack, dict) and ack.get("ok") is True and raw.get("error") is None
+            elif operation == "cli_mutation":
+                if request.get("action") not in ("activate", "rollback", "reload-source"):
+                    self.finding("RL_CONTROL_REQUEST", "unknown control mutation action")
+                receipt = raw.get("mutation_receipt")
+                proven = isinstance(receipt, dict) and raw.get("error") is None
+                # Mutation ACK alone cannot prove publication. The independent
+                # before/after runtime observations remain required coverage.
+            derived = "completed" if proven else "failed"
+            self.counts[f"control_operations.{derived}"] += 1
+            if not proven:
+                self.finding("RL_CONTROL_FAILURE", "control operation has failed/unknown terminal facts", operation=operation, operation_id=operation_id)
+            if row.get("classification") != derived:
+                self.finding("RL_CONTROL_CLASSIFICATION", "control classification contradicts independently derived facts", operation_id=operation_id)
+        if pending:
+            self.finding("RL_CONTROL_RESULT", "begun control operations lack terminal receipts", ids=list(pending))
+
+    def load_prelude(self):
+        """Preserve every connection preparation and old/new flow operation."""
+        if not self.optional_file("prelude-operations.json"):
+            if self.retained_proofs and not self.receipt.get("synthetic"):
+                self.finding("RL_PRELUDE_RESULT", "retained proof has no full prelude operation denominator")
+            return
+        document = self.inputs.document("prelude-operations.json", 16 << 20)
+        if document.get("schema_version") != "oxidase.resource-prelude/v1":
+            raise EvidenceError("unknown prelude operation schema")
+        evidence = required(document, "evidence")
+        rows = required(evidence, "prelude_operations")
+        counts = required(evidence, "prelude_counts")
+        if not isinstance(rows, list) or not 0 < len(rows) <= 4096 or not isinstance(counts, dict):
+            raise EvidenceError("invalid/excessive prelude operation ledger")
+        if counts.get("violations"):
+            self.finding("RL_PRELUDE_RESULT", "prelude discloses duplicate/identity ledger violations")
+        for proof in self.retained_proofs:
+            for name in ("prelude_operations", "prelude_counts"):
+                if name in proof and proof[name] != evidence[name]:
+                    self.finding("RL_PRELUDE_RESULT", "retained proof and independent prelude file disagree", field=name)
+            index = {row.get("operation_id"): row.get("raw") for row in rows if isinstance(row, dict)}
+            flows = proof.get("new_b_streams_raw", []) + [proof.get("held_grpc_raw", {}), proof.get("upgrade_raw", {})]
+            for raw in flows:
+                if not isinstance(raw, dict) or index.get(raw.get("operation_id")) != raw:
+                    self.finding("RL_PRELUDE_RESULT", "retained flow does not exactly match its independently conserved prelude operation")
+        peers = self.receipt.get("fixture_peers", {})
+        approved = [peers[key] for key in ("a", "b") if peers.get(key)]
+        if not approved:
+            self.finding("RL_PRELUDE_IDENTITY", "prelude has no declared physical fixture endpoints")
+        payload = integer(required(self.receipt["parameters"], "payload_bytes"), "prelude payload", 1)
+        base = {"status": 200, "content_type": "application/grpc", "body": {"kind": "grpc", "payload_bytes": payload, "fill_byte": 120},
+                "trailers": {"grpc-status": "0", "grpc-message": "ok"}, "allowed_peers": approved,
+                "authority": "gateway.example.test", "server_name": "gateway.example.test"}
+        seen, derived_counts, by_role = set(), Counter(), defaultdict(Counter)
+        windows = []
+        proof_end = max((integer(raw.get("ended_ns"), "retained flow end")
+                         for proof in self.retained_proofs for raw in
+                         [proof.get("held_grpc_raw", {}), proof.get("upgrade_raw", {})] if raw.get("ended_ns") is not None), default=0)
+        for proof in self.retained_proofs:
+            for name, limit, expected_role in (("initialization_window", 8 * NS, "held"), ("withdrawal_window", 10 * NS, "probe")):
+                window = proof.get(name)
+                if not isinstance(window, dict):
+                    continue
+                left, right, deadline = (integer(required(window, key), f"prelude {key}") for key in ("start_ns", "end_ns", "deadline_ns"))
+                if not left <= right <= deadline or deadline - left > limit or window.get("roles") != [expected_role] or window.get("allowed_statuses") != [503]:
+                    self.finding("RL_PRELUDE_WINDOW", "prelude rejection allowance is not a finite exact-role window")
+                else:
+                    windows.append((expected_role, left, right))
+        for index, row in enumerate(rows, 1):
+            operation_id = required(row, "operation_id")
+            if operation_id in seen or operation_id != f"prelude:{index}":
+                raise EvidenceError("prelude identity missing, duplicated or out of allocation order")
+            seen.add(operation_id)
+            role, raw, terminal = required(row, "role"), required(row, "raw"), row.get("terminal")
+            if role not in ("control", "probe", "held", "upgrade", "cancel") or not isinstance(raw, dict) or raw.get("operation_id") != operation_id:
+                raise EvidenceError("invalid prelude role or changed raw identity")
+            start, end = integer(required(raw, "started_ns"), "prelude start"), integer(required(raw, "ended_ns"), "prelude end")
+            head = raw.get("head_ns")
+            if end < start or head is not None and not start <= integer(head, "prelude head") <= end:
+                raise EvidenceError("prelude capture time is backwards")
+            derived_counts["offered"] += 1
+            by_role[role]["offered"] += 1
+            if terminal is not None:
+                derived_counts["classified"] += 1
+                by_role[role]["classified"] += 1
+            if terminal == "abandoned":
+                derived_counts["abandoned"] += 1
+                by_role[role]["abandoned"] += 1
+            if terminal in (None, "failed", "abandoned"):
+                self.finding("RL_PRELUDE_RESULT", "begun prelude operation failed or was never received", operation_id=operation_id)
+                self.counts["prelude.failed"] += 1
+                continue
+            if role == "control":
+                if terminal != "prepared" or row.get("cause") != "connection_ready" or raw.get("status") is not None or head is not None or raw.get("error_stage") or raw.get("error_code"):
+                    self.finding("RL_PRELUDE_CONNECTION", "connection preparation lacks actual handshake terminal facts")
+                self.counts["prelude.connection_prepared"] += 1
+                continue
+            if raw.get("status") == 503:
+                if head is None or not any(owner == role and left <= head <= right for owner, left, right in windows):
+                    self.finding("RL_PRELUDE_WINDOW", "prelude 503 lies outside its exact finite role/window")
+                fixed = b"Service Unavailable"
+                if terminal != "response_complete" or raw.get("eof") is not True or raw.get("body_bytes") != len(fixed) or raw.get("body_sha256") != hashlib.sha256(fixed).hexdigest() or raw.get("content_type") != "text/plain; charset=utf-8" or raw.get("error_stage") or raw.get("error_code"):
+                    self.finding("RL_PRELUDE_CONTENT", "expected rejection has incomplete/corrupt safe response")
+                self.counts["prelude.expected_rejection"] += 1
+                continue
+            if role == "upgrade":
+                recipe = {"status": 101, "content_type": None, "body": {"kind": "utf8", "text": "qualification-tunnel" * 8}, "trailers": {},
+                          "allowed_peers": [peers.get("a")], "authority": "gateway.example.test", "server_name": "gateway.example.test", "path": "/base/ws"}
+            else:
+                path = "/base/hold?b=2&a=1&a=3" if role == "held" else ("/base/cancel?b=2&a=1&a=3" if role == "cancel" else "/base/soak.Service/Call?b=2&a=1&a=3")
+                recipe = {**base, "path": path}
+            key = "_prelude_operation"
+            if key in self.receipt["recipes"]:
+                raise EvidenceError("reserved prelude recipe is user-defined")
+            self.receipt["recipes"][key] = recipe
+            measured = {**raw, "admitted": True, "connection_attempted": False, "upgrade": role == "upgrade"}
+            if row.get("acknowledgement") is not None:
+                measured["cancel_ack"] = row["acknowledgement"]
+            # ACK may follow the client body Drop; the proof terminal encloses
+            # that asynchronous acknowledgement without replacing DATA times.
+            collected = {"raw": measured, "start_ns": start, "end_ns": max(end, proof_end), "head_ns": head}
+            try:
+                derived = self.wire({"lane": "upgrade" if role == "upgrade" else ("cancel" if role == "cancel" else "healthy"),
+                                     "phase": "warmup", "protocol": raw.get("protocol"), "recipe": key, "raw": measured}, collected)
+                expected = {"completed_success": "response_complete", "intentional_cancelled": "cancelled_after_data", "upgrade_completed": "response_complete"}.get(derived)
+                planned_close = derived == "upgrade_completed" and terminal == "tunnel_cancelled" and measured.get("tunnel_close_result") == "peer_closed_without_close_notify"
+                if terminal != expected and not planned_close:
+                    self.finding("RL_PRELUDE_CLASSIFICATION", "prelude terminal label contradicts independently checked wire facts", operation_id=operation_id)
+                self.counts[f"prelude.{derived}"] += 1
+            finally:
+                del self.receipt["recipes"][key]
+        for key in ("offered", "classified", "abandoned"):
+            if counts.get(key) != derived_counts[key]:
+                self.finding("RL_PRELUDE_CONSERVATION", "prelude count contradicts every begun operation", counter=key)
+            self.counts[f"prelude.{key}"] = derived_counts[key]
+        normalized = {role: {key: value[key] for key in ("offered", "classified", "abandoned")} for role, value in by_role.items()}
+        if counts.get("by_role") != normalized:
+            self.finding("RL_PRELUDE_CONSERVATION", "prelude per-role denominator does not conserve raw operations")
+
+    def load_probes(self):
+        path = self.inputs.directory / "control-probes.jsonl"
+        if not path.is_file() and not (self.inputs.directory / "control-probes.jsonl.gz").is_file():
+            if self.probe_references:
+                self.finding("RL_PROBE_RESULT", "control probe references have no raw operation ledger")
+            return
+        pending, sequence = {}, 0
+        for _, row in self.inputs.rows("control-probes.jsonl"):
+            if row.get("schema_version") != "oxidase.resource-control-probe/v1":
+                raise EvidenceError("unknown control probe schema")
+            current = integer(required(row, "writer_seq"), "probe writer_seq", 1)
+            if current != sequence + 1:
+                raise EvidenceError("control probe writer sequence missing or duplicated")
+            sequence = current
+            operation_id = required(row, "operation_id")
+            if not isinstance(operation_id, str) or len(operation_id) > 128:
+                raise EvidenceError("invalid control probe identity")
+            kind = required(row, "kind")
+            if kind == "started":
+                if operation_id in pending or operation_id in self.probes or len(pending) + len(self.probes) >= MAX_PROBES:
+                    raise EvidenceError("duplicate or excessive control probe identity")
+                integer(required(row, "start_ns"), "probe start")
+                pending[operation_id] = row
+            elif kind == "terminal":
+                started = pending.pop(operation_id, None)
+                if started is None:
+                    raise EvidenceError("control terminal has no independent started operation")
+                for key in ("start_ns", "scenario", "protocol", "recipe", "target", "phase", "window_id"):
+                    if key in row and key in started and row[key] != started[key]:
+                        self.finding("RL_PROBE_RESULT", "control terminal changed its start identity/contract", field=key)
+                merged = {**started, **row}
+                start = integer(required(merged, "start_ns"), "probe start")
+                end = integer(required(merged, "end_ns"), "probe end")
+                if end < start:
+                    raise EvidenceError("control probe time moves backwards")
+                merged.setdefault("phase", self.phase_at(start))
+                self.check_phase(merged["phase"], start, end, "control probe")
+                raw = required(merged, "raw")
+                raw = {**raw, "admitted": required(merged, "admitted"),
+                       "connection_attempted": integer(required(merged, "connection_attempts"), "probe connections") > 0}
+                merged["raw"] = raw
+                driver = merged.get("driver_exit")
+                if driver is not None:
+                    not_created = isinstance(driver, dict) and driver.get("result") == "not_created" and merged.get("admitted") is False
+                    if not isinstance(driver, dict) or driver.get("join_acknowledged") is not True or (driver.get("result") not in ("completed", "error") and not not_created):
+                        self.finding("RL_PROBE_DRIVER", "control client driver was not actually joined/classified")
+                    elif driver.get("result") == "error" and not merged.get("window_id"):
+                        self.finding("RL_PROBE_DRIVER", "driver error has no bounded injection window")
+                else:
+                    self.finding("RL_PROBE_DRIVER", "control client has no actual driver completion receipt", "INCONCLUSIVE")
+                self.probes[operation_id] = merged
+            else:
+                raise EvidenceError("unknown control probe operation event")
+        if pending:
+            self.finding("RL_PROBE_RESULT", "begun control probes have no terminal operation", ids=list(pending))
+        # Reconstruct the fixed path recipe from the request, not from the reply.
+        for operation_id, probe in self.probes.items():
+            request = required(probe, "request")
+            recipe_name = probe.get("recipe", "grpc" if request.get("grpc") else "download")
+            declared = required(required(self.receipt, "recipes"), recipe_name)
+            path = required(request, "path")
+            if not isinstance(path, str) or not path.startswith("/resource/"):
+                self.finding("RL_PROBE_REQUEST", "control probe does not use the fixed resource fixture route")
+                continue
+            key = "_control_probe"
+            if key in self.receipt["recipes"]:
+                raise EvidenceError("reserved independent control recipe already exists")
+            self.receipt["recipes"][key] = {**declared, "path": "/base" + path}
+            outcome = {"lane": "churn" if probe.get("window_id") else "healthy", "phase": probe["phase"],
+                       "protocol": required(probe, "protocol"), "recipe": key,
+                       "target": probe.get("target", "upstream"), "window_id": probe.get("window_id"), "raw": probe["raw"]}
+            error = {**probe, "head_ns": probe["raw"].get("head_ns")}
+            try:
+                classification = self.wire(outcome, error)
+                probe["derived_classification"] = classification
+                self.counts["control_probes"] += 1
+                self.counts[f"control.{classification}"] += 1
+                if classification == "completed_success":
+                    self.success_points.append((probe["start_ns"], probe["end_ns"], outcome["target"], 1, probe["raw"].get("upstream_peer")))
+            finally:
+                del self.receipt["recipes"][key]
+        for name, reference in self.probe_references:
+            probe = self.probes.get(reference.get("operation_id"))
+            if probe is None:
+                self.finding("RL_PROBE_RESULT", "coverage points to a missing control operation", behavior=name)
+                continue
+            if "raw" in reference and any(probe["raw"].get(key) != value for key, value in reference["raw"].items()):
+                self.finding("RL_PROBE_RESULT", "coverage raw reply differs from its operation ledger", behavior=name)
+            classification = probe.get("derived_classification")
+            raw = probe["raw"]
+            proven = False
+            if name == "deadline_timeout":
+                # A header delay alone is not the logical total-budget oracle.
+                proven = classification == "expected_injected_failure" and raw.get("status") == 504
+                if proven:
+                    self.coverage["deadline_timeout_probe"] += 1
+            elif name == "post_head_error":
+                proven = classification == "expected_injected_failure" and raw.get("status") == 200 and raw.get("error_stage") == "response_body"
+            elif name == "positive_aaaa":
+                expected = self.receipt.get("fixture_peers", {}).get("ipv6")
+                proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
+                if proven:
+                    self.coverage["positive_aaaa_probe"] += 1
+            elif name in ("dns_readd", "recovery_a", "fault_recovery"):
+                expected = reference.get("expected_peer", self.receipt.get("fixture_peers", {}).get("a"))
+                proven = classification == "completed_success" and expected is not None and raw.get("upstream_peer") == expected
+                if name == "dns_readd" and proven:
+                    self.coverage[name] += 1
+            if not proven:
+                self.finding("RL_TRIGGER", "control probe does not prove its claimed behavior", behavior=name)
+
     def retained_proof(self, evidence):
         """Verify raw old/new streams, not the legacy controller booleans."""
         proof = required(evidence, "raw")
+        self.retained_proofs.append(proof)
         peers = self.receipt.get("fixture_peers")
         if not isinstance(peers, dict) or not peers.get("a") or not peers.get("b"):
             self.finding("RL_RETAINED_PROOF", "held/new stream proof lacks declared physical fixture A/B identities", "INCONCLUSIVE")
@@ -437,7 +876,7 @@ class Analyzer:
         if any(name in declared_recipes for name in temporary):
             raise EvidenceError("receipt uses a reserved independent proof recipe")
         declared_recipes.update(temporary)
-        initial_failures = self.finding_count["FAIL"] + self.finding_count["INCONCLUSIVE"]
+        initial_failures = self.finding_count["FAIL"]
         operation_ids = set()
         try:
             for raw in new_streams:
@@ -458,7 +897,7 @@ class Analyzer:
                     self.finding("RL_RETAINED_PROOF", "old pinned flow did not use physical fixture A")
                 self.wire({"lane": lane, "phase": "warmup", "protocol": protocol, "recipe": recipe,
                            "raw": {**raw, "admitted": True, "connection_attempted": False, "upgrade": lane == "upgrade"}})
-            if initial_failures == self.finding_count["FAIL"] + self.finding_count["INCONCLUSIVE"]:
+            if initial_failures == self.finding_count["FAIL"]:
                 self.coverage["old_held_grpc_and_upgrade"] += 1
         finally:
             for name in temporary:
@@ -468,7 +907,7 @@ class Analyzer:
     def body_digest(body, raw, partial=None):
         kind = required(body, "kind")
         payload = integer(body.get("payload_bytes", 0), "recipe payload_bytes")
-        if payload > (1 << 32) - 1:
+        if payload > 16 * 1024 * 1024:
             raise EvidenceError("recipe payload exceeds supported byte limit")
         prefix = b""
         if kind == "empty":
@@ -523,13 +962,19 @@ class Analyzer:
             if raw.get("error_stage") not in ("connection", "connect", "tls", "handshake", "http_handshake"):
                 self.finding("RL_CONNECTION_ACCOUNTING", "response-phase failure was misreported as connection preparation")
             return self.failure(outcome, error, "connection_error")
-        if status != recipe.get("status") or raw.get("error_stage") or raw.get("error_code"):
+        planned_unclean_upgrade = (lane == "upgrade" and raw.get("tunnel_close_result") == "peer_closed_without_close_notify" and
+                                   raw.get("tunnel_client_shutdown") is True and raw.get("error_stage") in (None, "tunnel_close") and
+                                   raw.get("error_code") in (None, "peer_closed_without_close_notify"))
+        if status != recipe.get("status") or ((raw.get("error_stage") or raw.get("error_code")) and not planned_unclean_upgrade):
             return self.failure(outcome, error, "unexpected_http_response" if status is not None else "transport_error")
         mismatches = []
         for key in ("content_type", "authority", "server_name", "path"):
             if key in recipe and raw.get(key) != recipe[key]:
                 mismatches.append(key)
-        if (lane != "upgrade" or "allowed_peers" in recipe) and raw.get("upstream_peer") not in required(recipe, "allowed_peers"):
+        if recipe.get("upstream_expected") is False:
+            if self.receipt["parameters"].get("campaign") != "I" or any(raw.get(key) is not None for key in ("upstream_peer", "upstream_name", "authority", "server_name", "path")):
+                mismatches.append("local-only metadata boundary")
+        elif (lane != "upgrade" or "allowed_peers" in recipe) and raw.get("upstream_peer") not in required(recipe, "allowed_peers"):
             mismatches.append("upstream_peer")
         body_bytes = integer(required(raw, "body_bytes"), "actual body_bytes")
         body = required(recipe, "body")
@@ -552,11 +997,13 @@ class Analyzer:
             if ack is not None:
                 operation_id = raw.get("operation_id")
                 if error is not None:
-                    operation_id = error["raw"].get("operation_id", f"{error['worker_id']}:{error['operation_seq']}")
+                    operation_id = error["raw"].get("operation_id")
+                    if operation_id is None and "worker_id" in error:
+                        operation_id = f"{error['worker_id']}:{error['operation_seq']}"
                 if (not isinstance(ack, dict) or ack.get("operation_id") != operation_id or
                         ack.get("termination") != "cancelled_after_data" or
                         ack.get("body_dropped_after_data") is not True or
-                        not isinstance(ack.get("body_bytes"), int) or ack["body_bytes"] <= 0):
+                        not isinstance(ack.get("body_bytes"), int) or isinstance(ack["body_bytes"], bool) or ack["body_bytes"] < body_bytes):
                     mismatches.append("cancel-receipt")
                 elif error is not None and not error["start_ns"] <= integer(required(ack, "dropped_ns"), "actual cancellation time") <= error["end_ns"]:
                     mismatches.append("cancel-receipt-time")
@@ -567,7 +1014,7 @@ class Analyzer:
                 return "content_error"
             self.coverage["client_cancellation"] += 1
             return "intentional_cancelled"
-        if raw.get("eof") is not True or body_bytes != full_length:
+        if (raw.get("eof") is not True and not planned_unclean_upgrade) or body_bytes != full_length:
             mismatches.append("body-length/EOF")
         actual_trailers = required(raw, "trailers")
         for name, value in required(recipe, "trailers").items():
@@ -585,6 +1032,22 @@ class Analyzer:
             if raw.get("upgrade") is not True or raw.get("status") != 101 or protocol != "upgrade":
                 self.finding("RL_UPGRADE_PROOF", "upgrade lacks a real 101 handshake/tunnel protocol")
                 return "content_error"
+            close_result = raw.get("tunnel_close_result")
+            if close_result is not None:
+                if raw.get("request_head_sent") is not True or raw.get("tunnel_client_shutdown") is not True:
+                    self.finding("RL_UPGRADE_PROOF", "tunnel close was not preceded by a real request and intentional shutdown")
+                    return "content_error"
+                if close_result == "clean_eof" and raw.get("eof") is not True:
+                    self.finding("RL_UPGRADE_PROOF", "clean TLS EOF contradicts actual EOF evidence")
+                    return "content_error"
+                if close_result == "peer_closed_without_close_notify":
+                    if raw.get("eof") is not False:
+                        self.finding("RL_UPGRADE_PROOF", "unclean TLS close was falsely converted to ordinary EOF")
+                        return "content_error"
+                    self.finding("RL_GRACEFUL_TLS_CLOSE", "full tunnel exchange ended with observed peer closure without TLS close_notify", "INCONCLUSIVE")
+                elif close_result != "clean_eof":
+                    self.finding("RL_UPGRADE_PROOF", "unknown/error/timeout tunnel close is not a planned termination")
+                    return "content_error"
             self.coverage["upgrade"] += 1
             return "upgrade_completed"
         if protocol == "h2":
@@ -596,6 +1059,13 @@ class Analyzer:
         if recipe["body"]["kind"] == "grpc":
             self.coverage["grpc_trailers"] += 1
         self.coverage["complete_download"] += 1
+        peer = raw.get("upstream_peer")
+        if isinstance(peer, str) and peer.startswith("["):
+            try:
+                if ipaddress.ip_address(peer[1:peer.index("]")]).version == 6:
+                    self.actual_ipv6_responses += 1
+            except ValueError:
+                raise EvidenceError("invalid physical IPv6 peer")
         if "upload" in recipe:
             upload = raw.get("upload")
             if not isinstance(upload, dict) or upload.get("eof") is not True or upload.get("fixture_ack") is not True:
@@ -619,9 +1089,11 @@ class Analyzer:
         window = self.windows.get(window_id)
         allowed = False
         if window and outcome.get("target") == window["target"] and outcome["lane"] in window["lanes"]:
-            observed = error.get("head_ns") if raw.get("status") is not None and not raw.get("error_stage") else error["end_ns"]
+            observed = error.get("head_ns") if raw.get("status") is not None and not raw.get("error_stage") else error.get("raw", {}).get("ended_ns", error["end_ns"])
             if observed is None:
                 observed = error["end_ns"]
+            if not error["start_ns"] <= integer(observed, "actual failure time") <= error["end_ns"]:
+                raise EvidenceError("actual failure time lies outside collected operation")
             if window["start_ns"] <= observed <= window["end_ns"]:
                 for choice in window["allowed"]:
                     if ("status" in choice and choice["status"] == raw.get("status")) or (
@@ -629,6 +1101,12 @@ class Analyzer:
                             choice.get("error_code") == raw.get("error_code")):
                         allowed = True
         if allowed and outcome["lane"] != "healthy":
+            if raw.get("status") in (503, 504) and not raw.get("error_stage"):
+                safe = b"Service Unavailable" if raw["status"] == 503 else b"Gateway Timeout"
+                if (raw.get("eof") is not True or raw.get("content_type") != "text/plain; charset=utf-8" or
+                        raw.get("body_bytes") != len(safe) or raw.get("body_sha256") != hashlib.sha256(safe).hexdigest()):
+                    self.finding("RL_CONTENT", "finite injected status does not excuse incomplete/corrupt safe response")
+                    return "content_error"
             if raw.get("status") == 200 and raw.get("error_stage") == "response_body":
                 recipe = required(required(self.receipt, "recipes"), required(outcome, "recipe"))
                 prefix_errors = []
@@ -637,9 +1115,11 @@ class Analyzer:
                         prefix_errors.append(key)
                 if raw.get("upstream_peer") not in required(recipe, "allowed_peers"):
                     prefix_errors.append("upstream_peer")
+                if "failure_peers" in window and raw.get("upstream_peer") not in window["failure_peers"]:
+                    prefix_errors.append("fault target peer")
                 received = integer(required(raw, "body_bytes"), "partial response bytes")
                 _, digest = self.body_digest(required(recipe, "body"), raw, received)
-                if received == 0 or raw.get("data_observed") is not True or raw.get("eof") is not False:
+                if raw.get("data_observed") is not bool(received) or raw.get("eof") is not False:
                     prefix_errors.append("partial DATA/error evidence")
                 if digest is None or raw.get("body_sha256") != digest:
                     prefix_errors.append("partial body digest")
@@ -647,9 +1127,16 @@ class Analyzer:
                     self.finding("RL_CONTENT", "injected body error cannot excuse corrupt DATA/metadata", fields=prefix_errors)
                     return "content_error"
                 case_id = raw.get("fault_case_id")
-                if case_id is not None and str(window_id).startswith("fault-") and str(case_id) != str(window_id)[6:]:
+                expected_case = window.get("fault_case_id")
+                if expected_case is not None and case_id != expected_case:
+                    self.finding("RL_FAULT_WINDOW", "actual fixture fault case differs from the declared case")
+                    return "transport_error"
+                if expected_case is None and case_id is not None and str(window_id).startswith("fault-") and str(case_id) != str(window_id)[6:]:
                     self.finding("RL_FAULT_WINDOW", "actual fixture fault case differs from the claimed window")
                     return "transport_error"
+                self.coverage["post_head_error"] += 1
+                if received:
+                    self.coverage["post_head_error_after_data"] += 1
             return "expected_injected_failure"
         self.finding("RL_UNEXPECTED_RESPONSE", "wire failure is outside exact target/time/phase allowance",
                      status=raw.get("status"), stage=raw.get("error_stage"), window_id=window_id)
@@ -737,7 +1224,8 @@ class Analyzer:
                     self.counts[derived] += count
                 if derived == "completed_success":
                     self.worker_success[worker] += count
-                    self.success_points.append((outcome_start, outcome.get("last_end_ns", end), outcome.get("target"), count))
+                    self.success_points.append((outcome.get("last_start_ns", outcome_start), outcome.get("last_end_ns", end),
+                                                outcome.get("target"), count, raw.get("upstream_peer")))
                     self.raw_histogram[(outcome["phase"], outcome["lane"], outcome["protocol"])] += count
                     self.verified_wire_responses += count
                 if outcome["phase"] in ("quiet", "post_drain"):
@@ -769,9 +1257,14 @@ class Analyzer:
         if self.receipt["parameters"].get("traffic_required", True) and self.counts["completed_success"] == 0:
             self.finding("RL_NO_REAL_SUCCESS", "no response completed with independently verified body/trailers")
         for window in self.windows.values():
-            if not any(window["end_ns"] <= end <= window["recovery_deadline_ns"] and target == window["target"]
-                       for _, end, target, _ in self.success_points):
-                self.finding("RL_RECOVERY_DEADLINE", "fault target did not fully recover within its deadline", id=window["id"])
+            peers = window.get("recovery_peers", [None])
+            if not isinstance(peers, list) or not peers or any(peer is not None and not isinstance(peer, str) for peer in peers):
+                raise EvidenceError("recovery peer scope must be a nonempty bounded list")
+            for required_peer in peers:
+                if not any(window["end_ns"] <= start <= end <= window["recovery_deadline_ns"] and target == window["target"] and
+                           (required_peer is None or peer == required_peer)
+                           for start, end, target, _, peer in self.success_points):
+                    self.finding("RL_RECOVERY_DEADLINE", "fault target/peer did not fully recover within its deadline", id=window["id"], peer=required_peer)
 
     @staticmethod
     def metrics(text):
@@ -841,6 +1334,9 @@ class Analyzer:
             self.resource_previous[kind] = values
             self.last_resource[kind] = {**values, "states": states}
             bounds = self.receipt.get("bounds", {}).get(kind)
+            if not bounds and self.receipt["parameters"].get("formal") and kind not in self.unbounded_kinds:
+                self.unbounded_kinds.add(kind)
+                self.finding("RL_CAPACITY_UNPROVEN", "observed resource kind has no predeclared structural capacity or exit budget; a peak is not a bound", "INCONCLUSIVE", kind=kind)
             if bounds:
                 maximum = integer(required(bounds, "live_max"), f"{kind} live_max")
                 maximum = bounds.get(f"{sample['phase']}_live_max", maximum)
@@ -859,6 +1355,8 @@ class Analyzer:
             self.phase_points[sample["phase"]][f"live.{kind}"].append((sample["end_ns"], values["live"]))
             self.phase_points[sample["phase"]][f"retired.{kind}"].append((sample["end_ns"], states["retired"]))
         missing = set(self.receipt.get("bounds", {})) - kinds
+        if not self.receipt.get("synthetic"):
+            missing |= RESOURCE_KINDS - kinds
         if missing:
             self.finding("RL_MISSING_GAUGE", "bounded resource kinds missing", kinds=sorted(missing))
 
@@ -925,6 +1423,9 @@ class Analyzer:
                     if not start <= integer(required(capture, "start_ns"), "scrape start") <= integer(required(capture, "end_ns"), "scrape end") <= end:
                         raise EvidenceError("scrape timestamps lie outside capture interval")
                 metrics = self.metrics(required(row, "metrics"))
+                for name, value in metrics.items():
+                    self.first_metric.setdefault(name, value)
+                    self.last_metric[name] = value
                 for name in required(self.receipt, "required_gauges"):
                     if name not in metrics:
                         self.finding("RL_MISSING_GAUGE", "mandatory raw metric unavailable", metric=name)
@@ -1017,6 +1518,15 @@ class Analyzer:
         return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denominator if denominator else None
 
     def final_checks(self):
+        positive_aaaa = sum(max(0, value - self.first_metric.get(name, value))
+                            for name, value in self.last_metric.items()
+                            if name.startswith("oxidase_discovery_queries_total{") and
+                            'family="aaaa"' in name and 'result="positive"' in name)
+        if self.actual_ipv6_responses and positive_aaaa:
+            self.coverage["positive_aaaa"] = min(self.actual_ipv6_responses, positive_aaaa)
+        total_deadline = self.last_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0) - self.first_metric.get('oxidase_upstream_timeouts_total{phase="total"}', 0)
+        if self.coverage["deadline_timeout_probe"] and total_deadline > 0:
+            self.coverage["deadline_timeout"] = min(self.coverage["deadline_timeout_probe"], total_deadline)
         required_coverage = list(required(self.receipt, "coverage_required"))
         params = self.receipt["parameters"]
         if params.get("formal") and params.get("campaign") in ("H", "C"):
@@ -1082,7 +1592,10 @@ class Analyzer:
             self.receipt = self.inputs.document("receipt.json")
             self.identities()
             self.timeline()
+            self.load_prelude()
+            self.load_controls()
             self.load_errors()
+            self.load_probes()
             self.operations()
             self.samples()
             curves = self.final_checks()

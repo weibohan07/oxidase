@@ -38,8 +38,8 @@ def anomaly(data, bucket_index=2, **changes):
 def fault_corpus():
     data = corpus()
     data["receipt.json"]["parameters"]["campaign"] = "C"
-    bucket, outcome, row = anomaly(data, status=503, body_bytes=0,
-                                  body_sha256=hashlib.sha256(b"").hexdigest())
+    bucket, outcome, row = anomaly(data, status=503, body_bytes=19, content_type="text/plain; charset=utf-8",
+                                  body_sha256=hashlib.sha256(b"Service Unavailable").hexdigest())
     for record in (outcome, row):
         record.update(lane="fault", window_id="reset-1")
     window = {"kind": "fault_window", "t_ns": bucket["bucket_end_ns"] + 1,
@@ -254,6 +254,10 @@ class VerifierCorpusTests(unittest.TestCase):
                                            "dropped_ns": bucket["bucket_start_ns"] + 10}
         self.assertEqual(self.verify(data)["result"], "PASS_IMPLEMENTATION")
         for record in (outcome, error):
+            record["raw"]["cancel_ack"]["body_bytes"] = 4
+        self.assert_failure(data, "RL_CONTENT")
+        for record in (outcome, error):
+            record["raw"]["cancel_ack"]["body_bytes"] = 1024
             record["raw"]["cancel_ack"]["operation_id"] = "unrelated:99"
         self.assert_failure(data, "RL_CONTENT")
 
@@ -281,12 +285,17 @@ class VerifierCorpusTests(unittest.TestCase):
                     window["end_ns"] = window["start_ns"]
                 self.assert_failure(data, code)
 
+    def test_healthy_other_peer_cannot_hide_faulted_peer_that_never_recovers(self):
+        data = fault_corpus()
+        data["events.jsonl"][2]["recovery_peer"] = "127.0.0.2:23456"
+        self.assert_failure(data, "RL_RECOVERY_DEADLINE")
+
     def test_post_head_failure_is_classified_at_body_error_not_old_response_head(self):
         data = fault_corpus()
         outcome = data["buckets.jsonl"][2]["outcomes"][0]
         error = data["errors.jsonl"][0]
         for raw in (outcome["raw"], error["raw"]):
-            raw.update(status=200, eof=False, error_stage="response_body", error_code="body_error",
+            raw.update(status=200, content_type=None, eof=False, error_stage="response_body", error_code="body_error",
                        body_bytes=5, body_sha256=hashlib.sha256(b"xxxxx").hexdigest(), data_observed=True)
         error["head_ns"] = error["start_ns"]
         window = data["events.jsonl"][2]
@@ -298,6 +307,19 @@ class VerifierCorpusTests(unittest.TestCase):
         for raw in (outcome["raw"], error["raw"]):
             raw["body_sha256"] = hashlib.sha256(b"wrong").hexdigest()
         self.assert_failure(data, "RL_CONTENT")
+
+    def test_legitimate_post_head_reset_without_flushed_data_keeps_empty_prefix_truth(self):
+        data = fault_corpus()
+        outcome = data["buckets.jsonl"][2]["outcomes"][0]
+        error = data["errors.jsonl"][0]
+        for raw in (outcome["raw"], error["raw"]):
+            raw.update(status=200, content_type=None, eof=False, error_stage="response_body", error_code="body_error",
+                       body_bytes=0, body_sha256=hashlib.sha256(b"").hexdigest(), data_observed=False)
+        data["events.jsonl"][2]["allowed"] = [{"error_stage": "response_body", "error_code": "body_error"}]
+        report = self.verify(data)
+        self.assertEqual(report["result"], "PASS_IMPLEMENTATION", report["findings"])
+        self.assertEqual(report["coverage"]["post_head_error"], 1)
+        self.assertEqual(report["coverage"].get("post_head_error_after_data", 0), 0)
 
     def test_http_request_already_sent_cannot_be_connection_preparation_failure(self):
         data = corpus()
@@ -582,6 +604,24 @@ class VerifierCorpusTests(unittest.TestCase):
         self.assertEqual(report["counts"]["upgrade_completed"], 1)
         self.assertEqual(report["counts"]["completed_success"], 5)
         self.assertEqual(report["counts"]["admitted_http_operations"], 5)
+
+    def test_unclean_tls_tunnel_close_is_narrow_inconclusive_not_fake_body_eof(self):
+        data = retained_corpus()
+        upgrade = data["events.jsonl"][1]["evidence"]["raw"]["upgrade_raw"]
+        upgrade.update(eof=False, request_head_sent=True, tunnel_client_shutdown=True,
+                       tunnel_close_result="peer_closed_without_close_notify")
+        report = self.verify(data)
+        self.assertEqual(report["result"], "INCONCLUSIVE", report["findings"])
+        self.assertIn("RL_GRACEFUL_TLS_CLOSE", codes(report))
+        for change in ("timeout", "error", "unknown"):
+            upgrade["tunnel_close_result"] = change
+            self.assert_failure(data, "RL_CONTENT")
+        upgrade["tunnel_close_result"] = "peer_closed_without_close_notify"
+        upgrade["body_sha256"] = "0" * 64
+        self.assert_failure(data, "RL_CONTENT")
+        upgrade["body_sha256"] = hashlib.sha256(b"qualification-tunnel" * 8).hexdigest()
+        upgrade["eof"] = True
+        self.assert_failure(data, "RL_UPGRADE_PROOF")
 
     def test_histogram_uses_actual_capture_bounds_without_reclassifying_phase(self):
         data = corpus()

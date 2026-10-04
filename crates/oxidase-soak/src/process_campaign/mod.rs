@@ -9,6 +9,8 @@ mod monitor;
 #[cfg(unix)]
 mod resource_campaign;
 #[cfg(unix)]
+mod resource_controls;
+#[cfg(unix)]
 mod resource_evidence;
 #[cfg(unix)]
 mod resource_identity;
@@ -75,6 +77,10 @@ enum ResourceCampaign {
     DnsOnly,
     PublishOnly,
     BackgroundOnly,
+    HealthOnly,
+    DnsBackgroundOnly,
+    H2Only,
+    H2Cancel,
     GrpcOnly,
     UpgradeOnly,
     ScrapeOnly,
@@ -114,6 +120,10 @@ struct ResourceArguments {
     payload_size: usize,
     #[arg(long, default_value_t = 1048576)]
     upload_size: usize,
+    /// Minimum start-to-start period per complete-response worker. Zero is
+    /// ordinary closed-loop load; isolation comparisons report actual rates.
+    #[arg(long, default_value_t = 0)]
+    operation_interval_ms: u64,
     #[arg(long)]
     formal: bool,
     #[arg(long)]
